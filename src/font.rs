@@ -51,9 +51,9 @@ impl Font {
             texture.push(0);
         }
         let mut entries: HashMap<char, AtlasEntry> = HashMap::with_capacity(256);
+        let mut x = 0;
+        let mut y = 0;
         for c in 'a'..='z' {
-            let x = rand::random::<usize>() % width;
-            let y = rand::random::<usize>() % height;
             let glyph = self.load_glyph(c as char);
             let w = glyph.bitmap.width() as usize;
             let h = glyph.bitmap.rows() as usize;
@@ -63,6 +63,12 @@ impl Font {
                 }
             }
             entries.insert(c, AtlasEntry { x, y, width: w, height: h });
+            println!("{} {} {} {} {}", c, x as f32 / 1024.0, y as f32 / 1024.0, w as f32 / 1024.0, h as f32 / 1024.0);
+            x += 100;
+            if x >= (1024 - 100) {
+                x = 0;
+                y += 100;
+            }
         }
         Atlas { buffer: texture, width, height, entries }
     }

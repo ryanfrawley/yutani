@@ -7,21 +7,23 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
 );
 
 pub struct Camera {
-    pub eye: cgmath::Point3<f32>,
-    pub target: cgmath::Point3<f32>,
-    pub up: cgmath::Vector3<f32>,
-    pub aspect: f32,
-    pub fovy: f32,
-    pub znear: f32,
-    pub zfar: f32,
+}
+
+pub struct Projection {
+    pub width: u32,
+    pub height: u32,
 }
 
 impl Camera {
-    pub fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::from_nonuniform_scale(1.0, self.aspect, 1.0);
-        let projection = cgmath::ortho(-1.0, 1.0, -1.0, 1.0, -100.0, 100.0);
+    pub fn build_view_projection_matrix(&self, width: f32, height: f32) -> cgmath::Matrix4<f32> {
+        let view = cgmath::Matrix4::from_nonuniform_scale(1.0, 1.0, 1.0);
+        let projection = cgmath::ortho(0.0, width, height, 0.0, -100.0, 100.0);
         OPENGL_TO_WGPU_MATRIX * view * projection
     }
+}
+
+pub struct CameraController {
+
 }
 
 // We need this for Rust to store our data correctly for the shaders
@@ -42,7 +44,7 @@ impl CameraUniform {
         }
     }
 
-    pub fn update_view_proj(&mut self, camera: &Camera) {
-        self.view_proj = camera.build_view_projection_matrix().into();
+    pub fn update_view_proj(&mut self, camera: &Camera, width: f32, height: f32) {
+        self.view_proj = camera.build_view_projection_matrix(width as f32, height as f32).into();
     }
 }

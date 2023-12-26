@@ -15,17 +15,6 @@ use winit::{
 use wgpu::util::DeviceExt;
 
 
-const VERTICES: &[vertex::Vertex] = &[
-    vertex::Vertex { position: [0.5, -0.5, 0.0], tex_coords: [1.0, 1.0] },
-    vertex::Vertex { position: [-0.5, -0.5, 0.0], tex_coords: [0.0, 1.0] },
-    vertex::Vertex { position: [-0.5, 0.5, 0.0], tex_coords: [0.0, 0.0] },
-    vertex::Vertex { position: [0.5, 0.5, 0.0], tex_coords: [1.0, 0.0] },
-];
-
-const INDICES: &[u16] = &[
-    0, 1, 2, 3, 0
-];
-
 struct State {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -40,13 +29,12 @@ struct State {
 
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    num_vertices: u32,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     font_bind_group: wgpu::BindGroup,
     font_texture: texture::Texture,
-    instances: Vec<instance::Instance>,
-    instance_buffer: wgpu::Buffer,
+    // instances: Vec<instance::Instance>,
+    // instance_buffer: wgpu::Buffer,
     camera: camera::Camera,
     camera_uniform: camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -55,7 +43,6 @@ struct State {
 
 impl State {
     async fn new(window: Window, mut font: font::Font) -> Self {
-        let num_vertices = VERTICES.len() as u32;
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -112,8 +99,41 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-        for key in atlas.entries.keys() {
-            println!("{} {}", atlas.entries[key].x, atlas.entries[key].y);
+
+        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(26 * 4);
+        let mut indices: Vec<u16> = Vec::new();
+
+        let mut col = 0;
+        let mut row = 0;
+        let col_width = 100;
+        let cols_per_row = 1024 / col_width;
+        for value in atlas.entries.values() {
+            let start_idx = vertices.len();
+            let u1 = value.x as f32 / 1024.0;
+            let v1 = value.y as f32 / 1024.0;
+            let u2 = (value.x + value.width) as f32 / 1024.0;
+            let v2 = (value.y + value.height) as f32 / 1024.0;
+            let x = 60.5 + (col * col_width) as f32;
+            let y = (20.0 * 3.0) + (row * col_width) as f32;
+            let w = value.width as f32;
+            let h = value.height as f32;
+            println!("{} {}", x, w);
+            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1] });
+            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2] });
+            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1] });
+            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2] });
+            for i in start_idx..(start_idx + 3) {
+                indices.push(i as u16);
+            }
+            for i in (start_idx + 1)..=(start_idx + 3) {
+                indices.push(i as u16);
+            }
+            col += 1;
+            if col > cols_per_row {
+                col = 0;
+                row += 1;
+            }
+            println!("{} {}", value.x, value.y);
         }
 
         let font_alpha = texture::Texture::from_memory(
@@ -163,18 +183,10 @@ impl State {
             label: Some("font bind group"),
         });
 
-        let camera = camera::Camera {
-            eye: (0.0, 0.0, 2.0).into(),
-            target: (0.0, 0.0, 0.0).into(),
-            up: cgmath::Vector3::unit_y(),
-            aspect: config.width as f32 / config.height as f32,
-            fovy: 45.0,
-            znear: 1.0,
-            zfar: 1000.0,
-        };
-
+        // TODO
+        let camera = camera::Camera {};
         let mut camera_uniform = camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera);
+        camera_uniform.update_view_proj(&camera, config.width as f32, config.height as f32);
 
         let camera_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
@@ -235,7 +247,6 @@ impl State {
                 entry_point: "vs_main",
                 buffers: &[
                     vertex::Vertex::desc(),
-                    instance::InstanceRaw::desc(),
                 ],
             },
             fragment: Some(wgpu::FragmentState {
@@ -248,10 +259,10 @@ impl State {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Cw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -267,37 +278,19 @@ impl State {
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
+            contents: bytemuck::cast_slice(&vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         let index_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("index buffer"),
-                contents: bytemuck::cast_slice(INDICES),
+                contents: bytemuck::cast_slice(&indices),
                 usage: wgpu::BufferUsages::INDEX,
             },
         );
 
-        let num_indices = INDICES.len() as u32;
-
-        let instances = (0..1).map(move |x| {
-            let position = cgmath::Vector3 { x: 0.0, y: 0.0, z: 0.0 };
-            let tex_coords = cgmath::Vector4 { x: 0.0, y: 0.0, z: 1.0, w: 1.0 };
-
-            instance::Instance { position, tex_coords }
-        }).collect::<Vec<_>>();
-
-        let instance_data = instances.iter().map(instance::Instance::to_raw).collect::<Vec<_>>();
-
-        let instance_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("instance buffer"),
-                contents: bytemuck::cast_slice(&instance_data),
-                usage: wgpu::BufferUsages::VERTEX,
-            },
-        );
-
+        let num_indices = indices.len() as u32;
 
         Self {
             window,
@@ -308,13 +301,12 @@ impl State {
             size,
             render_pipeline,
             vertex_buffer,
-            num_vertices,
             index_buffer,
             num_indices,
             font_bind_group,
             font_texture: font_alpha,
-            instances,
-            instance_buffer,
+            // instances,
+            // instance_buffer,
             camera,
             camera_uniform,
             camera_buffer,
@@ -330,6 +322,8 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.camera_uniform.update_view_proj(&self.camera, size.width as f32, size.height as f32);
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
@@ -365,28 +359,27 @@ impl State {
             });
 
 
-            self.instances[0].position.x += 0.001;
-            println!("{}", self.instances[0].position.x);
+            // self.instances[0].position.x += 0.001;
+            // println!("{}", self.instances[0].position.x);
 
 
-            let instance_data = self.instances.iter().map(instance::Instance::to_raw).collect::<Vec<_>>();
+            // let instance_data = self.instances.iter().map(instance::Instance::to_raw).collect::<Vec<_>>();
 
-            self.instance_buffer = self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("instance buffer"),
-                    contents: bytemuck::cast_slice(&instance_data),
-                    usage: wgpu::BufferUsages::VERTEX,
-                },
-            );
+            // self.instance_buffer = self.device.create_buffer_init(
+            //     &wgpu::util::BufferInitDescriptor {
+            //         label: Some("instance buffer"),
+            //         contents: bytemuck::cast_slice(&instance_data),
+            //         usage: wgpu::BufferUsages::VERTEX,
+            //     },
+            // );
 
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
