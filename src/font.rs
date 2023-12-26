@@ -22,6 +22,8 @@ pub struct AtlasEntry {
     pub y: usize,
     pub width: usize,
     pub height: usize,
+    pub offset_y: usize,
+    pub advance_x: usize,
 }
 
 impl Font {
@@ -62,7 +64,8 @@ impl Font {
                     texture[(((p + y) % 1024) * width + (q + x) % 1024) as usize] = glyph.bitmap.buffer()[(p * w + q) as usize];
                 }
             }
-            entries.insert(c, AtlasEntry { x, y, width: w, height: h });
+            println!("vert bearing {}", glyph.metrics.horiBearingY / 64);
+            entries.insert(c, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance / 64) as usize, offset_y: (glyph.metrics.horiBearingY / 64) as usize });
             println!("{} {} {} {} {}", c, x as f32 / 1024.0, y as f32 / 1024.0, w as f32 / 1024.0, h as f32 / 1024.0);
             x += 100;
             if x >= (1024 - 100) {

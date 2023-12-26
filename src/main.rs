@@ -103,18 +103,15 @@ impl State {
         let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(26 * 4);
         let mut indices: Vec<u16> = Vec::new();
 
-        let mut col = 0;
+        let mut x = 30.0;
         let mut row = 0;
-        let col_width = 100;
-        let cols_per_row = 1024 / col_width;
         for value in atlas.entries.values() {
             let start_idx = vertices.len();
             let u1 = value.x as f32 / 1024.0;
             let v1 = value.y as f32 / 1024.0;
             let u2 = (value.x + value.width) as f32 / 1024.0;
             let v2 = (value.y + value.height) as f32 / 1024.0;
-            let x = 60.5 + (col * col_width) as f32;
-            let y = (20.0 * 3.0) + (row * col_width) as f32;
+            let y = (90.0 * 3.0) + (row * 120) as f32 - value.offset_y as f32;
             let w = value.width as f32;
             let h = value.height as f32;
             println!("{} {}", x, w);
@@ -128,12 +125,11 @@ impl State {
             for i in (start_idx + 1)..=(start_idx + 3) {
                 indices.push(i as u16);
             }
-            col += 1;
-            if col > cols_per_row {
-                col = 0;
+            x += value.advance_x as f32;
+            if x > 900.0 {
+                x = 30.0;
                 row += 1;
             }
-            println!("{} {}", value.x, value.y);
         }
 
         let font_alpha = texture::Texture::from_memory(
@@ -422,7 +418,7 @@ async fn run() {
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(13.0, 192);
+    font.set_char_size(30.0, 192);
 
     let mut state = State::new(window, font).await;
 
