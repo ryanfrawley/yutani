@@ -104,14 +104,14 @@ impl State {
 
         let mut x = 30.0;
         let mut row = 0;
-        let color = [1.0, 0.3, 0.75, 1.0];
+        let color = [1.0, 0.5, 0.75, 1.0];
         for value in atlas.entries.values() {
             let start_idx = vertices.len();
             let u1 = value.x as f32 / 1024.0;
             let v1 = value.y as f32 / 1024.0;
             let u2 = (value.x + value.width) as f32 / 1024.0;
             let v2 = (value.y + value.height) as f32 / 1024.0;
-            let y = 60.0 + 26.0 + (row * font.face.height() >> 6) as f32 - value.offset_y as f32;
+            let y = 60.0 + 26.0 + (row * font.face.size_metrics().unwrap().height >> 6) as f32 - value.offset_y as f32;
             let w = value.width as f32;
             let h = value.height as f32;
             println!("{} {}", x, w);
