@@ -103,15 +103,16 @@ impl State {
         let mut indices: Vec<u16> = Vec::new();
 
         let mut x = 30.0;
-        let mut row = 0;
+        let mut row = 1;
         let color = [1.0, 0.5, 0.75, 1.0];
+        let line_height = font.face.size_metrics().unwrap().height >> 6;
         for value in atlas.entries.values() {
             let start_idx = vertices.len();
             let u1 = value.x as f32 / 1024.0;
             let v1 = value.y as f32 / 1024.0;
             let u2 = (value.x + value.width) as f32 / 1024.0;
             let v2 = (value.y + value.height) as f32 / 1024.0;
-            let y = 60.0 + 26.0 + (row * font.face.size_metrics().unwrap().height >> 6) as f32 - value.offset_y as f32;
+            let y = (row * line_height) as f32 - value.offset_y as f32;
             let w = value.width as f32;
             let h = value.height as f32;
             println!("{} {}", x, w);
@@ -418,7 +419,7 @@ async fn run() {
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(13.0, 192);
+    font.set_char_size(33.0, 192);
 
     let mut state = State::new(window, font).await;
 
