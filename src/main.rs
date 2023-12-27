@@ -99,7 +99,6 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-
         let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(26 * 4);
         let mut indices: Vec<u16> = Vec::new();
 
@@ -112,7 +111,7 @@ impl State {
             let v1 = value.y as f32 / 1024.0;
             let u2 = (value.x + value.width) as f32 / 1024.0;
             let v2 = (value.y + value.height) as f32 / 1024.0;
-            let y = 60.0 + 26.0 + (row * 26) as f32 - value.offset_y as f32;
+            let y = 60.0 + 26.0 + (row * font.face.height() >> 6) as f32 - value.offset_y as f32;
             let w = value.width as f32;
             let h = value.height as f32;
             println!("{} {}", x, w);
@@ -127,7 +126,7 @@ impl State {
                 indices.push(i as u16);
             }
             x += value.advance_x as f32;
-            if x > 900.0 {
+            if x > 300.0 {
                 x = 30.0;
                 row += 1;
             }
