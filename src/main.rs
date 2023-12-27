@@ -287,7 +287,6 @@ impl State {
         let mut x = padding;
         let mut row = 1;
         let app_bar_height = 20.0;
-        println!("app bar height {}", app_bar_height);
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
         let color = match theme {
@@ -366,7 +365,6 @@ impl State {
         match event {
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                 let k = event.text.to_owned().unwrap_or_default();
-                println!("key {}", k);
                 self.text += &k;
                 self.update_vertices();
                 self.window.request_redraw();

@@ -49,6 +49,7 @@ impl Font {
         let size = 4096;
         let width = size;
         let height = size;
+        let mut row_height = 0;
         let mut texture: Vec<u8> = Vec::with_capacity(width * height);
         for _ in 0..(width * height) {
             texture.push(0);
@@ -61,18 +62,20 @@ impl Font {
             let glyph = self.load_glyph(ch);
             let w = glyph.bitmap.width() as usize;
             let h = glyph.bitmap.rows() as usize;
+            if h > row_height {
+                row_height = h;
+            }
             for p in 0..h {
                 for q in 0..w {
                     texture[(((p + y) % size) * width + (q + x) % size) as usize] = glyph.bitmap.buffer()[(p * w + q) as usize];
                 }
             }
-            println!("vert bearing {}", glyph.metrics.horiBearingY / 64);
             entries.insert(ch, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance >> 6) as usize, offset_y: (glyph.metrics.horiBearingY >> 6) as isize });
-            println!("{} {} {} {} {}", c, x as f32 / size as f32, y as f32 / size as f32, w as f32 / size as f32, h as f32 / size as f32);
             x += (glyph.metrics.horiAdvance >> 6) as usize;
-            if x >= (4096 - 100) {
+            if x >= size - w {
                 x = 0;
-                y += 100;
+                y += row_height;
+                row_height = 0;
             }
         }
         Atlas { buffer: texture, width, height, entries }
