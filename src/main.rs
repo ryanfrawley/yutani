@@ -30,15 +30,15 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    num_indices: u32,
+    font: font::Font,
     font_bind_group: wgpu::BindGroup,
     font_texture: texture::Texture,
-    // instances: Vec<instance::Instance>,
-    // instance_buffer: wgpu::Buffer,
     camera: camera::Camera,
     camera_uniform: camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    atlas: font::Atlas,
+    text: String,
 }
 
 impl State {
@@ -98,45 +98,6 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(26 * 4);
-        let mut indices: Vec<u16> = Vec::new();
-
-        let mut x = 30.0;
-        let mut row = 2;
-        let str = "Hello world!";
-        let color = [1.0, 0.2, 0.2, 1.0];
-        let line_height = font.face.size_metrics().unwrap().height >> 6;
-        for c in str.chars() {
-            let value = &atlas.entries[&c];
-            let w = value.width as f32;
-
-            // Wrap to next line
-            if x + w + (value.advance_x as f32) >= config.width as f32 {
-                x = 30.0;
-                row += 1;
-            }
-
-            let start_idx = vertices.len();
-            let size = 4096.0;
-            let u1 = value.x as f32 / size;
-            let v1 = value.y as f32 / size;
-            let u2 = (value.x + value.width) as f32 / size;
-            let v2 = (value.y + value.height) as f32 / size;
-            let y = (row * line_height) as f32 - value.offset_y as f32;
-            let h = value.height as f32;
-
-            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
-            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
-            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
-            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
-            for i in start_idx..(start_idx + 3) {
-                indices.push(i as u16);
-            }
-            for i in (start_idx + 1)..=(start_idx + 3) {
-                indices.push(i as u16);
-            }
-            x += value.advance_x as f32;
-        }
 
         let font_alpha = texture::Texture::from_memory(
             &device,
@@ -278,21 +239,23 @@ impl State {
             multiview: None,
         });
 
+        let mut v: Vec<u8> = Vec::with_capacity(100000);
+        for i in 0..100000 {
+            v.push(0);
+        }
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            contents: &bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
         let index_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("index buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
+                contents: &bytemuck::cast_slice(&v),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             },
         );
-
-        let num_indices = indices.len() as u32;
 
         Self {
             window,
@@ -300,20 +263,91 @@ impl State {
             device,
             queue,
             config,
+            atlas,
             size,
             render_pipeline,
             vertex_buffer,
             index_buffer,
-            num_indices,
+            font,
             font_bind_group,
             font_texture: font_alpha,
-            // instances,
-            // instance_buffer,
             camera,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            text: String::new(),
         }
+    }
+
+    fn update_vertices(&mut self) {
+        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (self.text.len() + 1));
+        let mut indices: Vec<u16> = Vec::with_capacity(6 * (self.text.len() + 1));
+
+        let padding = 16.0;
+        let mut x = padding;
+        let mut row = 1;
+        let app_bar_height = 20.0;
+        println!("app bar height {}", app_bar_height);
+
+        let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
+        let color = match theme {
+            winit::window::Theme::Light => [0.0, 0.05, 0.2, 1.0],
+            winit::window::Theme::Dark => [1.0, 1.0, 1.0, 1.0],
+        };
+        let line_height = self.font.face.size_metrics().unwrap().height >> 6;
+        for c in self.text.chars() {
+            let value = &self.atlas.entries[&c];
+            let w = value.width as f32;
+
+            // Wrap to next line
+            if x + w + (value.advance_x as f32) >= self.config.width as f32 {
+                x = padding;
+                row += 1;
+            }
+
+            let start_idx = vertices.len();
+            let size = 4096.0;
+            let u1 = value.x as f32 / size;
+            let v1 = value.y as f32 / size;
+            let u2 = (value.x + value.width) as f32 / size;
+            let v2 = (value.y + value.height) as f32 / size;
+            let y = app_bar_height + padding + (row * line_height) as f32 - value.offset_y as f32;
+            let h = value.height as f32;
+
+            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
+            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
+            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
+            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
+            for i in start_idx..(start_idx + 3) {
+                indices.push(i as u16);
+            }
+            for i in (start_idx + 1)..=(start_idx + 3) {
+                indices.push(i as u16);
+            }
+            x += value.advance_x as f32;
+        }
+
+        // Add cursor
+        let metrics = self.font.face.size_metrics().unwrap();
+        let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
+        let y = app_bar_height + padding + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
+        // let cursor_color = [1.0, 0.0, 0.0, 1.0];
+        let start = vertices.len();
+        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [0.0, 0.0], color: [1.0, 0.0, 0.0, 1.0] });
+        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [0.0, 0.0], color: [0.0, 1.0, 0.0, 1.0] });
+        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [0.0, 0.0], color: [0.0, 0.0, 1.0, 1.0] });
+        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [0.0, 0.0], color: [1.0, 0.0, 1.0, 1.0] });
+        for i in start..(start + 3) {
+            indices.push(i as u16);
+        }
+        for i in (start + 1)..=(start + 3) {
+            indices.push(i as u16);
+        }
+
+        // Update buffers
+        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -329,6 +363,17 @@ impl State {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+                let k = event.text.to_owned().unwrap_or_default();
+                println!("key {}", k);
+                self.text += &k;
+                self.update_vertices();
+                self.window.request_redraw();
+                return true;
+            },
+            _ => (),
+        }
         false
     }
 
@@ -375,13 +420,14 @@ impl State {
             //     },
             // );
 
+            // recalculate vertices
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+            render_pass.draw_indexed(0..((self.text.len() + 1) * 6) as u32, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -428,22 +474,7 @@ async fn run() {
     font.set_char_size(13.0, (window.scale_factor() * 96.0) as u32);
 
     let mut state = State::new(window, font).await;
-
-    // let atlas = font.build_atlas();
-    // println!("w: {}, h: {}", atlas.width, atlas.height);
-    // for y in 0..atlas.height {
-    //     for x in 0..atlas.width {
-    //         let c = atlas.buffer[(y * atlas.width + x) as usize];
-    //         print!("{}", match c {
-    //             0 => ' ',
-    //             1..=63 => '░',
-    //             64..=127 => '▒',
-    //             128..=191 => '▓',
-    //             192..=255 => '█',
-    //         });
-    //     }
-    //     println!("");
-    // }
+    state.update_vertices();
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
 
@@ -453,6 +484,7 @@ async fn run() {
                 match event {
                     WindowEvent::ThemeChanged(new_theme) => {
                         theme = new_theme;
+                        state.update_vertices();
                         state.window.request_redraw();
                     },
                     WindowEvent::CloseRequested => {
@@ -506,16 +538,16 @@ async fn run() {
 fn clear_color(theme: winit::window::Theme) -> wgpu::Color {
     match theme {
         winit::window::Theme::Light => wgpu::Color {
-            r: 0.1,
-            g: 0.2,
-            b: 0.4,
-            a: 0.6,
+            r: 0.6,
+            g: 0.8,
+            b: 1.0,
+            a: 1.0,
         },
         winit::window::Theme::Dark => wgpu::Color {
             r: 0.01,
             g: 0.01,
             b: 0.01,
-            a: 0.9,
+            a: 1.0,
         },
     }
 
