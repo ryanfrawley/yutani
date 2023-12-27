@@ -285,7 +285,7 @@ impl State {
 
         let padding = 16.0;
         let mut x = padding;
-        let mut row = 1;
+        let mut row = 0;
         let app_bar_height = 20.0;
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
@@ -310,7 +310,7 @@ impl State {
             let v1 = value.y as f32 / size;
             let u2 = (value.x + value.width) as f32 / size;
             let v2 = (value.y + value.height) as f32 / size;
-            let y = app_bar_height + padding + (row * line_height) as f32 - value.offset_y as f32;
+            let y = self.config.height as f32 - padding - (row * line_height) as f32 - value.offset_y as f32;
             let h = value.height as f32;
 
             vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
@@ -329,14 +329,14 @@ impl State {
         // Add cursor
         let metrics = self.font.face.size_metrics().unwrap();
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = app_bar_height + padding + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let y = self.config.height as f32 - padding - (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
-        // let cursor_color = [1.0, 0.0, 0.0, 1.0];
+        let cursor_color = [0.9, 0.9, 0.9, 1.0];
         let start = vertices.len();
-        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [0.0, 0.0], color: [1.0, 0.0, 0.0, 1.0] });
-        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [0.0, 0.0], color: [0.0, 1.0, 0.0, 1.0] });
-        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [0.0, 0.0], color: [0.0, 0.0, 1.0, 1.0] });
-        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [0.0, 0.0], color: [1.0, 0.0, 1.0, 1.0] });
+        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
         for i in start..(start + 3) {
             indices.push(i as u16);
         }
@@ -359,6 +359,7 @@ impl State {
         self.surface.configure(&self.device, &self.config);
         self.camera_uniform.update_view_proj(&self.camera, size.width as f32, size.height as f32);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        self.update_vertices();
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
@@ -404,22 +405,6 @@ impl State {
             });
 
 
-            // self.instances[0].position.x += 0.001;
-            // println!("{}", self.instances[0].position.x);
-
-
-            // let instance_data = self.instances.iter().map(instance::Instance::to_raw).collect::<Vec<_>>();
-
-            // self.instance_buffer = self.device.create_buffer_init(
-            //     &wgpu::util::BufferInitDescriptor {
-            //         label: Some("instance buffer"),
-            //         contents: bytemuck::cast_slice(&instance_data),
-            //         usage: wgpu::BufferUsages::VERTEX,
-            //     },
-            // );
-
-            // recalculate vertices
-
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
@@ -462,7 +447,7 @@ async fn run() {
     // }
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
+    let family = &fonts.iter().find(|f| f.contains("Hack")).unwrap();
     println!("selected font {}", family);
 
  	let family_prop = font_loader::system_fonts::FontPropertyBuilder::new().family(family.as_str()).build();
