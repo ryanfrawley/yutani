@@ -22,7 +22,7 @@ pub struct AtlasEntry {
     pub y: usize,
     pub width: usize,
     pub height: usize,
-    pub offset_y: usize,
+    pub offset_y: isize,
     pub advance_x: usize,
 }
 
@@ -67,7 +67,7 @@ impl Font {
                 }
             }
             println!("vert bearing {}", glyph.metrics.horiBearingY / 64);
-            entries.insert(ch, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance / 64) as usize, offset_y: (glyph.metrics.horiBearingY / 64) as usize });
+            entries.insert(ch, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance >> 6) as usize, offset_y: (glyph.metrics.horiBearingY >> 6) as isize });
             println!("{} {} {} {} {}", c, x as f32 / size as f32, y as f32 / size as f32, w as f32 / size as f32, h as f32 / size as f32);
             x += (glyph.metrics.horiAdvance >> 6) as usize;
             if x >= (4096 - 100) {
