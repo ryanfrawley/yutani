@@ -46,8 +46,9 @@ impl Font {
     }
 
     pub fn build_atlas(&mut self) -> Atlas {
-        let width = 1024;
-        let height = 1024;
+        let size = 4096;
+        let width = size;
+        let height = size;
         let mut texture: Vec<u8> = Vec::with_capacity(width * height);
         for _ in 0..(width * height) {
             texture.push(0);
@@ -55,20 +56,21 @@ impl Font {
         let mut entries: HashMap<char, AtlasEntry> = HashMap::with_capacity(256);
         let mut x = 0;
         let mut y = 0;
-        for c in 'a'..='z' {
-            let glyph = self.load_glyph(c as char);
+        for c in 0..=255 {
+            let ch = char::from_u32(c).unwrap();
+            let glyph = self.load_glyph(ch);
             let w = glyph.bitmap.width() as usize;
             let h = glyph.bitmap.rows() as usize;
             for p in 0..h {
                 for q in 0..w {
-                    texture[(((p + y) % 1024) * width + (q + x) % 1024) as usize] = glyph.bitmap.buffer()[(p * w + q) as usize];
+                    texture[(((p + y) % size) * width + (q + x) % size) as usize] = glyph.bitmap.buffer()[(p * w + q) as usize];
                 }
             }
             println!("vert bearing {}", glyph.metrics.horiBearingY / 64);
-            entries.insert(c, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance / 64) as usize, offset_y: (glyph.metrics.horiBearingY / 64) as usize });
-            println!("{} {} {} {} {}", c, x as f32 / 1024.0, y as f32 / 1024.0, w as f32 / 1024.0, h as f32 / 1024.0);
-            x += 100;
-            if x >= (1024 - 100) {
+            entries.insert(ch, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance / 64) as usize, offset_y: (glyph.metrics.horiBearingY / 64) as usize });
+            println!("{} {} {} {} {}", c, x as f32 / size as f32, y as f32 / size as f32, w as f32 / size as f32, h as f32 / size as f32);
+            x += (glyph.metrics.horiAdvance >> 6) as usize;
+            if x >= (4096 - 100) {
                 x = 0;
                 y += 100;
             }

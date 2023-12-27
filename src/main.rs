@@ -103,19 +103,29 @@ impl State {
         let mut indices: Vec<u16> = Vec::new();
 
         let mut x = 30.0;
-        let mut row = 1;
-        let color = [1.0, 0.5, 0.75, 1.0];
+        let mut row = 2;
+        let str = "Hello world!";
+        let color = [1.0, 0.2, 0.2, 1.0];
         let line_height = font.face.size_metrics().unwrap().height >> 6;
-        for value in atlas.entries.values() {
-            let start_idx = vertices.len();
-            let u1 = value.x as f32 / 1024.0;
-            let v1 = value.y as f32 / 1024.0;
-            let u2 = (value.x + value.width) as f32 / 1024.0;
-            let v2 = (value.y + value.height) as f32 / 1024.0;
-            let y = (row * line_height) as f32 - value.offset_y as f32;
+        for c in str.chars() {
+            let value = &atlas.entries[&c];
             let w = value.width as f32;
+
+            // Wrap to next line
+            if x + w + (value.advance_x as f32) >= config.width as f32 {
+                x = 30.0;
+                row += 1;
+            }
+
+            let start_idx = vertices.len();
+            let size = 4096.0;
+            let u1 = value.x as f32 / size;
+            let v1 = value.y as f32 / size;
+            let u2 = (value.x + value.width) as f32 / size;
+            let v2 = (value.y + value.height) as f32 / size;
+            let y = (row * line_height) as f32 - value.offset_y as f32;
             let h = value.height as f32;
-            println!("{} {}", x, w);
+
             vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
             vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
             vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
@@ -127,10 +137,6 @@ impl State {
                 indices.push(i as u16);
             }
             x += value.advance_x as f32;
-            if x > 300.0 {
-                x = 30.0;
-                row += 1;
-            }
         }
 
         let font_alpha = texture::Texture::from_memory(
@@ -251,7 +257,7 @@ impl State {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -419,7 +425,7 @@ async fn run() {
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(33.0, 192);
+    font.set_char_size(13.0, 192);
 
     let mut state = State::new(window, font).await;
 
