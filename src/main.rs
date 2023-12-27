@@ -89,7 +89,6 @@ impl State {
             width: size.width,
             height: size.height,
             present_mode: surface_caps.present_modes[0],
-            // alpha_mode: surface_caps.alpha_modes[0],
             alpha_mode: wgpu::CompositeAlphaMode::PostMultiplied,
             view_formats: vec![],
         };
@@ -403,7 +402,7 @@ async fn run() {
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
         .with_decorations(true)
-        .with_blur(true)
+        .with_blur(transparent)
         .build(&event_loop)
         .unwrap();
 
@@ -418,14 +417,15 @@ async fn run() {
     //     println!("{}", name);
     // }
 
-    let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
+    // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
+    let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
     println!("selected font {}", family);
 
  	let family_prop = font_loader::system_fonts::FontPropertyBuilder::new().family(family.as_str()).build();
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(13.0, 192);
+    font.set_char_size(13.0, (window.scale_factor() * 96.0) as u32);
 
     let mut state = State::new(window, font).await;
 
