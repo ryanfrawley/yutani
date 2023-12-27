@@ -105,20 +105,21 @@ impl State {
 
         let mut x = 30.0;
         let mut row = 0;
+        let color = [1.0, 0.3, 0.75, 1.0];
         for value in atlas.entries.values() {
             let start_idx = vertices.len();
             let u1 = value.x as f32 / 1024.0;
             let v1 = value.y as f32 / 1024.0;
             let u2 = (value.x + value.width) as f32 / 1024.0;
             let v2 = (value.y + value.height) as f32 / 1024.0;
-            let y = (90.0 * 3.0) + (row * 120) as f32 - value.offset_y as f32;
+            let y = 60.0 + 26.0 + (row * 26) as f32 - value.offset_y as f32;
             let w = value.width as f32;
             let h = value.height as f32;
             println!("{} {}", x, w);
-            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1] });
-            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2] });
-            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1] });
-            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2] });
+            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
+            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
+            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
+            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
             for i in start_idx..(start_idx + 3) {
                 indices.push(i as u16);
             }
@@ -250,7 +251,7 @@ impl State {
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -418,7 +419,7 @@ async fn run() {
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(30.0, 192);
+    font.set_char_size(13.0, 192);
 
     let mut state = State::new(window, font).await;
 
