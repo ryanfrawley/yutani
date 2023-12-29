@@ -9,7 +9,7 @@ pub struct Console {
     pub scroll_y: usize,
     pub cursor_x: usize,
     pub cursor_y: usize,
-    pub input: Vec<char>,
+    pub input: String,
 }
 
 impl Console {
@@ -20,7 +20,7 @@ impl Console {
 
         Self {
             buffer: ring_buffer::RingBuffer::new(buffer_len),
-            input: Vec::with_capacity(input_len),
+            input: String::with_capacity(input_len),
             rows,
             columns,
             scroll_y: 0,
@@ -39,6 +39,14 @@ impl Console {
         for c in str.chars() {
             self.buffer.push_back(c);
         }
+    }
+
+    pub fn write_input(&mut self) {
+        for c in self.input.chars() {
+            self.buffer.push_back(c);
+        }
+        self.buffer.push_back('\n');
+        self.input.clear();
     }
 
     pub fn iter(&self) -> ring_buffer::RingBufferIterator<char> {

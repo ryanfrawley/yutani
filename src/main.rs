@@ -295,8 +295,8 @@ impl State {
         };
         let line_height = self.font.face.size_metrics().unwrap().height >> 6;
         let mut column = 0;
-        for c in self.console.iter_view() {
-            match *c {
+        for c in self.console.input.chars().chain(['\n'].iter().map(|c| *c).chain(self.console.iter_view().map(|c| *c))) {
+            match c {
                 '\n' => {
                     row += 1;
                     column = 0;
@@ -377,11 +377,29 @@ impl State {
     fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
-                let k = event.text.to_owned().unwrap_or_default();
-                self.console.write(&k);
-                self.update_vertices();
-                self.window.request_redraw();
-                return true;
+                if event.state == winit::event::ElementState::Pressed {
+                    match event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            self.console.write_input();
+                            self.console.input.clear();
+                        },
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            self.console.scroll_by(1);
+                        },
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            self.console.scroll_by(-1);
+                        },
+                        _ => (),
+                    };
+                    let k = event.text.to_owned().unwrap_or_default();
+                    match k.chars().next() {
+                        Some(k) => self.console.input.push(k),
+                        None => (),
+                    };
+                    self.update_vertices();
+                    self.window.request_redraw();
+                    return true;
+                }
             },
             _ => (),
         }
