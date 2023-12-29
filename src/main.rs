@@ -2,14 +2,15 @@ mod vertex;
 mod font;
 mod texture;
 mod font_loader;
-mod instance;
 mod camera;
+mod ring_buffer;
+mod console;
 
 use winit::{
     event::*,
     event_loop::EventLoop,
     window::{WindowBuilder, Window},
-    platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS},
+    platform::macos::WindowBuilderExtMacOS,
 };
 
 use wgpu::util::DeviceExt;
@@ -32,7 +33,6 @@ struct State {
     index_buffer: wgpu::Buffer,
     font: font::Font,
     font_bind_group: wgpu::BindGroup,
-    font_texture: texture::Texture,
     camera: camera::Camera,
     camera_uniform: camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -270,7 +270,6 @@ impl State {
             index_buffer,
             font,
             font_bind_group,
-            font_texture: font_alpha,
             camera,
             camera_uniform,
             camera_buffer,
@@ -447,7 +446,7 @@ async fn run() {
     // }
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let family = &fonts.iter().find(|f| f.contains("Hack")).unwrap();
+    let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
     println!("selected font {}", family);
 
  	let family_prop = font_loader::system_fonts::FontPropertyBuilder::new().family(family.as_str()).build();
