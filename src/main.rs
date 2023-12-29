@@ -279,14 +279,16 @@ impl State {
         }
     }
 
+    // fn push_char_vertices(&mut self, &mut vertices: &Vec<vertex::Vertex>, indices: &mut Vec<u16>, )
+
     fn update_vertices(&mut self) {
         let area = self.console.columns * self.console.rows;
         let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (area + 1));
         let mut indices: Vec<u16> = Vec::with_capacity(6 * (area + 1));
 
         let mut x = WINDOW_PADDING;
-        let mut row = 0;
-        let app_bar_height = 20.0;
+        let mut row = 1;
+        let app_bar_height = 24.0;
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
         let color = match theme {
@@ -295,7 +297,9 @@ impl State {
         };
         let line_height = self.font.face.size_metrics().unwrap().height >> 6;
         let mut column = 0;
-        for c in self.console.input.chars().chain(['\n'].iter().map(|c| *c).chain(self.console.iter_view().map(|c| *c))) {
+
+        let mut draw_char = |c, r| {
+            let mut row = r;
             match c {
                 '\n' => {
                     row += 1;
@@ -312,7 +316,7 @@ impl State {
                     let v1 = value.y as f32 / size;
                     let u2 = (value.x + value.width) as f32 / size;
                     let v2 = (value.y + value.height) as f32 / size;
-                    let y = self.config.height as f32 - WINDOW_PADDING - (row * line_height) as f32 - value.offset_y as f32;
+                    let y = WINDOW_PADDING + app_bar_height + (row * line_height) as f32 - value.offset_y as f32;
                     let h = value.height as f32;
 
                     vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
@@ -334,12 +338,17 @@ impl State {
                     }
                 }
             }
+            row
+        };
+
+        for c in self.console.iter_view().map(|c| *c).chain(self.console.input.chars()) {
+            row = draw_char(c, row);
         }
 
         // Add cursor
         let metrics = self.font.face.size_metrics().unwrap();
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = self.config.height as f32 - WINDOW_PADDING - (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let y = WINDOW_PADDING + app_bar_height + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = [0.9, 0.9, 0.9, 1.0];
         let start = vertices.len();
@@ -383,18 +392,22 @@ impl State {
                             self.console.write_input();
                             self.console.input.clear();
                         },
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                            self.console.input.pop();
+                        },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
                             self.console.scroll_by(1);
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
                             self.console.scroll_by(-1);
                         },
-                        _ => (),
-                    };
-                    let k = event.text.to_owned().unwrap_or_default();
-                    match k.chars().next() {
-                        Some(k) => self.console.input.push(k),
-                        None => (),
+                        _ => {
+                            let k = event.text.to_owned().unwrap_or_default();
+                            match k.chars().next() {
+                                Some(k) => self.console.input.push(k),
+                                None => (),
+                            };
+                        },
                     };
                     self.update_vertices();
                     self.window.request_redraw();

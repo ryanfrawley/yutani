@@ -138,6 +138,11 @@ mod tests {
         assert_eq!(console.buffer[10], 'd');
     }
 
+
+    // i n p u t
+    // o u t _ _ 
+    // _ _ _ _ _ 
+
     #[test]
     fn test_iter_view1() {
         let mut console = Console::new(5, 3, 64, 1024);
@@ -229,4 +234,5 @@ mod tests {
             assert_eq!(chars[idx], *c);
         }
     }
+
 }

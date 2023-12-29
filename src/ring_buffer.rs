@@ -26,6 +26,10 @@ impl<T> RingBuffer<T> {
         }
     }
 
+    pub fn get_head(&self) -> usize {
+        self.head
+    }
+
     pub fn push_back(&mut self, item: T) {
         if self.buffer.len() < self.buffer.capacity() {
             self.buffer.push(item);
