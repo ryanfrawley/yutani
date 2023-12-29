@@ -32,6 +32,7 @@ struct State {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    num_indices: u32,
     font: font::Font,
     font_bind_group: wgpu::BindGroup,
     camera: camera::Camera,
@@ -269,6 +270,7 @@ impl State {
             render_pipeline,
             vertex_buffer,
             index_buffer,
+            num_indices: 0,
             font,
             font_bind_group,
             camera,
@@ -278,8 +280,6 @@ impl State {
             console: console::Console::new(100, 80, 10000, 1024),
         }
     }
-
-    // fn push_char_vertices(&mut self, &mut vertices: &Vec<vertex::Vertex>, indices: &mut Vec<u16>, )
 
     fn update_vertices(&mut self) {
         let area = self.console.columns * self.console.rows;
@@ -356,6 +356,7 @@ impl State {
         vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
         vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
         vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
+
         for i in start..(start + 3) {
             indices.push(i as u16);
         }
@@ -366,6 +367,7 @@ impl State {
         // Update buffers
         self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+        self.num_indices = indices.len() as u32;
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -383,14 +385,23 @@ impl State {
         self.update_vertices();
     }
 
+    fn process_input(&mut self) {
+        let str = self.console.input.clone();
+        self.console.write_input();
+        if str.contains("stinky") {
+            self.console.write("No! You are stinky.\n");
+        }  else if str.contains("ello") || str.contains("hi") {
+            self.console.write("Hi there!\n");
+        }
+    }
+
     fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                 if event.state == winit::event::ElementState::Pressed {
                     match event.logical_key {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
-                            self.console.write_input();
-                            self.console.input.clear();
+                            self.process_input();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
                             self.console.input.pop();
@@ -453,7 +464,7 @@ impl State {
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..((self.console.columns * self.console.rows + 1) * 6) as u32, 0, 0..1);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
