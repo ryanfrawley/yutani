@@ -19,10 +19,9 @@ impl<T> RingBuffer<T> {
     }
 
     pub fn iter(&self) -> RingBufferIterator<T> {
-        let len = self.buffer.len();
         RingBufferIterator {
             next: self.head,
-            end: (self.head + len) % len,
+            remaining: self.buffer.len(),
             buffer: self,
         }
     }
@@ -42,7 +41,7 @@ impl<T> RingBuffer<T> {
 
 pub struct RingBufferIterator<'a, T> {
     buffer: &'a RingBuffer<T>,
-    end: usize,
+    remaining: usize,
     next: usize,
 }
 
@@ -50,7 +49,7 @@ impl<'a, T> Iterator for RingBufferIterator<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next == self.end {
+        if self.remaining == 0 {
             return None;
         }
         let result = &self.buffer.buffer[self.next];
@@ -58,6 +57,7 @@ impl<'a, T> Iterator for RingBufferIterator<'a, T> {
         if self.next == self.buffer.buffer.len() {
             self.next = 0;
         }
+        self.remaining = self.remaining - 1;
         Some(result)
     }
 }
@@ -91,6 +91,15 @@ mod tests {
     }
 
     #[test]
+    fn test_push_str() {
+        let mut buffer: RingBuffer<char> = RingBuffer::new(20);
+        for c in "hello".chars().collect::<Vec<_>>() {
+            buffer.push_back(c);
+        }
+        assert_eq!(buffer.buffer, ['h', 'e', 'l', 'l', 'o']);
+    }
+
+    #[test]
     fn test_overflow() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(3);
         buffer.push_back(1);
@@ -108,12 +117,19 @@ mod tests {
         buffer.push_back(3);
         for (idx, i) in buffer.iter().enumerate() {
             match idx {
-                0 => assert_eq!(*i, 1),
-                1 => assert_eq!(*i, 2),
-                2 => assert_eq!(*i, 3),
+                0 => assert_eq!(i, &1),
+                1 => assert_eq!(i, &2),
+                2 => assert_eq!(i, &3),
                 _ => assert!(false)
             }
         }
+    }
+
+    #[test]
+    fn test_iter_zero_len() {
+        let buffer: RingBuffer<bool> = RingBuffer::new(0);
+        let mut it = buffer.iter();
+        assert_eq!(it.next(), None);
     }
 
     #[test]

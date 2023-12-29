@@ -15,6 +15,7 @@ use winit::{
 
 use wgpu::util::DeviceExt;
 
+const WINDOW_PADDING: f32 = 16.0;
 
 struct State {
     surface: wgpu::Surface,
@@ -38,7 +39,7 @@ struct State {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
-    text: String,
+    console: console::Console,
 }
 
 impl State {
@@ -274,16 +275,16 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
-            text: String::new(),
+            console: console::Console::new(100, 80, 10000, 1024),
         }
     }
 
     fn update_vertices(&mut self) {
-        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (self.text.len() + 1));
-        let mut indices: Vec<u16> = Vec::with_capacity(6 * (self.text.len() + 1));
+        let area = self.console.columns * self.console.rows;
+        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (area + 1));
+        let mut indices: Vec<u16> = Vec::with_capacity(6 * (area + 1));
 
-        let padding = 16.0;
-        let mut x = padding;
+        let mut x = WINDOW_PADDING;
         let mut row = 0;
         let app_bar_height = 20.0;
 
@@ -293,42 +294,52 @@ impl State {
             winit::window::Theme::Dark => [1.0, 1.0, 1.0, 1.0],
         };
         let line_height = self.font.face.size_metrics().unwrap().height >> 6;
-        for c in self.text.chars() {
-            let value = &self.atlas.entries[&c];
-            let w = value.width as f32;
+        let mut column = 0;
+        for c in self.console.iter_view() {
+            match *c {
+                '\n' => {
+                    row += 1;
+                    column = 0;
+                    x = WINDOW_PADDING;
+                },
+                _ => {
+                    let value = &self.atlas.entries[&c];
+                    let w = value.width as f32;
 
-            // Wrap to next line
-            if x + w + (value.advance_x as f32) >= self.config.width as f32 {
-                x = padding;
-                row += 1;
-            }
+                    let start_idx = vertices.len();
+                    let size = 4096.0;
+                    let u1 = value.x as f32 / size;
+                    let v1 = value.y as f32 / size;
+                    let u2 = (value.x + value.width) as f32 / size;
+                    let v2 = (value.y + value.height) as f32 / size;
+                    let y = self.config.height as f32 - WINDOW_PADDING - (row * line_height) as f32 - value.offset_y as f32;
+                    let h = value.height as f32;
 
-            let start_idx = vertices.len();
-            let size = 4096.0;
-            let u1 = value.x as f32 / size;
-            let v1 = value.y as f32 / size;
-            let u2 = (value.x + value.width) as f32 / size;
-            let v2 = (value.y + value.height) as f32 / size;
-            let y = self.config.height as f32 - padding - (row * line_height) as f32 - value.offset_y as f32;
-            let h = value.height as f32;
-
-            vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
-            vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
-            vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
-            vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
-            for i in start_idx..(start_idx + 3) {
-                indices.push(i as u16);
+                    vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
+                    vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
+                    vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
+                    vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
+                    for i in start_idx..(start_idx + 3) {
+                        indices.push(i as u16);
+                    }
+                    for i in (start_idx + 1)..=(start_idx + 3) {
+                        indices.push(i as u16);
+                    }
+                    x += value.advance_x as f32;
+                    column += 1;
+                    if column == self.console.columns {
+                        column = 0;
+                        x = WINDOW_PADDING;
+                        row += 1;
+                    }
+                }
             }
-            for i in (start_idx + 1)..=(start_idx + 3) {
-                indices.push(i as u16);
-            }
-            x += value.advance_x as f32;
         }
 
         // Add cursor
         let metrics = self.font.face.size_metrics().unwrap();
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = self.config.height as f32 - padding - (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let y = self.config.height as f32 - WINDOW_PADDING - (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = [0.9, 0.9, 0.9, 1.0];
         let start = vertices.len();
@@ -358,6 +369,8 @@ impl State {
         self.surface.configure(&self.device, &self.config);
         self.camera_uniform.update_view_proj(&self.camera, size.width as f32, size.height as f32);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        // TODO: Resize the vertex and index buffers to fit the new screen area.
+        self.console.resize((self.config.width as f32 - WINDOW_PADDING * 2.0) as usize / (self.font.face.size_metrics().unwrap().max_advance >> 6) as usize, 60);
         self.update_vertices();
     }
 
@@ -365,7 +378,7 @@ impl State {
         match event {
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                 let k = event.text.to_owned().unwrap_or_default();
-                self.text += &k;
+                self.console.write(&k);
                 self.update_vertices();
                 self.window.request_redraw();
                 return true;
@@ -409,7 +422,7 @@ impl State {
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..((self.text.len() + 1) * 6) as u32, 0, 0..1);
+            render_pass.draw_indexed(0..((self.console.columns * self.console.rows + 1) * 6) as u32, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -440,10 +453,6 @@ async fn run() {
     let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new().monospace().build();
     let mut fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
     fonts.dedup();
-
-    // for name in fonts {
-    //     println!("{}", name);
-    // }
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
     let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
