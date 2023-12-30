@@ -13,9 +13,18 @@ use winit::{
     platform::macos::WindowBuilderExtMacOS,
 };
 
+// use rand_distr::{Distribution, Normal};
+// use rand::thread_rng;
+
 use wgpu::util::DeviceExt;
 
 const WINDOW_PADDING: f32 = 16.0;
+const DECORATOR_HEIGHT: f32 = 24.0;
+
+pub struct ViewportSize {
+    char_width: usize,
+    char_height: usize,
+}
 
 struct State {
     surface: wgpu::Surface,
@@ -148,7 +157,6 @@ impl State {
             label: Some("font bind group"),
         });
 
-        // TODO
         let camera = camera::Camera {};
         let mut camera_uniform = camera::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, config.width as f32, config.height as f32);
@@ -241,20 +249,31 @@ impl State {
             multiview: None,
         });
 
-        let mut v: Vec<u8> = Vec::with_capacity(100000);
-        for i in 0..100000 {
-            v.push(0);
+        
+        // Calculate console viewport & buffer sizes
+        let metrics = font.face.size_metrics().unwrap();
+        let viewport = State::get_viewport_size(
+                config.width as f32,
+                config.height as f32,
+                (metrics.max_advance >> 6) as usize,
+                (metrics.height >> 6) as usize);
+        let mut vertex_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
+        for _ in 0..vertex_buf.capacity() {
+            vertex_buf.push(0);
         }
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
-            contents: &bytemuck::cast_slice(&v),
+            contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-
+        let mut index_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<u16>() * 6);
+        for _ in 0..index_buf.capacity() {
+            index_buf.push(0);
+        }
         let index_buffer = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label: Some("index buffer"),
-                contents: &bytemuck::cast_slice(&v),
+                contents: &bytemuck::cast_slice(&index_buf),
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             },
         );
@@ -281,6 +300,43 @@ impl State {
         }
     }
 
+    fn get_viewport_size(width: f32, height: f32, advance_x: usize, line_height: usize) -> ViewportSize {
+        ViewportSize {
+            char_width: (width - WINDOW_PADDING * 2.0) as usize / advance_x,
+            char_height: (height - DECORATOR_HEIGHT - WINDOW_PADDING * 2.0) as usize / line_height,
+        }
+    }
+
+    fn resize_buffers(&mut self) {
+        // Calculate console viewport & buffer sizes
+        let metrics = self.font.face.size_metrics().unwrap();
+        let viewport = State::get_viewport_size(
+                self.config.width as f32,
+                self.config.height as f32,
+                (metrics.max_advance >> 6) as usize,
+                (metrics.height >> 6) as usize);
+        let mut vertex_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
+        for _ in 0..vertex_buf.capacity() {
+            vertex_buf.push(0);
+        }
+        self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vertex buffer"),
+            contents: &bytemuck::cast_slice(&vertex_buf),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let mut index_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<u16>() * 6);
+        for _ in 0..index_buf.capacity() {
+            index_buf.push(0);
+        }
+        self.index_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("index buffer"),
+                contents: &bytemuck::cast_slice(&index_buf),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+    }
+
     fn update_vertices(&mut self) {
         let area = self.console.columns * self.console.rows;
         let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (area + 1));
@@ -288,7 +344,6 @@ impl State {
 
         let mut x = WINDOW_PADDING;
         let mut row = 1;
-        let app_bar_height = 24.0;
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
         let color = match theme {
@@ -298,7 +353,7 @@ impl State {
         let line_height = self.font.face.size_metrics().unwrap().height >> 6;
         let mut column = 0;
 
-        let mut draw_char = |c, r| {
+        let mut draw_char = |c, r, color| {
             let mut row = r;
             match c {
                 '\n' => {
@@ -316,7 +371,7 @@ impl State {
                     let v1 = value.y as f32 / size;
                     let u2 = (value.x + value.width) as f32 / size;
                     let v2 = (value.y + value.height) as f32 / size;
-                    let y = WINDOW_PADDING + app_bar_height + (row * line_height) as f32 - value.offset_y as f32;
+                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.offset_y as f32;
                     let h = value.height as f32;
 
                     vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
@@ -342,13 +397,20 @@ impl State {
         };
 
         for c in self.console.iter_view().map(|c| *c).chain(self.console.input.chars()) {
-            row = draw_char(c, row);
+            // let mut rng = rand::thread_rng();
+            // let normal = Normal::new(0.8, 1.0).unwrap();
+            // let color = [normal.sample(&mut rng), normal.sample(&mut rng), normal.sample(&mut rng), 1.0];
+            let color = [0.9, 0.9, 0.9, 1.0];
+            row = draw_char(c, row, color);
+            if row as usize > self.console.rows + self.console.input.len() / self.console.columns {
+                break;
+            }
         }
 
         // Add cursor
         let metrics = self.font.face.size_metrics().unwrap();
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = WINDOW_PADDING + app_bar_height + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = [0.9, 0.9, 0.9, 1.0];
         let start = vertices.len();
@@ -380,8 +442,14 @@ impl State {
         self.surface.configure(&self.device, &self.config);
         self.camera_uniform.update_view_proj(&self.camera, size.width as f32, size.height as f32);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
-        // TODO: Resize the vertex and index buffers to fit the new screen area.
-        self.console.resize((self.config.width as f32 - WINDOW_PADDING * 2.0) as usize / (self.font.face.size_metrics().unwrap().max_advance >> 6) as usize, 60);
+        let metrics = self.font.face.size_metrics().unwrap();
+        let size = State::get_viewport_size(
+            self.config.width as f32,
+            self.config.height as f32,
+            (metrics.max_advance >> 6) as usize,
+            (metrics.height >> 6) as usize);
+        self.console.resize(size.char_width, size.char_height);
+        self.resize_buffers();
         self.update_vertices();
     }
 
