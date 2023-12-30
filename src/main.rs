@@ -402,7 +402,7 @@ impl State {
             // let color = [normal.sample(&mut rng), normal.sample(&mut rng), normal.sample(&mut rng), 1.0];
             let color = [0.9, 0.9, 0.9, 1.0];
             row = draw_char(c, row, color);
-            if row as usize > self.console.rows + self.console.input.len() / self.console.columns {
+            if row as usize > self.console.rows {
                 break;
             }
         }
