@@ -16,7 +16,7 @@ pub struct Projection {
 
 impl Camera {
     pub fn build_view_projection_matrix(&self, width: f32, height: f32) -> cgmath::Matrix4<f32> {
-        let view = cgmath::Matrix4::from_nonuniform_scale(1.0, 1.0, 1.0);
+        let view = cgmath::Matrix4::from_nonuniform_scale(1.0, 1.0, -1.0);
         let projection = cgmath::ortho(0.0, width, height, 0.0, -100.0, 100.0);
         OPENGL_TO_WGPU_MATRIX * view * projection
     }

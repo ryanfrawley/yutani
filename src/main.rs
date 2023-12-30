@@ -317,7 +317,7 @@ impl State {
                 (metrics.max_advance >> 6) as usize,
                 (metrics.height >> 6) as usize);
         println!("w: {} h: {}", viewport.char_width, viewport.char_height);
-        let mut vertex_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
+        let mut vertex_buf: Vec<u8> = Vec::with_capacity(((2 * viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
         for _ in 0..vertex_buf.capacity() {
             vertex_buf.push(0);
         }
@@ -326,7 +326,7 @@ impl State {
             contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        let mut index_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<u16>() * 6);
+        let mut index_buf: Vec<u8> = Vec::with_capacity((2 * (viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<u16>() * 6);
         for _ in 0..index_buf.capacity() {
             index_buf.push(0);
         }
@@ -341,8 +341,8 @@ impl State {
 
     fn update_vertices(&mut self) {
         let area = self.console.columns * self.console.rows;
-        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * (area + 1));
-        let mut indices: Vec<u16> = Vec::with_capacity(6 * (area + 1));
+        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * 2 * (area + 1));
+        let mut indices: Vec<u16> = Vec::with_capacity(6 * 2 * (area + 1));
 
         let mut x = WINDOW_PADDING;
         let mut row = 1;
@@ -352,10 +352,11 @@ impl State {
             winit::window::Theme::Light => [0.0, 0.05, 0.2, 1.0],
             winit::window::Theme::Dark => [1.0, 1.0, 1.0, 1.0],
         };
-        let line_height = self.font.face.size_metrics().unwrap().height >> 6;
+        let metrics = self.font.face.size_metrics().unwrap();
+        let line_height = metrics.height >> 6;
         let mut column = 0;
 
-        let mut draw_char = |c, r, color| {
+        let mut draw_char = |c, r, color_bg, color_fg| {
             let mut row = r;
             match c {
                 '\n' => {
@@ -366,8 +367,7 @@ impl State {
                 _ => {
                     let value = &self.atlas.entries[&c];
                     let w = value.width as f32;
-
-                    let start_idx = vertices.len();
+                    let mut start_idx = vertices.len();
                     let size = 4096.0;
                     let u1 = value.x as f32 / size;
                     let v1 = value.y as f32 / size;
@@ -376,16 +376,37 @@ impl State {
                     let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.offset_y as f32;
                     let h = value.height as f32;
 
-                    vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color });
-                    vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color });
-                    vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color });
-                    vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color });
+                    // background
+                    let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                    let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - bg_h - (metrics.descender >> 6) as f32;
+                    let bg_w = (metrics.max_advance >> 6) as f32;
+                    vertices.push(vertex::Vertex { position: [x, bg_y, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x, bg_y + bg_h, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y + bg_h, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
+
                     for i in start_idx..(start_idx + 3) {
                         indices.push(i as u16);
                     }
                     for i in (start_idx + 1)..=(start_idx + 3) {
                         indices.push(i as u16);
                     }
+
+                    start_idx = vertices.len();
+
+                    // foreground
+                    vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color: color_fg });
+                    for i in start_idx..(start_idx + 3) {
+                        indices.push(i as u16);
+                    }
+                    for i in (start_idx + 1)..=(start_idx + 3) {
+                        indices.push(i as u16);
+                    }
+
+                    // advance cursor
                     x += value.advance_x as f32;
                     column += 1;
                     if column == self.console.columns {
@@ -402,15 +423,15 @@ impl State {
             // let mut rng = rand::thread_rng();
             // let normal = Normal::new(0.8, 1.0).unwrap();
             // let color = [normal.sample(&mut rng), normal.sample(&mut rng), normal.sample(&mut rng), 1.0];
-            let color = [0.9, 0.9, 0.9, 1.0];
-            row = draw_char(c, row, color);
+            let color_bg = [0.7, 0.2, 0.2, 1.0];
+            let color_fg = [0.9, 0.9, 0.9, 1.0];
+            row = draw_char(c, row, color_bg, color_fg);
             if row as usize > self.console.rows {
                 break;
             }
         }
 
         // Add cursor
-        let metrics = self.font.face.size_metrics().unwrap();
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
