@@ -9,6 +9,7 @@ mod console;
 use winit::{
     event::*,
     event_loop::EventLoop,
+    event_loop::EventLoopWindowTarget,
     window::{WindowBuilder, Window},
     platform::macos::WindowBuilderExtMacOS,
 };
@@ -302,8 +303,8 @@ impl State {
 
     fn get_viewport_size(width: f32, height: f32, advance_x: usize, line_height: usize) -> ViewportSize {
         ViewportSize {
-            char_width: (width - WINDOW_PADDING * 2.0) as usize / advance_x,
-            char_height: (height - DECORATOR_HEIGHT - WINDOW_PADDING * 2.0) as usize / line_height,
+            char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
+            char_height: usize::max(1, (height - DECORATOR_HEIGHT - WINDOW_PADDING * 2.0) as usize / line_height),
         }
     }
 
@@ -315,6 +316,7 @@ impl State {
                 self.config.height as f32,
                 (metrics.max_advance >> 6) as usize,
                 (metrics.height >> 6) as usize);
+        println!("w: {} h: {}", viewport.char_width, viewport.char_height);
         let mut vertex_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
         for _ in 0..vertex_buf.capacity() {
             vertex_buf.push(0);
@@ -453,9 +455,12 @@ impl State {
         self.update_vertices();
     }
 
-    fn process_input(&mut self) {
+    fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
         let str = self.console.input.clone();
         self.console.write_input();
+        if str == "exit" {
+            elwt.exit();
+        }
         if str.contains("stinky") {
             self.console.write("No! You are stinky.\n");
         }  else if str.contains("ello") || str.contains("hi") {
@@ -463,13 +468,13 @@ impl State {
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
+    fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
         match event {
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                 if event.state == winit::event::ElementState::Pressed {
                     match event.logical_key {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
-                            self.process_input();
+                            self.process_input(elwt);
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
                             self.console.input.pop();
@@ -581,7 +586,7 @@ async fn run() {
 
     event_loop.run(move |event, elwt| {
         match event {
-            Event::WindowEvent { window_id, event} if window_id == state.window.id() => if !state.input(&event) {
+            Event::WindowEvent { window_id, event} if window_id == state.window.id() => if !state.input(&event, elwt) {
                 match event {
                     WindowEvent::ThemeChanged(new_theme) => {
                         theme = new_theme;
