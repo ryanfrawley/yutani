@@ -102,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new() {
+    fn new() {
         let console = Console::new(5, 3, 64, 1024);
         assert_eq!(console.columns, 5);
         assert_eq!(console.rows, 3);
@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write1() {
+    fn write1() {
         let mut console = Console::new(5, 3, 64, 1024);
         console.write("Hello");
         assert_eq!(console.buffer[0], 'H');
@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write2() {
+    fn write2() {
         let mut console = Console::new(5, 3, 64, 1024);
         console.write("Hello");
         console.write(" ");
@@ -142,7 +142,7 @@ mod tests {
 
 
     #[test]
-    fn test_iter_view1() {
+    fn iter_view1() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "This should take up multiple lines.";
         let chars: Vec<char> = text.chars().collect();
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_up1() {
+    fn scroll_up1() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorld";
         console.write(text);
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_up2() {
+    fn scroll_up2() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorldTest";
         console.write(text);
@@ -179,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_up3() {
+    fn scroll_up3() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorldZ";
         console.write(text);
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_none() {
+    fn scroll_none() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorldTest";
         console.write(text);
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_down() {
+    fn scroll_down() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorldStars";
         console.write(text);
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scroll_down_invalid() {
+    fn scroll_down_invalid() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "HelloWorldStars";
         console.write(text);
@@ -223,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_scroll() {
+    fn iter_scroll() {
         let mut console = Console::new(5, 3, 64, 1024);
         let text = "This should take up multiple lines.";
         let chars: Vec<char> = text.chars().collect();

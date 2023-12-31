@@ -82,20 +82,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_empty() {
+    fn empty() {
         let buffer: RingBuffer<u8> = RingBuffer::new(5);
         assert_eq!(buffer.len(), 0);
     }
 
     #[test]
-    fn test_push1() {
+    fn push1() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(5);
         buffer.push_back(99);
         assert_eq!(buffer.buffer, [99]);
     }
 
     #[test]
-    fn test_push_str() {
+    fn push_str() {
         let mut buffer: RingBuffer<char> = RingBuffer::new(20);
         for c in "hello".chars().collect::<Vec<_>>() {
             buffer.push_back(c);
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overflow() {
+    fn overflow() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(3);
         buffer.push_back(1);
         buffer.push_back(2);
@@ -114,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter() {
+    fn iter() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(3);
         buffer.push_back(1);
         buffer.push_back(2);
@@ -130,14 +130,14 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_zero_len() {
+    fn iter_zero_len() {
         let buffer: RingBuffer<bool> = RingBuffer::new(0);
         let mut it = buffer.iter();
         assert_eq!(it.next(), None);
     }
 
     #[test]
-    fn test_iter_underflow() {
+    fn iter_underflow() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(10);
         buffer.push_back(1);
         buffer.push_back(2);
@@ -153,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_overflow() {
+    fn iter_overflow() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(3);
         buffer.push_back(1);
         buffer.push_back(2);
@@ -172,7 +172,7 @@ mod tests {
 
 
     #[test]
-    fn test_index() {
+    fn index() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(3);
         buffer.push_back(1);
         buffer.push_back(2);
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_index_bounds() {
+    fn index_bounds() {
         let mut buffer: RingBuffer<u8> = RingBuffer::new(1);
         buffer.push_back(1);
         let _panic = buffer[1];
