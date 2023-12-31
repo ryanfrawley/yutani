@@ -16,51 +16,37 @@ pub fn tokenize(str: &str) -> Vec<String> {
     for c in str.chars() {
         if escape {
             escape = false;
+            println!("pushed esc char: {}", c);
             token.push(c);
             continue;
         }
 
         match state {
             State::SingleQuote => {
-                match escape {
-                    true => {
-                        escape = false;
-                        token.push('\'');
-                    },
-                    false => {
-                        match c {
-                            '\'' => state = State::Token,
-                            _ => token.push(c),
-                        };
-                    }
-                }
+                match c {
+                    '\'' => state = State::Token,
+                    '$' => state = State::Variable,
+                    '\\' => escape = true,
+                    _ => token.push(c),
+                };
                 continue;
             },
             State::DoubleQuote => {
-                match escape {
-                    true => {
-                        escape = false;
-                        token.push(c);
-                    },
-                    false => {
-                        match c {
-                            '"' => state = State::Token,
-                            _ => token.push(c),
-                        };
-                    }
-                }
+                match c {
+                    '"' => state = State::Token,
+                    '$' => state = State::Variable,
+                    '\\' => escape = true,
+                    _ => token.push(c),
+                };
+                continue;
             },
             State::Backtick => {
-                match escape {
-                    true => escape = false,
-                    false => {
-                        if c == '`' {
-                            // TODO: Parse backtick contents as new input and pipe output to current
-                            // token
-                            state = State::Token;
-                        }
-                    }
+                if c == '`' {
+                    // TODO: Parse backtick contents as new input and pipe output to current
+                    // token
+                    state = State::Token;
                 }
+                continue;
             }
             State::Whitespace => {
                 match c {
@@ -95,6 +81,10 @@ pub fn tokenize(str: &str) -> Vec<String> {
                     '`' => {
                         state = State::Backtick;
                     },
+                    '\\' => {
+                        escape = true;
+                        state = State::Token;
+                    }
                     _ => token.push(c),
                 };
             },
@@ -105,6 +95,8 @@ pub fn tokenize(str: &str) -> Vec<String> {
             }
         };
     }
+
+    println!("token: {}", token);
 
     match state {
         State::Whitespace => (),
@@ -139,25 +131,25 @@ mod tests {
     }
 
     #[test]
-    fn quotes_double() {
+    fn dquote() {
         let tokens = tokenize("hello \"world\"");
         assert_eq!(tokens, vec!["hello", "world"]);
     }
 
     #[test]
-    fn quotes_double_whitespace() {
+    fn dquote_whitespace() {
         let tokens = tokenize("h\"ello  worl\"d");
         assert_eq!(tokens, vec!["hello  world"]);
     }
 
     #[test]
-    fn quotes_double_multiple() {
+    fn dquote_multiple() {
         let tokens = tokenize("h\"e\"llo  \"worl\"d");
         assert_eq!(tokens, vec!["hello", "world"]);
     }
 
     #[test]
-    fn quotes_single() {
+    fn squote() {
         let tokens = tokenize("hello 'world'");
         assert_eq!(tokens, vec!["hello", "world"]);
     }
@@ -169,14 +161,26 @@ mod tests {
     }
 
     #[test]
-    fn escape_quote_single() {
+    fn escape_squote() {
         let tokens = tokenize("\\'test");
         assert_eq!(tokens, vec!["'test"]);
     }
 
     #[test]
-    fn escape_quote_double() {
+    fn escape_dquote1() {
         let tokens = tokenize("\\\"test");
         assert_eq!(tokens, vec!["\"test"]);
+    }
+
+    #[test]
+    fn escape_dquote2() {
+        let tokens = tokenize("test\\\"");
+        assert_eq!(tokens, vec!["test\""]);
+    }
+
+    #[test]
+    fn escape_dquote_wrapped_dquote() {
+        let tokens = tokenize("\"te\\\"st\"");
+        assert_eq!(tokens, vec!["te\"st"]);
     }
 }
