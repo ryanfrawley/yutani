@@ -356,7 +356,8 @@ impl State {
         let line_height = metrics.height >> 6;
         let mut column = 0;
 
-        let mut draw_char = |c, r, color_bg, color_fg| {
+        let mut draw_char = |c, r, col, color_bg, color_fg| {
+            let mut column = col;
             let mut row = r;
             match c {
                 '\n' => {
@@ -368,11 +369,10 @@ impl State {
                     let value = &self.atlas.entries[&c];
                     let w = value.width as f32;
                     let mut start_idx = vertices.len();
-                    let size = 4096.0;
-                    let u1 = value.x as f32 / size;
-                    let v1 = value.y as f32 / size;
-                    let u2 = (value.x + value.width) as f32 / size;
-                    let v2 = (value.y + value.height) as f32 / size;
+                    let u1 = value.x as f32 / self.atlas.width as f32;
+                    let v1 = value.y as f32 / self.atlas.height as f32;
+                    let u2 = (value.x + value.width) as f32 / self.atlas.width as f32;
+                    let v2 = (value.y + value.height) as f32 / self.atlas.height as f32;
                     let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.offset_y as f32;
                     let h = value.height as f32;
 
@@ -380,10 +380,11 @@ impl State {
                     let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
                     let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - bg_h - (metrics.descender >> 6) as f32;
                     let bg_w = (metrics.max_advance >> 6) as f32;
-                    vertices.push(vertex::Vertex { position: [x, bg_y, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x, bg_y + bg_h, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y + bg_h, 0.0], tex_coords: [0.0, 0.0], color: color_bg });
+                    let bg_uv = 1.0 / self.atlas.width as f32; // todo: split into height & width
+                    vertices.push(vertex::Vertex { position: [x, bg_y, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x, bg_y + bg_h, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
+                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y + bg_h, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
 
                     for i in start_idx..(start_idx + 3) {
                         indices.push(i as u16);
@@ -416,31 +417,59 @@ impl State {
                     }
                 }
             }
-            row
+            (row, column)
         };
 
-        for c in self.console.iter_view().map(|c| *c).chain(self.console.input.chars()) {
-            // let mut rng = rand::thread_rng();
-            // let normal = Normal::new(0.8, 1.0).unwrap();
-            // let color = [normal.sample(&mut rng), normal.sample(&mut rng), normal.sample(&mut rng), 1.0];
-            let color_bg = [0.7, 0.2, 0.2, 1.0];
-            let color_fg = [0.9, 0.9, 0.9, 1.0];
-            row = draw_char(c, row, color_bg, color_fg);
+        let mut color_fg = [0.9, 0.9 ,0.9, 1.0];
+        let mut in_escape = false;
+
+        // draw the buffer view
+        for c in self.console.iter_view().map(|c| *c) {
+            let mut consumed = false;
+            match c {
+                '\\' => {
+                    match in_escape {
+                        false =>  {
+                            consumed = true;
+                        },
+                        true => {
+
+                        }
+                    }
+                },
+                _ => (),
+            }
+            if consumed {
+                continue;
+            }
+
+            let bg_scale = 0.5 + (column as f32 / self.console.columns as f32) * 0.5;
+            (row, column) = draw_char(c, row, column, [0.2 * bg_scale, 0.2 * bg_scale, 0.8 * bg_scale, 1.0], color_fg);
             if row as usize > self.console.rows {
                 break;
             }
         }
 
-        // Add cursor
+        // draw the input
+        for c in self.console.input.chars() {
+            let color_fg = [0.9, 0.9, 0.9, 1.0];
+            (row, column) = draw_char(c, row, column, [0.0, 0.0, 0.0, 0.0], color_fg);
+            if row as usize > self.console.rows {
+                break;
+            }
+        }
+
+        // add the cursor
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
-        let cursor_color = [0.9, 0.9, 0.9, 1.0];
+        let cursor_color = [0.1, 0.0, 0.8, 1.0];
         let start = vertices.len();
-        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [0.0, 0.0], color: cursor_color });
+        let bg_uv = 1.0 / self.atlas.width as f32; // TODO: Split into width and height
+        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
 
         for i in start..(start + 3) {
             indices.push(i as u16);
@@ -477,16 +506,23 @@ impl State {
     }
 
     fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
-        let str = self.console.input.clone();
+        let args = console::Console::tokenize_input(&self.console.input);
+        for arg in args {
+            println!("arg: {}", arg);
+        }
+
         self.console.write_input();
-        if str == "exit" {
-            elwt.exit();
-        }
-        if str.contains("stinky") {
-            self.console.write("No! You are stinky.\n");
-        }  else if str.contains("ello") || str.contains("hi") {
-            self.console.write("Hi there!\n");
-        }
+
+        // if str.starts_with("echo ") {
+        //     self.console.write(&str);
+        //     self.console.write("\n");
+        // } else if str == "exit" {
+        //     elwt.exit();
+        // } else if str.contains("stinky") {
+        //     self.console.write("No! You are stinky.\n");
+        // } else if str.contains("ello") || str.contains("hi") {
+        //     self.console.write("Hi there!\n");
+        // }
     }
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {

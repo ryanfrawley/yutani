@@ -1,5 +1,6 @@
 use super::ring_buffer;
 use std::iter::Skip;
+use std::collections::VecDeque;
 
 pub struct Console {
     pub buffer: ring_buffer::RingBuffer<char>,
@@ -39,6 +40,94 @@ impl Console {
         for c in str.chars() {
             self.buffer.push_back(c);
         }
+    }
+
+    pub fn tokenize_input(str: &str) -> Vec<String> {
+        enum State {
+            Whitespace,
+            Token,
+            Backtick,
+            SingleQuote,
+            DoubleQuote,
+            Variable,
+        }
+
+        let mut tokens: Vec<String> = Vec::new();
+        let mut state: State = State::Whitespace;
+        let mut token = String::new();
+        let mut escape = false;
+        for c in str.chars() {
+            if c == '\\' {
+                if escape {
+                    token.push(c);
+                }
+                escape = !escape;
+                continue;
+            }
+
+            match state {
+                State::SingleQuote => {
+                    match escape {
+                        true => escape = false,
+                        false => {
+                            if c == '\'' {
+                                state = State::Token;
+                                continue;
+                            }
+                        }
+                    }
+                },
+                State::DoubleQuote => {
+                    match escape {
+                        true => escape = false,
+                        false => {
+                            if c == '"' {
+                                state = State::Token;
+                                continue;
+                            }
+                        }
+                    }
+                },
+                State::Backtick => {
+                    match escape {
+                        true => escape = false,
+                        false => {
+                            if c == '`' {
+                                state = State::Token;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                State::Whitespace => {
+                    match c {
+                        _ if c.is_whitespace() => continue,
+                        '\'' => { state = State::SingleQuote; continue; },
+                        '"' => { state = State::DoubleQuote; continue; },
+                        '`' => { state = State::Backtick; continue; },
+                        '$' => state = State::Variable,
+                        _ => state = State::Token,
+                    }
+                },
+                State::Token => {
+                    if c.is_whitespace() {
+                        tokens.push(token);
+                        token = String::new();
+                        state = State::Whitespace;
+                        continue;
+                    }
+                },
+                State::Variable => {
+                    if c.is_whitespace() {
+                        state = State::Whitespace;
+                        continue;
+                    }
+                }
+            };
+            token.push(c);
+        }
+        tokens.push(token);
+        tokens
     }
 
     pub fn write_input(&mut self) {
@@ -138,10 +227,6 @@ mod tests {
         assert_eq!(console.buffer[10], 'd');
     }
 
-
-    // i n p u t
-    // o u t _ _ 
-    // _ _ _ _ _ 
 
     #[test]
     fn test_iter_view1() {

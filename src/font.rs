@@ -57,6 +57,10 @@ impl Font {
         let mut entries: HashMap<char, AtlasEntry> = HashMap::with_capacity(256);
         let mut x = 0;
         let mut y = 0;
+        texture[0] = 255;
+        texture[1] = 255;
+        texture[4096] = 255;
+        texture[4097] = 255;
         for c in 0..=255 {
             let ch = char::from_u32(c).unwrap();
             let glyph = self.load_glyph(ch);
