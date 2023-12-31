@@ -502,7 +502,7 @@ impl State {
         match args[0].as_str() {
             "echo" => echo::echo(&mut self.console, &args[1..]),
             "exit" => elwt.exit(),
-            _ => self.console.write("unrecognized command: "),
+            _ => self.console.write(&format!("unrecognized command: {}", args[0])),
         };
 
         self.console.write("\n");
@@ -617,7 +617,7 @@ async fn run() {
  	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
-    font.set_char_size(13.0, (window.scale_factor() * 96.0) as u32);
+    font.set_char_size(12.0, (window.scale_factor() * 96.0) as u32);
 
     let mut state = State::new(window, font).await;
     state.update_vertices();
