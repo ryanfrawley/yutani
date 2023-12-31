@@ -6,6 +6,7 @@ mod camera;
 mod ring_buffer;
 
 mod console;
+mod tokenizer;
 mod echo;
 
 use winit::{
@@ -314,10 +315,10 @@ impl State {
         // Calculate console viewport & buffer sizes
         let metrics = self.font.face.size_metrics().unwrap();
         let viewport = State::get_viewport_size(
-                self.config.width as f32,
-                self.config.height as f32,
-                (metrics.max_advance >> 6) as usize,
-                (metrics.height >> 6) as usize);
+            self.config.width as f32,
+            self.config.height as f32,
+            (metrics.max_advance >> 6) as usize,
+            (metrics.height >> 6) as usize);
         println!("w: {} h: {}", viewport.char_width, viewport.char_height);
         let mut vertex_buf: Vec<u8> = Vec::with_capacity(((2 * viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
         for _ in 0..vertex_buf.capacity() {
@@ -422,31 +423,15 @@ impl State {
             (row, column)
         };
 
-        let mut color_fg = [0.9, 0.9 ,0.9, 1.0];
-        let mut in_escape = false;
+        let color_fg = match theme {
+            winit::window::Theme::Dark => [0.9, 0.9 ,0.9, 1.0],
+            winit::window::Theme::Light => [0.0, 0.0, 0.0, 1.0],
+        };
 
         // draw the buffer view
         for c in self.console.iter_view().map(|c| *c) {
-            let mut consumed = false;
-            match c {
-                '\\' => {
-                    match in_escape {
-                        false =>  {
-                            consumed = true;
-                        },
-                        true => {
-
-                        }
-                    }
-                },
-                _ => (),
-            }
-            if consumed {
-                continue;
-            }
-
-            let bg_scale = 0.5 + (column as f32 / self.console.columns as f32) * 0.5;
-            (row, column) = draw_char(c, row, column, [0.2 * bg_scale, 0.2 * bg_scale, 0.8 * bg_scale, 1.0], color_fg);
+            // let bg_scale = 0.5 + (column as f32 / self.console.columns as f32) * 0.5;
+            (row, column) = draw_char(c, row, column, [0.0, 0.0, 0.0, 0.0], color_fg);
             if row as usize > self.console.rows {
                 break;
             }
@@ -454,11 +439,10 @@ impl State {
 
         // draw the input
         for c in self.console.input.chars() {
-            let color_fg = [0.9, 0.9, 0.9, 1.0];
-            (row, column) = draw_char(c, row, column, [0.0, 0.0, 0.0, 0.0], color_fg);
             if row as usize > self.console.rows {
                 break;
             }
+            (row, column) = draw_char(c, row, column, [0.0, 0.0, 0.0, 0.0], color_fg);
         }
 
         // add the cursor
@@ -508,27 +492,20 @@ impl State {
     }
 
     fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
-        let args = console::Console::tokenize_input(&self.console.input);
+        let args = tokenizer::tokenize(&self.console.input);
         self.console.write_input();
+
+        for arg in args.clone() {
+            println!("arg {}", arg);
+        }
 
         match args[0].as_str() {
             "echo" => echo::echo(&mut self.console, &args[1..]),
             "exit" => elwt.exit(),
-            _ => self.console.write("unrecognized command"),
+            _ => self.console.write("unrecognized command: "),
         };
 
         self.console.write("\n");
-
-        // if str.starts_with("echo ") {
-        //     self.console.write(&str);
-        //     self.console.write("\n");
-        // } else if str == "exit" {
-        //     elwt.exit();
-        // } else if str.contains("stinky") {
-        //     self.console.write("No! You are stinky.\n");
-        // } else if str.contains("ello") || str.contains("hi") {
-        //     self.console.write("Hi there!\n");
-        // }
     }
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {

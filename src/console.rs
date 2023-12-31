@@ -42,110 +42,6 @@ impl Console {
         }
     }
 
-    pub fn tokenize_input(str: &str) -> Vec<String> {
-        enum State {
-            Whitespace,
-            Token,
-            Backtick,
-            SingleQuote,
-            DoubleQuote,
-            Variable,
-        }
-
-        let mut tokens: Vec<String> = Vec::new();
-        let mut state: State = State::Whitespace;
-        let mut token = String::new();
-        let mut escape = false;
-        for c in str.chars() {
-            if c == '\\' {
-                if escape {
-                    token.push(c);
-                }
-                escape = !escape;
-                continue;
-            }
-
-            match state {
-                State::SingleQuote => {
-                    match escape {
-                        true => escape = false,
-                        false => {
-                            if c == '\'' {
-                                state = State::Token;
-                                continue;
-                            }
-                        }
-                    }
-                },
-                State::DoubleQuote => {
-                    match escape {
-                        true => escape = false,
-                        false => {
-                            if c == '"' {
-                                state = State::Token;
-                                continue;
-                            }
-                        }
-                    }
-                },
-                State::Backtick => {
-                    match escape {
-                        true => escape = false,
-                        false => {
-                            if c == '`' {
-                                // TODO: Parse backtick contents as new input and pipe output to current
-                                // token
-                                state = State::Token;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                State::Whitespace => {
-                    match c {
-                        _ if c.is_whitespace() => continue,
-                        '\'' => { state = State::SingleQuote; continue; },
-                        '"' => { state = State::DoubleQuote; continue; },
-                        '`' => { state = State::Backtick; continue; },
-                        '$' => state = State::Variable,
-                        _ => state = State::Token,
-                    }
-                },
-                State::Token => {
-                    match c {
-                        _ if c.is_whitespace() => {
-                            tokens.push(token);
-                            token = String::new();
-                            state = State::Whitespace;
-                            continue;
-                        },
-                        '\'' => {
-                            state = State::SingleQuote;
-                            continue;
-                        },
-                        '"' => {
-                            state = State::DoubleQuote;
-                            continue;
-                        },
-                        '`' => {
-                            state = State::Backtick;
-                            continue;
-                        }
-                        _ => (),
-                    };
-                },
-                State::Variable => {
-                    if c.is_whitespace() {
-                        state = State::Whitespace;
-                        continue;
-                    }
-                }
-            };
-            token.push(c);
-        }
-        tokens.push(token);
-        tokens
-    }
 
     pub fn write_input(&mut self) {
         for c in self.input.chars() {
@@ -336,5 +232,4 @@ mod tests {
             assert_eq!(chars[idx], *c);
         }
     }
-
 }
