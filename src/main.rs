@@ -507,7 +507,7 @@ impl State {
 
     fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
         let args = console::Console::tokenize_input(&self.console.input);
-        for arg in args {
+        for arg in args { 
             println!("arg: {}", arg);
         }
 

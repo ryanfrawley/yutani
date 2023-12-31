@@ -93,6 +93,8 @@ impl Console {
                         true => escape = false,
                         false => {
                             if c == '`' {
+                                // TODO: Parse backtick contents as new input and pipe output to current
+                                // token
                                 state = State::Token;
                                 continue;
                             }
@@ -110,12 +112,27 @@ impl Console {
                     }
                 },
                 State::Token => {
-                    if c.is_whitespace() {
-                        tokens.push(token);
-                        token = String::new();
-                        state = State::Whitespace;
-                        continue;
-                    }
+                    match c {
+                        _ if c.is_whitespace() => {
+                            tokens.push(token);
+                            token = String::new();
+                            state = State::Whitespace;
+                            continue;
+                        },
+                        '\'' => {
+                            state = State::SingleQuote;
+                            continue;
+                        },
+                        '"' => {
+                            state = State::DoubleQuote;
+                            continue;
+                        },
+                        '`' => {
+                            state = State::Backtick;
+                            continue;
+                        }
+                        _ => (),
+                    };
                 },
                 State::Variable => {
                     if c.is_whitespace() {
