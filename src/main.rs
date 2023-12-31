@@ -351,10 +351,6 @@ impl State {
         let mut row = 1;
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let color = match theme {
-            winit::window::Theme::Light => [0.0, 0.05, 0.2, 1.0],
-            winit::window::Theme::Dark => [1.0, 1.0, 1.0, 1.0],
-        };
         let metrics = self.font.face.size_metrics().unwrap();
         let line_height = metrics.height >> 6;
         let mut column = 0;
@@ -376,7 +372,7 @@ impl State {
                     let v1 = value.y as f32 / self.atlas.height as f32;
                     let u2 = (value.x + value.width) as f32 / self.atlas.width as f32;
                     let v2 = (value.y + value.height) as f32 / self.atlas.height as f32;
-                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.offset_y as f32;
+                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.bearing_y as f32;
                     let h = value.height as f32;
 
                     // background
@@ -399,10 +395,10 @@ impl State {
                     start_idx = vertices.len();
 
                     // foreground
-                    vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [u1, v1], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [u1, v2], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [u2, v1], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [u2, v2], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32, y, 0.0], tex_coords: [u1, v1], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32, y + h, 0.0], tex_coords: [u1, v2], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32 + w, y, 0.0], tex_coords: [u2, v1], color: color_fg });
+                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32 + w, y + h, 0.0], tex_coords: [u2, v2], color: color_fg });
                     for i in start_idx..(start_idx + 3) {
                         indices.push(i as u16);
                     }
@@ -451,11 +447,12 @@ impl State {
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = [0.1, 0.0, 0.8, 1.0];
         let start = vertices.len();
-        let bg_uv = 1.0 / self.atlas.width as f32; // TODO: Split into width and height
-        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [bg_uv, bg_uv], color: cursor_color });
+        let bg_u = 1.0 / self.atlas.width as f32;
+        let bg_v = 1.0 / self.atlas.height as f32;
+        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
+        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
 
         for i in start..(start + 3) {
             indices.push(i as u16);

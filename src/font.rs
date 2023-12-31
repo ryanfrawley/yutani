@@ -22,7 +22,8 @@ pub struct AtlasEntry {
     pub y: usize,
     pub width: usize,
     pub height: usize,
-    pub offset_y: isize,
+    pub bearing_y: isize,
+    pub bearing_x: usize,
     pub advance_x: usize,
 }
 
@@ -74,7 +75,7 @@ impl Font {
                     texture[(((p + y) % size) * width + (q + x) % size) as usize] = glyph.bitmap.buffer()[(p * w + q) as usize];
                 }
             }
-            entries.insert(ch, AtlasEntry { x, y, width: w, height: h, advance_x: (glyph.metrics.horiAdvance >> 6) as usize, offset_y: (glyph.metrics.horiBearingY >> 6) as isize });
+            entries.insert(ch, AtlasEntry { x, y, width: w, height: h, bearing_x: (glyph.metrics.horiBearingX >> 6) as usize, advance_x: (glyph.metrics.horiAdvance >> 6) as usize, bearing_y: (glyph.metrics.horiBearingY >> 6) as isize });
             x += (glyph.metrics.horiAdvance >> 6) as usize;
             if x >= size - w {
                 x = 0;
