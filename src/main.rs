@@ -4,7 +4,9 @@ mod texture;
 mod font_loader;
 mod camera;
 mod ring_buffer;
+
 mod console;
+mod echo;
 
 use winit::{
     event::*,
@@ -507,11 +509,15 @@ impl State {
 
     fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
         let args = console::Console::tokenize_input(&self.console.input);
-        for arg in args { 
-            println!("arg: {}", arg);
-        }
-
         self.console.write_input();
+
+        match args[0].as_str() {
+            "echo" => echo::echo(&mut self.console, &args[1..]),
+            "exit" => elwt.exit(),
+            _ => self.console.write("unrecognized command"),
+        };
+
+        self.console.write("\n");
 
         // if str.starts_with("echo ") {
         //     self.console.write(&str);
