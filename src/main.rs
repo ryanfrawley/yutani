@@ -445,7 +445,10 @@ impl State {
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
-        let cursor_color = [0.1, 0.0, 0.8, 1.0];
+        let cursor_color = match theme {
+            winit::window::Theme::Light => [0.1, 0.0, 0.8, 1.0],
+            winit::window::Theme::Dark => [0.9, 0.9, 0.9, 1.0],
+        };
         let start = vertices.len();
         let bg_u = 1.0 / self.atlas.width as f32;
         let bg_v = 1.0 / self.atlas.height as f32;
@@ -492,8 +495,8 @@ impl State {
         let args = tokenizer::tokenize(&self.console.input);
         self.console.write_input();
 
-        for arg in args.clone() {
-            println!("arg {}", arg);
+        if args.len() == 0 {
+            return;
         }
 
         match args[0].as_str() {
