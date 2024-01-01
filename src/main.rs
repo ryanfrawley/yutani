@@ -425,6 +425,7 @@ impl State {
         };
 
         // draw the buffer view
+
         for c in self.console.iter_view().map(|c| *c) {
             // let bg_scale = 0.5 + (column as f32 / self.console.columns as f32) * 0.5;
             (row, column) = draw_char(c, row, column, [0.0, 0.0, 0.0, 0.0], color_fg);
@@ -442,6 +443,7 @@ impl State {
         }
 
         // add the cursor
+        x = WINDOW_PADDING + (self.console.cursor_x * (metrics.max_advance >> 6) as usize) as f32;
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
@@ -510,6 +512,16 @@ impl State {
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
         match event {
+            WindowEvent::MouseWheel { device_id, delta, phase } => {
+                match delta {
+                    MouseScrollDelta::LineDelta(r, d) => {
+                        println!("scroll ({}, {})", r, d);
+                    },
+                    MouseScrollDelta::PixelDelta(p) => {
+                        println!("pixscroll: {},  {}", p.x, p.y);
+                    }
+                }
+            },
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
                 if event.state == winit::event::ElementState::Pressed {
                     match event.logical_key {
@@ -520,15 +532,24 @@ impl State {
                             self.console.input.pop();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
-                            self.console.scroll_by(1);
+                            self.console.scroll_up();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
-                            self.console.scroll_by(-1);
+                            self.console.scroll_down();
+                        },
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
+                            self.console.cursor_left();
+                        },
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
+                            self.console.cursor_right();
                         },
                         _ => {
                             let k = event.text.to_owned().unwrap_or_default();
                             match k.chars().next() {
-                                Some(k) => self.console.input.push(k),
+                                Some(k) => { 
+                                    self.console.input.push(k);
+                                    self.console.cursor_right();
+                                },
                                 None => (),
                             };
                         },
