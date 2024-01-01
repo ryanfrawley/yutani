@@ -445,9 +445,12 @@ impl State {
         }
 
         // add the cursor
-        x = WINDOW_PADDING + (self.console.cursor_x * (metrics.max_advance >> 6) as usize) as f32;
+        x = WINDOW_PADDING + ((self.console.cursor_offset % self.console.columns) * (metrics.max_advance >> 6) as usize) as f32;
+        let input_offset =
+            (self.console.input.len() / self.console.columns) as i64 - 
+            (self.console.cursor_offset / self.console.columns) as i64;
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
+        let y = WINDOW_PADDING + DECORATOR_HEIGHT + ((row - input_offset) * line_height) as f32 - h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = match theme {
             winit::window::Theme::Light => [0.1, 0.0, 0.8, 1.0],
@@ -562,7 +565,7 @@ impl State {
                             self.process_input(elwt);
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
-                            self.console.input.pop();
+                            self.console.delete_left();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
                             // self.console.scroll_up();
@@ -580,8 +583,7 @@ impl State {
                             let k = event.text.to_owned().unwrap_or_default();
                             match k.chars().next() {
                                 Some(k) => { 
-                                    self.console.input.push(k);
-                                    self.console.cursor_right();
+                                    self.console.insert_right(k);
                                 },
                                 None => (),
                             };

@@ -7,8 +7,7 @@ pub struct Console {
     pub rows: usize,
     pub scroll_ptr: usize,
     pub scroll_y: usize,
-    pub cursor_x: usize,
-    pub cursor_y: usize,
+    pub cursor_offset: usize,
     pub input: String,
 }
 
@@ -25,16 +24,15 @@ impl Console {
             columns,
             scroll_y: 0,
             scroll_ptr: 0,
-            cursor_x: 0,
-            cursor_y: 0,
+            cursor_offset: 0,
         }
     }
 
     pub fn resize(&mut self, columns: usize, rows: usize) {
         self.columns = columns;
         self.rows = rows;
-        if self.cursor_x >= columns { // TODO: maintain the cursor on the same chracter
-            self.cursor_x = columns - 1;
+        if self.cursor_offset >= columns { // TODO: maintain the cursor on the same chracter
+            self.cursor_offset = columns - 1;
         }
     }
 
@@ -50,7 +48,26 @@ impl Console {
             self.buffer.push_back(c);
         }
         self.buffer.push_back('\n');
+        self.cursor_offset = 0;
         self.input.clear();
+    }
+
+    pub fn delete_left(&mut self) -> bool {
+        if self.cursor_offset == 0 {
+            return false;
+        }
+        self.input.remove(self.cursor_offset - 1);
+        self.cursor_offset = match self.cursor_offset {
+            0 => 0,
+            _ => self.cursor_offset - 1,
+        };
+        true
+    }
+
+    pub fn insert_right(&mut self, c: char) -> bool {
+        self.input.insert(self.cursor_offset, c);
+        self.cursor_offset += 1;
+        true
     }
 
     pub fn iter(&self) -> ring_buffer::RingBufferIterator<char> {
@@ -62,18 +79,18 @@ impl Console {
     }
 
     pub fn cursor_left(&mut self) -> bool {
-        if self.cursor_x == 0 {
+        if self.cursor_offset == 0 {
             return false;
         }
-        self.cursor_x -= 1;
+        self.cursor_offset -= 1;
         true
     }
 
     pub fn cursor_right(&mut self) -> bool {
-        if self.cursor_x >= self.columns - 1 {
+        if self.cursor_offset >= self.input.len() {
             return false;
         }
-        self.cursor_x += 1;
+        self.cursor_offset += 1;
         true
     }
 
