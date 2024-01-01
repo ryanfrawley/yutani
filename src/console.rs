@@ -31,9 +31,6 @@ impl Console {
     pub fn resize(&mut self, columns: usize, rows: usize) {
         self.columns = columns;
         self.rows = rows;
-        if self.cursor_offset >= columns { // TODO: maintain the cursor on the same chracter
-            self.cursor_offset = columns - 1;
-        }
     }
 
     pub fn write(&mut self, str: &str) {

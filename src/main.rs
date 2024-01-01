@@ -680,7 +680,7 @@ async fn run() {
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
 
-    event_loop.run(move |event, elwt| {
+    let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent { window_id, event} if window_id == state.window.id() => if !state.input(&event, elwt) {
                 match event {
@@ -696,8 +696,8 @@ async fn run() {
                         state.resize(size);
                         state.window.request_redraw();
                     },
-                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                        // state.resize(scale_factor); // TODO
+                    WindowEvent::ScaleFactorChanged { scale_factor: _scale_factor, .. } => {
+                        state.window.request_redraw();
                     },
                     WindowEvent::RedrawRequested => {
                         state.update();
@@ -752,7 +752,6 @@ fn clear_color(theme: winit::window::Theme) -> wgpu::Color {
             a: 1.0,
         },
     }
-
 }
 
 fn main() {
