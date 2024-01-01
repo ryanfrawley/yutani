@@ -54,6 +54,7 @@ struct State {
     camera_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
     console: console::Console,
+    scroll_y: f64,
 }
 
 impl State {
@@ -301,6 +302,7 @@ impl State {
             camera_buffer,
             camera_bind_group,
             console: console::Console::new(100, 80, 10000, 1024),
+            scroll_y: 0.0,
         }
     }
 
@@ -372,12 +374,12 @@ impl State {
                     let v1 = value.y as f32 / self.atlas.height as f32;
                     let u2 = (value.x + value.width) as f32 / self.atlas.width as f32;
                     let v2 = (value.y + value.height) as f32 / self.atlas.height as f32;
-                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.bearing_y as f32;
+                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.bearing_y as f32 + self.scroll_y as f32;
                     let h = value.height as f32;
 
                     // background
                     let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-                    let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - bg_h - (metrics.descender >> 6) as f32;
+                    let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - bg_h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
                     let bg_w = (metrics.max_advance >> 6) as f32;
                     let bg_uv = 1.0 / self.atlas.width as f32; // todo: split into height & width
                     vertices.push(vertex::Vertex { position: [x, bg_y, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
@@ -445,7 +447,7 @@ impl State {
         // add the cursor
         x = WINDOW_PADDING + (self.console.cursor_x * (metrics.max_advance >> 6) as usize) as f32;
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32;
+        let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = match theme {
             winit::window::Theme::Light => [0.1, 0.0, 0.8, 1.0],
@@ -512,17 +514,48 @@ impl State {
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
         match event {
-            WindowEvent::MouseWheel { device_id, delta, phase } => {
+            WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
-                    MouseScrollDelta::LineDelta(r, d) => {
-                        println!("scroll ({}, {})", r, d);
+                    MouseScrollDelta::LineDelta(_r, d) => {
+                        match d {
+                            _ if d > &0.0 => {
+                                for _ in 0..(d.round() as usize) {
+                                    self.console.scroll_down();
+                                }
+                            },
+                            _ => {
+                                for _ in 0..(d.round().abs() as usize) {
+                                    self.console.scroll_up();
+                                }
+                            }
+                        }
                     },
                     MouseScrollDelta::PixelDelta(p) => {
-                        println!("pixscroll: {},  {}", p.x, p.y);
+                        let height = (self.font.face.size_metrics().unwrap().height >> 6) as f64;
+                        let new_scroll = self.scroll_y + p.y;
+
+                        if new_scroll >= height {
+                            self.console.scroll_up();
+                        } else if new_scroll.abs() >= height {
+                            self.console.scroll_down();
+                        }
+
+                        let delta = new_scroll - self.scroll_y;
+
+                        self.scroll_y = new_scroll % height as f64;
+
+                        if self.console.scroll_y == 0 && self.scroll_y > 0.0 {
+                            self.scroll_y = 0.0;
+                        } else if self.console.scroll_ptr >= self.console.buffer.len() && self.scroll_y < 0.0 {
+                            self.scroll_y = 0.0;
+                        }
                     }
                 }
+                self.update_vertices();
+                self.window.request_redraw();
+                return true;
             },
-            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     match event.logical_key {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
@@ -532,10 +565,10 @@ impl State {
                             self.console.input.pop();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
-                            self.console.scroll_up();
+                            // self.console.scroll_up();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
-                            self.console.scroll_down();
+                            // self.console.scroll_down();
                         },
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
                             self.console.cursor_left();

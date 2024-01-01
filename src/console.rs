@@ -1,6 +1,5 @@
 use super::ring_buffer;
 use std::iter::Skip;
-use std::collections::VecDeque;
 
 pub struct Console {
     pub buffer: ring_buffer::RingBuffer<char>,
