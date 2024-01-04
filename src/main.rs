@@ -55,6 +55,8 @@ struct State {
     atlas: font::Atlas,
     console: console::Console,
     scroll_y: f64,
+    mouse_x: f64,
+    mouse_y: f64,
 }
 
 impl State {
@@ -303,6 +305,8 @@ impl State {
             camera_bind_group,
             console: console::Console::new(100, 80, 10000, 1024),
             scroll_y: 0.0,
+            mouse_x: 0.0,
+            mouse_y: 0.0,
         }
     }
 
@@ -422,7 +426,7 @@ impl State {
         };
 
         let color_fg = match theme {
-            winit::window::Theme::Dark => [0.9, 0.9 ,0.9, 1.0],
+            winit::window::Theme::Dark => [0.0, 0.9 ,0.9, 1.0],
             winit::window::Theme::Light => [0.0, 0.0, 0.0, 1.0],
         };
 
@@ -517,6 +521,32 @@ impl State {
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
         match event {
+            WindowEvent::MouseInput { device_id, state, button } => {
+                match button {
+                    MouseButton::Left => {
+                        match state {
+                            ElementState::Pressed => {
+                                let x = 
+                                    (self.mouse_x - WINDOW_PADDING as f64) /
+                                    (self.config.width as f64 - 2.0 * WINDOW_PADDING as f64);
+
+                                let y = 
+                                    (self.mouse_y + self.scroll_y - (WINDOW_PADDING + DECORATOR_HEIGHT) as f64) /
+                                    (self.config.height as f64 - 2.0 * WINDOW_PADDING as f64);
+
+                                let col = (x * self.console.columns as f64).floor();
+                                let row = (y * self.console.rows as f64).floor();
+                            },
+                            _ => (),
+                        }
+                    },
+                    _ => (),
+                }
+            },
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_x = position.x;
+                self.mouse_y = position.y;
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
                     MouseScrollDelta::LineDelta(_r, d) => {

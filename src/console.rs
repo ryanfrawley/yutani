@@ -274,4 +274,7 @@ mod tests {
         }
         assert_eq!(count, chars.len());
     }
+
+    // TODO: Figure out why scrolling up can break if we have a full width output line with no line
+    // breaks.
 }
