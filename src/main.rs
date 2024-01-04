@@ -512,7 +512,7 @@ impl State {
 
         match args[0].as_str() {
             "echo" => echo::echo(&mut self.console, &args[1..]),
-            "exit" => elwt.exit(),
+            "exit" => { elwt.exit(); return; },
             _ => self.console.write(&format!("unrecognized command: {}", args[0])),
         };
 
