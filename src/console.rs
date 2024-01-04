@@ -9,6 +9,7 @@ pub struct Console {
     pub scroll_y: usize,
     pub cursor_offset: usize,
     pub input: String,
+    pub current_dir: String,
 }
 
 impl Console {
@@ -25,6 +26,7 @@ impl Console {
             scroll_y: 0,
             scroll_ptr: 0,
             cursor_offset: 0,
+            current_dir: String::from("~"),
         }
     }
 
