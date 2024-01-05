@@ -511,6 +511,7 @@ impl State {
         }
 
         match args[0].as_str() {
+            "export" => command::export(&mut self.console, &args[1..]),
             "which" => command::which(&mut self.console, &args[1..]),
             "pwd" => command::pwd(&mut self.console, &args[1..]),
             "echo" => command::echo(&mut self.console, &args[1..]),
