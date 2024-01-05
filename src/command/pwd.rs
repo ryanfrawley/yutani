@@ -1,4 +1,4 @@
-use super::console;
+use crate::console;
 
 pub fn pwd(console: &mut console::Console, args: &[String]) {
     if args.len() > 0 {

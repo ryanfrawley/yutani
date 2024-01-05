@@ -7,8 +7,7 @@ mod ring_buffer;
 
 mod console;
 mod tokenizer;
-mod echo;
-mod pwd;
+mod command;
 
 use winit::{
     event::*,
@@ -512,8 +511,9 @@ impl State {
         }
 
         match args[0].as_str() {
-            "pwd" => pwd::pwd(&mut self.console, &args[1..]),
-            "echo" => echo::echo(&mut self.console, &args[1..]),
+            "which" => command::which(&mut self.console, &args[1..]),
+            "pwd" => command::pwd(&mut self.console, &args[1..]),
+            "echo" => command::echo(&mut self.console, &args[1..]),
             "exit" => { elwt.exit(); return; },
             _ => self.console.write(&format!("unrecognized command: {}", args[0])),
         };
@@ -523,7 +523,7 @@ impl State {
 
     fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
         match event {
-            WindowEvent::MouseInput { device_id, state, button } => {
+            WindowEvent::MouseInput { state, button, .. } => {
                 match button {
                     MouseButton::Left => {
                         match state {

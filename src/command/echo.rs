@@ -1,4 +1,4 @@
-use super::console;
+use crate::console;
 
 pub fn echo(console: &mut console::Console, args: &[String]) {
     let mut first = true;
