@@ -9,6 +9,8 @@ mod console;
 mod tokenizer;
 mod command;
 
+mod pty;
+
 use winit::{
     event::*,
     event_loop::EventLoop,
@@ -57,6 +59,7 @@ struct State {
     scroll_y: f64,
     mouse_x: f64,
     mouse_y: f64,
+    master: i32,
 }
 
 impl State {
@@ -285,6 +288,11 @@ impl State {
             },
         );
 
+        let master = match pty::fork_pty() {
+            Ok(m) => m,
+            Err(e) => panic!("{e:?}"),
+        };
+
         Self {
             window,
             surface,
@@ -307,6 +315,7 @@ impl State {
             scroll_y: 0.0,
             mouse_x: 0.0,
             mouse_y: 0.0,
+            master,
         }
     }
 
@@ -504,21 +513,18 @@ impl State {
 
     fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
         let args = tokenizer::tokenize(&self.console.input);
-        self.console.write_input();
 
         if args.len() == 0 {
             return;
         }
 
-        match args[0].as_str() {
-            "export" => command::export(&mut self.console, &args[1..]),
-            "which" => command::which(&mut self.console, &args[1..]),
-            "pwd" => command::pwd(&mut self.console, &args[1..]),
-            "echo" => command::echo(&mut self.console, &args[1..]),
-            "exit" => { elwt.exit(); return; },
-            _ => self.console.write(&format!("unrecognized command: {}", args[0])),
+        self.console.input.push('\x04');
+        match nix::unistd::write(self.master, self.console.input.as_bytes()) {
+            Ok(n) => println!("wrote {n} bytes"),
+            Err(e) => panic!("{e}"),
         };
 
+        self.console.write_input();
         self.console.write("\n");
     }
 
@@ -790,3 +796,4 @@ fn clear_color(theme: winit::window::Theme) -> wgpu::Color {
 fn main() {
     pollster::block_on(run());
 }
+
