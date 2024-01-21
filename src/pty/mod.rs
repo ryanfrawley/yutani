@@ -1,8 +1,10 @@
 extern crate libc;
 use std::ffi::CString;
+use std::ptr::null_mut;
 use nix::libc::*;
 
-pub fn fork_pty() -> Result<i32, String> {
+pub fn fork_pty<F>(on_output: F) -> Result<i32, String> 
+where F: Fn(&[u8]) {
     let fdm: i32;
     let fds: i32;
     let mut rc: i32;
@@ -27,22 +29,21 @@ pub fn fork_pty() -> Result<i32, String> {
             return Err("Error on unlockpt()".to_string()); 
         } 
 
-        // open the slave pty
+        // Open the slave pty
         fds = open(ptsname(fdm), O_RDWR); 
         println!("Virtual interface configured");
-        // printf("The master side is named : %s\n", ptsname(fdm));
 
         match nix::unistd::fork() {
             Ok(nix::unistd::ForkResult::Child) => { 
-                // close the master side of the pty
+                // Close the master side of the pty
                 close(fdm); 
 
-                // get the default terminal settings
+                // Get the default terminal settings
                 let mut slave_settings_orig = std::mem::MaybeUninit::<termios>::uninit();
                 tcgetattr(fds, slave_settings_orig.as_mut_ptr()); 
                 let slave_settings_orig = slave_settings_orig.assume_init();
 
-                // set raw mode on the slave side of the pty
+                // Set raw mode on the slave side of the pty
                 let mut slave_settings_new = slave_settings_orig.clone();
                 slave_settings_new.c_lflag &= !(ECHO | ICANON);
                 tcsetattr(fds, TCSANOW, &mut slave_settings_new); 
@@ -82,7 +83,7 @@ pub fn fork_pty() -> Result<i32, String> {
                     FD_SET(0, &mut fd_in);
                     FD_SET(fdm, &mut fd_in);
 
-                    match select(fdm + 1, &mut fd_in, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) {
+                    match select(fdm + 1, &mut fd_in, null_mut(), null_mut(), null_mut()) {
                         -1 => panic!("failed to select fdm + 1"),
                         _ => {
                             // If data on standard input
@@ -90,9 +91,7 @@ pub fn fork_pty() -> Result<i32, String> {
                                 match read(0, input.as_mut_ptr() as *mut c_void, input.len() ) {
                                     n if n < 0 => panic!("{n}"),
                                     n => {
-                                        println!("before write");
                                         write(fdm, input.as_ptr() as *const c_void, n as usize);
-                                        println!("after write");
                                     },
                                 }
                             }
@@ -102,6 +101,7 @@ pub fn fork_pty() -> Result<i32, String> {
                                 match read(fdm, input.as_mut_ptr() as *mut c_void, input.len()) {
                                     n if n < 0 => panic!("{n}"),
                                     n => {
+                                        on_output(&input);
                                         write(1, input.as_ptr() as *const c_void, n as usize);
                                     },
                                 }

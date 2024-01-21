@@ -4,6 +4,7 @@ mod texture;
 mod font_loader;
 mod camera;
 mod ring_buffer;
+mod app_window;
 
 mod console;
 mod tokenizer;
@@ -13,7 +14,7 @@ mod pty;
 
 use winit::{
     event::*,
-    event_loop::EventLoop,
+    event_loop::EventLoopBuilder,
     event_loop::EventLoopWindowTarget,
     window::{WindowBuilder, Window},
     platform::macos::WindowBuilderExtMacOS,
@@ -288,10 +289,7 @@ impl State {
             },
         );
 
-        let master = match pty::fork_pty() {
-            Ok(m) => m,
-            Err(e) => panic!("{e:?}"),
-        };
+        let master = 0;
 
         Self {
             window,
@@ -380,6 +378,9 @@ impl State {
                     x = WINDOW_PADDING;
                 },
                 _ => {
+                    if !self.atlas.entries.contains_key(&c) {
+                        return (row, col);
+                    }
                     let value = &self.atlas.entries[&c];
                     let w = value.width as f32;
                     let mut start_idx = vertices.len();
@@ -511,7 +512,7 @@ impl State {
         self.update_vertices();
     }
 
-    fn process_input(&mut self, elwt: &EventLoopWindowTarget<()>) {
+    fn process_input(&mut self, elwt: &EventLoopWindowTarget<app_window::CustomEvent>) {
         let args = tokenizer::tokenize(&self.console.input);
 
         if args.len() == 0 {
@@ -528,7 +529,7 @@ impl State {
         self.console.write("\n");
     }
 
-    fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<()>) -> bool {
+    fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<app_window::CustomEvent>) -> bool {
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
                 match button {
@@ -684,7 +685,19 @@ impl State {
 
 async fn run() {
     env_logger::init();
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event().build().unwrap();
+    let event_loop_proxy = event_loop.create_proxy();
+
+    // fork before the window is created, and create an additional thread to post the custom events
+    std::thread::spawn(move || {
+        pty::fork_pty(|on_output| {
+            let str = String::from_utf8(on_output.to_vec()).unwrap();
+            event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
+        });
+    });
+
+
+
     let transparent = false; // needed because of a shadow bug
     let window = WindowBuilder::new()
         .with_title("Terminal")
@@ -696,6 +709,7 @@ async fn run() {
         .with_blur(transparent)
         .build(&event_loop)
         .unwrap();
+
 
 
     // event_loop.set_control_flow(ControlFlow::Poll);
@@ -721,6 +735,11 @@ async fn run() {
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
+            Event::UserEvent(n) => match n {
+                app_window::CustomEvent::PtyInput(z) => {
+                    state.console.write(&z);
+                }
+            },
             Event::WindowEvent { window_id, event} if window_id == state.window.id() => if !state.input(&event, elwt) {
                 match event {
                     WindowEvent::ThemeChanged(new_theme) => {
@@ -760,17 +779,6 @@ async fn run() {
                 // can just render here instead.
                 //window.request_redraw();
             },
-            // Event::WindowEvent {
-            //     event: WindowEvent::RedrawRequested,
-            //     ..
-            // } => {
-            //     // Redraw the application.
-            //     //
-            //     // It's preferable for applications that do not render continuously to render in
-            //     // this event rather than in AboutToWait, since rendering in here allows
-            //     // the program to gracefully handle redraws requested by the OS.
-            //     println!("redraw");
-            // },
             _ => ()
         }
     });
