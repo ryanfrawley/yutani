@@ -1,10 +1,8 @@
 mod app_window;
-mod camera;
 mod font;
 mod font_loader;
+mod renderer;
 mod ring_buffer;
-mod texture;
-mod vertex;
 
 mod command;
 mod console;
@@ -54,8 +52,8 @@ struct State {
     num_indices: u32,
     font: font::Font,
     font_bind_group: wgpu::BindGroup,
-    camera: camera::Camera,
-    camera_uniform: camera::CameraUniform,
+    camera: renderer::camera::Camera,
+    camera_uniform: renderer::camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
@@ -127,7 +125,7 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-        let font_alpha = texture::Texture::from_memory(
+        let font_alpha = renderer::texture::Texture::from_memory(
             &device,
             &queue,
             &atlas.buffer,
@@ -175,8 +173,8 @@ impl State {
             label: Some("font bind group"),
         });
 
-        let camera = camera::Camera {};
-        let mut camera_uniform = camera::CameraUniform::new();
+        let camera = renderer::camera::Camera {};
+        let mut camera_uniform = renderer::camera::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, config.width as f32, config.height as f32);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -209,7 +207,7 @@ impl State {
             label: Some("camera bind group"),
         });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader = device.create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -224,7 +222,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[vertex::Vertex::desc()],
+                buffers: &[renderer::vertex::Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -263,7 +261,7 @@ impl State {
         );
         let mut vertex_buf: Vec<u8> = Vec::with_capacity(
             (viewport.char_height * viewport.char_width + 1)
-                * std::mem::size_of::<vertex::Vertex>()
+                * std::mem::size_of::<renderer::vertex::Vertex>()
                 * 4,
         );
         for _ in 0..vertex_buf.capacity() {
@@ -339,7 +337,7 @@ impl State {
         println!("w: {} h: {}", viewport.char_width, viewport.char_height);
         let mut vertex_buf: Vec<u8> = Vec::with_capacity(
             ((2 * viewport.char_height * viewport.char_width) + 1)
-                * std::mem::size_of::<vertex::Vertex>()
+                * std::mem::size_of::<renderer::vertex::Vertex>()
                 * 4,
         );
         for _ in 0..vertex_buf.capacity() {
@@ -369,7 +367,7 @@ impl State {
 
     fn update_vertices(&mut self) {
         let area = self.console.columns * self.console.rows;
-        let mut vertices: Vec<vertex::Vertex> = Vec::with_capacity(4 * 2 * (area + 1));
+        let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * 2 * (area + 1));
         let mut indices: Vec<u16> = Vec::with_capacity(6 * 2 * (area + 1));
 
         let mut x = WINDOW_PADDING;
@@ -413,22 +411,22 @@ impl State {
                         + self.scroll_y as f32;
                     let bg_w = (metrics.max_advance >> 6) as f32;
                     let bg_uv = 1.0 / self.atlas.width as f32; // todo: split into height & width
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x, bg_y, 0.0],
                         tex_coords: [bg_uv, bg_uv],
                         color: color_bg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x, bg_y + bg_h, 0.0],
                         tex_coords: [bg_uv, bg_uv],
                         color: color_bg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + bg_w, bg_y, 0.0],
                         tex_coords: [bg_uv, bg_uv],
                         color: color_bg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + bg_w, bg_y + bg_h, 0.0],
                         tex_coords: [bg_uv, bg_uv],
                         color: color_bg,
@@ -444,22 +442,22 @@ impl State {
                     start_idx = vertices.len();
 
                     // foreground
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + value.bearing_x as f32, y, 0.0],
                         tex_coords: [u1, v1],
                         color: color_fg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + value.bearing_x as f32, y + h, 0.0],
                         tex_coords: [u1, v2],
                         color: color_fg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + value.bearing_x as f32 + w, y, 0.0],
                         tex_coords: [u2, v1],
                         color: color_fg,
                     });
-                    vertices.push(vertex::Vertex {
+                    vertices.push(renderer::vertex::Vertex {
                         position: [x + value.bearing_x as f32 + w, y + h, 0.0],
                         tex_coords: [u2, v2],
                         color: color_fg,
@@ -526,22 +524,22 @@ impl State {
         let start = vertices.len();
         let bg_u = 1.0 / self.atlas.width as f32;
         let bg_v = 1.0 / self.atlas.height as f32;
-        vertices.push(vertex::Vertex {
+        vertices.push(renderer::vertex::Vertex {
             position: [x, y, 0.0],
             tex_coords: [bg_u, bg_v],
             color: cursor_color,
         });
-        vertices.push(vertex::Vertex {
+        vertices.push(renderer::vertex::Vertex {
             position: [x, y + h, 0.0],
             tex_coords: [bg_u, bg_v],
             color: cursor_color,
         });
-        vertices.push(vertex::Vertex {
+        vertices.push(renderer::vertex::Vertex {
             position: [x + w, y, 0.0],
             tex_coords: [bg_u, bg_v],
             color: cursor_color,
         });
-        vertices.push(vertex::Vertex {
+        vertices.push(renderer::vertex::Vertex {
             position: [x + w, y + h, 0.0],
             tex_coords: [bg_u, bg_v],
             color: cursor_color,
@@ -596,7 +594,7 @@ impl State {
             return;
         }
 
-        self.console.input.push('\x04');
+        self.console.input.push('\n');
         match nix::unistd::write(self.master, self.console.input.as_bytes()) {
             Ok(n) => println!("wrote {n} bytes"),
             Err(e) => panic!("{e}"),
