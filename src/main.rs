@@ -1,14 +1,14 @@
-mod vertex;
-mod font;
-mod texture;
-mod font_loader;
-mod camera;
-mod ring_buffer;
 mod app_window;
+mod camera;
+mod font;
+mod font_loader;
+mod ring_buffer;
+mod texture;
+mod vertex;
 
+mod command;
 mod console;
 mod tokenizer;
-mod command;
 
 mod pty;
 
@@ -16,8 +16,8 @@ use winit::{
     event::*,
     event_loop::EventLoopBuilder,
     event_loop::EventLoopWindowTarget,
-    window::{WindowBuilder, Window},
     platform::macos::WindowBuilderExtMacOS,
+    window::{Window, WindowBuilder},
 };
 
 // use rand_distr::{Distribution, Normal};
@@ -72,34 +72,38 @@ impl State {
             ..Default::default()
         });
 
-        let surface = unsafe {
-            instance.create_surface(&window)
-        }.unwrap();
+        let surface = unsafe { instance.create_surface(&window) }.unwrap();
 
-        let adapter = instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            }
-        ).await.unwrap();
+            })
+            .await
+            .unwrap();
 
-        let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                features: wgpu::Features::empty(),
-                limits: if cfg!(target_arch = "wasm32") {
-                    wgpu::Limits::downlevel_webgl2_defaults()
-                } else {
-                    wgpu::Limits::default()
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    features: wgpu::Features::empty(),
+                    limits: if cfg!(target_arch = "wasm32") {
+                        wgpu::Limits::downlevel_webgl2_defaults()
+                    } else {
+                        wgpu::Limits::default()
+                    },
+                    label: None,
                 },
-                label: None,
-            },
-            None, // trace path
-        ).await.unwrap();
+                None, // trace path
+            )
+            .await
+            .unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
 
-        let surface_format = surface_caps.formats.iter()
+        let surface_format = surface_caps
+            .formats
+            .iter()
             .copied()
             .filter(|f| f.is_srgb())
             .next()
@@ -120,7 +124,6 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-
         let font_alpha = texture::Texture::from_memory(
             &device,
             &queue,
@@ -128,30 +131,31 @@ impl State {
             atlas.width as u32,
             atlas.height as u32,
             wgpu::TextureFormat::R8Unorm,
-            Some("font texture")
+            Some("font texture"),
         );
 
-        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        let texture_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("font texture bind group layout")
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("font texture bind group layout"),
+            });
 
         let font_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -172,56 +176,44 @@ impl State {
         let mut camera_uniform = camera::CameraUniform::new();
         camera_uniform.update_view_proj(&camera, config.width as f32, config.height as f32);
 
-        let camera_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("camera buffer"),
-                contents: bytemuck::cast_slice(&[camera_uniform]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            },
-        );
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
-        let camera_bind_group_layout = device.create_bind_group_layout(
-            &wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    }
-                ],
-                label: Some("camera bind group layout"),
-            },
-        );
-
-        let camera_bind_group = device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                layout: &camera_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: camera_buffer.as_entire_binding(),
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-                label: Some("camera bind group"),
-            },
-        );
+                    count: None,
+                }],
+                label: Some("camera bind group layout"),
+            });
 
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+            label: Some("camera bind group"),
+        });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("render pipeline layout"),
-            bind_group_layouts: &[
-                &texture_bind_group_layout,
-                &camera_bind_group_layout,
-            ],
-            push_constant_ranges: &[],
-        });
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("render pipeline layout"),
+                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("render pipeline"),
@@ -229,9 +221,7 @@ impl State {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_main",
-                buffers: &[
-                    vertex::Vertex::desc(),
-                ],
+                buffers: &[vertex::Vertex::desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -260,15 +250,19 @@ impl State {
             multiview: None,
         });
 
-        
         // Calculate console viewport & buffer sizes
         let metrics = font.face.size_metrics().unwrap();
         let viewport = State::get_viewport_size(
-                config.width as f32,
-                config.height as f32,
-                (metrics.max_advance >> 6) as usize,
-                (metrics.height >> 6) as usize);
-        let mut vertex_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
+            config.width as f32,
+            config.height as f32,
+            (metrics.max_advance >> 6) as usize,
+            (metrics.height >> 6) as usize,
+        );
+        let mut vertex_buf: Vec<u8> = Vec::with_capacity(
+            (viewport.char_height * viewport.char_width + 1)
+                * std::mem::size_of::<vertex::Vertex>()
+                * 4,
+        );
         for _ in 0..vertex_buf.capacity() {
             vertex_buf.push(0);
         }
@@ -277,19 +271,19 @@ impl State {
             contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        let mut index_buf: Vec<u8> = Vec::with_capacity((viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<u16>() * 6);
+        let mut index_buf: Vec<u8> = Vec::with_capacity(
+            (viewport.char_height * viewport.char_width + 1) * std::mem::size_of::<u16>() * 6,
+        );
         for _ in 0..index_buf.capacity() {
             index_buf.push(0);
         }
-        let index_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("index buffer"),
-                contents: &bytemuck::cast_slice(&index_buf),
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            },
-        );
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("index buffer"),
+            contents: &bytemuck::cast_slice(&index_buf),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
 
-        let master = 0;
+        let master = 3;
 
         Self {
             window,
@@ -317,10 +311,18 @@ impl State {
         }
     }
 
-    fn get_viewport_size(width: f32, height: f32, advance_x: usize, line_height: usize) -> ViewportSize {
+    fn get_viewport_size(
+        width: f32,
+        height: f32,
+        advance_x: usize,
+        line_height: usize,
+    ) -> ViewportSize {
         ViewportSize {
             char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
-            char_height: usize::max(1, (height - DECORATOR_HEIGHT - WINDOW_PADDING * 2.0) as usize / line_height),
+            char_height: usize::max(
+                1,
+                (height - DECORATOR_HEIGHT - WINDOW_PADDING * 2.0) as usize / line_height,
+            ),
         }
     }
 
@@ -331,28 +333,37 @@ impl State {
             self.config.width as f32,
             self.config.height as f32,
             (metrics.max_advance >> 6) as usize,
-            (metrics.height >> 6) as usize);
+            (metrics.height >> 6) as usize,
+        );
         println!("w: {} h: {}", viewport.char_width, viewport.char_height);
-        let mut vertex_buf: Vec<u8> = Vec::with_capacity(((2 * viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<vertex::Vertex>() * 4);
+        let mut vertex_buf: Vec<u8> = Vec::with_capacity(
+            ((2 * viewport.char_height * viewport.char_width) + 1)
+                * std::mem::size_of::<vertex::Vertex>()
+                * 4,
+        );
         for _ in 0..vertex_buf.capacity() {
             vertex_buf.push(0);
         }
-        self.vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vertex buffer"),
-            contents: &bytemuck::cast_slice(&vertex_buf),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        });
-        let mut index_buf: Vec<u8> = Vec::with_capacity((2 * (viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<u16>() * 6);
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vertex buffer"),
+                contents: &bytemuck::cast_slice(&vertex_buf),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let mut index_buf: Vec<u8> = Vec::with_capacity(
+            (2 * (viewport.char_height * viewport.char_width) + 1) * std::mem::size_of::<u16>() * 6,
+        );
         for _ in 0..index_buf.capacity() {
             index_buf.push(0);
         }
-        self.index_buffer = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
+        self.index_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("index buffer"),
                 contents: &bytemuck::cast_slice(&index_buf),
                 usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            },
-        );
+            });
     }
 
     fn update_vertices(&mut self) {
@@ -376,7 +387,7 @@ impl State {
                     row += 1;
                     column = 0;
                     x = WINDOW_PADDING;
-                },
+                }
                 _ => {
                     if !self.atlas.entries.contains_key(&c) {
                         return (row, col);
@@ -388,18 +399,39 @@ impl State {
                     let v1 = value.y as f32 / self.atlas.height as f32;
                     let u2 = (value.x + value.width) as f32 / self.atlas.width as f32;
                     let v2 = (value.y + value.height) as f32 / self.atlas.height as f32;
-                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - value.bearing_y as f32 + self.scroll_y as f32;
+                    let y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32
+                        - value.bearing_y as f32
+                        + self.scroll_y as f32;
                     let h = value.height as f32;
 
                     // background
                     let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-                    let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32 - bg_h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
+                    let bg_y = WINDOW_PADDING + DECORATOR_HEIGHT + (row * line_height) as f32
+                        - bg_h
+                        - (metrics.descender >> 6) as f32
+                        + self.scroll_y as f32;
                     let bg_w = (metrics.max_advance >> 6) as f32;
                     let bg_uv = 1.0 / self.atlas.width as f32; // todo: split into height & width
-                    vertices.push(vertex::Vertex { position: [x, bg_y, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x, bg_y + bg_h, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
-                    vertices.push(vertex::Vertex { position: [x + bg_w, bg_y + bg_h, 0.0], tex_coords: [bg_uv, bg_uv], color: color_bg });
+                    vertices.push(vertex::Vertex {
+                        position: [x, bg_y, 0.0],
+                        tex_coords: [bg_uv, bg_uv],
+                        color: color_bg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x, bg_y + bg_h, 0.0],
+                        tex_coords: [bg_uv, bg_uv],
+                        color: color_bg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x + bg_w, bg_y, 0.0],
+                        tex_coords: [bg_uv, bg_uv],
+                        color: color_bg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x + bg_w, bg_y + bg_h, 0.0],
+                        tex_coords: [bg_uv, bg_uv],
+                        color: color_bg,
+                    });
 
                     for i in start_idx..(start_idx + 3) {
                         indices.push(i as u16);
@@ -411,10 +443,26 @@ impl State {
                     start_idx = vertices.len();
 
                     // foreground
-                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32, y, 0.0], tex_coords: [u1, v1], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32, y + h, 0.0], tex_coords: [u1, v2], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32 + w, y, 0.0], tex_coords: [u2, v1], color: color_fg });
-                    vertices.push(vertex::Vertex { position: [x + value.bearing_x as f32 + w, y + h, 0.0], tex_coords: [u2, v2], color: color_fg });
+                    vertices.push(vertex::Vertex {
+                        position: [x + value.bearing_x as f32, y, 0.0],
+                        tex_coords: [u1, v1],
+                        color: color_fg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x + value.bearing_x as f32, y + h, 0.0],
+                        tex_coords: [u1, v2],
+                        color: color_fg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x + value.bearing_x as f32 + w, y, 0.0],
+                        tex_coords: [u2, v1],
+                        color: color_fg,
+                    });
+                    vertices.push(vertex::Vertex {
+                        position: [x + value.bearing_x as f32 + w, y + h, 0.0],
+                        tex_coords: [u2, v2],
+                        color: color_fg,
+                    });
                     for i in start_idx..(start_idx + 3) {
                         indices.push(i as u16);
                     }
@@ -436,7 +484,7 @@ impl State {
         };
 
         let color_fg = match theme {
-            winit::window::Theme::Dark => [0.0, 0.9 ,0.9, 1.0],
+            winit::window::Theme::Dark => [0.0, 0.9, 0.9, 1.0],
             winit::window::Theme::Light => [0.0, 0.0, 0.0, 1.0],
         };
 
@@ -459,12 +507,16 @@ impl State {
         }
 
         // add the cursor
-        x = WINDOW_PADDING + ((self.console.cursor_offset % self.console.columns) * (metrics.max_advance >> 6) as usize) as f32;
-        let input_offset =
-            (self.console.input.len() / self.console.columns) as i64 - 
-            (self.console.cursor_offset / self.console.columns) as i64;
+        x = WINDOW_PADDING
+            + ((self.console.cursor_offset % self.console.columns)
+                * (metrics.max_advance >> 6) as usize) as f32;
+        let input_offset = (self.console.input.len() / self.console.columns) as i64
+            - (self.console.cursor_offset / self.console.columns) as i64;
         let h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let y = WINDOW_PADDING + DECORATOR_HEIGHT + ((row - input_offset) * line_height) as f32 - h - (metrics.descender >> 6) as f32 + self.scroll_y as f32;
+        let y = WINDOW_PADDING + DECORATOR_HEIGHT + ((row - input_offset) * line_height) as f32
+            - h
+            - (metrics.descender >> 6) as f32
+            + self.scroll_y as f32;
         let w = (self.font.face.size_metrics().unwrap().max_advance >> 6) as f32;
         let cursor_color = match theme {
             winit::window::Theme::Light => [0.1, 0.0, 0.8, 1.0],
@@ -473,10 +525,26 @@ impl State {
         let start = vertices.len();
         let bg_u = 1.0 / self.atlas.width as f32;
         let bg_v = 1.0 / self.atlas.height as f32;
-        vertices.push(vertex::Vertex { position: [x, y, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x, y + h, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
-        vertices.push(vertex::Vertex { position: [x + w, y + h, 0.0], tex_coords: [bg_u, bg_v], color: cursor_color });
+        vertices.push(vertex::Vertex {
+            position: [x, y, 0.0],
+            tex_coords: [bg_u, bg_v],
+            color: cursor_color,
+        });
+        vertices.push(vertex::Vertex {
+            position: [x, y + h, 0.0],
+            tex_coords: [bg_u, bg_v],
+            color: cursor_color,
+        });
+        vertices.push(vertex::Vertex {
+            position: [x + w, y, 0.0],
+            tex_coords: [bg_u, bg_v],
+            color: cursor_color,
+        });
+        vertices.push(vertex::Vertex {
+            position: [x + w, y + h, 0.0],
+            tex_coords: [bg_u, bg_v],
+            color: cursor_color,
+        });
 
         for i in start..(start + 3) {
             indices.push(i as u16);
@@ -486,8 +554,10 @@ impl State {
         }
 
         // Update buffers
-        self.queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.queue.write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+        self.queue
+            .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue
+            .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
     }
 
@@ -499,14 +569,20 @@ impl State {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.camera_uniform.update_view_proj(&self.camera, size.width as f32, size.height as f32);
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        self.camera_uniform
+            .update_view_proj(&self.camera, size.width as f32, size.height as f32);
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
         let metrics = self.font.face.size_metrics().unwrap();
         let size = State::get_viewport_size(
             self.config.width as f32,
             self.config.height as f32,
             (metrics.max_advance >> 6) as usize,
-            (metrics.height >> 6) as usize);
+            (metrics.height >> 6) as usize,
+        );
         self.console.resize(size.char_width, size.char_height);
         self.resize_buffers();
         self.update_vertices();
@@ -529,47 +605,44 @@ impl State {
         self.console.write("\n");
     }
 
-    fn input(&mut self, event: &WindowEvent, elwt: &EventLoopWindowTarget<app_window::CustomEvent>) -> bool {
+    fn input(
+        &mut self,
+        event: &WindowEvent,
+        elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    ) -> bool {
         match event {
-            WindowEvent::MouseInput { state, button, .. } => {
-                match button {
-                    MouseButton::Left => {
-                        match state {
-                            ElementState::Pressed => {
-                                let x = 
-                                    (self.mouse_x - WINDOW_PADDING as f64) /
-                                    (self.config.width as f64 - 2.0 * WINDOW_PADDING as f64);
+            WindowEvent::MouseInput { state, button, .. } => match button {
+                MouseButton::Left => match state {
+                    ElementState::Pressed => {
+                        let x = (self.mouse_x - WINDOW_PADDING as f64)
+                            / (self.config.width as f64 - 2.0 * WINDOW_PADDING as f64);
 
-                                let y = 
-                                    (self.mouse_y + self.scroll_y - (WINDOW_PADDING + DECORATOR_HEIGHT) as f64) /
-                                    (self.config.height as f64 - 2.0 * WINDOW_PADDING as f64);
+                        let y = (self.mouse_y + self.scroll_y
+                            - (WINDOW_PADDING + DECORATOR_HEIGHT) as f64)
+                            / (self.config.height as f64 - 2.0 * WINDOW_PADDING as f64);
 
-                                let col = (x * self.console.columns as f64).floor();
-                                let row = (y * self.console.rows as f64).floor();
-                            },
-                            _ => (),
-                        }
-                    },
+                        let col = (x * self.console.columns as f64).floor();
+                        let row = (y * self.console.rows as f64).floor();
+                    }
                     _ => (),
-                }
+                },
+                _ => (),
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_x = position.x;
                 self.mouse_y = position.y;
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
-                    MouseScrollDelta::LineDelta(_r, d) => {
-                        match d {
-                            _ if d > &0.0 => {
-                                for _ in 0..(d.round() as usize) {
-                                    self.console.scroll_down();
-                                }
-                            },
-                            _ => {
-                                for _ in 0..(d.round().abs() as usize) {
-                                    self.console.scroll_up();
-                                }
+                    MouseScrollDelta::LineDelta(_r, d) => match d {
+                        _ if d > &0.0 => {
+                            for _ in 0..(d.round() as usize) {
+                                self.console.scroll_down();
+                            }
+                        }
+                        _ => {
+                            for _ in 0..(d.round().abs() as usize) {
+                                self.console.scroll_up();
                             }
                         }
                     },
@@ -589,7 +662,9 @@ impl State {
 
                         if self.console.scroll_y == 0 && self.scroll_y > 0.0 {
                             self.scroll_y = 0.0;
-                        } else if self.console.scroll_ptr >= self.console.buffer.len() && self.scroll_y < 0.0 {
+                        } else if self.console.scroll_ptr >= self.console.buffer.len()
+                            && self.scroll_y < 0.0
+                        {
                             self.scroll_y = 0.0;
                         }
                     }
@@ -597,59 +672,61 @@ impl State {
                 self.update_vertices();
                 self.window.request_redraw();
                 return true;
-            },
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     match event.logical_key {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
                             self.process_input(elwt);
-                        },
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
                             self.console.delete_left();
-                        },
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
                             // self.console.scroll_up();
-                        },
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
                             // self.console.scroll_down();
-                        },
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
                             self.console.cursor_left();
-                        },
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
                             self.console.cursor_right();
-                        },
+                        }
                         _ => {
                             let k = event.text.to_owned().unwrap_or_default();
                             match k.chars().next() {
-                                Some(k) => { 
+                                Some(k) => {
                                     self.console.insert_right(k);
-                                },
+                                }
                                 None => (),
                             };
-                        },
+                        }
                     };
                     self.update_vertices();
                     self.window.request_redraw();
                     return true;
                 }
-            },
+            }
             _ => (),
         }
         false
     }
 
-    fn update(&mut self) {
-
-    }
+    fn update(&mut self) {}
 
     fn render(&mut self, clear: wgpu::Color) -> Result<(), wgpu::SurfaceError> {
-        println!("render");
+        // println!("render");
         let output = self.surface.get_current_texture().unwrap();
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("terminal")
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("terminal"),
+            });
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -660,13 +737,12 @@ impl State {
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
                         store: wgpu::StoreOp::Store,
-                    }
+                    },
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
@@ -685,18 +761,23 @@ impl State {
 
 async fn run() {
     env_logger::init();
-    let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event().build().unwrap();
+    let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event()
+        .build()
+        .unwrap();
     let event_loop_proxy = event_loop.create_proxy();
 
     // fork before the window is created, and create an additional thread to post the custom events
     std::thread::spawn(move || {
-        pty::fork_pty(|on_output| {
-            let str = String::from_utf8(on_output.to_vec()).unwrap();
-            event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
-        });
+        pty::fork_pty(
+            |fdm| {
+                println!("received fdm from pty {fdm}");
+            },
+            |on_output| {
+                let str = String::from_utf8(on_output.to_vec()).unwrap();
+                event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
+            },
+        );
     });
-
-
 
     let transparent = false; // needed because of a shadow bug
     let window = WindowBuilder::new()
@@ -710,11 +791,11 @@ async fn run() {
         .build(&event_loop)
         .unwrap();
 
-
-
     // event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new().monospace().build();
+    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
+        .monospace()
+        .build();
     let mut fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
     fonts.dedup();
 
@@ -722,8 +803,10 @@ async fn run() {
     let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
     println!("selected font {}", family);
 
- 	let family_prop = font_loader::system_fonts::FontPropertyBuilder::new().family(family.as_str()).build();
- 	let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
+    let family_prop = font_loader::system_fonts::FontPropertyBuilder::new()
+        .family(family.as_str())
+        .build();
+    let (family, _) = font_loader::system_fonts::get(&family_prop).unwrap();
 
     let mut font = font::Font::new(family);
     font.set_char_size(10.0, (window.scale_factor() * 96.0) as u32);
@@ -740,35 +823,40 @@ async fn run() {
                     state.console.write(&z);
                 }
             },
-            Event::WindowEvent { window_id, event} if window_id == state.window.id() => if !state.input(&event, elwt) {
-                match event {
-                    WindowEvent::ThemeChanged(new_theme) => {
-                        theme = new_theme;
-                        state.update_vertices();
-                        state.window.request_redraw();
-                    },
-                    WindowEvent::CloseRequested => {
-                        elwt.exit();
-                    },
-                    WindowEvent::Resized(size) => {
-                        state.resize(size);
-                        state.window.request_redraw();
-                    },
-                    WindowEvent::ScaleFactorChanged { scale_factor: _scale_factor, .. } => {
-                        state.window.request_redraw();
-                    },
-                    WindowEvent::RedrawRequested => {
-                        state.update();
-                        match state.render(clear_color(theme)) {
-                            Ok(_) => (),
-                            Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                            Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                            Err(e) => eprintln!("{:?}", e)
+            Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
+                if !state.input(&event, elwt) {
+                    match event {
+                        WindowEvent::ThemeChanged(new_theme) => {
+                            theme = new_theme;
+                            state.update_vertices();
+                            state.window.request_redraw();
                         }
-                    },
-                    _ => ()
+                        WindowEvent::CloseRequested => {
+                            elwt.exit();
+                        }
+                        WindowEvent::Resized(size) => {
+                            state.resize(size);
+                            state.window.request_redraw();
+                        }
+                        WindowEvent::ScaleFactorChanged {
+                            scale_factor: _scale_factor,
+                            ..
+                        } => {
+                            state.window.request_redraw();
+                        }
+                        WindowEvent::RedrawRequested => {
+                            state.update();
+                            match state.render(clear_color(theme)) {
+                                Ok(_) => (),
+                                Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                                Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                                Err(e) => eprintln!("{:?}", e),
+                            }
+                        }
+                        _ => (),
+                    }
                 }
-            },
+            }
             Event::AboutToWait => {
                 // Application update code.
 
@@ -778,8 +866,8 @@ async fn run() {
                 // applications which do not always need to. Applications that redraw continuously
                 // can just render here instead.
                 //window.request_redraw();
-            },
-            _ => ()
+            }
+            _ => (),
         }
     });
 }
@@ -804,4 +892,3 @@ fn clear_color(theme: winit::window::Theme) -> wgpu::Color {
 fn main() {
     pollster::block_on(run());
 }
-

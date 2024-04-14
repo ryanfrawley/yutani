@@ -1,54 +1,58 @@
 extern crate libc;
+use nix::libc::*;
 use std::ffi::CString;
 use std::ptr::null_mut;
-use nix::libc::*;
 
-pub fn fork_pty<F>(on_output: F) -> Result<i32, String> 
-where F: Fn(&[u8]) {
+pub fn fork_pty<OnFdmInit, OnOutput>(
+    on_fdm_init: OnFdmInit,
+    on_output: OnOutput,
+) -> Result<i32, String>
+where
+    OnFdmInit: Fn(i32),
+    OnOutput: Fn(&[u8]),
+{
     let fdm: i32;
     let fds: i32;
     let mut rc: i32;
     let mut input: [u8; 1500] = [0; 1500];
 
     unsafe {
-        fdm = posix_openpt(O_RDWR); 
-        if fdm < 0 
-        { 
-            return Err("Error on posix_openpt()".to_string()); 
-        } 
+        fdm = posix_openpt(O_RDWR);
+        println!("fdm: {fdm}");
+        if fdm < 0 {
+            return Err("Error on posix_openpt()".to_string());
+        }
 
-        rc = grantpt(fdm); 
-        if rc != 0
-        { 
-            return Err("Error on grantpt()".to_string()); 
-        } 
+        rc = grantpt(fdm);
+        if rc != 0 {
+            return Err("Error on grantpt()".to_string());
+        }
 
-        rc = unlockpt(fdm); 
-        if rc != 0 
-        { 
-            return Err("Error on unlockpt()".to_string()); 
-        } 
+        rc = unlockpt(fdm);
+        if rc != 0 {
+            return Err("Error on unlockpt()".to_string());
+        }
 
         // Open the slave pty
-        fds = open(ptsname(fdm), O_RDWR); 
+        fds = open(ptsname(fdm), O_RDWR);
         println!("Virtual interface configured");
 
         match nix::unistd::fork() {
-            Ok(nix::unistd::ForkResult::Child) => { 
+            Ok(nix::unistd::ForkResult::Child) => {
                 // Close the master side of the pty
-                close(fdm); 
+                close(fdm);
 
                 // Get the default terminal settings
                 let mut slave_settings_orig = std::mem::MaybeUninit::<termios>::uninit();
-                tcgetattr(fds, slave_settings_orig.as_mut_ptr()); 
+                tcgetattr(fds, slave_settings_orig.as_mut_ptr());
                 let slave_settings_orig = slave_settings_orig.assume_init();
 
                 // Set raw mode on the slave side of the pty
                 let mut slave_settings_new = slave_settings_orig.clone();
                 slave_settings_new.c_lflag &= !(ECHO | ICANON);
-                tcsetattr(fds, TCSANOW, &mut slave_settings_new); 
+                tcsetattr(fds, TCSANOW, &mut slave_settings_new);
 
-                // The slave side of the PTY becomes the standard input and outputs of the child process 
+                // The slave side of the PTY becomes the standard input and outputs of the child process
                 dup2(fds, 0);
                 dup2(fds, 1);
                 dup2(fds, 2);
@@ -67,17 +71,18 @@ where F: Fn(&[u8]) {
                     Ok(_) => Ok(0),
                     Err(n) => Err(format!("Failed in execvp(): {n}")),
                 }
-            },
+            }
             Ok(nix::unistd::ForkResult::Parent { child }) => {
+                on_fdm_init(fdm);
+
                 let mut fd_in = std::mem::MaybeUninit::<fd_set>::uninit();
                 nix::libc::FD_ZERO(fd_in.as_mut_ptr());
                 let mut fd_in = fd_in.assume_init();
 
-                // Close the slave side of the PTY 
+                // Close the slave side of the PTY
                 close(fds);
 
-                loop
-                { 
+                loop {
                     // Wait for data from standard input and master side of PTY
                     FD_ZERO(&mut fd_in);
                     FD_SET(0, &mut fd_in);
@@ -88,11 +93,11 @@ where F: Fn(&[u8]) {
                         _ => {
                             // If data on standard input
                             if FD_ISSET(0, &mut fd_in) {
-                                match read(0, input.as_mut_ptr() as *mut c_void, input.len() ) {
+                                match read(0, input.as_mut_ptr() as *mut c_void, input.len()) {
                                     n if n < 0 => panic!("{n}"),
                                     n => {
                                         write(fdm, input.as_ptr() as *const c_void, n as usize);
-                                    },
+                                    }
                                 }
                             }
 
@@ -103,15 +108,14 @@ where F: Fn(&[u8]) {
                                     n => {
                                         on_output(&input);
                                         write(1, input.as_ptr() as *const c_void, n as usize);
-                                    },
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }, 
-            Err(e) => Err(format!("Error in fork(): {e}"))
+            }
+            Err(e) => Err(format!("Error in fork(): {e}")),
         }
     }
 }
-
