@@ -20,6 +20,9 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+extern crate libc;
+use nix::libc::*;
+
 // use rand_distr::{Distribution, Normal};
 // use rand::thread_rng;
 
@@ -64,7 +67,7 @@ struct State {
 }
 
 impl State {
-    async fn new(window: Window, mut font: font::Font) -> Self {
+    async fn new(master: i32, window: Window, mut font: font::Font) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -282,8 +285,6 @@ impl State {
             contents: &bytemuck::cast_slice(&index_buf),
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
-
-        let master = 3;
 
         Self {
             window,
@@ -766,17 +767,22 @@ async fn run() {
         .unwrap();
     let event_loop_proxy = event_loop.create_proxy();
 
+    // create the pty before forking so we have the handle available
+    let fdm: i32;
+    unsafe {
+        fdm = posix_openpt(O_RDWR);
+        println!("fdm: {fdm}");
+        if fdm < 0 {
+            panic!("Error on posix_openpt()");
+        }
+    }
+
     // fork before the window is created, and create an additional thread to post the custom events
     std::thread::spawn(move || {
-        pty::fork_pty(
-            |fdm| {
-                println!("received fdm from pty {fdm}");
-            },
-            |on_output| {
-                let str = String::from_utf8(on_output.to_vec()).unwrap();
-                event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
-            },
-        );
+        let _ = pty::fork_pty(fdm, |data| {
+            let str = String::from_utf8(data.to_vec()).unwrap();
+            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
+        });
     });
 
     let transparent = false; // needed because of a shadow bug
@@ -811,7 +817,7 @@ async fn run() {
     let mut font = font::Font::new(family);
     font.set_char_size(10.0, (window.scale_factor() * 96.0) as u32);
 
-    let mut state = State::new(window, font).await;
+    let mut state = State::new(fdm, window, font).await;
     state.update_vertices();
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);

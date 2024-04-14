@@ -3,26 +3,15 @@ use nix::libc::*;
 use std::ffi::CString;
 use std::ptr::null_mut;
 
-pub fn fork_pty<OnFdmInit, OnOutput>(
-    on_fdm_init: OnFdmInit,
-    on_output: OnOutput,
-) -> Result<i32, String>
+pub fn fork_pty<OnOutput>(fdm: i32, on_output: OnOutput) -> Result<i32, String>
 where
-    OnFdmInit: Fn(i32),
     OnOutput: Fn(&[u8]),
 {
-    let fdm: i32;
     let fds: i32;
     let mut rc: i32;
     let mut input: [u8; 1500] = [0; 1500];
 
     unsafe {
-        fdm = posix_openpt(O_RDWR);
-        println!("fdm: {fdm}");
-        if fdm < 0 {
-            return Err("Error on posix_openpt()".to_string());
-        }
-
         rc = grantpt(fdm);
         if rc != 0 {
             return Err("Error on grantpt()".to_string());
@@ -73,8 +62,6 @@ where
                 }
             }
             Ok(nix::unistd::ForkResult::Parent { child }) => {
-                on_fdm_init(fdm);
-
                 let mut fd_in = std::mem::MaybeUninit::<fd_set>::uninit();
                 nix::libc::FD_ZERO(fd_in.as_mut_ptr());
                 let mut fd_in = fd_in.assume_init();
