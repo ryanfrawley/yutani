@@ -775,11 +775,11 @@ async fn run() {
         }
     }
 
-    // fork before the window is created, and create an additional thread to post the custom events
+    // Fork before the window is created so we hold the master fd across setup.
+    let pty = pty::fork_pty(fdm).expect("failed to fork pty");
     std::thread::spawn(move || {
-        let _ = pty::fork_pty(fdm, |data| {
-            let str = String::from_utf8(data.to_vec()).unwrap();
-            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(str.to_owned()));
+        pty.run(|data| {
+            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
         });
     });
 

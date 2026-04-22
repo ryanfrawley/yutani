@@ -1,108 +1,180 @@
 extern crate libc;
 use nix::libc::*;
 use std::ffi::CString;
-use std::ptr::null_mut;
 
-pub fn fork_pty<OnOutput>(fdm: i32, on_output: OnOutput) -> Result<i32, String>
-where
-    OnOutput: Fn(&[u8]),
-{
+/// Handle to a running child shell attached to a PTY master. Fork has already
+/// returned in the parent; the child has exec'd the shell.
+pub struct Pty {
+    pub child: i32,
+    pub master: i32,
+}
+
+/// Forks and execs the user's shell on the slave side of `fdm`. Returns in the
+/// parent once `fork` has completed, without blocking on shell output. Drive
+/// I/O by calling `run` on the returned handle (typically from a worker thread).
+pub fn fork_pty(fdm: i32) -> Result<Pty, String> {
     let fds: i32;
-    let mut rc: i32;
-    let mut input: [u8; 1500] = [0; 1500];
 
     unsafe {
-        rc = grantpt(fdm);
-        if rc != 0 {
+        if grantpt(fdm) != 0 {
             return Err("Error on grantpt()".to_string());
         }
-
-        rc = unlockpt(fdm);
-        if rc != 0 {
+        if unlockpt(fdm) != 0 {
             return Err("Error on unlockpt()".to_string());
         }
 
-        // Open the slave pty
         fds = open(ptsname(fdm), O_RDWR);
-        println!("Virtual interface configured");
+        if fds < 0 {
+            return Err("Error opening slave pty".to_string());
+        }
 
         match nix::unistd::fork() {
             Ok(nix::unistd::ForkResult::Child) => {
-                // Close the master side of the pty
                 close(fdm);
 
-                // Get the default terminal settings
-                let mut slave_settings_orig = std::mem::MaybeUninit::<termios>::uninit();
-                tcgetattr(fds, slave_settings_orig.as_mut_ptr());
-                let slave_settings_orig = slave_settings_orig.assume_init();
+                let mut slave_settings = std::mem::MaybeUninit::<termios>::uninit();
+                tcgetattr(fds, slave_settings.as_mut_ptr());
+                let mut slave_settings = slave_settings.assume_init();
+                slave_settings.c_lflag &= !(ECHO | ICANON);
+                tcsetattr(fds, TCSANOW, &mut slave_settings);
 
-                // Set raw mode on the slave side of the pty
-                let mut slave_settings_new = slave_settings_orig.clone();
-                slave_settings_new.c_lflag &= !(ECHO | ICANON);
-                tcsetattr(fds, TCSANOW, &mut slave_settings_new);
-
-                // The slave side of the PTY becomes the standard input and outputs of the child process
                 dup2(fds, 0);
                 dup2(fds, 1);
                 dup2(fds, 2);
 
                 setsid();
-
-                // As the child is a session leader, set the controlling terminal to be the slave side of the PTY
-                // (Mandatory for programs like the shell to make them manage correctly their outputs)
                 ioctl(0, TIOCSCTTY.into(), 1);
 
                 let default_shell = CString::new(std::env::var("SHELL").unwrap()).unwrap();
-
-                println!("executing default shell\n");
-
+                // execvp replaces the process image; the Ok branch is unreachable.
                 match nix::unistd::execvp(default_shell.as_c_str(), &[&default_shell]) {
-                    Ok(_) => Ok(0),
-                    Err(n) => Err(format!("Failed in execvp(): {n}")),
+                    Ok(_) => std::process::exit(0),
+                    Err(_) => std::process::exit(127),
                 }
             }
             Ok(nix::unistd::ForkResult::Parent { child }) => {
-                let mut fd_in = std::mem::MaybeUninit::<fd_set>::uninit();
-                nix::libc::FD_ZERO(fd_in.as_mut_ptr());
-                let mut fd_in = fd_in.assume_init();
-
-                // Close the slave side of the PTY
                 close(fds);
-
-                loop {
-                    // Wait for data from standard input and master side of PTY
-                    FD_ZERO(&mut fd_in);
-                    FD_SET(0, &mut fd_in);
-                    FD_SET(fdm, &mut fd_in);
-
-                    match select(fdm + 1, &mut fd_in, null_mut(), null_mut(), null_mut()) {
-                        -1 => panic!("failed to select fdm + 1"),
-                        _ => {
-                            // If data on standard input
-                            if FD_ISSET(0, &mut fd_in) {
-                                match read(0, input.as_mut_ptr() as *mut c_void, input.len()) {
-                                    n if n < 0 => panic!("{n}"),
-                                    n => {
-                                        write(fdm, input.as_ptr() as *const c_void, n as usize);
-                                    }
-                                }
-                            }
-
-                            // If data on master side of PTY
-                            if FD_ISSET(fdm, &mut fd_in) {
-                                match read(fdm, input.as_mut_ptr() as *mut c_void, input.len()) {
-                                    n if n < 0 => panic!("{n}"),
-                                    n => {
-                                        on_output(&input);
-                                        write(1, input.as_ptr() as *const c_void, n as usize);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                Ok(Pty {
+                    child: child.as_raw(),
+                    master: fdm,
+                })
             }
             Err(e) => Err(format!("Error in fork(): {e}")),
         }
+    }
+}
+
+impl Pty {
+    /// Blocks the calling thread reading from the PTY master, forwarding each
+    /// UTF-8 chunk to `on_output`. Returns when the child exits (EOF or EIO),
+    /// after reaping it with `waitpid`.
+    pub fn run<F: Fn(&str)>(&self, on_output: F) {
+        let mut input: [u8; 1500] = [0; 1500];
+        let mut pending: Vec<u8> = Vec::with_capacity(4);
+
+        unsafe {
+            loop {
+                let n = read(self.master, input.as_mut_ptr() as *mut c_void, input.len());
+                if n <= 0 {
+                    break;
+                }
+                pending.extend_from_slice(&input[..n as usize]);
+                emit_utf8(&mut pending, &on_output);
+            }
+
+            let mut status: c_int = 0;
+            libc::waitpid(self.child, &mut status, 0);
+        }
+    }
+}
+
+// Drain the longest valid-UTF8 prefix of `pending` into `on_output`. Incomplete
+// trailing bytes stay in `pending` for the next read; invalid bytes are dropped.
+fn emit_utf8<F: Fn(&str)>(pending: &mut Vec<u8>, on_output: &F) {
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                if !s.is_empty() {
+                    on_output(s);
+                }
+                pending.clear();
+                return;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to > 0 {
+                    let s = unsafe { std::str::from_utf8_unchecked(&pending[..valid_up_to]) };
+                    on_output(s);
+                }
+                match e.error_len() {
+                    None => {
+                        // Trailing incomplete sequence — keep it for next call.
+                        pending.drain(..valid_up_to);
+                        return;
+                    }
+                    Some(err_len) => {
+                        // Invalid bytes — drop them and keep scanning.
+                        pending.drain(..valid_up_to + err_len);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emit_utf8;
+    use std::cell::RefCell;
+
+    fn collector() -> (impl Fn(&str), std::rc::Rc<RefCell<String>>) {
+        let out = std::rc::Rc::new(RefCell::new(String::new()));
+        let out_clone = out.clone();
+        let cb = move |s: &str| out_clone.borrow_mut().push_str(s);
+        (cb, out)
+    }
+
+    #[test]
+    fn ascii_passes_through() {
+        let (cb, out) = collector();
+        let mut pending = b"hello".to_vec();
+        emit_utf8(&mut pending, &cb);
+        assert_eq!(*out.borrow(), "hello");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn split_multibyte_waits_for_rest() {
+        // "é" is 0xC3 0xA9 — feed the first byte alone.
+        let (cb, out) = collector();
+        let mut pending = vec![0xC3];
+        emit_utf8(&mut pending, &cb);
+        assert_eq!(*out.borrow(), "");
+        assert_eq!(pending, vec![0xC3]);
+
+        pending.push(0xA9);
+        emit_utf8(&mut pending, &cb);
+        assert_eq!(*out.borrow(), "é");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn valid_prefix_with_incomplete_tail() {
+        let (cb, out) = collector();
+        // "ab" + first byte of "é"
+        let mut pending = vec![b'a', b'b', 0xC3];
+        emit_utf8(&mut pending, &cb);
+        assert_eq!(*out.borrow(), "ab");
+        assert_eq!(pending, vec![0xC3]);
+    }
+
+    #[test]
+    fn invalid_byte_is_dropped() {
+        let (cb, out) = collector();
+        // "a" + stray continuation byte + "b"
+        let mut pending = vec![b'a', 0x80, b'b'];
+        emit_utf8(&mut pending, &cb);
+        assert_eq!(*out.borrow(), "ab");
+        assert!(pending.is_empty());
     }
 }
