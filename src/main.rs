@@ -406,9 +406,11 @@ impl State {
                 [bg_u, bg_v],
                 bg,
             );
-            // foreground glyph
-            if let Some(g) = atlas.entries.get(&ch) {
-                if g.width > 0 && g.height > 0 {
+            // foreground glyph — fall back to .notdef (tofu box) if the font
+            // doesn't have this character, so the user sees *something*.
+            let g = atlas.entries.get(&ch).unwrap_or(&atlas.notdef);
+            if g.width > 0 && g.height > 0 {
+                {
                     let gx = x + g.bearing_x as f32;
                     let gy = baseline_y - g.bearing_y as f32 + scroll_y;
                     let u0 = g.x as f32 / atlas_w;
@@ -674,7 +676,12 @@ async fn run() {
     fonts.dedup();
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let family = &fonts.iter().find(|f| f.contains("Fira")).unwrap();
+    // Prefer FiraCode (broad symbol + PUA coverage) over FiraMono (limited).
+    let family = fonts
+        .iter()
+        .find(|f| f.contains("FiraCode") || f.contains("Fira Code"))
+        .or_else(|| fonts.iter().find(|f| f.contains("Fira")))
+        .expect("no Fira font found");
     println!("selected font {}", family);
 
     let family_prop = font_loader::system_fonts::FontPropertyBuilder::new()
