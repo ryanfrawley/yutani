@@ -561,15 +561,20 @@ impl State {
 
         // Grid row `r` sits with its baseline at (r+1) * line_height; the
         // glyph box extends up by bearing_y and down by (height - bearing_y).
-        // Push content below the translucent title bar when the viewport is
-        // at the bottom of the live grid (otherwise e.g. the first prompt
-        // after `clear` would sit behind the traffic-light strip). Linearly
-        // ease back to 0 as the user scrolls up by one line, so older
-        // content can flow behind the title bar smoothly during a scroll.
-        let dist_from_bottom =
-            self.terminal.view_offset() as f32 * line_height + scroll_y;
-        let decorator_offset = DECORATOR_HEIGHT
-            * (1.0 - (dist_from_bottom / line_height).clamp(0.0, 1.0));
+        // Push content below the translucent title bar at the boundaries of
+        // the scroll range — the bottom of the live grid AND the top of
+        // scrollback — so the first/last row never sits half-behind the
+        // toolbar. Mid-scroll the offset is 0 so older content can flow
+        // behind the title bar smoothly. Eases linearly over one line at
+        // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
+        let view_offset = self.terminal.view_offset() as f32;
+        let scrollback_len = self.terminal.scrollback_len() as f32;
+        let dist_from_bottom = view_offset * line_height + scroll_y;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
+        let near = (dist_from_bottom / line_height)
+            .min(dist_from_top / line_height)
+            .clamp(0.0, 1.0);
+        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
         let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
@@ -876,7 +881,12 @@ impl State {
         // is premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
         let win_w = self.gpu.config.width as f32;
         let win_h = self.gpu.config.height as f32;
-        let fade_height = DECORATOR_HEIGHT * 2.0;
+        // Top fade is taller than the bottom: the title bar + toolbar takes
+        // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
+        // below that gives content a soft runway as it scrolls into view
+        // rather than popping out from a hard edge.
+        let top_fade_height = DECORATOR_HEIGHT * 3.0;
+        let bottom_fade_height_max = DECORATOR_HEIGHT * 2.0;
         let fade_rgb = [1.0, 1.0, 1.0];
         let clear = [0.0, 0.0, 0.0, 0.0];
 
@@ -938,11 +948,12 @@ impl State {
         // Top: split into two strips — a fully-opaque slab adjacent to the
         // window edge (so content sliding behind the title bar is firmly
         // hidden) and a linear gradient strip below it that softens the
-        // boundary. Always rendered at full alpha.
+        // boundary. The opaque slab covers the chrome height; the gradient
+        // extends 2× below that for a soft transition. Always full alpha.
         let top_opaque = scaled_opaque(1.0);
-        let top_mid = fade_height * 0.5;
+        let top_mid = DECORATOR_HEIGHT;
         push_strip(&mut vertices, &mut indices, 0.0, top_mid, top_opaque, top_opaque);
-        push_strip(&mut vertices, &mut indices, top_mid, fade_height, top_opaque, clear);
+        push_strip(&mut vertices, &mut indices, top_mid, top_fade_height, top_opaque, clear);
 
         // Bottom: a single linear gradient strip — clear at the inner edge
         // (top of the fade band) ramping to opaque at the window's bottom.
@@ -961,7 +972,7 @@ impl State {
         let bottom_height_progress =
             (dist_from_bottom / height_ramp_end).clamp(0.0, 1.0);
         let bottom_opaque = scaled_opaque(bottom_alpha);
-        let bottom_fade_height = fade_height * bottom_height_progress;
+        let bottom_fade_height = bottom_fade_height_max * bottom_height_progress;
         push_strip(
             &mut vertices,
             &mut indices,
@@ -1166,13 +1177,17 @@ impl State {
         let bg_h = ascender - descender;
         let cell_w = self.font.cell_width() as f64;
         // Mirror the renderer's dynamic decorator offset: full DECORATOR_HEIGHT
-        // when the viewport is at the live grid, easing to 0 over one line of
-        // upward scroll. Out-of-sync formulas here would drift the hit-test
-        // by a row vs. what's actually drawn.
-        let dist_from_bottom =
-            self.terminal.view_offset() as f64 * line_height + self.scroll_y;
-        let chrome_offset = DECORATOR_HEIGHT as f64
-            * (1.0 - (dist_from_bottom / line_height).clamp(0.0, 1.0));
+        // at both scroll-range boundaries (live grid and top of scrollback),
+        // easing to 0 over one line in either direction. Out-of-sync formulas
+        // here would drift the hit-test by a row vs. what's actually drawn.
+        let view_offset = self.terminal.view_offset() as f64;
+        let scrollback_len = self.terminal.scrollback_len() as f64;
+        let dist_from_bottom = view_offset * line_height + self.scroll_y;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
+        let near = (dist_from_bottom / line_height)
+            .min(dist_from_top / line_height)
+            .clamp(0.0, 1.0);
+        let chrome_offset = DECORATOR_HEIGHT as f64 * (1.0 - near);
         // Strip top = renderer's `baseline - ascender - (lh - bg_h)/2`
         // for row 0, where baseline_0 = WP + chrome + line_height.
         let strip_pad = (line_height - bg_h) * 0.5;
