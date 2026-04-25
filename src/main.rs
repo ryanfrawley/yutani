@@ -979,29 +979,33 @@ impl State {
             ]
         };
 
-        // Top: split into two strips — a fully-opaque slab adjacent to the
-        // window edge (so content sliding behind the title bar is firmly
-        // hidden) and a linear gradient strip below it that softens the
-        // boundary. The opaque slab covers the chrome height; the gradient
-        // extends 2× below that for a soft transition. Always full alpha.
-        let top_opaque = scaled_opaque(1.0);
-        let top_mid = DECORATOR_HEIGHT;
-        push_strip(&mut vertices, &mut indices, 0.0, top_mid, top_opaque, top_opaque);
-        push_strip(&mut vertices, &mut indices, top_mid, top_fade_height, top_opaque, clear);
-
-        // Bottom: a single linear gradient strip — clear at the inner edge
-        // (top of the fade band) ramping to opaque at the window's bottom.
-        // Both alpha and the strip's height are modulated by a scroll-
-        // dependent progress so the fade emerges from a zero-height seam at
-        // rest and grows linearly to its full size as the user scrolls
-        // upward. Reaches full size + opacity at half a glyph height.
-        let dist_from_bottom =
-            self.terminal.view_offset() as f32 * line_height + scroll_y;
-        // Alpha ramp completes in half a glyph height; the height ramp grows
-        // slower (over a few full lines) so the fade band feels like it's
-        // expanding into the viewport rather than appearing all at once.
+        // Both fades emerge from a zero-height seam at the window edge and
+        // grow inward as the user scrolls. Alpha ramp completes in half a
+        // glyph height; the height ramp grows slower (over a few full lines)
+        // so the band feels like it's expanding into the viewport rather
+        // than appearing all at once.
         let alpha_ramp_end = line_height * 0.5;
         let height_ramp_end = line_height * 4.0;
+
+        // Top: opaque slab + gradient strip below. Modulated by distance to
+        // the NEAREST scroll boundary — at the live grid OR at the top of
+        // scrollback the topmost row sits fully below the toolbar (see
+        // decorator_offset), so there's no content behind the title bar to
+        // mask and the fade vanishes. Mid-scroll it ramps to full size.
+        let dist_from_boundary = dist_from_bottom.min(dist_from_top);
+        let top_alpha = (dist_from_boundary / alpha_ramp_end).clamp(0.0, 1.0);
+        let top_height_progress =
+            (dist_from_boundary / height_ramp_end).clamp(0.0, 1.0);
+        let top_opaque = scaled_opaque(top_alpha);
+        let top_mid = DECORATOR_HEIGHT * top_height_progress;
+        let top_band_height = top_fade_height * top_height_progress;
+        push_strip(&mut vertices, &mut indices, 0.0, top_mid, top_opaque, top_opaque);
+        push_strip(&mut vertices, &mut indices, top_mid, top_band_height, top_opaque, clear);
+
+        // Bottom: a single linear gradient strip — clear at the inner edge
+        // ramping to opaque at the window's bottom. Modulated by how far
+        // we've scrolled up from the live grid; reaches full alpha at half
+        // a glyph height, full size over a few lines.
         let bottom_alpha = (dist_from_bottom / alpha_ramp_end).clamp(0.0, 1.0);
         let bottom_height_progress =
             (dist_from_bottom / height_ramp_end).clamp(0.0, 1.0);
