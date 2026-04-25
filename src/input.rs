@@ -1,108 +1,410 @@
-/// Local-echo input widget state. This is the user's pre-submit edit buffer,
-/// separate from the terminal model — nothing here has been sent to the PTY yet.
-pub struct InputState {
-    pub text: String,
-    pub cursor_offset: usize,
+//! Translate winit key events into the byte sequences a unix terminal expects
+//! on the PTY. There is no local edit buffer here — every keystroke goes
+//! straight to the slave, which is what full-screen apps (vim, less, htop)
+//! require and what shell line editors (zle, readline) handle on their side.
+
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+
+/// Mouse button identifier (in xterm code-space, before modifier/motion flags).
+/// 0 = left, 1 = middle, 2 = right, 64 = wheel-up, 65 = wheel-down.
+pub type MouseButton = u8;
+
+pub const MOUSE_LEFT: MouseButton = 0;
+pub const MOUSE_MIDDLE: MouseButton = 1;
+pub const MOUSE_RIGHT: MouseButton = 2;
+pub const MOUSE_WHEEL_UP: MouseButton = 64;
+pub const MOUSE_WHEEL_DOWN: MouseButton = 65;
+
+/// Encode a mouse event for the PTY in either SGR (1006) or legacy X10 form.
+/// `col`/`row` are 1-based cell positions. `motion` is set for events emitted
+/// by drag/move tracking. `press` is true on button-down (and for wheel
+/// notches), false on button-up; legacy X10 ignores it (release uses button 3).
+pub fn encode_mouse(
+    button: MouseButton,
+    col: u16,
+    row: u16,
+    press: bool,
+    motion: bool,
+    sgr: bool,
+    mods: ModifiersState,
+) -> Vec<u8> {
+    let mut b = button;
+    if motion {
+        b += 32;
+    }
+    if mods.shift_key() {
+        b += 4;
+    }
+    if mods.alt_key() {
+        b += 8;
+    }
+    if mods.control_key() {
+        b += 16;
+    }
+    if sgr {
+        let final_byte = if press { 'M' } else { 'm' };
+        return format!("\x1b[<{};{};{}{}", b, col, row, final_byte).into_bytes();
+    }
+    // Legacy X10: button + col + row each offset by 32, capped at 255.
+    let cb = if press { b.saturating_add(32) } else { 35 }; // 3 + 32 = release
+    let cx = (col as u32).saturating_add(32).min(255) as u8;
+    let cy = (row as u32).saturating_add(32).min(255) as u8;
+    vec![0x1b, b'[', b'M', cb, cx, cy]
 }
 
-impl InputState {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            text: String::with_capacity(capacity),
-            cursor_offset: 0,
+/// Bytes to write to the PTY for a key press. `text` is the layout-translated
+/// text from `KeyEvent::text` (may be empty for Ctrl-modified events on some
+/// platforms; we then fall back to the character in `logical`). `app_cursor`
+/// is the terminal's DECCKM bit — when set, unmodified arrow / Home / End
+/// emit SS3 forms (`\eOA`) instead of CSI (`\e[A`). Returns `None` for keys
+/// we don't translate (Cmd-anything, dead keys, unbound named keys).
+pub fn encode_key(
+    logical: &Key,
+    text: Option<&str>,
+    mods: ModifiersState,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    // Cmd is reserved for system shortcuts on macOS (copy/paste/quit).
+    if mods.super_key() {
+        return None;
+    }
+
+    let ctrl = mods.control_key();
+    let alt = mods.alt_key();
+    let shift = mods.shift_key();
+
+    // xterm modifier-encoding parameter: 1 + (shift|alt<<1|ctrl<<2). `None`
+    // when no modifiers are held — caller emits the un-parameterized form.
+    let mod_bits = (shift as u8) | ((alt as u8) << 1) | ((ctrl as u8) << 2);
+    let mod_param = (mod_bits != 0).then(|| mod_bits + 1);
+
+    if let Key::Named(named) = logical {
+        return named_key(*named, alt, mod_param, app_cursor);
+    }
+
+    // Fall back to logical_key's character if `text` is missing.
+    let s = text.or_else(|| match logical {
+        Key::Character(s) => Some(s.as_str()),
+        _ => None,
+    })?;
+    let first = s.chars().next()?;
+    let single_char = s.chars().nth(1).is_none();
+
+    let mut out = Vec::with_capacity(s.len() + 1);
+    if alt {
+        out.push(0x1b);
+    }
+    if ctrl && single_char {
+        if let Some(code) = ctrl_byte(first) {
+            out.push(code);
+            return Some(out);
         }
     }
+    out.extend_from_slice(s.as_bytes());
+    Some(out)
+}
 
-    pub fn insert_right(&mut self, c: char) -> bool {
-        self.text.insert(self.cursor_offset, c);
-        self.cursor_offset += 1;
-        true
-    }
+/// Map a printable char to its Ctrl-modified byte. Letters fold case; the
+/// classic punctuation forms map to 0x00, 0x1b…0x1f, 0x7f.
+fn ctrl_byte(ch: char) -> Option<u8> {
+    Some(match ch {
+        'a'..='z' => (ch as u8) - b'a' + 1,
+        'A'..='Z' => (ch as u8) - b'A' + 1,
+        '@' | ' ' => 0x00,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    })
+}
 
-    pub fn delete_left(&mut self) -> bool {
-        if self.cursor_offset == 0 {
-            return false;
+fn named_key(
+    named: NamedKey,
+    alt: bool,
+    mod_param: Option<u8>,
+    app_cursor: bool,
+) -> Option<Vec<u8>> {
+    // Cursor / Home / End. `\e[<fb>` normally; `\eO<fb>` in app-cursor mode
+    // when no modifiers are held; `\e[1;<mod><fb>` whenever any modifier is
+    // held (xterm escapes modifiers through the CSI form regardless of mode).
+    let csi_letter = |fb: u8| -> Vec<u8> {
+        match mod_param {
+            None if app_cursor => vec![0x1b, b'O', fb],
+            None => vec![0x1b, b'[', fb],
+            Some(p) => format!("\x1b[1;{}{}", p, fb as char).into_bytes(),
         }
-        self.text.remove(self.cursor_offset - 1);
-        self.cursor_offset -= 1;
-        true
-    }
-
-    pub fn cursor_left(&mut self) -> bool {
-        if self.cursor_offset == 0 {
-            return false;
+    };
+    // `\e[<n>~` with optional `;<mod>` before the tilde.
+    let tilde = |n: u8| -> Vec<u8> {
+        match mod_param {
+            None => format!("\x1b[{}~", n).into_bytes(),
+            Some(p) => format!("\x1b[{};{}~", n, p).into_bytes(),
         }
-        self.cursor_offset -= 1;
-        true
-    }
-
-    pub fn cursor_right(&mut self) -> bool {
-        if self.cursor_offset >= self.text.len() {
-            return false;
+    };
+    // Simple C0 controls — Alt prefixes with ESC, other modifiers ignored
+    // (terminals disagree on how to encode e.g. Ctrl+Enter; pass it through).
+    let control = |b: u8| -> Vec<u8> {
+        if alt {
+            vec![0x1b, b]
+        } else {
+            vec![b]
         }
-        self.cursor_offset += 1;
-        true
-    }
+    };
 
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor_offset = 0;
-    }
+    Some(match named {
+        NamedKey::Enter => control(b'\r'),
+        NamedKey::Tab if mod_param == Some(2) => vec![0x1b, b'[', b'Z'], // Shift+Tab
+        NamedKey::Tab => control(b'\t'),
+        NamedKey::Backspace => control(0x7f),
+        NamedKey::Escape => control(0x1b),
+        NamedKey::Space => control(b' '),
+        NamedKey::ArrowUp => csi_letter(b'A'),
+        NamedKey::ArrowDown => csi_letter(b'B'),
+        NamedKey::ArrowRight => csi_letter(b'C'),
+        NamedKey::ArrowLeft => csi_letter(b'D'),
+        NamedKey::Home => csi_letter(b'H'),
+        NamedKey::End => csi_letter(b'F'),
+        NamedKey::PageUp => tilde(5),
+        NamedKey::PageDown => tilde(6),
+        NamedKey::Insert => tilde(2),
+        NamedKey::Delete => tilde(3),
+        NamedKey::F1 => vec![0x1b, b'O', b'P'],
+        NamedKey::F2 => vec![0x1b, b'O', b'Q'],
+        NamedKey::F3 => vec![0x1b, b'O', b'R'],
+        NamedKey::F4 => vec![0x1b, b'O', b'S'],
+        NamedKey::F5 => tilde(15),
+        NamedKey::F6 => tilde(17),
+        NamedKey::F7 => tilde(18),
+        NamedKey::F8 => tilde(19),
+        NamedKey::F9 => tilde(20),
+        NamedKey::F10 => tilde(21),
+        NamedKey::F11 => tilde(23),
+        NamedKey::F12 => tilde(24),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winit::keyboard::SmolStr;
 
-    #[test]
-    fn insert_advances_cursor() {
-        let mut s = InputState::new(16);
-        s.insert_right('a');
-        s.insert_right('b');
-        assert_eq!(s.text, "ab");
-        assert_eq!(s.cursor_offset, 2);
+    fn ch(c: &str) -> Key {
+        Key::Character(SmolStr::new(c))
     }
 
     #[test]
-    fn delete_left_at_start_is_noop() {
-        let mut s = InputState::new(16);
-        s.insert_right('a');
-        s.cursor_offset = 0;
-        assert!(!s.delete_left());
-        assert_eq!(s.text, "a");
+    fn plain_letter_passes_through() {
+        assert_eq!(
+            encode_key(&ch("a"), Some("a"), ModifiersState::empty(), false),
+            Some(b"a".to_vec()),
+        );
     }
 
     #[test]
-    fn cursor_moves_clamp_to_bounds() {
-        let mut s = InputState::new(16);
-        s.insert_right('a');
-        assert!(!s.cursor_right());
-        assert!(s.cursor_left());
-        assert!(!s.cursor_left());
+    fn ctrl_letter_becomes_control_code() {
+        assert_eq!(
+            encode_key(&ch("c"), None, ModifiersState::CONTROL, false),
+            Some(vec![0x03]),
+        );
     }
 
     #[test]
-    fn clear_resets_everything() {
-        let mut s = InputState::new(16);
-        s.insert_right('a');
-        s.insert_right('b');
-        s.clear();
-        assert!(s.is_empty());
-        assert_eq!(s.cursor_offset, 0);
+    fn ctrl_shift_letter_still_folds() {
+        // Ctrl+Shift+A — text is "A" but the control code is the same as ^A.
+        assert_eq!(
+            encode_key(
+                &ch("A"),
+                Some("A"),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                false,
+            ),
+            Some(vec![0x01]),
+        );
     }
 
     #[test]
-    fn insert_in_middle() {
-        let mut s = InputState::new(16);
-        s.insert_right('a');
-        s.insert_right('c');
-        s.cursor_left();
-        s.insert_right('b');
-        assert_eq!(s.text, "abc");
-        assert_eq!(s.cursor_offset, 2);
+    fn ctrl_left_bracket_is_escape() {
+        assert_eq!(
+            encode_key(&ch("["), None, ModifiersState::CONTROL, false),
+            Some(vec![0x1b]),
+        );
+    }
+
+    #[test]
+    fn alt_letter_prefixes_esc() {
+        assert_eq!(
+            encode_key(&ch("a"), Some("a"), ModifiersState::ALT, false),
+            Some(vec![0x1b, b'a']),
+        );
+    }
+
+    #[test]
+    fn cmd_is_swallowed() {
+        assert_eq!(
+            encode_key(&ch("c"), Some("c"), ModifiersState::SUPER, false),
+            None,
+        );
+    }
+
+    #[test]
+    fn enter_is_carriage_return() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Enter), None, ModifiersState::empty(), false),
+            Some(vec![b'\r']),
+        );
+    }
+
+    #[test]
+    fn backspace_is_del() {
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Backspace),
+                None,
+                ModifiersState::empty(),
+                false,
+            ),
+            Some(vec![0x7f]),
+        );
+    }
+
+    #[test]
+    fn escape_key() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Escape), None, ModifiersState::empty(), false),
+            Some(vec![0x1b]),
+        );
+    }
+
+    #[test]
+    fn arrow_up_unmodified() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, ModifiersState::empty(), false),
+            Some(b"\x1b[A".to_vec()),
+        );
+    }
+
+    #[test]
+    fn arrow_up_with_ctrl_uses_modifier_param() {
+        // ctrl bit = 4, +1 = 5 → "\e[1;5A"
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::ArrowUp), None, ModifiersState::CONTROL, false),
+            Some(b"\x1b[1;5A".to_vec()),
+        );
+    }
+
+    #[test]
+    fn shift_tab_is_cbt() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Tab), None, ModifiersState::SHIFT, false),
+            Some(b"\x1b[Z".to_vec()),
+        );
+    }
+
+    #[test]
+    fn function_keys() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F1), None, ModifiersState::empty(), false),
+            Some(b"\x1bOP".to_vec()),
+        );
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::F5), None, ModifiersState::empty(), false),
+            Some(b"\x1b[15~".to_vec()),
+        );
+    }
+
+    #[test]
+    fn page_keys_with_modifiers() {
+        // shift bit 1 + 1 = 2 → "\e[5;2~"
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::PageUp), None, ModifiersState::SHIFT, false),
+            Some(b"\x1b[5;2~".to_vec()),
+        );
+    }
+
+    #[test]
+    fn arrow_in_app_cursor_mode_uses_ss3() {
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowUp),
+                None,
+                ModifiersState::empty(),
+                true,
+            ),
+            Some(b"\x1bOA".to_vec()),
+        );
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Home),
+                None,
+                ModifiersState::empty(),
+                true,
+            ),
+            Some(b"\x1bOH".to_vec()),
+        );
+    }
+
+    #[test]
+    fn arrow_in_app_cursor_mode_falls_back_to_csi_with_modifiers() {
+        // Even in app-cursor mode, holding a modifier forces the CSI form so
+        // the parameter encoding still works.
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::ArrowUp),
+                None,
+                ModifiersState::CONTROL,
+                true,
+            ),
+            Some(b"\x1b[1;5A".to_vec()),
+        );
+    }
+
+    #[test]
+    fn mouse_sgr_press_and_release() {
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 12, 5, true, false, true, ModifiersState::empty()),
+            b"\x1b[<0;12;5M".to_vec(),
+        );
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 12, 5, false, false, true, ModifiersState::empty()),
+            b"\x1b[<0;12;5m".to_vec(),
+        );
+    }
+
+    #[test]
+    fn mouse_sgr_motion_and_modifiers() {
+        // motion (+32) + shift (+4) on right button.
+        assert_eq!(
+            encode_mouse(MOUSE_RIGHT, 1, 1, true, true, true, ModifiersState::SHIFT),
+            b"\x1b[<38;1;1M".to_vec(),
+        );
+    }
+
+    #[test]
+    fn mouse_legacy_x10_form() {
+        // 1-based col 1 → 33, row 1 → 33; left button + 32 = 32 (' ').
+        assert_eq!(
+            encode_mouse(MOUSE_LEFT, 1, 1, true, false, false, ModifiersState::empty()),
+            vec![0x1b, b'[', b'M', 32, 33, 33],
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_up() {
+        assert_eq!(
+            encode_mouse(MOUSE_WHEEL_UP, 5, 7, true, false, true, ModifiersState::empty()),
+            b"\x1b[<64;5;7M".to_vec(),
+        );
+    }
+
+    #[test]
+    fn alt_enter_prefixes_esc() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Enter), None, ModifiersState::ALT, false),
+            Some(vec![0x1b, b'\r']),
+        );
     }
 }

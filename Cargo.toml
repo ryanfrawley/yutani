@@ -17,6 +17,7 @@ winit = { version = "0.29.5", features = ["rwh_05"] }
 libc = "0.2.15"
 cgmath = "0.18.0"
 nix = { version = "0.27.1", features = ["process"] }
+arboard = "3"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", default-features = false, features = ["winuser", "wingdi"] }

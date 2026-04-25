@@ -33,6 +33,36 @@ pub enum Event {
     // top/bottom 1-based. None = default (full screen / no region).
     SetScrollRegion(Option<u16>, Option<u16>),
 
+    // Editing — all params clamped to >= 1
+    InsertLine(u16),  // CSI L (IL)
+    DeleteLine(u16),  // CSI M (DL)
+    InsertChar(u16),  // CSI @ (ICH)
+    DeleteChar(u16),  // CSI P (DCH)
+    EraseChar(u16),   // CSI X (ECH)
+
+    // CSI <n>n — DSR. 5 = ask if OK, 6 = report cursor position. Caller is
+    // expected to write a reply back to the host.
+    DeviceStatusReport(u16),
+
+    // CSI c (or CSI 0c) — Primary Device Attributes. Caller replies with
+    // identification (e.g. \e[?1;2c).
+    DeviceAttributes,
+    // CSI > c — Secondary Device Attributes (terminal type / version).
+    SecondaryDeviceAttributes,
+
+    // CSI <n> SP q — DECSCUSR. 0/1=blink block, 2=block, 3=blink underline,
+    // 4=underline, 5=blink bar, 6=bar.
+    SetCursorStyle(u16),
+
+    // OSC payload, decoded between OSC introducer and the BEL/ST terminator.
+    // Format is typically "<Pn>;<rest>" — caller dispatches by code.
+    Osc(String),
+
+    // DCS payload (everything between ESC P and ST). Used by xterm's
+    // XTGETTCAP termcap query — apps like vim probe terminal capabilities
+    // here on startup. SOS/PM/APC are still swallowed silently.
+    Dcs(String),
+
     Sgr(Vec<u16>),
 
     // DEC private mode (CSI ? N h/l). One event per param.
@@ -56,6 +86,13 @@ enum State {
     CsiIgnore,
     OscString,
     OscEsc,
+    // DCS payload, captured for the host (XTGETTCAP queries land here).
+    DcsString,
+    DcsEsc,
+    // SOS / PM / APC payload — same framing (BEL or ESC \) but no consumer,
+    // so we discard the bytes rather than buffer them.
+    StringSwallow,
+    StringEsc,
 }
 
 pub struct Parser {
@@ -65,6 +102,15 @@ pub struct Parser {
     // we flush this into `params`.
     cur_param: Option<u16>,
     private: bool,
+    // `>` introducer (secondary DA, modify-other-keys queries…).
+    intro_gt: bool,
+    // Last intermediate byte (0x20-0x2F) seen in the CSI. We only check for
+    // a single space, which selects DECSCUSR-style finals like `q`.
+    intermediate: Option<char>,
+    // OSC payload accumulator. Flushed on BEL or ST.
+    osc_buf: String,
+    // DCS payload accumulator. Same lifecycle as `osc_buf`.
+    dcs_buf: String,
 }
 
 impl Parser {
@@ -74,6 +120,10 @@ impl Parser {
             params: Vec::with_capacity(8),
             cur_param: None,
             private: false,
+            intro_gt: false,
+            intermediate: None,
+            osc_buf: String::new(),
+            dcs_buf: String::new(),
         }
     }
 
@@ -85,8 +135,12 @@ impl Parser {
             State::CsiParam => self.csi_param(ch, &mut emit),
             State::CsiIntermediate => self.csi_intermediate(ch, &mut emit),
             State::CsiIgnore => self.csi_ignore(ch),
-            State::OscString => self.osc(ch),
-            State::OscEsc => self.osc_esc(ch),
+            State::OscString => self.osc(ch, &mut emit),
+            State::OscEsc => self.osc_esc(ch, &mut emit),
+            State::DcsString => self.dcs(ch, &mut emit),
+            State::DcsEsc => self.dcs_esc(ch, &mut emit),
+            State::StringSwallow => self.string_swallow(ch),
+            State::StringEsc => self.string_esc(),
         }
     }
 
@@ -110,6 +164,12 @@ impl Parser {
                 self.state = State::CsiEntry;
             }
             ']' => self.state = State::OscString,
+            // DCS — captured for XTGETTCAP and similar.
+            'P' => self.state = State::DcsString,
+            // SOS / PM / APC — string-form sequences we don't implement.
+            // Must be consumed up to ST so their payload doesn't leak into
+            // ground state and get printed verbatim.
+            'X' | '^' | '_' => self.state = State::StringSwallow,
             '7' => {
                 emit(Event::SaveCursor);
                 self.state = State::Ground;
@@ -130,6 +190,8 @@ impl Parser {
         self.params.clear();
         self.cur_param = None;
         self.private = false;
+        self.intro_gt = false;
+        self.intermediate = None;
     }
 
     fn csi_entry(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
@@ -138,7 +200,11 @@ impl Parser {
                 self.private = true;
                 self.state = State::CsiParam;
             }
-            '<' | '=' | '>' => self.state = State::CsiIgnore,
+            '>' => {
+                self.intro_gt = true;
+                self.state = State::CsiParam;
+            }
+            '<' | '=' => self.state = State::CsiIgnore,
             '0'..='9' => {
                 self.push_digit(ch);
                 self.state = State::CsiParam;
@@ -147,7 +213,10 @@ impl Parser {
                 self.flush_param();
                 self.state = State::CsiParam;
             }
-            ' '..='/' => self.state = State::CsiIntermediate, // 0x20-0x2F
+            ' '..='/' => {
+                self.intermediate = Some(ch);
+                self.state = State::CsiIntermediate;
+            }
             '@'..='~' => {
                 self.dispatch_csi(ch, emit);
                 self.state = State::Ground;
@@ -160,7 +229,10 @@ impl Parser {
         match ch {
             '0'..='9' => self.push_digit(ch),
             ';' => self.flush_param(),
-            ' '..='/' => self.state = State::CsiIntermediate,
+            ' '..='/' => {
+                self.intermediate = Some(ch);
+                self.state = State::CsiIntermediate;
+            }
             '@'..='~' => {
                 self.dispatch_csi(ch, emit);
                 self.state = State::Ground;
@@ -171,7 +243,7 @@ impl Parser {
 
     fn csi_intermediate(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
         match ch {
-            ' '..='/' => {} // collect (we don't use intermediates)
+            ' '..='/' => self.intermediate = Some(ch),
             '@'..='~' => {
                 self.dispatch_csi(ch, emit);
                 self.state = State::Ground;
@@ -187,18 +259,75 @@ impl Parser {
         }
     }
 
-    fn osc(&mut self, ch: char) {
+    fn osc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
         match ch {
-            '\x07' => self.state = State::Ground,
+            '\x07' => {
+                self.flush_osc(emit);
+                self.state = State::Ground;
+            }
             '\x1b' => self.state = State::OscEsc,
-            _ => {} // swallow
+            _ => self.osc_buf.push(ch),
         }
     }
 
-    fn osc_esc(&mut self, _ch: char) {
-        // Either ESC \ terminates (we got \); anything else aborts. Treat both
-        // the same — state machine isn't precise enough to care.
+    fn osc_esc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
+        // ESC \ is the proper ST terminator; anything else aborts the OSC
+        // string without emitting (the bytes were already accumulated, so
+        // drop them).
+        if ch == '\\' {
+            self.flush_osc(emit);
+        } else {
+            self.osc_buf.clear();
+        }
         self.state = State::Ground;
+    }
+
+    fn dcs(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
+        match ch {
+            '\x07' => {
+                self.flush_dcs(emit);
+                self.state = State::Ground;
+            }
+            '\x1b' => self.state = State::DcsEsc,
+            _ => self.dcs_buf.push(ch),
+        }
+    }
+
+    fn dcs_esc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
+        if ch == '\\' {
+            self.flush_dcs(emit);
+        } else {
+            self.dcs_buf.clear();
+        }
+        self.state = State::Ground;
+    }
+
+    fn flush_dcs(&mut self, emit: &mut impl FnMut(Event)) {
+        let s = std::mem::take(&mut self.dcs_buf);
+        if !s.is_empty() {
+            emit(Event::Dcs(s));
+        }
+    }
+
+    fn string_swallow(&mut self, ch: char) {
+        match ch {
+            '\x07' => self.state = State::Ground,
+            '\x1b' => self.state = State::StringEsc,
+            _ => {} // swallow payload
+        }
+    }
+
+    fn string_esc(&mut self) {
+        // ESC inside a string sequence either terminates it (ESC \\ — proper
+        // ST) or aborts. Either way, return to ground without emitting.
+        self.state = State::Ground;
+    }
+
+    fn flush_osc(&mut self, emit: &mut impl FnMut(Event)) {
+        let s = std::mem::take(&mut self.osc_buf);
+        if !s.is_empty() {
+            emit(Event::Osc(s));
+        }
     }
 
     fn push_digit(&mut self, ch: char) {
@@ -217,6 +346,25 @@ impl Parser {
         // Commit any trailing digits as a final param.
         if self.cur_param.is_some() {
             self.flush_param();
+        }
+
+        // DECSCUSR (CSI <n> SP q) is the only intermediate-bearing sequence we
+        // care about; drop any other intermediate-laden sequence rather than
+        // misinterpreting the final byte.
+        if self.intermediate == Some(' ') && final_byte == 'q' {
+            let p0 = self.params.first().copied();
+            emit(Event::SetCursorStyle(p0.unwrap_or(0)));
+            return;
+        }
+        if self.intermediate.is_some() {
+            return;
+        }
+
+        if self.intro_gt {
+            if final_byte == 'c' {
+                emit(Event::SecondaryDeviceAttributes);
+            }
+            return;
         }
 
         if self.private {
@@ -240,6 +388,13 @@ impl Parser {
             'K' => emit(Event::EraseInLine(p0.unwrap_or(0))),
             'S' => emit(Event::ScrollUp(get1(p0))),
             'T' => emit(Event::ScrollDown(get1(p0))),
+            'L' => emit(Event::InsertLine(get1(p0))),
+            'M' => emit(Event::DeleteLine(get1(p0))),
+            '@' => emit(Event::InsertChar(get1(p0))),
+            'P' => emit(Event::DeleteChar(get1(p0))),
+            'X' => emit(Event::EraseChar(get1(p0))),
+            'n' => emit(Event::DeviceStatusReport(p0.unwrap_or(0))),
+            'c' => emit(Event::DeviceAttributes),
             'r' => emit(Event::SetScrollRegion(
                 p0.filter(|&v| v != 0),
                 p1.filter(|&v| v != 0),
@@ -388,13 +543,55 @@ mod tests {
     }
 
     #[test]
-    fn osc_terminated_by_bel_or_st_is_swallowed() {
+    fn osc_emits_payload_on_bel_or_st() {
         assert_eq!(
             collect("a\x1b]0;title\x07b"),
-            vec![Event::Print('a'), Event::Print('b')],
+            vec![Event::Print('a'), Event::Osc("0;title".into()), Event::Print('b')],
         );
         assert_eq!(
-            collect("a\x1b]0;title\x1b\\b"),
+            collect("a\x1b]11;?\x1b\\b"),
+            vec![Event::Print('a'), Event::Osc("11;?".into()), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn dcs_payload_emits_event() {
+        // Vim's startup probe: DCS + q <hex names> ST.
+        assert_eq!(
+            collect("a\x1bP+q436f;6b75\x1b\\b"),
+            vec![
+                Event::Print('a'),
+                Event::Dcs("+q436f;6b75".into()),
+                Event::Print('b'),
+            ],
+        );
+    }
+
+    #[test]
+    fn dcs_terminated_by_bel_emits_event() {
+        assert_eq!(
+            collect("a\x1bPjunk\x07b"),
+            vec![Event::Print('a'), Event::Dcs("junk".into()), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn sos_pm_apc_are_swallowed() {
+        for intro in ['X', '^', '_'] {
+            let s = format!("a\x1b{}payload\x1b\\b", intro);
+            assert_eq!(
+                collect(&s),
+                vec![Event::Print('a'), Event::Print('b')],
+                "introducer {intro:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn osc_aborted_by_other_esc_does_not_emit() {
+        // ESC followed by something other than \ aborts without emitting.
+        assert_eq!(
+            collect("a\x1b]0;x\x1bZb"),
             vec![Event::Print('a'), Event::Print('b')],
         );
     }
@@ -406,10 +603,29 @@ mod tests {
     }
 
     #[test]
-    fn greater_than_introducer_is_ignored() {
-        // \x1b[>c is the "send device attributes" query from the host;
-        // treat as non-SGR private and swallow.
-        assert_eq!(collect("a\x1b[>cb"), vec![Event::Print('a'), Event::Print('b')]);
+    fn primary_and_secondary_device_attributes() {
+        assert_eq!(
+            collect("\x1b[c\x1b[0c\x1b[>c"),
+            vec![
+                Event::DeviceAttributes,
+                Event::DeviceAttributes,
+                Event::SecondaryDeviceAttributes,
+            ],
+        );
+    }
+
+    #[test]
+    fn decscusr_with_space_intermediate() {
+        assert_eq!(
+            collect("\x1b[2 q\x1b[ q"),
+            vec![Event::SetCursorStyle(2), Event::SetCursorStyle(0)],
+        );
+    }
+
+    #[test]
+    fn unknown_intermediate_drops_sequence() {
+        // CSI 2 ' p — intermediate '\'' isn't one we recognize, so silent drop.
+        assert_eq!(collect("a\x1b[2'pb"), vec![Event::Print('a'), Event::Print('b')]);
     }
 
     #[test]
@@ -425,6 +641,46 @@ mod tests {
         assert_eq!(
             out,
             vec![Event::Print('a'), Event::Sgr(vec![31]), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn editing_csi_emits_expected_events() {
+        assert_eq!(
+            collect("\x1b[3L\x1b[2M\x1b[5@\x1b[4P\x1b[6X"),
+            vec![
+                Event::InsertLine(3),
+                Event::DeleteLine(2),
+                Event::InsertChar(5),
+                Event::DeleteChar(4),
+                Event::EraseChar(6),
+            ],
+        );
+    }
+
+    #[test]
+    fn editing_csi_defaults_to_1() {
+        assert_eq!(
+            collect("\x1b[L\x1b[M\x1b[@\x1b[P\x1b[X"),
+            vec![
+                Event::InsertLine(1),
+                Event::DeleteLine(1),
+                Event::InsertChar(1),
+                Event::DeleteChar(1),
+                Event::EraseChar(1),
+            ],
+        );
+    }
+
+    #[test]
+    fn device_status_report_parses() {
+        assert_eq!(
+            collect("\x1b[6n\x1b[5n\x1b[n"),
+            vec![
+                Event::DeviceStatusReport(6),
+                Event::DeviceStatusReport(5),
+                Event::DeviceStatusReport(0),
+            ],
         );
     }
 
