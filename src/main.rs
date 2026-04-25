@@ -48,6 +48,12 @@ struct State {
     num_indices: u32,
     font: font::Font,
     font_bind_group: wgpu::BindGroup,
+    /// Layout for the font texture + sampler. Kept around so we can rebind
+    /// after a font-size change rebuilds the atlas texture.
+    font_bind_group_layout: wgpu::BindGroupLayout,
+    /// Current font size in points; mutated by Cmd-+ / Cmd--.
+    pt_size: f32,
+    dpi: u32,
     camera: renderer::camera::Camera,
     camera_uniform: renderer::camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
@@ -200,7 +206,13 @@ impl Selection {
 }
 
 impl State {
-    async fn new(master: i32, window: Window, mut font: font::Font) -> Self {
+    async fn new(
+        master: i32,
+        window: Window,
+        mut font: font::Font,
+        pt_size: f32,
+        dpi: u32,
+    ) -> Self {
         let gpu = gpu::GpuContext::new(&window).await;
 
         // Font texture setup
@@ -216,7 +228,7 @@ impl State {
             Some("font texture"),
         );
 
-        let texture_bind_group_layout =
+        let font_bind_group_layout =
             gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
@@ -240,7 +252,7 @@ impl State {
             });
 
         let font_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
+            layout: &font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -295,7 +307,7 @@ impl State {
         let render_pipeline_layout =
             gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render pipeline layout"),
-                bind_group_layouts: &[&texture_bind_group_layout, &camera_bind_group_layout],
+                bind_group_layouts: &[&font_bind_group_layout, &camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -380,6 +392,9 @@ impl State {
             num_indices: 0,
             font,
             font_bind_group,
+            font_bind_group_layout,
+            pt_size,
+            dpi,
             camera,
             camera_uniform,
             camera_buffer,
@@ -964,6 +979,57 @@ impl State {
         self.num_indices = indices.len() as u32;
     }
 
+    /// Bump (or shrink) the font by `delta_pt` points and rebuild everything
+    /// that depends on cell metrics: atlas, font texture, bind group, terminal
+    /// grid, vertex/index buffers. Clamped so the rasterizer never gets a
+    /// nonsensical size.
+    fn change_font_size(&mut self, delta_pt: f32) {
+        let new_pt = (self.pt_size + delta_pt).clamp(6.0, 96.0);
+        if (new_pt - self.pt_size).abs() < f32::EPSILON {
+            return;
+        }
+        self.pt_size = new_pt;
+        self.font.set_char_size(self.pt_size, self.dpi);
+        self.atlas = self.font.build_atlas();
+        let font_alpha = renderer::texture::Texture::from_memory(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &self.atlas.buffer,
+            self.atlas.width as u32,
+            self.atlas.height as u32,
+            wgpu::TextureFormat::R8Unorm,
+            Some("font texture"),
+        );
+        self.font_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.font_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&font_alpha.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&font_alpha.sampler),
+                },
+            ],
+            label: Some("font bind group"),
+        });
+        // Resize the grid to match the new cell dimensions, then refill the
+        // vertex/index buffers (their capacity depends on grid size too).
+        let metrics = self.font.face.size_metrics().unwrap();
+        let viewport = State::get_viewport_size(
+            self.gpu.config.width as f32,
+            self.gpu.config.height as f32,
+            self.font.cell_width(),
+            ((metrics.ascender - metrics.descender) >> 6) as usize,
+        );
+        self.terminal.resize(viewport.char_width, viewport.char_height);
+        self.notify_pty_size(viewport.char_width, viewport.char_height);
+        self.resize_buffers();
+        self.update_vertices();
+        self.window.request_redraw();
+    }
+
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.gpu.resize(size);
         self.camera_uniform
@@ -1430,6 +1496,17 @@ impl State {
                                 self.paste_from_clipboard();
                                 return true;
                             }
+                            // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
+                            // delivers `=` for the unshifted key and `+` when
+                            // shift is held, so handle both as "increase".
+                            if s.as_ref() == "+" || s.as_ref() == "=" {
+                                self.change_font_size(1.0);
+                                return true;
+                            }
+                            if s.as_ref() == "-" || s.as_ref() == "_" {
+                                self.change_font_size(-1.0);
+                                return true;
+                            }
                         }
                     }
                     let bytes = input::encode_key(
@@ -1607,7 +1684,7 @@ async fn run() {
         }
     }
 
-    let mut state = State::new(fdm, window, font).await;
+    let mut state = State::new(fdm, window, font, pt_size, dpi).await;
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
