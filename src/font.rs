@@ -1,6 +1,8 @@
 extern crate freetype as ft;
 use std::collections::HashMap;
 
+use crate::box_drawing;
+
 pub struct Glyph {
     pub bitmap: ft::Bitmap,
     pub metrics: ft::GlyphMetrics,
@@ -121,6 +123,7 @@ impl Font {
         let cell_w = self.cell_width();
         let metrics = self.face.size_metrics().expect("primary face has no size metrics");
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        let ascender_px = (metrics.ascender >> 6) as isize;
 
         // The font's .notdef glyph (index 0). Rendered in place of any
         // character the font doesn't provide — usually a hollow box.
@@ -147,6 +150,23 @@ impl Font {
                     Some(ch) => ch,
                     None => continue,
                 };
+                // Box-drawing & block-element ranges are synthesized so that
+                // strokes land on integer pixel boundaries and connecting
+                // glyphs (╭/╰/│, ─, ┼ family, etc.) align across cell
+                // boundaries with no half-alpha hairlines.
+                if let Some(bm) = box_drawing::synth(ch, cell_w, cell_h, ascender_px) {
+                    let entry = pack_synth(
+                        &bm,
+                        &mut texture,
+                        width,
+                        size,
+                        &mut x,
+                        &mut y,
+                        &mut row_height,
+                    );
+                    entries.insert(ch, entry);
+                    continue;
+                }
                 // Walk primary → fallbacks, take the first face with a glyph
                 // for this codepoint. If none have it, the render path falls
                 // back to `atlas.notdef` (the primary face's tofu box).
@@ -179,6 +199,46 @@ impl Font {
             notdef,
         }
     }
+}
+
+// Pack a procedurally-generated bitmap into the atlas. Skips the edge-
+// hardening logic in `pack_glyph` because synthesized strokes are already
+// pixel-aligned at full coverage by construction.
+fn pack_synth(
+    bm: &box_drawing::Bitmap,
+    texture: &mut [u8],
+    width: usize,
+    size: usize,
+    x: &mut usize,
+    y: &mut usize,
+    row_height: &mut usize,
+) -> AtlasEntry {
+    let w = bm.width;
+    let h = bm.height;
+    if h > *row_height {
+        *row_height = h;
+    }
+    for p in 0..h {
+        for q in 0..w {
+            texture[((p + *y) % size) * width + (q + *x) % size] = bm.data[p * w + q];
+        }
+    }
+    let entry = AtlasEntry {
+        x: *x,
+        y: *y,
+        width: w,
+        height: h,
+        bearing_x: bm.bearing_x,
+        bearing_y: bm.bearing_y,
+        advance_x: bm.advance_x,
+    };
+    *x += bm.advance_x.max(1);
+    if *x + w >= size {
+        *x = 0;
+        *y += *row_height;
+        *row_height = 0;
+    }
+    entry
 }
 
 fn pack_glyph(
