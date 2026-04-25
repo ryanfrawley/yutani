@@ -31,6 +31,40 @@ use wgpu::util::DeviceExt;
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
 
+const DEFAULT_FONT_SIZE: f32 = 10.0;
+
+fn config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut p = std::path::PathBuf::from(home);
+    p.push(".config");
+    p.push("aria-terminal");
+    p.push("config");
+    Some(p)
+}
+
+fn load_font_size() -> Option<f32> {
+    let s = std::fs::read_to_string(config_path()?).ok()?;
+    for line in s.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (k, v) = line.split_once('=')?;
+        if k.trim() == "font_size" {
+            return v.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn save_font_size(size: f32) {
+    let Some(p) = config_path() else { return };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(p, format!("font_size = {}\n", size));
+}
+
 pub struct ViewportSize {
     char_width: usize,
     char_height: usize,
@@ -1001,6 +1035,7 @@ impl State {
             return;
         }
         self.pt_size = new_pt;
+        save_font_size(self.pt_size);
         self.font.set_char_size(self.pt_size, self.dpi);
         self.atlas = self.font.build_atlas();
         let font_alpha = renderer::texture::Texture::from_memory(
@@ -1652,7 +1687,7 @@ async fn run() {
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
 
-    let pt_size = 24.0;
+    let pt_size = load_font_size().unwrap_or(DEFAULT_FONT_SIZE);
     let dpi = (window.scale_factor() * 96.0) as u32;
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
