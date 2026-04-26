@@ -227,19 +227,6 @@ struct State {
     /// which the redraw handler calls before drawing. Lets winit coalesce a
     /// burst of N events into one rebuild + one frame.
     vertices_dirty: bool,
-    /// Cached time of the last completed render, used to throttle redraws to
-    /// at most one per display refresh interval. Avoids spending wall time
-    /// inside `surface.get_current_texture()` waiting for a swapchain slot
-    /// the user can't see anyway.
-    last_paint: std::time::Instant,
-    /// Cap on redraw frequency, derived from the current monitor's refresh
-    /// rate (queried at startup and on resize). Defaults to 16.67ms (60Hz)
-    /// when the platform doesn't report a rate.
-    min_frame_interval: std::time::Duration,
-    /// When `invalidate` is called inside the cap window, we defer the redraw
-    /// to this instant instead of issuing it immediately. AboutToWait turns
-    /// this into a wake-up so the deferred frame actually fires.
-    pending_redraw_at: Option<std::time::Instant>,
 }
 
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
@@ -791,8 +778,6 @@ impl State {
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
 
-        let min_frame_interval = detect_min_frame_interval(&window);
-
         Self {
             window,
             gpu,
@@ -848,53 +833,16 @@ impl State {
             master,
             perf: PerfLog::new(),
             vertices_dirty: true,
-            last_paint: std::time::Instant::now() - std::time::Duration::from_secs(1),
-            min_frame_interval,
-            pending_redraw_at: None,
         }
     }
 
-    /// Re-query the current monitor's refresh rate. Call after the window may
-    /// have moved between displays (Resized fires when DPI changes too).
-    fn refresh_frame_cap(&mut self) {
-        self.min_frame_interval = detect_min_frame_interval(&self.window);
-    }
-
-    /// Mark the vertex buffer stale and ask winit to redraw, capped at the
-    /// display's refresh rate. If we painted too recently, defer the redraw
-    /// to the next eligible slot — `AboutToWait` arms a wake-up so the
-    /// deferred frame fires even with no further events.
+    /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls
+    /// inside one event-loop turn coalesce into a single RedrawRequested,
+    /// and `surface.get_current_texture()` blocks at the swapchain to keep
+    /// us aligned with the display's vsync cadence.
     fn invalidate(&mut self) {
         self.vertices_dirty = true;
-        let now = std::time::Instant::now();
-        let next_ok = self.last_paint + self.min_frame_interval;
-        if now >= next_ok {
-            self.pending_redraw_at = None;
-            self.window.request_redraw();
-        } else {
-            // Keep the earliest pending request; later invalidates within the
-            // window collapse into the same deferred frame.
-            self.pending_redraw_at = Some(match self.pending_redraw_at {
-                Some(t) => t.min(next_ok),
-                None => next_ok,
-            });
-        }
-    }
-
-    /// Wake-up time for any deferred redraw, so AboutToWait can include it
-    /// in the ControlFlow::WaitUntil calculation.
-    fn pending_redraw_wake(&self) -> Option<std::time::Instant> {
-        self.pending_redraw_at
-    }
-
-    /// If a deferred redraw is now eligible, fire it. Called from AboutToWait.
-    fn maybe_fire_pending_redraw(&mut self) {
-        if let Some(t) = self.pending_redraw_at {
-            if std::time::Instant::now() >= t {
-                self.pending_redraw_at = None;
-                self.window.request_redraw();
-            }
-        }
+        self.window.request_redraw();
     }
 
     /// Rebuild the vertex/index buffers if they're stale, recording the cost
@@ -2477,13 +2425,10 @@ async fn run() {
     let installed = font_loader::system_fonts::query_all();
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    // Prefer Fira Code (programming ligatures) when available, fall back
-    // to Iosevka. Match exact family names first so we don't accidentally
-    // pick `Iosevka Term` (intentionally unligated) over plain `Iosevka`.
-    let primary_name = ["Fira Code", "Iosevka", "Iosevka Term", "Menlo"]
+    let primary_name = ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
         .iter()
         .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
-        .or_else(|| mono_fonts.iter().find(|f| f.contains("Fira Code")))
+        .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
         .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
         .expect("no monospace primary font found")
         .clone();
@@ -2626,9 +2571,6 @@ async fn run() {
                         }
                         WindowEvent::Resized(size) => {
                             state.resize(size);
-                            // A resize can move us between displays of
-                            // different refresh rates; refresh the cap.
-                            state.refresh_frame_cap();
                             state.window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -2643,10 +2585,6 @@ async fn run() {
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
-                            // Stamp the paint time *after* render returns so
-                            // the cap measures real spacing between frames.
-                            state.last_paint = std::time::Instant::now();
-                            state.pending_redraw_at = None;
                             match result {
                                 Ok((surface_wait, fast)) => {
                                     state.perf.note_render(render_dur, surface_wait, fast);
@@ -2670,9 +2608,6 @@ async fn run() {
                 if animating {
                     state.invalidate();
                 }
-                // Honor any deferred redraw whose frame-cap window has
-                // elapsed before sleeping.
-                state.maybe_fire_pending_redraw();
                 state.perf.maybe_flush();
                 let next_anim = if animating {
                     Some(std::time::Instant::now() + ANIM_FRAME)
@@ -2683,7 +2618,6 @@ async fn run() {
                     state.next_blink_wake(),
                     next_anim,
                     state.perf.next_wake(),
-                    state.pending_redraw_wake(),
                 ]
                 .into_iter()
                 .flatten()
@@ -2739,17 +2673,6 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
         b = b.italic();
     }
     font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
-}
-
-/// Minimum interval between paints, derived from the window's current monitor
-/// refresh rate. Falls back to 60Hz when the platform can't report a rate.
-/// Returning 1/refresh keeps us from issuing redraws the OS would just drop.
-fn detect_min_frame_interval(window: &Window) -> std::time::Duration {
-    let mhz = window
-        .current_monitor()
-        .and_then(|m| m.refresh_rate_millihertz())
-        .unwrap_or(60_000);
-    std::time::Duration::from_nanos(1_000_000_000_000u64 / mhz.max(1) as u64)
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
