@@ -177,6 +177,13 @@ struct State {
     terminal: terminal::Terminal,
     modifiers: winit::keyboard::ModifiersState,
     scroll_y: f64,
+    /// Drop in-flight trackpad momentum once a newer command (a keystroke
+    /// that snaps to the bottom) has overridden the user's scroll intent.
+    /// Cleared when momentum runs out OR a fresh gesture begins after a
+    /// real idle gap — see `last_wheel_at` for how we tell the two apart
+    /// (momentum's Started arrives ~one frame after the prior Ended).
+    scroll_suppressed: bool,
+    last_wheel_at: Option<std::time::Instant>,
     mouse_x: f64,
     mouse_y: f64,
     // Last cell we reported a motion event for. Mouse motion fires per pixel,
@@ -821,6 +828,8 @@ impl State {
             ),
             modifiers: winit::keyboard::ModifiersState::empty(),
             scroll_y: 0.0,
+            scroll_suppressed: false,
+            last_wheel_at: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
             last_reported_cell: None,
@@ -2131,9 +2140,32 @@ impl State {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let m = self.font.face().size_metrics().unwrap();
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
+                // A `Started` after a real idle gap is the user putting fingers
+                // back on the trackpad — that supersedes any prior suppression.
+                // Without the gap check, momentum's own Started (which fires
+                // ~one frame after the previous gesture's Ended) would clear
+                // the flag and let the tail of the flick re-scroll the view
+                // after a key snap.
+                const FRESH_GESTURE_GAP: std::time::Duration =
+                    std::time::Duration::from_millis(100);
+                let now = std::time::Instant::now();
+                let gap = self.last_wheel_at.map(|t| now.duration_since(t));
+                if matches!(phase, TouchPhase::Started)
+                    && gap.map_or(true, |g| g >= FRESH_GESTURE_GAP)
+                {
+                    self.scroll_suppressed = false;
+                }
+                if self.scroll_suppressed {
+                    // Don't advance `last_wheel_at` on suppressed events —
+                    // otherwise the steady stream of momentum ticks keeps
+                    // resetting the idle gap, and a real fresh gesture that
+                    // arrives mid-momentum still looks like a 16ms follow-up.
+                    return true;
+                }
+                self.last_wheel_at = Some(now);
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
@@ -2280,6 +2312,10 @@ impl State {
                         // returned None and don't touch the scroll state.
                         self.terminal.scroll_to_bottom();
                         self.scroll_y = 0.0;
+                        // Drop any in-flight trackpad momentum so the snap
+                        // sticks — otherwise the tail of the flick keeps
+                        // scrolling the view away from the bottom.
+                        self.scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
                         self.write_pty(&bytes);
