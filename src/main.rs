@@ -382,7 +382,7 @@ impl State {
         });
 
         // Calculate console viewport & buffer sizes
-        let metrics = font.face.size_metrics().unwrap();
+        let metrics = font.face().size_metrics().unwrap();
         let viewport = State::get_viewport_size(
             gpu.config.width as f32,
             gpu.config.height as f32,
@@ -477,7 +477,7 @@ impl State {
 
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.font.face.size_metrics().unwrap();
+        let metrics = self.font.face().size_metrics().unwrap();
         let viewport = State::get_viewport_size(
             self.gpu.config.width as f32,
             self.gpu.config.height as f32,
@@ -529,7 +529,7 @@ impl State {
         let mut indices: Vec<u16> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let metrics = self.font.face.size_metrics().unwrap();
+        let metrics = self.font.face().size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let cell_w = self.font.cell_width() as f32;
         let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
@@ -616,6 +616,7 @@ impl State {
         let mut emit_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
                              idxs: &mut Vec<u16>,
                              ch: char,
+                             variant: font::FaceVariant,
                              r: isize,
                              c: usize,
                              fg: [f32; 4],
@@ -642,9 +643,9 @@ impl State {
                 bg,
                 [0.0; 4],
             );
-            // foreground glyph — fall back to .notdef (tofu box) if the font
-            // doesn't have this character, so the user sees *something*.
-            let g = atlas.entries.get(&ch).unwrap_or(&atlas.notdef);
+            // foreground glyph — Atlas::lookup falls back from styled
+            // variant → regular → .notdef so the user always sees *something*.
+            let g = atlas.lookup(ch, variant);
             if g.width > 0 && g.height > 0 {
                 // Cell-filling glyphs (Powerline caps, box-drawing,
                 // half-blocks) get the affected axis stretched to the cell's
@@ -728,7 +729,8 @@ impl State {
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
                 let fg = cell.style.color_fg.unwrap_or(default_fg);
                 let bg = cell.style.color_bg.unwrap_or(default_bg);
-                emit_cell(&mut vertices, &mut indices, cell.ch, r, c, fg, bg);
+                let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
+                emit_cell(&mut vertices, &mut indices, cell.ch, variant, r, c, fg, bg);
             }
         }
 
@@ -1067,7 +1069,7 @@ impl State {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.font.face.size_metrics().unwrap();
+        let metrics = self.font.face().size_metrics().unwrap();
         let viewport = State::get_viewport_size(
             self.gpu.config.width as f32,
             self.gpu.config.height as f32,
@@ -1090,7 +1092,7 @@ impl State {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.font.face.size_metrics().unwrap();
+        let metrics = self.font.face().size_metrics().unwrap();
         let size = State::get_viewport_size(
             self.gpu.config.width as f32,
             self.gpu.config.height as f32,
@@ -1209,7 +1211,7 @@ impl State {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.font.face.size_metrics().unwrap();
+        let metrics = self.font.face().size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;
@@ -1472,7 +1474,7 @@ impl State {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let m = self.font.face.size_metrics().unwrap();
+                let m = self.font.face().size_metrics().unwrap();
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
@@ -1696,6 +1698,23 @@ async fn run() {
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
 
+    // Bold/italic/bold-italic primary cuts of the same family. Each is best-
+    // effort: when a cut isn't installed the styled lookup falls back to the
+    // regular face. Cores like Iosevka ship all four; users without them get
+    // un-styled text rather than synthetic bolding/oblique.
+    for (variant, bold, italic) in [
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ] {
+        let Some(data) = load_family_styled(&primary_name, bold, italic) else {
+            continue;
+        };
+        if font.set_variant(variant, data, pt_size, dpi) {
+            println!("primary {:?}: {}", variant, primary_name);
+        }
+    }
+
     // Fallback chain. Each entry is a list of candidate family substrings; the
     // first installed family wins. Order matters — earlier fallbacks shadow
     // later ones for any glyph they share.
@@ -1727,15 +1746,35 @@ async fn run() {
         // unsupported by our atlas pipeline, so we deliberately skip it.)
         ("emoji", &["Noto Emoji"]),
     ];
+    // For each fallback category, attach the matching cut to every variant we
+    // managed to install a primary for. A bold CJK glyph still wants the bold
+    // CJK fallback; if no styled CJK is installed, the styled variant is left
+    // without that fallback and Atlas::lookup tumbles down to Regular.
+    let variants_to_fill = [
+        (font::FaceVariant::Regular, false, false),
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ];
     for (label, candidates) in fallback_categories {
         let Some(family) = pick_family(&installed, candidates) else {
             continue;
         };
-        let Some(data) = load_family(&family) else {
-            continue;
-        };
-        if font.add_fallback(data, pt_size, dpi) {
-            println!("fallback {}: {}", label, family);
+        for (variant, bold, italic) in variants_to_fill {
+            // Regular has no installed primary check — Font::new always
+            // populates it. Styled variants only get fallbacks when their
+            // primary face is installed; otherwise the chain is dead weight.
+            if variant != font::FaceVariant::Regular
+                && font.variants[variant as usize].face.is_none()
+            {
+                continue;
+            }
+            let Some(data) = load_family_styled(&family, bold, italic) else {
+                continue;
+            };
+            if font.add_fallback(variant, data, pt_size, dpi) {
+                println!("fallback {} {:?}: {}", label, variant, family);
+            }
         }
     }
 
@@ -1832,6 +1871,28 @@ fn load_family(family: &str) -> Option<Vec<u8>> {
         .family(family)
         .build();
     font_loader::system_fonts::get(&prop).map(|(data, _)| data)
+}
+
+// Variant-aware load. macOS's Core Text matcher silently substitutes the
+// regular cut when no bold/italic is installed; `get_strict` rejects that
+// substitution by re-checking the matched descriptor's actual traits. Other
+// platforms fall back to the trait-tagged builder + plain `get`, which is
+// best-effort.
+#[cfg(target_os = "macos")]
+fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
+    font_loader::system_fonts::get_strict(family, bold, italic).map(|(data, _)| data)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
+    let mut b = font_loader::system_fonts::FontPropertyBuilder::new().family(family);
+    if bold {
+        b = b.bold();
+    }
+    if italic {
+        b = b.italic();
+    }
+    font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {

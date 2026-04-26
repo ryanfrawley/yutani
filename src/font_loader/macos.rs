@@ -19,7 +19,7 @@
 /// Font loading utilities for installed system fonts
 pub mod system_fonts {
     use core_text::font_descriptor::*;
-    use core_text::font_descriptor;
+    use core_text::font_descriptor::{self, TraitAccessors};
     use core_text;
     use std::fs::File;
     use std::mem;
@@ -111,6 +111,63 @@ pub mod system_fonts {
             }
         };
         return None
+    }
+
+    /// Strictly match a family + style. Walks all matching descriptors and
+    /// returns the bytes of the first whose actual italic/bold traits equal
+    /// the requested ones. Core Text's plain `get()` happily substitutes the
+    /// regular cut when a styled face isn't installed; this helper rejects
+    /// that substitution so callers can tell "real bold cut found" from "no
+    /// styled cut available".
+    pub fn get_strict(family: &str, bold: bool, italic: bool) -> Option<(Vec<u8>, c_int)> {
+        let mut want: CTFontSymbolicTraits = 0;
+        if bold { want |= kCTFontBoldTrait; }
+        if italic { want |= kCTFontItalicTrait; }
+
+        let mut prop = FontPropertyBuilder::new().family(family);
+        if bold { prop = prop.bold(); }
+        if italic { prop = prop.italic(); }
+        let descriptor = prop.build();
+
+        let descs: CFArray<CTFontDescriptor> = unsafe {
+            let descs = CTFontDescriptorCreateMatchingFontDescriptors(
+                descriptor.as_concrete_TypeRef(),
+                ptr::null(),
+            );
+            if descs.is_null() {
+                return None;
+            }
+            TCFType::wrap_under_create_rule(descs)
+        };
+
+        let mask = kCTFontBoldTrait | kCTFontItalicTrait;
+        for desc in descs.iter() {
+            let traits = desc.traits().symbolic_traits();
+            if traits & mask != want {
+                continue;
+            }
+            let url: CFURL = unsafe {
+                let value = CTFontDescriptorCopyAttribute(
+                    desc.as_concrete_TypeRef(),
+                    kCTFontURLAttribute,
+                );
+                if value.is_null() {
+                    continue;
+                }
+                let value: CFType = TCFType::wrap_under_create_rule(value);
+                if !value.instance_of::<CFURL>() {
+                    continue;
+                }
+                TCFType::wrap_under_get_rule(mem::transmute(value.as_CFTypeRef()))
+            };
+            if let Some(path) = url.to_path() {
+                let mut buffer = Vec::new();
+                if File::open(path).and_then(|mut f| f.read_to_end(&mut buffer)).is_ok() {
+                    return Some((buffer, 0));
+                }
+            }
+        }
+        None
     }
 
     /// Query the names of all fonts installed in the system
