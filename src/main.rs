@@ -1045,7 +1045,13 @@ impl State {
         // behind the title bar smoothly. Eases linearly over one line at
         // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
         let view_offset = self.terminal.view_offset() as f32;
-        let scrollback_len = self.terminal.scrollback_len() as f32;
+        // Alt screen has no scrollback to fade toward — pin both distances
+        // to zero so the top/bottom edge fades stay invisible.
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f32
+        };
         let dist_from_bottom = view_offset * line_height + scroll_y;
         let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
         let near = (dist_from_bottom / line_height)
@@ -1803,7 +1809,11 @@ impl State {
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     fn is_top_fade_animating(&self) -> bool {
-        let scrollback_len = self.terminal.scrollback_len() as f32;
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f32
+        };
         let view_offset = self.terminal.view_offset() as f32;
         let metrics = self.font.face().size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
@@ -1877,7 +1887,11 @@ impl State {
         // easing to 0 over one line in either direction. Out-of-sync formulas
         // here would drift the hit-test by a row vs. what's actually drawn.
         let view_offset = self.terminal.view_offset() as f64;
-        let scrollback_len = self.terminal.scrollback_len() as f64;
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f64
+        };
         let dist_from_bottom = view_offset * line_height + self.scroll_y;
         let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
         let near = (dist_from_bottom / line_height)
@@ -2140,6 +2154,14 @@ impl State {
                     }
                     return true;
                 }
+                // Alt screen has no scrollback to navigate; full-screen apps
+                // (vim, less, htop) provide their own keyboard motion. Without
+                // this guard, trackpad pixels would accumulate in scroll_y and
+                // visually drift the grid past its bounds.
+                if self.terminal.on_alt_screen() {
+                    self.scroll_y = 0.0;
+                    return true;
+                }
                 match delta {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
@@ -2154,14 +2176,19 @@ impl State {
                     MouseScrollDelta::PixelDelta(p) => {
                         self.scroll_y += p.y;
                         // Drain accumulated pixels into discrete line scrolls.
+                        // Zero the residue if scroll_up/down refused so scroll_y
+                        // can't accumulate past a viewport boundary regardless
+                        // of what at_top/at_bottom report.
                         while self.scroll_y >= line_height {
                             if !self.terminal.scroll_up(1) {
+                                self.scroll_y = 0.0;
                                 break;
                             }
                             self.scroll_y -= line_height;
                         }
                         while self.scroll_y <= -line_height {
                             if !self.terminal.scroll_down(1) {
+                                self.scroll_y = 0.0;
                                 break;
                             }
                             self.scroll_y += line_height;
