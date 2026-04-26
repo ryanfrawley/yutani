@@ -214,9 +214,186 @@ struct State {
     last_click: Option<(std::time::Instant, (isize, usize))>,
     click_count: u32,
     master: i32,
+    perf: PerfLog,
+    /// Set whenever something invalidates the vertex/index buffers (PTY input,
+    /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
+    /// which the redraw handler calls before drawing. Lets winit coalesce a
+    /// burst of N events into one rebuild + one frame.
+    vertices_dirty: bool,
+    /// Cached time of the last completed render, used to throttle redraws to
+    /// at most one per display refresh interval. Avoids spending wall time
+    /// inside `surface.get_current_texture()` waiting for a swapchain slot
+    /// the user can't see anyway.
+    last_paint: std::time::Instant,
+    /// Cap on redraw frequency, derived from the current monitor's refresh
+    /// rate (queried at startup and on resize). Defaults to 16.67ms (60Hz)
+    /// when the platform doesn't report a rate.
+    min_frame_interval: std::time::Duration,
+    /// When `invalidate` is called inside the cap window, we defer the redraw
+    /// to this instant instead of issuing it immediately. AboutToWait turns
+    /// this into a wake-up so the deferred frame actually fires.
+    pending_redraw_at: Option<std::time::Instant>,
 }
 
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Burst-scoped timing aggregator. Accumulates work caused by a run of PTY
+/// chunks + the frames that draw them, then prints a one-line summary once
+/// the activity has settled (>= PERF_FLUSH_IDLE since the last sample).
+/// Disabled unless `PERFLOG=1` is set in the environment so the steady-state
+/// terminal stays quiet.
+const PERF_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+struct PerfLog {
+    enabled: bool,
+    burst_start: Option<std::time::Instant>,
+    last_event: std::time::Instant,
+    pty_chunks: u32,
+    pty_bytes: usize,
+    feed_ns: u128,
+    update_ns: u128,
+    update_calls: u32,
+    render_ns: u128,
+    render_calls: u32,
+    fast_calls: u32,
+    fast_ns: u128,
+    slow_calls: u32,
+    slow_ns: u128,
+    surface_wait_ns: u128,
+}
+
+impl PerfLog {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("PERFLOG").map(|v| !v.is_empty() && v != "0").unwrap_or(false),
+            burst_start: None,
+            last_event: std::time::Instant::now(),
+            pty_chunks: 0,
+            pty_bytes: 0,
+            feed_ns: 0,
+            update_ns: 0,
+            update_calls: 0,
+            render_ns: 0,
+            render_calls: 0,
+            fast_calls: 0,
+            fast_ns: 0,
+            slow_calls: 0,
+            slow_ns: 0,
+            surface_wait_ns: 0,
+        }
+    }
+
+    fn note_pty(&mut self, bytes: usize, feed: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.pty_chunks += 1;
+        self.pty_bytes += bytes;
+        self.feed_ns += feed.as_nanos();
+    }
+
+    fn note_update(&mut self, dur: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.update_ns += dur.as_nanos();
+        self.update_calls += 1;
+    }
+
+    fn note_render(
+        &mut self,
+        dur: std::time::Duration,
+        surface_wait: std::time::Duration,
+        fast: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.render_ns += dur.as_nanos();
+        self.render_calls += 1;
+        self.surface_wait_ns += surface_wait.as_nanos();
+        if fast {
+            self.fast_calls += 1;
+            self.fast_ns += dur.as_nanos();
+        } else {
+            self.slow_calls += 1;
+            self.slow_ns += dur.as_nanos();
+        }
+    }
+
+    /// Wake-up time the event loop should arm to so we can print the summary
+    /// soon after the burst goes quiet. `None` when no burst is pending.
+    fn next_wake(&self) -> Option<std::time::Instant> {
+        if !self.enabled || self.burst_start.is_none() {
+            return None;
+        }
+        Some(self.last_event + PERF_FLUSH_IDLE)
+    }
+
+    fn maybe_flush(&mut self) {
+        if !self.enabled || self.burst_start.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_event) < PERF_FLUSH_IDLE {
+            return;
+        }
+        let total = now.duration_since(self.burst_start.unwrap());
+        let accounted_ns = self.feed_ns + self.update_ns + self.render_ns;
+        let avg_ns = |total_ns: u128, n: u32| {
+            if n == 0 { 0.0 } else { total_ns as f64 / n as f64 / 1e6 }
+        };
+        eprintln!(
+            "[perf] burst {:>6.1}ms wall | pty {:>2}c {:>6}B | feed {:>5.2}ms | update {:>6.2}ms x{:>2} | render {:>6.2}ms x{:>2} (fast x{:>2} avg{:>4.2} / slow x{:>2} avg{:>4.2}) | swait {:>6.2}ms | acc {:>4.1}%",
+            total.as_secs_f64() * 1e3,
+            self.pty_chunks,
+            self.pty_bytes,
+            self.feed_ns as f64 / 1e6,
+            self.update_ns as f64 / 1e6,
+            self.update_calls,
+            self.render_ns as f64 / 1e6,
+            self.render_calls,
+            self.fast_calls,
+            avg_ns(self.fast_ns, self.fast_calls),
+            self.slow_calls,
+            avg_ns(self.slow_ns, self.slow_calls),
+            self.surface_wait_ns as f64 / 1e6,
+            if total.as_nanos() > 0 {
+                (accounted_ns as f64 / total.as_nanos() as f64) * 100.0
+            } else {
+                0.0
+            },
+        );
+        self.burst_start = None;
+        self.pty_chunks = 0;
+        self.pty_bytes = 0;
+        self.feed_ns = 0;
+        self.update_ns = 0;
+        self.update_calls = 0;
+        self.render_ns = 0;
+        self.render_calls = 0;
+        self.fast_calls = 0;
+        self.fast_ns = 0;
+        self.slow_calls = 0;
+        self.slow_ns = 0;
+        self.surface_wait_ns = 0;
+    }
+}
 
 /// Minimum pixel distance the mouse must travel after mouse-down before a
 /// Cell-mode drag begins to paint a selection. Below this, a press-and-release
@@ -607,6 +784,8 @@ impl State {
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
 
+        let min_frame_interval = detect_min_frame_interval(&window);
+
         Self {
             window,
             gpu,
@@ -658,7 +837,67 @@ impl State {
             last_click: None,
             click_count: 0,
             master,
+            perf: PerfLog::new(),
+            vertices_dirty: true,
+            last_paint: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            min_frame_interval,
+            pending_redraw_at: None,
         }
+    }
+
+    /// Re-query the current monitor's refresh rate. Call after the window may
+    /// have moved between displays (Resized fires when DPI changes too).
+    fn refresh_frame_cap(&mut self) {
+        self.min_frame_interval = detect_min_frame_interval(&self.window);
+    }
+
+    /// Mark the vertex buffer stale and ask winit to redraw, capped at the
+    /// display's refresh rate. If we painted too recently, defer the redraw
+    /// to the next eligible slot — `AboutToWait` arms a wake-up so the
+    /// deferred frame fires even with no further events.
+    fn invalidate(&mut self) {
+        self.vertices_dirty = true;
+        let now = std::time::Instant::now();
+        let next_ok = self.last_paint + self.min_frame_interval;
+        if now >= next_ok {
+            self.pending_redraw_at = None;
+            self.window.request_redraw();
+        } else {
+            // Keep the earliest pending request; later invalidates within the
+            // window collapse into the same deferred frame.
+            self.pending_redraw_at = Some(match self.pending_redraw_at {
+                Some(t) => t.min(next_ok),
+                None => next_ok,
+            });
+        }
+    }
+
+    /// Wake-up time for any deferred redraw, so AboutToWait can include it
+    /// in the ControlFlow::WaitUntil calculation.
+    fn pending_redraw_wake(&self) -> Option<std::time::Instant> {
+        self.pending_redraw_at
+    }
+
+    /// If a deferred redraw is now eligible, fire it. Called from AboutToWait.
+    fn maybe_fire_pending_redraw(&mut self) {
+        if let Some(t) = self.pending_redraw_at {
+            if std::time::Instant::now() >= t {
+                self.pending_redraw_at = None;
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// Rebuild the vertex/index buffers if they're stale, recording the cost
+    /// in `perf`. Called from the redraw handler before `render`.
+    fn flush_vertices(&mut self) {
+        if !self.vertices_dirty {
+            return;
+        }
+        let t = std::time::Instant::now();
+        self.update_vertices();
+        self.perf.note_update(t.elapsed());
+        self.vertices_dirty = false;
     }
 
     fn get_viewport_size(
@@ -1358,29 +1597,33 @@ impl State {
             if dist_from_bottom > 0.0 { 1.0 } else { 0.0 },
             self.config.bottom_fade_anim_secs,
         );
+        // top_band_height / top_alpha also feed the per-fragment glyph-fade
+        // uniform below, so they're computed unconditionally. The strip quads
+        // themselves are skipped at phase=0: emitting them would draw with
+        // alpha 0 but still bump num_strip_indices, forcing render() through
+        // the slow blur+composite path.
         let top_alpha = self.top_fade_phase;
         let top_band_height = top_fade_height * self.top_fade_phase;
-        let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
-        // Blur-only strip (tint = 0). Solid section + gradient fade-out;
-        // chrome contrast comes from the per-fragment glyph fade now, so
-        // the strip is purely about softening with the blur.
-        let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
-        push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
-        push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
+        if self.top_fade_phase > 0.0 {
+            let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
+            let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
+            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
+            push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
+        }
 
-        // Bottom: blur-only (tint = 0), driven by bottom_fade_phase so the
-        // strip slides in/out at the same constant rate as the top.
-        let bottom_alpha = self.bottom_fade_phase;
-        let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
-        let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
-        push_strip(
-            &mut strip_vertices,
-            &mut strip_indices,
-            win_h - bottom_fade_height,
-            win_h,
-            clear,
-            bottom_blur,
-        );
+        if self.bottom_fade_phase > 0.0 {
+            let bottom_alpha = self.bottom_fade_phase;
+            let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
+            let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
+            push_strip(
+                &mut strip_vertices,
+                &mut strip_indices,
+                win_h - bottom_fade_height,
+                win_h,
+                clear,
+                bottom_blur,
+            );
+        }
 
         self.gpu
             .queue
@@ -1472,8 +1715,7 @@ impl State {
         self.terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.resize_buffers();
-        self.update_vertices();
-        self.window.request_redraw();
+        self.invalidate();
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -1499,7 +1741,7 @@ impl State {
         self.terminal.resize(size.char_width, size.char_height);
         self.notify_pty_size(size.char_width, size.char_height);
         self.resize_buffers();
-        self.update_vertices();
+        self.invalidate();
     }
 
     fn notify_pty_size(&self, cols: usize, rows: usize) {
@@ -1838,8 +2080,7 @@ impl State {
                     }
                 } else if self.held_button == Some(input::MOUSE_LEFT) {
                     self.handle_mouse_drag();
-                    self.update_vertices();
-                    self.window.request_redraw();
+                    self.invalidate();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1871,8 +2112,7 @@ impl State {
                         } else {
                             self.handle_mouse_release();
                         }
-                        self.update_vertices();
-                        self.window.request_redraw();
+                        self.invalidate();
                         return true;
                     }
                 }
@@ -1935,8 +2175,7 @@ impl State {
                         }
                     }
                 }
-                self.update_vertices();
-                self.window.request_redraw();
+                self.invalidate();
                 return true;
             }
             WindowEvent::ModifiersChanged(mods) => {
@@ -2017,8 +2256,7 @@ impl State {
                         self.reset_blink();
                         self.clear_selection();
                         self.write_pty(&bytes);
-                        self.update_vertices();
-                        self.window.request_redraw();
+                        self.invalidate();
                         return true;
                     }
                 }
@@ -2030,8 +2268,13 @@ impl State {
 
     fn update(&mut self) {}
 
-    fn render(&mut self, clear: wgpu::Color) -> Result<(), wgpu::SurfaceError> {
+    fn render(
+        &mut self,
+        clear: wgpu::Color,
+    ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
+        let surface_t0 = std::time::Instant::now();
         let output = self.gpu.surface.get_current_texture().unwrap();
+        let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -2042,12 +2285,19 @@ impl State {
                     label: Some("terminal"),
                 });
 
-        // 1. Scene → offscreen target.
+        // Fast path: when no edge-fade strips are visible, the blur chain
+        // produces output that nothing samples. Render the scene directly to
+        // the swapchain and skip blur + composite (saves ~5 fullscreen passes
+        // per frame, the dominant cost during PTY bursts).
+        let needs_blur = self.num_strip_indices > 0;
+        let scene_target = if needs_blur { &self.blur.scene.view } else { &view };
+
+        // 1. Scene → swapchain (fast path) or → offscreen (blur path).
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.blur.scene.view,
+                    view: scene_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -2073,12 +2323,12 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        // 2. Dual-Kawase down/up chain over the (already-faded) scene.
-        self.blur.run(&mut encoder);
+        if needs_blur {
+            // 2. Dual-Kawase down/up chain over the (already-faded) scene.
+            self.blur.run(&mut encoder);
 
-        // 3. Composite to swapchain: blit the scene, then alpha-blend the
-        // blur-sampled strip quads on top.
-        {
+            // 3. Composite to swapchain: blit the scene, then alpha-blend the
+            // blur-sampled strip quads on top.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2098,24 +2348,22 @@ impl State {
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
-            if self.num_strip_indices > 0 {
-                pass.set_pipeline(&self.blur.strip_pipeline);
-                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
-                pass.set_bind_group(1, &self.camera_bind_group, &[]);
-                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
-                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
-                pass.set_index_buffer(
-                    self.strip_index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
-            }
+            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+            pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+            pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+            pass.set_index_buffer(
+                self.strip_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        Ok(())
+        Ok((surface_wait, !needs_blur))
     }
 }
 
@@ -2283,7 +2531,7 @@ async fn run() {
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
-    state.update_vertices();
+    state.invalidate();
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
 
@@ -2291,13 +2539,15 @@ async fn run() {
         match event {
             Event::UserEvent(n) => match n {
                 app_window::CustomEvent::PtyInput(z) => {
+                    let bytes = z.len();
+                    let t0 = std::time::Instant::now();
                     state.terminal.feed(&z);
                     let reply = state.terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.perf.note_pty(bytes, t0.elapsed());
+                    state.invalidate();
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
@@ -2306,14 +2556,16 @@ async fn run() {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
                             state.sync_theme_colors();
-                            state.update_vertices();
-                            state.window.request_redraw();
+                            state.invalidate();
                         }
                         WindowEvent::CloseRequested => {
                             elwt.exit();
                         }
                         WindowEvent::Resized(size) => {
                             state.resize(size);
+                            // A resize can move us between displays of
+                            // different refresh rates; refresh the cap.
+                            state.refresh_frame_cap();
                             state.window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -2324,8 +2576,18 @@ async fn run() {
                         }
                         WindowEvent::RedrawRequested => {
                             state.update();
-                            match state.render(clear_color(theme)) {
-                                Ok(_) => (),
+                            state.flush_vertices();
+                            let t0 = std::time::Instant::now();
+                            let result = state.render(clear_color(theme));
+                            let render_dur = t0.elapsed();
+                            // Stamp the paint time *after* render returns so
+                            // the cap measures real spacing between frames.
+                            state.last_paint = std::time::Instant::now();
+                            state.pending_redraw_at = None;
+                            match result {
+                                Ok((surface_wait, fast)) => {
+                                    state.perf.note_render(render_dur, surface_wait, fast);
+                                }
                                 Err(wgpu::SurfaceError::Lost) => state.resize(state.gpu.size),
                                 Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                                 Err(e) => eprintln!("{:?}", e),
@@ -2337,26 +2599,32 @@ async fn run() {
             }
             Event::AboutToWait => {
                 if state.maybe_blink_tick() {
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.invalidate();
                 }
                 // Top edge-fade slide animation: keep ticking frames as long
                 // as the phase hasn't reached its target (0 or 1).
                 let animating = state.is_top_fade_animating();
                 if animating {
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.invalidate();
                 }
+                // Honor any deferred redraw whose frame-cap window has
+                // elapsed before sleeping.
+                state.maybe_fire_pending_redraw();
+                state.perf.maybe_flush();
                 let next_anim = if animating {
                     Some(std::time::Instant::now() + ANIM_FRAME)
                 } else {
                     None
                 };
-                let next_wake = match (state.next_blink_wake(), next_anim) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(t), None) | (None, Some(t)) => Some(t),
-                    (None, None) => None,
-                };
+                let next_wake = [
+                    state.next_blink_wake(),
+                    next_anim,
+                    state.perf.next_wake(),
+                    state.pending_redraw_wake(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),
@@ -2408,6 +2676,17 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
         b = b.italic();
     }
     font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
+}
+
+/// Minimum interval between paints, derived from the window's current monitor
+/// refresh rate. Falls back to 60Hz when the platform can't report a rate.
+/// Returning 1/refresh keeps us from issuing redraws the OS would just drop.
+fn detect_min_frame_interval(window: &Window) -> std::time::Duration {
+    let mhz = window
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz())
+        .unwrap_or(60_000);
+    std::time::Duration::from_nanos(1_000_000_000_000u64 / mhz.max(1) as u64)
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
