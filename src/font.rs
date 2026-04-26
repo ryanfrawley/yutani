@@ -207,7 +207,6 @@ impl Font {
 
     pub fn set_char_size(&mut self, height_points: f32, dpi: u32) {
         let size = (height_points * 64.0) as isize;
-        println!("size: {}", size);
         for variant in &mut self.variants {
             if let Some(face) = variant.face.as_mut() {
                 face.set_char_size(size, 0, dpi, dpi).unwrap();

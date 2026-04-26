@@ -78,6 +78,12 @@ struct State {
     window: Window,
 
     render_pipeline: wgpu::RenderPipeline,
+    /// Wireframe debug pipeline — same vertex shader but PolygonMode::Line
+    /// and a flat-color fragment. `None` if the adapter doesn't expose
+    /// POLYGON_MODE_LINE; the toggle becomes a no-op there.
+    wireframe_pipeline: Option<wgpu::RenderPipeline>,
+    /// Toggled by Cmd-Shift-W. When true, render() picks wireframe_pipeline.
+    wireframe: bool,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -381,6 +387,49 @@ impl State {
             multiview: None,
         });
 
+        let wireframe_pipeline = if gpu
+            .device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE)
+        {
+            Some(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wireframe pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[renderer::vertex::Vertex::desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_wire",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: gpu.config.format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Line,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            }))
+        } else {
+            None
+        };
+
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
         let viewport = State::get_viewport_size(
@@ -422,6 +471,8 @@ impl State {
             gpu,
             atlas,
             render_pipeline,
+            wireframe_pipeline,
+            wireframe: false,
             vertex_buffer,
             index_buffer,
             num_indices: 0,
@@ -982,25 +1033,33 @@ impl State {
         };
 
         // Both fades emerge from a zero-height seam at the window edge and
-        // grow inward as the user scrolls. Alpha ramp completes in half a
-        // glyph height; the height ramp grows slower (over a few full lines)
-        // so the band feels like it's expanding into the viewport rather
-        // than appearing all at once.
-        let alpha_ramp_end = line_height * 0.5;
+        // grow inward as the user scrolls. The height ramp grows over a few
+        // full lines so the band feels like it's expanding into the
+        // viewport rather than appearing all at once. Alpha ramp is
+        // separate per-edge so each side hits full opacity at its own pace.
         let height_ramp_end = line_height * 4.0;
 
-        // Top: opaque slab + gradient strip below. Modulated by distance to
-        // the NEAREST scroll boundary — at the live grid OR at the top of
-        // scrollback the topmost row sits fully below the toolbar (see
-        // decorator_offset), so there's no content behind the title bar to
-        // mask and the fade vanishes. Mid-scroll it ramps to full size.
-        let dist_from_boundary = dist_from_bottom.min(dist_from_top);
-        let top_alpha = (dist_from_boundary / alpha_ramp_end).clamp(0.0, 1.0);
+        // Top: opaque slab + gradient strip below. Modulated by distance
+        // from the TOP of scrollback — the only position where the fade
+        // would obscure live content (decorator_offset puts the oldest row
+        // fully below the toolbar there, so no masking is needed). Visible
+        // at full size everywhere else, easing out as the user approaches
+        // the top of the scroll range. Alpha snaps in fast (~1/5 of a line)
+        // so the title-bar masking is solid by the time anything has
+        // visibly slid behind it.
+        let top_alpha_ramp_end = line_height * 0.2;
+        let top_alpha = (dist_from_top / top_alpha_ramp_end).clamp(0.0, 1.0);
         let top_height_progress =
-            (dist_from_boundary / height_ramp_end).clamp(0.0, 1.0);
+            (dist_from_top / height_ramp_end).clamp(0.0, 1.0);
         let top_opaque = scaled_opaque(top_alpha);
-        let top_mid = DECORATOR_HEIGHT * top_height_progress;
-        let top_band_height = top_fade_height * top_height_progress;
+        // Band height starts at 50% of max and grows to 100% across the
+        // height ramp. Combined with the fast alpha ramp, this means the
+        // fade is already a substantial band by the time it becomes
+        // visible — no thin sliver appearing first.
+        let top_band_height = top_fade_height * (0.5 + 0.5 * top_height_progress);
+        // Stops: 1.0, 1.0, 0.0 — solid from y=0 to half the band, then a
+        // linear ramp to clear over the second half.
+        let top_mid = top_band_height * 0.5;
         push_strip(&mut vertices, &mut indices, 0.0, top_mid, top_opaque, top_opaque);
         push_strip(&mut vertices, &mut indices, top_mid, top_band_height, top_opaque, clear);
 
@@ -1008,7 +1067,8 @@ impl State {
         // ramping to opaque at the window's bottom. Modulated by how far
         // we've scrolled up from the live grid; reaches full alpha at half
         // a glyph height, full size over a few lines.
-        let bottom_alpha = (dist_from_bottom / alpha_ramp_end).clamp(0.0, 1.0);
+        let bottom_alpha_ramp_end = line_height * 0.5;
+        let bottom_alpha = (dist_from_bottom / bottom_alpha_ramp_end).clamp(0.0, 1.0);
         let bottom_height_progress =
             (dist_from_bottom / height_ramp_end).clamp(0.0, 1.0);
         let bottom_opaque = scaled_opaque(bottom_alpha);
@@ -1564,6 +1624,18 @@ impl State {
                                 self.change_font_size(-1.0);
                                 return true;
                             }
+                            // Cmd-Shift-W: toggle wireframe debug view.
+                            // Shift makes "w" arrive as "W"; check both for
+                            // safety across keyboard layouts.
+                            if self.modifiers.shift_key()
+                                && (s.eq_ignore_ascii_case("w"))
+                            {
+                                if self.wireframe_pipeline.is_some() {
+                                    self.wireframe = !self.wireframe;
+                                    self.window.request_redraw();
+                                }
+                                return true;
+                            }
                         }
                     }
                     let bytes = input::encode_key(
@@ -1623,7 +1695,12 @@ impl State {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            let pipeline = if self.wireframe {
+                self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
+            } else {
+                &self.render_pipeline
+            };
+            render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));

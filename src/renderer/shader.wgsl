@@ -60,6 +60,16 @@ fn sd_rounded_box(p: vec2<f32>, b: vec2<f32>, r: vec4<f32>) -> f32 {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - rad;
 }
 
+// Wireframe pipeline: draw triangle edges in the per-quad vertex color
+// (fg for glyph quads, bg for background quads, selection/cursor/fade
+// colors for those overlays). Skips the SDF mask + glyph alpha that
+// fs_main relies on. Quads with alpha=0 (e.g. default-bg cells) end up
+// invisible — which is fine, the fg glyph quad still outlines the cell.
+@fragment
+fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let glyph = textureSample(t_diffuse, s_diffuse, in.tex_coords).r;

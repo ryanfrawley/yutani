@@ -26,10 +26,14 @@ impl GpuContext {
             })
             .await
             .unwrap();
+        // Opt into POLYGON_MODE_LINE if the adapter offers it (Metal, Vulkan,
+        // DX12 do; downlevel/WebGL don't). Drives the wireframe debug view.
+        let optional = wgpu::Features::POLYGON_MODE_LINE;
+        let features = adapter.features() & optional;
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::empty(),
+                    features,
                     limits: if cfg!(target_arch = "wasm32") {
                         wgpu::Limits::downlevel_webgl2_defaults()
                     } else {
