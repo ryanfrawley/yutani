@@ -466,10 +466,10 @@ fn pack_synth(
         bearing_y: bm.bearing_y,
         advance_x: bm.advance_x,
     };
-    *x += bm.advance_x.max(1);
+    *x += bm.advance_x.max(w).max(1) + 1;
     if *x + w >= size {
         *x = 0;
-        *y += *row_height;
+        *y += *row_height + 1;
         *row_height = 0;
     }
     entry
@@ -551,10 +551,18 @@ fn pack_glyph(
         advance_x: advance,
         bearing_y: glyph.bitmap_top() as isize,
     };
-    *x += advance.max(1);
-    if *x + w >= size {
+    // Step the atlas cursor past the bitmap's full footprint, not just the
+    // typographic advance. Programming-ligature substitutions (Fira Code calt
+    // halves) are designed with bitmap.width > horiAdvance so adjacent halves
+    // fuse across cells — advancing only by `advance` leaves the next packed
+    // glyph stomping on the previous glyph's right overhang in the atlas. The
+    // `+ 1` keeps a one-pixel gutter so the renderer's linear sampler can't
+    // bleed across glyphs at sub-pixel UVs.
+    let stride = w.max(advance).max(1) + 1;
+    *x += stride;
+    if *x + stride >= size {
         *x = 0;
-        *y += *row_height;
+        *y += *row_height + 1;
         *row_height = 0;
     }
     entry
@@ -645,5 +653,46 @@ mod tests {
         let a = atlas_with(&[], &['a']);
         let g = a.lookup('a', FaceVariant::Regular);
         assert_eq!(g.x, 99, "regular missing → notdef, not bold map");
+    }
+
+    // Regression: programming-ligature glyphs from FiraCode have
+    // `bitmap.width > horiAdvance` because their side bearings extend past
+    // the cell to fuse with neighbors. Advancing the atlas cursor by the
+    // typographic advance left the next packed glyph stomping on the prior
+    // one's right overhang — visible as `===` getting clobbered when `->`
+    // gets packed after it. The fix steps the cursor by `max(width, advance)
+    // + 1`, so packed entries can never overlap in the atlas regardless of
+    // the advance/width relationship.
+    #[test]
+    fn pack_synth_leaves_no_overlap_when_width_exceeds_advance() {
+        let size = 4096;
+        let width = size;
+        let mut texture = vec![0u8; width * size];
+        let mut x = 2;
+        let mut y = 0;
+        let mut row_height = 0;
+
+        // Simulate a ligature half: bitmap wider than advance.
+        let make = |w: usize, h: usize, advance: usize| crate::box_drawing::Bitmap {
+            data: vec![255u8; w * h],
+            width: w,
+            height: h,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance_x: advance,
+        };
+
+        let a = make(18, 20, 12);
+        let b = make(18, 20, 12);
+        let e1 = pack_synth(&a, &mut texture, width, size, &mut x, &mut y, &mut row_height);
+        let e2 = pack_synth(&b, &mut texture, width, size, &mut x, &mut y, &mut row_height);
+
+        assert!(
+            e2.x >= e1.x + e1.width,
+            "second glyph at x={} must not overlap first glyph's [{}, {})",
+            e2.x,
+            e1.x,
+            e1.x + e1.width,
+        );
     }
 }
