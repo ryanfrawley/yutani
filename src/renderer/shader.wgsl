@@ -46,6 +46,19 @@ var t_diffuse: texture_2d<f32>;
 @group(0) @binding(1)
 var s_diffuse: sampler;
 
+// Edge-fade params: top.xy = (band_height, alpha), bottom.xy = (band_height,
+// alpha), viewport.xy = (width, height), bg_uv.xy = the atlas UV for the
+// solid bg sentinel slot. Only fragments that don't sample the bg slot get
+// faded — so cell backgrounds stay solid and only the glyphs ramp away.
+struct FadeUniform {
+    top: vec4<f32>,
+    bottom: vec4<f32>,
+    viewport: vec4<f32>,
+    bg_uv: vec4<f32>,
+};
+@group(2) @binding(0)
+var<uniform> fade: FadeUniform;
+
 // Signed distance to a per-corner rounded box centered at the origin.
 // `b` is the half-extent; `r` packs (top-right, bottom-right, top-left,
 // bottom-left) radii. Returns < 0 inside, > 0 outside.
@@ -98,5 +111,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sdf = sd_rounded_box(in.local_pos, in.half_size, in.radii);
         mask = 1.0 - smoothstep(0.0, 1.0, sdf);
     }
-    return in.color * glyph * mask;
+    let base = in.color * glyph * mask;
+
+    // Y-position fade. clip_position.y is in framebuffer pixels with origin
+    // at the top, so y=0 is the window top. select() guards against div-by-0
+    // when the band collapses to nothing (no fade active).
+    let y = in.clip_position.y;
+    let top_h = fade.top.x;
+    let top_a = fade.top.y;
+    let bot_h = fade.bottom.x;
+    let bot_a = fade.bottom.y;
+    let vh = fade.viewport.y;
+    let top_fade = select(0.0, top_a * (1.0 - smoothstep(0.0, top_h, y)), top_h > 0.0);
+    let bot_fade = select(0.0, bot_a * (1.0 - smoothstep(0.0, bot_h, vh - y)), bot_h > 0.0);
+    let fade_strength = clamp(max(top_fade, bot_fade), 0.0, 1.0);
+    // Bg quads fade partially (up to 0.75) so dark cell backgrounds lighten
+    // toward the clear color near the toolbar — keeps chrome contrast
+    // readable. Glyphs still fade all the way to invisible.
+    let is_bg_quad = length(in.tex_coords - fade.bg_uv.xy) < 0.0005;
+    let applied_fade = select(fade_strength, fade_strength * 0.75, is_bg_quad);
+    return base * (1.0 - applied_fade);
 }

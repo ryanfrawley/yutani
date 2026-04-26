@@ -42,27 +42,82 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(p)
 }
 
-fn load_font_size() -> Option<f32> {
-    let s = std::fs::read_to_string(config_path()?).ok()?;
-    for line in s.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (k, v) = line.split_once('=')?;
-        if k.trim() == "font_size" {
-            return v.trim().parse().ok();
-        }
-    }
-    None
+#[derive(Clone, Copy)]
+struct Config {
+    font_size: f32,
+    top_fade_height: f32,
+    top_fade_solid_stop: f32,
+    top_fade_anim_secs: f32,
+    bottom_fade_height: f32,
+    bottom_fade_anim_secs: f32,
+    /// Shared by top and bottom strips — both sample the same blur output.
+    /// Per-edge would need a second blur chain.
+    blur_iterations: usize,
 }
 
-fn save_font_size(size: f32) {
-    let Some(p) = config_path() else { return };
-    if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
+impl Config {
+    fn defaults() -> Self {
+        Self {
+            font_size: DEFAULT_FONT_SIZE,
+            top_fade_height: DECORATOR_HEIGHT * 3.0,
+            top_fade_solid_stop: 0.5,
+            top_fade_anim_secs: 0.36,
+            bottom_fade_height: DECORATOR_HEIGHT * 2.0,
+            bottom_fade_anim_secs: 0.36,
+            blur_iterations: 2,
+        }
     }
-    let _ = std::fs::write(p, format!("font_size = {}\n", size));
+
+    fn load() -> Self {
+        let mut c = Self::defaults();
+        let Some(p) = config_path() else { return c };
+        let Ok(s) = std::fs::read_to_string(p) else { return c };
+        for line in s.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=') else { continue };
+            let (k, v) = (k.trim(), v.trim());
+            match k {
+                "font_size" => if let Ok(x) = v.parse() { c.font_size = x; },
+                "top_fade_height" => if let Ok(x) = v.parse() { c.top_fade_height = x; },
+                "top_fade_solid_stop" => if let Ok(x) = v.parse() { c.top_fade_solid_stop = x; },
+                "top_fade_anim_secs" => if let Ok(x) = v.parse() { c.top_fade_anim_secs = x; },
+                "bottom_fade_height" => if let Ok(x) = v.parse() { c.bottom_fade_height = x; },
+                "bottom_fade_anim_secs" => if let Ok(x) = v.parse() { c.bottom_fade_anim_secs = x; },
+                "blur_iterations" => if let Ok(x) = v.parse::<usize>() {
+                    c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
+                },
+                _ => (),
+            }
+        }
+        c
+    }
+
+    fn save(&self) {
+        let Some(p) = config_path() else { return };
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "font_size = {}\n\
+             top_fade_height = {}\n\
+             top_fade_solid_stop = {}\n\
+             top_fade_anim_secs = {}\n\
+             bottom_fade_height = {}\n\
+             bottom_fade_anim_secs = {}\n\
+             blur_iterations = {}\n",
+            self.font_size,
+            self.top_fade_height,
+            self.top_fade_solid_stop,
+            self.top_fade_anim_secs,
+            self.bottom_fade_height,
+            self.bottom_fade_anim_secs,
+            self.blur_iterations,
+        );
+        let _ = std::fs::write(p, body);
+    }
 }
 
 pub struct ViewportSize {
@@ -81,6 +136,13 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    // Separate buffer for the edge-fade strip quads. Drawn in the composite
+    // pass with the blur sampler bound, so the strips are filled with the
+    // dual-Kawase blur of the scene rather than a flat white tint.
+    strip_vertex_buffer: wgpu::Buffer,
+    strip_index_buffer: wgpu::Buffer,
+    num_strip_indices: u32,
+    blur: renderer::blur::BlurChain,
     font: font::Font,
     font_bind_group: wgpu::BindGroup,
     /// Layout for the font texture + sampler. Kept around so we can rebind
@@ -89,10 +151,13 @@ struct State {
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
+    config: Config,
     camera: renderer::camera::Camera,
     camera_uniform: renderer::camera::CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    fade_buffer: wgpu::Buffer,
+    fade_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
     terminal: terminal::Terminal,
     modifiers: winit::keyboard::ModifiersState,
@@ -108,6 +173,13 @@ struct State {
     // timer so user input can reset it (cursor stays solid while typing).
     blink_on: bool,
     last_blink: std::time::Instant,
+    /// Edge fade animations: phase ramps 0→1 in TOP_FADE_ANIM duration as
+    /// soon as the view scrolls away from the corresponding boundary, and
+    /// 1→0 when it returns. Decoupled from scroll distance so the fade
+    /// slides in at a constant rate regardless of scroll speed.
+    top_fade_phase: f32,
+    bottom_fade_phase: f32,
+    last_anim_tick: std::time::Instant,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -210,6 +282,7 @@ fn is_word_char(ch: char) -> bool {
 }
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Cell-range selection in absolute-line coordinates. `anchor` is where the
 /// drag started, `head` is where it currently is — they may be in either
@@ -245,9 +318,10 @@ impl State {
         master: i32,
         window: Window,
         mut font: font::Font,
-        pt_size: f32,
+        config: Config,
         dpi: u32,
     ) -> Self {
+        let pt_size = config.font_size;
         let gpu = gpu::GpuContext::new(&window).await;
 
         // Font texture setup
@@ -335,6 +409,37 @@ impl State {
             label: Some("camera bind group"),
         });
 
+        // Edge-fade uniform: layout matches FadeUniform in shader.wgsl —
+        // top.xy + bottom.xy + viewport.xy + bg_uv.xy = 4*vec4 = 64 bytes.
+        let fade_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fade uniform"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fade_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("fade bind group layout"),
+            });
+        let fade_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &fade_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: fade_buffer.as_entire_binding(),
+            }],
+            label: Some("fade bind group"),
+        });
+
         let shader = gpu
             .device
             .create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
@@ -342,7 +447,11 @@ impl State {
         let render_pipeline_layout =
             gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render pipeline layout"),
-                bind_group_layouts: &[&font_bind_group_layout, &camera_bind_group_layout],
+                bind_group_layouts: &[
+                    &font_bind_group_layout,
+                    &camera_bind_group_layout,
+                    &fade_bind_group_layout,
+                ],
                 push_constant_ranges: &[],
             });
 
@@ -417,6 +526,32 @@ impl State {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Three strip quads max (top opaque, top gradient, bottom gradient) ⇒
+        // 12 vertices, 18 indices. Sized generously so resize never reallocs.
+        let strip_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("strip vertex buffer"),
+            size: (32 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let strip_index_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("strip index buffer"),
+            size: (64 * std::mem::size_of::<u16>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut blur = renderer::blur::BlurChain::new(
+            &gpu.device,
+            gpu.config.format,
+            gpu.config.width,
+            gpu.config.height,
+            &camera_bind_group_layout,
+            renderer::vertex::Vertex::desc(),
+        );
+        blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        blur.iterations = config.blur_iterations.max(1);
+
         Self {
             window,
             gpu,
@@ -425,15 +560,22 @@ impl State {
             vertex_buffer,
             index_buffer,
             num_indices: 0,
+            strip_vertex_buffer,
+            strip_index_buffer,
+            num_strip_indices: 0,
+            blur,
             font,
             font_bind_group,
             font_bind_group_layout,
             pt_size,
             dpi,
+            config,
             camera,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+            fade_buffer,
+            fade_bind_group,
             terminal: terminal::Terminal::new(
                 viewport.char_width,
                 viewport.char_height,
@@ -447,6 +589,9 @@ impl State {
             held_button: None,
             blink_on: true,
             last_blink: std::time::Instant::now(),
+            top_fade_phase: 0.0,
+            bottom_fade_phase: 0.0,
+            last_anim_tick: std::time::Instant::now(),
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -919,11 +1064,15 @@ impl State {
         // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
         // below that gives content a soft runway as it scrolls into view
         // rather than popping out from a hard edge.
-        let top_fade_height = DECORATOR_HEIGHT * 3.0;
-        let bottom_fade_height_max = DECORATOR_HEIGHT * 2.0;
+        let top_fade_height = self.config.top_fade_height;
+        let bottom_fade_height_max = self.config.bottom_fade_height;
         let fade_rgb = [1.0, 1.0, 1.0];
         let clear = [0.0, 0.0, 0.0, 0.0];
 
+        // Strip quads live in their own vertex/index buffer — they're drawn
+        // by the blur strip pipeline in the composite pass.
+        let mut strip_vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(16);
+        let mut strip_indices: Vec<u16> = Vec::with_capacity(32);
         let mut push_strip = |vertices: &mut Vec<renderer::vertex::Vertex>,
                               indices: &mut Vec<u16>,
                               y0: f32,
@@ -979,45 +1128,61 @@ impl State {
             ]
         };
 
-        // Both fades emerge from a zero-height seam at the window edge and
-        // grow inward as the user scrolls. Alpha ramp completes in half a
-        // glyph height; the height ramp grows slower (over a few full lines)
-        // so the band feels like it's expanding into the viewport rather
-        // than appearing all at once.
-        let alpha_ramp_end = line_height * 0.5;
+        // Both fades emerge as the user scrolls away from a boundary. Each
+        // edge tracks its own boundary independently — the top fade only
+        // vanishes at the top of scrollback (where the topmost row sits
+        // fully below the toolbar via decorator_offset), and the bottom
+        // fade only vanishes at the live grid.
         let height_ramp_end = line_height * 4.0;
 
-        // Top: opaque slab + gradient strip below. Modulated by distance to
-        // the NEAREST scroll boundary — at the live grid OR at the top of
-        // scrollback the topmost row sits fully below the toolbar (see
-        // decorator_offset), so there's no content behind the title bar to
-        // mask and the fade vanishes. Mid-scroll it ramps to full size.
-        let dist_from_boundary = dist_from_bottom.min(dist_from_top);
-        let top_alpha = (dist_from_boundary / alpha_ramp_end).clamp(0.0, 1.0);
-        let top_height_progress =
-            (dist_from_boundary / height_ramp_end).clamp(0.0, 1.0);
-        let top_opaque = scaled_opaque(top_alpha);
-        let top_mid = DECORATOR_HEIGHT * top_height_progress;
-        let top_band_height = top_fade_height * top_height_progress;
-        push_strip(&mut vertices, &mut indices, 0.0, top_mid, top_opaque, top_opaque);
-        push_strip(&mut vertices, &mut indices, top_mid, top_band_height, top_opaque, clear);
+        // Edge fade animations: each phase ramps 0→1 the moment its
+        // boundary distance leaves zero (and 1→0 when it returns) at a
+        // constant rate, so the fade slides in fully in TOP_FADE_ANIM_SECS
+        // regardless of scroll speed. The phase drives both the band height
+        // (0 → full) and the alpha (0 → 1) together.
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_anim_tick).as_secs_f32();
+        self.last_anim_tick = now;
+        let advance = |phase: &mut f32, target: f32, secs: f32| {
+            let step = if secs > 0.0 { dt / secs } else { 1.0 };
+            if *phase < target {
+                *phase = (*phase + step).min(target);
+            } else if *phase > target {
+                *phase = (*phase - step).max(target);
+            }
+        };
+        advance(
+            &mut self.top_fade_phase,
+            if dist_from_top > 0.0 { 1.0 } else { 0.0 },
+            self.config.top_fade_anim_secs,
+        );
+        advance(
+            &mut self.bottom_fade_phase,
+            if dist_from_bottom > 0.0 { 1.0 } else { 0.0 },
+            self.config.bottom_fade_anim_secs,
+        );
+        let top_alpha = self.top_fade_phase;
+        let top_band_height = top_fade_height * self.top_fade_phase;
+        let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
+        // Blur-only strip (tint = 0). Solid section + gradient fade-out;
+        // chrome contrast comes from the per-fragment glyph fade now, so
+        // the strip is purely about softening with the blur.
+        let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
+        push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
+        push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
 
-        // Bottom: a single linear gradient strip — clear at the inner edge
-        // ramping to opaque at the window's bottom. Modulated by how far
-        // we've scrolled up from the live grid; reaches full alpha at half
-        // a glyph height, full size over a few lines.
-        let bottom_alpha = (dist_from_bottom / alpha_ramp_end).clamp(0.0, 1.0);
-        let bottom_height_progress =
-            (dist_from_bottom / height_ramp_end).clamp(0.0, 1.0);
-        let bottom_opaque = scaled_opaque(bottom_alpha);
-        let bottom_fade_height = bottom_fade_height_max * bottom_height_progress;
+        // Bottom: blur-only (tint = 0), driven by bottom_fade_phase so the
+        // strip slides in/out at the same constant rate as the top.
+        let bottom_alpha = self.bottom_fade_phase;
+        let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
+        let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
         push_strip(
-            &mut vertices,
-            &mut indices,
+            &mut strip_vertices,
+            &mut strip_indices,
             win_h - bottom_fade_height,
             win_h,
             clear,
-            bottom_opaque,
+            bottom_blur,
         );
 
         self.gpu
@@ -1027,6 +1192,38 @@ impl State {
             .queue
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
+
+        // Strip overlay: blur-only (tint = 0). The glyph fade already pulls
+        // foreground text toward the bg color near each edge; the blur sits
+        // on top to soften whatever's still visible in the gradient region.
+        if !strip_indices.is_empty() {
+            self.gpu.queue.write_buffer(
+                &self.strip_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&strip_vertices),
+            );
+            self.gpu.queue.write_buffer(
+                &self.strip_index_buffer,
+                0,
+                bytemuck::cast_slice(&strip_indices),
+            );
+        }
+        self.num_strip_indices = strip_indices.len() as u32;
+
+        // Bottom edge keeps just the blur strip — zero band_height here
+        // disables the per-fragment glyph/bg fade so cells stay solid right
+        // up to the window's bottom edge.
+        let fade_data: [f32; 16] = [
+            top_band_height, top_alpha, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            win_w, win_h, 0.0, 0.0,
+            bg_u, bg_v, 0.0, 0.0,
+        ];
+        self.gpu.queue.write_buffer(
+            &self.fade_buffer,
+            0,
+            bytemuck::cast_slice(&fade_data),
+        );
     }
 
     /// Bump (or shrink) the font by `delta_pt` points and rebuild everything
@@ -1039,7 +1236,8 @@ impl State {
             return;
         }
         self.pt_size = new_pt;
-        save_font_size(self.pt_size);
+        self.config.font_size = self.pt_size;
+        self.config.save();
         self.font.set_char_size(self.pt_size, self.dpi);
         self.atlas = self.font.build_atlas();
         let font_alpha = renderer::texture::Texture::from_memory(
@@ -1083,6 +1281,10 @@ impl State {
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         self.gpu.resize(size);
+        if size.width > 0 && size.height > 0 {
+            self.blur
+                .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
+        }
         self.camera_uniform
             .update_view_proj(&self.camera, size.width as f32, size.height as f32);
         self.gpu.queue.write_buffer(
@@ -1157,6 +1359,22 @@ impl State {
     fn reset_blink(&mut self) {
         self.blink_on = true;
         self.last_blink = std::time::Instant::now();
+    }
+
+    /// True while either edge-fade phase is still chasing its target —
+    /// used to keep the event loop ticking until the slide completes.
+    fn is_top_fade_animating(&self) -> bool {
+        let scrollback_len = self.terminal.scrollback_len() as f32;
+        let view_offset = self.terminal.view_offset() as f32;
+        let metrics = self.font.face.size_metrics().unwrap();
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+        let scroll_y = self.scroll_y as f32;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
+        let dist_from_bottom = view_offset * line_height + scroll_y;
+        let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
+        let bot_target = if dist_from_bottom > 0.0 { 1.0 } else { 0.0 };
+        (self.top_fade_phase - top_target).abs() > f32::EPSILON
+            || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
     }
 
     /// Push the current theme's foreground / background / cursor colors into
@@ -1562,6 +1780,26 @@ impl State {
                                 self.change_font_size(-1.0);
                                 return true;
                             }
+                            // Cmd-[ / Cmd-] tune the dual-Kawase iteration
+                            // count live so the user can scrub through blur
+                            // radii without recompiling.
+                            if s.as_ref() == "[" || s.as_ref() == "{" {
+                                self.blur.iterations = self.blur.iterations.saturating_sub(1).max(1);
+                                self.config.blur_iterations = self.blur.iterations;
+                                self.config.save();
+                                println!("blur iterations: {}", self.blur.iterations);
+                                self.window.request_redraw();
+                                return true;
+                            }
+                            if s.as_ref() == "]" || s.as_ref() == "}" {
+                                self.blur.iterations = (self.blur.iterations + 1)
+                                    .min(renderer::blur::MAX_BLUR_ITERATIONS);
+                                self.config.blur_iterations = self.blur.iterations;
+                                self.config.save();
+                                println!("blur iterations: {}", self.blur.iterations);
+                                self.window.request_redraw();
+                                return true;
+                            }
                         }
                     }
                     let bytes = input::encode_key(
@@ -1593,7 +1831,6 @@ impl State {
     fn update(&mut self) {}
 
     fn render(&mut self, clear: wgpu::Color) -> Result<(), wgpu::SurfaceError> {
-        // println!("render");
         let output = self.gpu.surface.get_current_texture().unwrap();
         let view = output
             .texture
@@ -1605,11 +1842,12 @@ impl State {
                     label: Some("terminal"),
                 });
 
+        // 1. Scene → offscreen target.
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render pass"),
+                label: Some("scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.blur.scene.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -1624,9 +1862,49 @@ impl State {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.font_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.fade_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        }
+
+        // 2. Dual-Kawase down/up chain over the (already-faded) scene.
+        self.blur.run(&mut encoder);
+
+        // 3. Composite to swapchain: blit the scene, then alpha-blend the
+        // blur-sampled strip quads on top.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
+            pass.draw(0..3, 0..1);
+
+            if self.num_strip_indices > 0 {
+                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+                pass.set_bind_group(1, &self.camera_bind_group, &[]);
+                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+                pass.set_index_buffer(
+                    self.strip_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
+            }
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
@@ -1691,7 +1969,8 @@ async fn run() {
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
 
-    let pt_size = load_font_size().unwrap_or(DEFAULT_FONT_SIZE);
+    let config = Config::load();
+    let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
@@ -1739,7 +2018,7 @@ async fn run() {
         }
     }
 
-    let mut state = State::new(fdm, window, font, pt_size, dpi).await;
+    let mut state = State::new(fdm, window, font, config, dpi).await;
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
@@ -1796,14 +2075,28 @@ async fn run() {
                 }
             }
             Event::AboutToWait => {
-                // Cursor blink: flip phase if the half-cycle elapsed, then
-                // park the loop until the next flip (or indefinitely when
-                // blinking is off / cursor hidden).
                 if state.maybe_blink_tick() {
                     state.update_vertices();
                     state.window.request_redraw();
                 }
-                match state.next_blink_wake() {
+                // Top edge-fade slide animation: keep ticking frames as long
+                // as the phase hasn't reached its target (0 or 1).
+                let animating = state.is_top_fade_animating();
+                if animating {
+                    state.update_vertices();
+                    state.window.request_redraw();
+                }
+                let next_anim = if animating {
+                    Some(std::time::Instant::now() + ANIM_FRAME)
+                } else {
+                    None
+                };
+                let next_wake = match (state.next_blink_wake(), next_anim) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(t), None) | (None, Some(t)) => Some(t),
+                    (None, None) => None,
+                };
+                match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),
                     ),
