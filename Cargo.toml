@@ -18,6 +18,7 @@ libc = "0.2.15"
 cgmath = "0.18.0"
 nix = { version = "0.27.1", features = ["process"] }
 arboard = "3"
+harfbuzz_rs = { version = "2", default-features = false, features = ["build-native-harfbuzz"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", default-features = false, features = ["winuser", "wingdi"] }

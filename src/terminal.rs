@@ -297,6 +297,13 @@ impl Terminal {
         self.view_offset == 0
     }
 
+    /// True while a full-screen app (vim, less, htop) is on the alternate
+    /// screen. Callers use this to suppress scrollback-targeted gestures
+    /// like the mouse wheel, since the alt screen has no scroll history.
+    pub fn on_alt_screen(&self) -> bool {
+        self.use_alternate
+    }
+
     /// Shift the viewport up by `n` lines, pulling older scrollback into view.
     /// No-op (returns false) on the alternate screen or if already at the top.
     pub fn scroll_up(&mut self, n: usize) -> bool {

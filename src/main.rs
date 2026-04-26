@@ -7,6 +7,7 @@ mod renderer;
 mod ansi;
 mod gpu;
 mod input;
+mod shaper;
 mod style;
 mod terminal;
 
@@ -150,7 +151,15 @@ struct State {
     num_strip_indices: u32,
     blur: renderer::blur::BlurChain,
     font: font::Font,
+    /// rustybuzz shaper, used during update_vertices to detect programming
+    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
+    /// single wide glyph instead of two adjacent characters.
+    shaper: shaper::Shaper,
     font_bind_group: wgpu::BindGroup,
+    /// The actual font atlas texture. Kept around so on-demand-rasterized
+    /// ligature glyphs can be uploaded incrementally via queue.write_texture
+    /// without recreating the texture or bind group.
+    font_texture: renderer::texture::Texture,
     /// Layout for the font texture + sampler. Kept around so we can rebind
     /// after a font-size change rebuilds the atlas texture.
     font_bind_group_layout: wgpu::BindGroupLayout,
@@ -168,6 +177,13 @@ struct State {
     terminal: terminal::Terminal,
     modifiers: winit::keyboard::ModifiersState,
     scroll_y: f64,
+    /// Drop in-flight trackpad momentum once a newer command (a keystroke
+    /// that snaps to the bottom) has overridden the user's scroll intent.
+    /// Cleared when momentum runs out OR a fresh gesture begins after a
+    /// real idle gap — see `last_wheel_at` for how we tell the two apart
+    /// (momentum's Started arrives ~one frame after the prior Ended).
+    scroll_suppressed: bool,
+    last_wheel_at: Option<std::time::Instant>,
     mouse_x: f64,
     mouse_y: f64,
     // Last cell we reported a motion event for. Mouse motion fires per pixel,
@@ -205,9 +221,186 @@ struct State {
     last_click: Option<(std::time::Instant, (isize, usize))>,
     click_count: u32,
     master: i32,
+    perf: PerfLog,
+    /// Set whenever something invalidates the vertex/index buffers (PTY input,
+    /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
+    /// which the redraw handler calls before drawing. Lets winit coalesce a
+    /// burst of N events into one rebuild + one frame.
+    vertices_dirty: bool,
+    /// Cached time of the last completed render, used to throttle redraws to
+    /// at most one per display refresh interval. Avoids spending wall time
+    /// inside `surface.get_current_texture()` waiting for a swapchain slot
+    /// the user can't see anyway.
+    last_paint: std::time::Instant,
+    /// Cap on redraw frequency, derived from the current monitor's refresh
+    /// rate (queried at startup and on resize). Defaults to 16.67ms (60Hz)
+    /// when the platform doesn't report a rate.
+    min_frame_interval: std::time::Duration,
+    /// When `invalidate` is called inside the cap window, we defer the redraw
+    /// to this instant instead of issuing it immediately. AboutToWait turns
+    /// this into a wake-up so the deferred frame actually fires.
+    pending_redraw_at: Option<std::time::Instant>,
 }
 
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Burst-scoped timing aggregator. Accumulates work caused by a run of PTY
+/// chunks + the frames that draw them, then prints a one-line summary once
+/// the activity has settled (>= PERF_FLUSH_IDLE since the last sample).
+/// Disabled unless `PERFLOG=1` is set in the environment so the steady-state
+/// terminal stays quiet.
+const PERF_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(150);
+
+struct PerfLog {
+    enabled: bool,
+    burst_start: Option<std::time::Instant>,
+    last_event: std::time::Instant,
+    pty_chunks: u32,
+    pty_bytes: usize,
+    feed_ns: u128,
+    update_ns: u128,
+    update_calls: u32,
+    render_ns: u128,
+    render_calls: u32,
+    fast_calls: u32,
+    fast_ns: u128,
+    slow_calls: u32,
+    slow_ns: u128,
+    surface_wait_ns: u128,
+}
+
+impl PerfLog {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("PERFLOG").map(|v| !v.is_empty() && v != "0").unwrap_or(false),
+            burst_start: None,
+            last_event: std::time::Instant::now(),
+            pty_chunks: 0,
+            pty_bytes: 0,
+            feed_ns: 0,
+            update_ns: 0,
+            update_calls: 0,
+            render_ns: 0,
+            render_calls: 0,
+            fast_calls: 0,
+            fast_ns: 0,
+            slow_calls: 0,
+            slow_ns: 0,
+            surface_wait_ns: 0,
+        }
+    }
+
+    fn note_pty(&mut self, bytes: usize, feed: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.pty_chunks += 1;
+        self.pty_bytes += bytes;
+        self.feed_ns += feed.as_nanos();
+    }
+
+    fn note_update(&mut self, dur: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.update_ns += dur.as_nanos();
+        self.update_calls += 1;
+    }
+
+    fn note_render(
+        &mut self,
+        dur: std::time::Duration,
+        surface_wait: std::time::Duration,
+        fast: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self.burst_start.is_none() {
+            self.burst_start = Some(now);
+        }
+        self.last_event = now;
+        self.render_ns += dur.as_nanos();
+        self.render_calls += 1;
+        self.surface_wait_ns += surface_wait.as_nanos();
+        if fast {
+            self.fast_calls += 1;
+            self.fast_ns += dur.as_nanos();
+        } else {
+            self.slow_calls += 1;
+            self.slow_ns += dur.as_nanos();
+        }
+    }
+
+    /// Wake-up time the event loop should arm to so we can print the summary
+    /// soon after the burst goes quiet. `None` when no burst is pending.
+    fn next_wake(&self) -> Option<std::time::Instant> {
+        if !self.enabled || self.burst_start.is_none() {
+            return None;
+        }
+        Some(self.last_event + PERF_FLUSH_IDLE)
+    }
+
+    fn maybe_flush(&mut self) {
+        if !self.enabled || self.burst_start.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_event) < PERF_FLUSH_IDLE {
+            return;
+        }
+        let total = now.duration_since(self.burst_start.unwrap());
+        let accounted_ns = self.feed_ns + self.update_ns + self.render_ns;
+        let avg_ns = |total_ns: u128, n: u32| {
+            if n == 0 { 0.0 } else { total_ns as f64 / n as f64 / 1e6 }
+        };
+        eprintln!(
+            "[perf] burst {:>6.1}ms wall | pty {:>2}c {:>6}B | feed {:>5.2}ms | update {:>6.2}ms x{:>2} | render {:>6.2}ms x{:>2} (fast x{:>2} avg{:>4.2} / slow x{:>2} avg{:>4.2}) | swait {:>6.2}ms | acc {:>4.1}%",
+            total.as_secs_f64() * 1e3,
+            self.pty_chunks,
+            self.pty_bytes,
+            self.feed_ns as f64 / 1e6,
+            self.update_ns as f64 / 1e6,
+            self.update_calls,
+            self.render_ns as f64 / 1e6,
+            self.render_calls,
+            self.fast_calls,
+            avg_ns(self.fast_ns, self.fast_calls),
+            self.slow_calls,
+            avg_ns(self.slow_ns, self.slow_calls),
+            self.surface_wait_ns as f64 / 1e6,
+            if total.as_nanos() > 0 {
+                (accounted_ns as f64 / total.as_nanos() as f64) * 100.0
+            } else {
+                0.0
+            },
+        );
+        self.burst_start = None;
+        self.pty_chunks = 0;
+        self.pty_bytes = 0;
+        self.feed_ns = 0;
+        self.update_ns = 0;
+        self.update_calls = 0;
+        self.render_ns = 0;
+        self.render_calls = 0;
+        self.fast_calls = 0;
+        self.fast_ns = 0;
+        self.slow_calls = 0;
+        self.slow_ns = 0;
+        self.surface_wait_ns = 0;
+    }
+}
 
 /// Minimum pixel distance the mouse must travel after mouse-down before a
 /// Cell-mode drag begins to paint a selection. Below this, a press-and-release
@@ -313,10 +506,6 @@ impl Selection {
         let (s, e) = self.range();
         (line, col) >= s && (line, col) <= e
     }
-
-    fn is_empty(&self) -> bool {
-        self.anchor == self.head
-    }
 }
 
 impl State {
@@ -324,6 +513,7 @@ impl State {
         master: i32,
         window: Window,
         mut font: font::Font,
+        shaper: shaper::Shaper,
         config: Config,
         dpi: u32,
     ) -> Self {
@@ -333,7 +523,7 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-        let font_alpha = renderer::texture::Texture::from_memory(
+        let font_texture = renderer::texture::Texture::from_memory(
             &gpu.device,
             &gpu.queue,
             &atlas.buffer,
@@ -371,11 +561,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&font_alpha.view),
+                    resource: wgpu::BindingResource::TextureView(&font_texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&font_alpha.sampler),
+                    resource: wgpu::BindingResource::Sampler(&font_texture.sampler),
                 },
             ],
             label: Some("font bind group"),
@@ -601,6 +791,8 @@ impl State {
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
 
+        let min_frame_interval = detect_min_frame_interval(&window);
+
         Self {
             window,
             gpu,
@@ -616,7 +808,9 @@ impl State {
             num_strip_indices: 0,
             blur,
             font,
+            shaper,
             font_bind_group,
+            font_texture,
             font_bind_group_layout,
             pt_size,
             dpi,
@@ -634,6 +828,8 @@ impl State {
             ),
             modifiers: winit::keyboard::ModifiersState::empty(),
             scroll_y: 0.0,
+            scroll_suppressed: false,
+            last_wheel_at: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
             last_reported_cell: None,
@@ -650,7 +846,67 @@ impl State {
             last_click: None,
             click_count: 0,
             master,
+            perf: PerfLog::new(),
+            vertices_dirty: true,
+            last_paint: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            min_frame_interval,
+            pending_redraw_at: None,
         }
+    }
+
+    /// Re-query the current monitor's refresh rate. Call after the window may
+    /// have moved between displays (Resized fires when DPI changes too).
+    fn refresh_frame_cap(&mut self) {
+        self.min_frame_interval = detect_min_frame_interval(&self.window);
+    }
+
+    /// Mark the vertex buffer stale and ask winit to redraw, capped at the
+    /// display's refresh rate. If we painted too recently, defer the redraw
+    /// to the next eligible slot — `AboutToWait` arms a wake-up so the
+    /// deferred frame fires even with no further events.
+    fn invalidate(&mut self) {
+        self.vertices_dirty = true;
+        let now = std::time::Instant::now();
+        let next_ok = self.last_paint + self.min_frame_interval;
+        if now >= next_ok {
+            self.pending_redraw_at = None;
+            self.window.request_redraw();
+        } else {
+            // Keep the earliest pending request; later invalidates within the
+            // window collapse into the same deferred frame.
+            self.pending_redraw_at = Some(match self.pending_redraw_at {
+                Some(t) => t.min(next_ok),
+                None => next_ok,
+            });
+        }
+    }
+
+    /// Wake-up time for any deferred redraw, so AboutToWait can include it
+    /// in the ControlFlow::WaitUntil calculation.
+    fn pending_redraw_wake(&self) -> Option<std::time::Instant> {
+        self.pending_redraw_at
+    }
+
+    /// If a deferred redraw is now eligible, fire it. Called from AboutToWait.
+    fn maybe_fire_pending_redraw(&mut self) {
+        if let Some(t) = self.pending_redraw_at {
+            if std::time::Instant::now() >= t {
+                self.pending_redraw_at = None;
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// Rebuild the vertex/index buffers if they're stale, recording the cost
+    /// in `perf`. Called from the redraw handler before `render`.
+    fn flush_vertices(&mut self) {
+        if !self.vertices_dirty {
+            return;
+        }
+        let t = std::time::Instant::now();
+        self.update_vertices();
+        self.perf.note_update(t.elapsed());
+        self.vertices_dirty = false;
     }
 
     fn get_viewport_size(
@@ -798,7 +1054,13 @@ impl State {
         // behind the title bar smoothly. Eases linearly over one line at
         // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
         let view_offset = self.terminal.view_offset() as f32;
-        let scrollback_len = self.terminal.scrollback_len() as f32;
+        // Alt screen has no scrollback to fade toward — pin both distances
+        // to zero so the top/bottom edge fades stay invisible.
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f32
+        };
         let dist_from_bottom = view_offset * line_height + scroll_y;
         let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
         let near = (dist_from_bottom / line_height)
@@ -808,10 +1070,133 @@ impl State {
         let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
+        // Two extra rows above and below the visible grid are rendered so
+        // smooth sub-line scrolling stays populated through the snap. Used
+        // both for shaping (below) and the main emit loop further down.
+        let r_lo: isize = -2;
+        let r_hi: isize = rows as isize + 2;
+
+        // Programming-ligature pass. Walks each visible row, prefix-matches
+        // each cell against the per-variant ligature table the Shaper
+        // pre-built at font load. Mutates atlas (rasterizes ligature
+        // glyphs on demand) so it has to run before the emit closure
+        // captures &self.atlas immutably below.
+        //
+        // Fira Code and friends implement ligatures as 1:1 contextual
+        // alternates (each char substituted to a half-glyph), not N→1
+        // ligature substitutions, so each covered cell still draws at
+        // its own column with normal cell width — only the glyph id
+        // changes. See `shaper.rs` for the longer story.
+        let mut row_overrides: std::collections::HashMap<
+            isize,
+            Vec<Option<(u32, font::FaceVariant)>>,
+        > = std::collections::HashMap::new();
+        // Reused across rows — refilled in place to avoid per-row allocation.
+        let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        for r in r_lo..r_hi {
+            row_chars.clear();
+            for c in 0..cols {
+                row_chars.push(
+                    self.terminal
+                        .extended_cell(r, c)
+                        .map(|cell| cell.ch)
+                        .unwrap_or(' '),
+                );
+            }
+            let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
+            let mut c = 0;
+            while c < cols {
+                let Some(start_cell) = self.terminal.extended_cell(r, c) else {
+                    c += 1;
+                    continue;
+                };
+                let variant =
+                    font::FaceVariant::from_flags(start_cell.style.bold, start_cell.style.italic);
+                let lig = match self.shaper.match_at(&row_chars[c..], variant) {
+                    Some(l) => l,
+                    None => {
+                        c += 1;
+                        continue;
+                    }
+                };
+                let span = lig.chars.len();
+                // All cells in the ligature must share the start cell's
+                // style — a colored or weight-changing split breaks the
+                // visual cohesion that contextual-alternate halves rely on.
+                let style_uniform = (1..span).all(|i| {
+                    self.terminal
+                        .extended_cell(r, c + i)
+                        .map(|cell| cell.style == start_cell.style)
+                        .unwrap_or(false)
+                });
+                if !style_uniform {
+                    c += 1;
+                    continue;
+                }
+                // Rasterize every output glyph into the atlas so the
+                // override lookup at render time is a hit. If any one
+                // glyph fails to load, abandon the substitution for this
+                // span (better to render the chars than render half a
+                // ligature).
+                let all_ok = lig.output_glyphs.iter().all(|gid| {
+                    self.atlas.ensure_glyph_id(&mut self.font, variant, *gid)
+                });
+                if !all_ok {
+                    c += 1;
+                    continue;
+                }
+                let over = row_override.get_or_insert_with(|| (0..cols).map(|_| None).collect());
+                for (i, gid) in lig.output_glyphs.iter().enumerate() {
+                    if c + i < cols {
+                        over[c + i] = Some((*gid, variant));
+                    }
+                }
+                c += span;
+            }
+            if let Some(over) = row_override {
+                row_overrides.insert(r, over);
+            }
+        }
+
+        // Re-upload the atlas texture if the shaping pass rasterized any
+        // new glyphs. write_texture reuses the existing GPU texture and
+        // bind group — no need to recreate either.
+        if self.atlas.dirty {
+            self.gpu.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.font_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.atlas.buffer,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.atlas.width as u32),
+                    rows_per_image: Some(self.atlas.height as u32),
+                },
+                wgpu::Extent3d {
+                    width: self.atlas.width as u32,
+                    height: self.atlas.height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas.dirty = false;
+        }
+
         let atlas = &self.atlas;
+        // Foreground glyph source for a cell: a single char (existing
+        // per-char path) or a font-internal glyph id (contextual
+        // alternate from a programming ligature). Both render at the
+        // cell's own column with normal cell width — Fira Code's
+        // ligatures are per-cell substitutions, not wide N→1 glyphs.
+        enum GlyphSource {
+            Char(char),
+            Substituted(u32),
+        }
         let mut emit_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
                              idxs: &mut Vec<u16>,
-                             ch: char,
+                             fg_source: GlyphSource,
                              variant: font::FaceVariant,
                              r: isize,
                              c: usize,
@@ -839,9 +1224,20 @@ impl State {
                 bg,
                 [0.0; 4],
             );
-            // foreground glyph — Atlas::lookup falls back from styled
-            // variant → regular → .notdef so the user always sees *something*.
-            let g = atlas.lookup(ch, variant);
+            // Foreground glyph. The per-cell substitution case (Fira
+            // Code-style contextual alternates) deliberately uses
+            // glyphs whose side bearings extend past the cell edges so
+            // adjacent halves visually fuse. The normal-char path's
+            // fills_h UV-clipping (added for box-drawing) cuts off
+            // exactly that overlap, so we disable it for substituted
+            // glyphs.
+            let (g, allow_overhang) = match fg_source {
+                GlyphSource::Char(ch) => (atlas.lookup(ch, variant), false),
+                GlyphSource::Substituted(glyph_id) => {
+                    (atlas.lookup_glyph_id(glyph_id, variant), true)
+                }
+            };
+            let span_w = cell_w;
             if g.width > 0 && g.height > 0 {
                 // Cell-filling glyphs (Powerline caps, box-drawing,
                 // half-blocks) get the affected axis stretched to the cell's
@@ -854,7 +1250,7 @@ impl State {
                 let bx = g.bearing_x as f32;
                 let by = g.bearing_y as f32;
                 let asc_eff = bg_h + descender; // pixels above baseline (descender is negative)
-                let fills_h = g.width as f32 >= cell_w * 0.85;
+                let fills_h = !allow_overhang && g.width as f32 >= span_w * 0.85;
                 let fills_v = g.height as f32 >= line_height * 0.85;
                 let (gx, gw, q_start, q_end) = if fills_h {
                     // Restrict UV to the in-cell columns so a glyph designed
@@ -862,8 +1258,8 @@ impl State {
                     // bitmap_width > cell_w) doesn't put its transparent
                     // overhang at the cell's left/right edge.
                     let q_start = (-bx).max(0.0).min(g.width as f32);
-                    let q_end = (cell_w - bx).max(0.0).min(g.width as f32);
-                    (x, cell_w, q_start, q_end)
+                    let q_end = (span_w - bx).max(0.0).min(g.width as f32);
+                    (x, span_w, q_start, q_end)
                 } else {
                     (x + bx, g.width as f32, 0.0, g.width as f32)
                 };
@@ -913,20 +1309,22 @@ impl State {
         ];
         let selection = self.selection;
 
-        // 1. Terminal grid + phantom rows on each side. We render two extra
-        // rows above (visual_row -2, -1) and two below (rows, rows+1) so that
-        // during a smooth sub-line scroll, the area being uncovered as the
-        // existing top/bottom row slides away is already populated by the
-        // next row sliding into place — no pops at snap boundaries.
-        let r_lo: isize = -2;
-        let r_hi: isize = rows as isize + 2;
+        // 1. Terminal grid + phantom rows on each side (`r_lo..r_hi` defined
+        // above where the shaping pass lives — same range so ligature
+        // covers and emits stay in sync).
         for r in r_lo..r_hi {
+            let over = row_overrides.get(&r);
             for c in 0..cols {
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
                 let fg = cell.style.color_fg.unwrap_or(default_fg);
                 let bg = cell.style.color_bg.unwrap_or(default_bg);
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
-                emit_cell(&mut vertices, &mut indices, cell.ch, variant, r, c, fg, bg);
+                // Ligature pass may have substituted this cell's glyph.
+                let fg_source = match over.and_then(|cs| cs[c]) {
+                    Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
+                    None => GlyphSource::Char(cell.ch),
+                };
+                emit_cell(&mut vertices, &mut indices, fg_source, variant, r, c, fg, bg);
             }
         }
 
@@ -1214,29 +1612,33 @@ impl State {
             if dist_from_bottom > 0.0 { 1.0 } else { 0.0 },
             self.config.bottom_fade_anim_secs,
         );
+        // top_band_height / top_alpha also feed the per-fragment glyph-fade
+        // uniform below, so they're computed unconditionally. The strip quads
+        // themselves are skipped at phase=0: emitting them would draw with
+        // alpha 0 but still bump num_strip_indices, forcing render() through
+        // the slow blur+composite path.
         let top_alpha = self.top_fade_phase;
         let top_band_height = top_fade_height * self.top_fade_phase;
-        let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
-        // Blur-only strip (tint = 0). Solid section + gradient fade-out;
-        // chrome contrast comes from the per-fragment glyph fade now, so
-        // the strip is purely about softening with the blur.
-        let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
-        push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
-        push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
+        if self.top_fade_phase > 0.0 {
+            let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
+            let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
+            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
+            push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
+        }
 
-        // Bottom: blur-only (tint = 0), driven by bottom_fade_phase so the
-        // strip slides in/out at the same constant rate as the top.
-        let bottom_alpha = self.bottom_fade_phase;
-        let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
-        let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
-        push_strip(
-            &mut strip_vertices,
-            &mut strip_indices,
-            win_h - bottom_fade_height,
-            win_h,
-            clear,
-            bottom_blur,
-        );
+        if self.bottom_fade_phase > 0.0 {
+            let bottom_alpha = self.bottom_fade_phase;
+            let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
+            let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
+            push_strip(
+                &mut strip_vertices,
+                &mut strip_indices,
+                win_h - bottom_fade_height,
+                win_h,
+                clear,
+                bottom_blur,
+            );
+        }
 
         self.gpu
             .queue
@@ -1293,7 +1695,7 @@ impl State {
         self.config.save();
         self.font.set_char_size(self.pt_size, self.dpi);
         self.atlas = self.font.build_atlas();
-        let font_alpha = renderer::texture::Texture::from_memory(
+        self.font_texture = renderer::texture::Texture::from_memory(
             &self.gpu.device,
             &self.gpu.queue,
             &self.atlas.buffer,
@@ -1307,11 +1709,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&font_alpha.view),
+                    resource: wgpu::BindingResource::TextureView(&self.font_texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&font_alpha.sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.font_texture.sampler),
                 },
             ],
             label: Some("font bind group"),
@@ -1328,8 +1730,7 @@ impl State {
         self.terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.resize_buffers();
-        self.update_vertices();
-        self.window.request_redraw();
+        self.invalidate();
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -1355,7 +1756,7 @@ impl State {
         self.terminal.resize(size.char_width, size.char_height);
         self.notify_pty_size(size.char_width, size.char_height);
         self.resize_buffers();
-        self.update_vertices();
+        self.invalidate();
     }
 
     fn notify_pty_size(&self, cols: usize, rows: usize) {
@@ -1417,7 +1818,11 @@ impl State {
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     fn is_top_fade_animating(&self) -> bool {
-        let scrollback_len = self.terminal.scrollback_len() as f32;
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f32
+        };
         let view_offset = self.terminal.view_offset() as f32;
         let metrics = self.font.face().size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
@@ -1491,7 +1896,11 @@ impl State {
         // easing to 0 over one line in either direction. Out-of-sync formulas
         // here would drift the hit-test by a row vs. what's actually drawn.
         let view_offset = self.terminal.view_offset() as f64;
-        let scrollback_len = self.terminal.scrollback_len() as f64;
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f64
+        };
         let dist_from_bottom = view_offset * line_height + self.scroll_y;
         let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
         let near = (dist_from_bottom / line_height)
@@ -1562,15 +1971,6 @@ impl State {
     fn handle_mouse_release(&mut self) {
         self.press_cell = None;
         self.press_pixel = None;
-        // A bare click in Cell mode produced an empty range — drop it. Word
-        // and Line clicks always produce a non-empty selection.
-        if self.selection_mode == SelectionMode::Cell {
-            if let Some(sel) = self.selection {
-                if sel.is_empty() {
-                    self.selection = None;
-                }
-            }
-        }
     }
 
     /// Build a selection from two cells under the current `selection_mode`.
@@ -1703,8 +2103,7 @@ impl State {
                     }
                 } else if self.held_button == Some(input::MOUSE_LEFT) {
                     self.handle_mouse_drag();
-                    self.update_vertices();
-                    self.window.request_redraw();
+                    self.invalidate();
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1736,15 +2135,37 @@ impl State {
                         } else {
                             self.handle_mouse_release();
                         }
-                        self.update_vertices();
-                        self.window.request_redraw();
+                        self.invalidate();
                         return true;
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let m = self.font.face().size_metrics().unwrap();
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
+                // A `Started` after a real idle gap is the user putting fingers
+                // back on the trackpad — that supersedes any prior suppression.
+                // Without the gap check, momentum's own Started (which fires
+                // ~one frame after the previous gesture's Ended) would clear
+                // the flag and let the tail of the flick re-scroll the view
+                // after a key snap.
+                const FRESH_GESTURE_GAP: std::time::Duration =
+                    std::time::Duration::from_millis(100);
+                let now = std::time::Instant::now();
+                let gap = self.last_wheel_at.map(|t| now.duration_since(t));
+                if matches!(phase, TouchPhase::Started)
+                    && gap.map_or(true, |g| g >= FRESH_GESTURE_GAP)
+                {
+                    self.scroll_suppressed = false;
+                }
+                if self.scroll_suppressed {
+                    // Don't advance `last_wheel_at` on suppressed events —
+                    // otherwise the steady stream of momentum ticks keeps
+                    // resetting the idle gap, and a real fresh gesture that
+                    // arrives mid-momentum still looks like a 16ms follow-up.
+                    return true;
+                }
+                self.last_wheel_at = Some(now);
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
@@ -1765,6 +2186,14 @@ impl State {
                     }
                     return true;
                 }
+                // Alt screen has no scrollback to navigate; full-screen apps
+                // (vim, less, htop) provide their own keyboard motion. Without
+                // this guard, trackpad pixels would accumulate in scroll_y and
+                // visually drift the grid past its bounds.
+                if self.terminal.on_alt_screen() {
+                    self.scroll_y = 0.0;
+                    return true;
+                }
                 match delta {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
@@ -1779,14 +2208,19 @@ impl State {
                     MouseScrollDelta::PixelDelta(p) => {
                         self.scroll_y += p.y;
                         // Drain accumulated pixels into discrete line scrolls.
+                        // Zero the residue if scroll_up/down refused so scroll_y
+                        // can't accumulate past a viewport boundary regardless
+                        // of what at_top/at_bottom report.
                         while self.scroll_y >= line_height {
                             if !self.terminal.scroll_up(1) {
+                                self.scroll_y = 0.0;
                                 break;
                             }
                             self.scroll_y -= line_height;
                         }
                         while self.scroll_y <= -line_height {
                             if !self.terminal.scroll_down(1) {
+                                self.scroll_y = 0.0;
                                 break;
                             }
                             self.scroll_y += line_height;
@@ -1800,8 +2234,7 @@ impl State {
                         }
                     }
                 }
-                self.update_vertices();
-                self.window.request_redraw();
+                self.invalidate();
                 return true;
             }
             WindowEvent::ModifiersChanged(mods) => {
@@ -1879,11 +2312,14 @@ impl State {
                         // returned None and don't touch the scroll state.
                         self.terminal.scroll_to_bottom();
                         self.scroll_y = 0.0;
+                        // Drop any in-flight trackpad momentum so the snap
+                        // sticks — otherwise the tail of the flick keeps
+                        // scrolling the view away from the bottom.
+                        self.scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
                         self.write_pty(&bytes);
-                        self.update_vertices();
-                        self.window.request_redraw();
+                        self.invalidate();
                         return true;
                     }
                 }
@@ -1895,8 +2331,13 @@ impl State {
 
     fn update(&mut self) {}
 
-    fn render(&mut self, clear: wgpu::Color) -> Result<(), wgpu::SurfaceError> {
+    fn render(
+        &mut self,
+        clear: wgpu::Color,
+    ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
+        let surface_t0 = std::time::Instant::now();
         let output = self.gpu.surface.get_current_texture().unwrap();
+        let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1907,12 +2348,19 @@ impl State {
                     label: Some("terminal"),
                 });
 
-        // 1. Scene → offscreen target.
+        // Fast path: when no edge-fade strips are visible, the blur chain
+        // produces output that nothing samples. Render the scene directly to
+        // the swapchain and skip blur + composite (saves ~5 fullscreen passes
+        // per frame, the dominant cost during PTY bursts).
+        let needs_blur = self.num_strip_indices > 0;
+        let scene_target = if needs_blur { &self.blur.scene.view } else { &view };
+
+        // 1. Scene → swapchain (fast path) or → offscreen (blur path).
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.blur.scene.view,
+                    view: scene_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -1938,12 +2386,12 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        // 2. Dual-Kawase down/up chain over the (already-faded) scene.
-        self.blur.run(&mut encoder);
+        if needs_blur {
+            // 2. Dual-Kawase down/up chain over the (already-faded) scene.
+            self.blur.run(&mut encoder);
 
-        // 3. Composite to swapchain: blit the scene, then alpha-blend the
-        // blur-sampled strip quads on top.
-        {
+            // 3. Composite to swapchain: blit the scene, then alpha-blend the
+            // blur-sampled strip quads on top.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1963,24 +2411,22 @@ impl State {
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
-            if self.num_strip_indices > 0 {
-                pass.set_pipeline(&self.blur.strip_pipeline);
-                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
-                pass.set_bind_group(1, &self.camera_bind_group, &[]);
-                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
-                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
-                pass.set_index_buffer(
-                    self.strip_index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
-            }
+            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+            pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+            pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+            pass.set_index_buffer(
+                self.strip_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        Ok(())
+        Ok((surface_wait, !needs_blur))
     }
 }
 
@@ -2031,10 +2477,15 @@ async fn run() {
     let installed = font_loader::system_fonts::query_all();
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let primary_name = mono_fonts
+    // Prefer Fira Code (programming ligatures) when available, fall back
+    // to Iosevka. Match exact family names first so we don't accidentally
+    // pick `Iosevka Term` (intentionally unligated) over plain `Iosevka`.
+    let primary_name = ["Fira Code", "Iosevka", "Iosevka Term", "Menlo"]
         .iter()
-        .find(|f| f.contains("Iosevka"))
-        .expect("no Iosevka font found")
+        .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
+        .or_else(|| mono_fonts.iter().find(|f| f.contains("Fira Code")))
+        .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
+        .expect("no monospace primary font found")
         .clone();
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
@@ -2042,6 +2493,12 @@ async fn run() {
     let config = Config::load();
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
+    // Build the rustybuzz shaper alongside the FreeType font. We keep one
+    // copy of the bytes for shaping (rustybuzz parses tables, doesn't
+    // rasterize) and hand the other to FreeType. Only primary cuts are
+    // shaped — fallbacks aren't asked to ligate.
+    let mut shaper = shaper::Shaper::new();
+    shaper.set_variant(font::FaceVariant::Regular, &primary_data);
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
 
@@ -2057,9 +2514,17 @@ async fn run() {
         let Some(data) = load_family_styled(&primary_name, bold, italic) else {
             continue;
         };
+        shaper.set_variant(variant, &data);
         if font.set_variant(variant, data, pt_size, dpi) {
             println!("primary {:?}: {}", variant, primary_name);
         }
+    }
+
+    // Pre-shape every candidate ligature sequence for each installed
+    // variant. After this, the render loop only needs prefix-matching
+    // against a small per-variant table — no rustybuzz on the hot path.
+    for variant in font::FaceVariant::ALL {
+        shaper.precompute(variant);
     }
 
     // Fallback chain. Each entry is a list of candidate family substrings; the
@@ -2125,11 +2590,11 @@ async fn run() {
         }
     }
 
-    let mut state = State::new(fdm, window, font, config, dpi).await;
+    let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
-    state.update_vertices();
+    state.invalidate();
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
 
@@ -2137,13 +2602,15 @@ async fn run() {
         match event {
             Event::UserEvent(n) => match n {
                 app_window::CustomEvent::PtyInput(z) => {
+                    let bytes = z.len();
+                    let t0 = std::time::Instant::now();
                     state.terminal.feed(&z);
                     let reply = state.terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.perf.note_pty(bytes, t0.elapsed());
+                    state.invalidate();
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
@@ -2152,14 +2619,16 @@ async fn run() {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
                             state.sync_theme_colors();
-                            state.update_vertices();
-                            state.window.request_redraw();
+                            state.invalidate();
                         }
                         WindowEvent::CloseRequested => {
                             elwt.exit();
                         }
                         WindowEvent::Resized(size) => {
                             state.resize(size);
+                            // A resize can move us between displays of
+                            // different refresh rates; refresh the cap.
+                            state.refresh_frame_cap();
                             state.window.request_redraw();
                         }
                         WindowEvent::ScaleFactorChanged {
@@ -2170,8 +2639,18 @@ async fn run() {
                         }
                         WindowEvent::RedrawRequested => {
                             state.update();
-                            match state.render(clear_color(theme)) {
-                                Ok(_) => (),
+                            state.flush_vertices();
+                            let t0 = std::time::Instant::now();
+                            let result = state.render(clear_color(theme));
+                            let render_dur = t0.elapsed();
+                            // Stamp the paint time *after* render returns so
+                            // the cap measures real spacing between frames.
+                            state.last_paint = std::time::Instant::now();
+                            state.pending_redraw_at = None;
+                            match result {
+                                Ok((surface_wait, fast)) => {
+                                    state.perf.note_render(render_dur, surface_wait, fast);
+                                }
                                 Err(wgpu::SurfaceError::Lost) => state.resize(state.gpu.size),
                                 Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                                 Err(e) => eprintln!("{:?}", e),
@@ -2183,26 +2662,32 @@ async fn run() {
             }
             Event::AboutToWait => {
                 if state.maybe_blink_tick() {
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.invalidate();
                 }
                 // Top edge-fade slide animation: keep ticking frames as long
                 // as the phase hasn't reached its target (0 or 1).
                 let animating = state.is_top_fade_animating();
                 if animating {
-                    state.update_vertices();
-                    state.window.request_redraw();
+                    state.invalidate();
                 }
+                // Honor any deferred redraw whose frame-cap window has
+                // elapsed before sleeping.
+                state.maybe_fire_pending_redraw();
+                state.perf.maybe_flush();
                 let next_anim = if animating {
                     Some(std::time::Instant::now() + ANIM_FRAME)
                 } else {
                     None
                 };
-                let next_wake = match (state.next_blink_wake(), next_anim) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(t), None) | (None, Some(t)) => Some(t),
-                    (None, None) => None,
-                };
+                let next_wake = [
+                    state.next_blink_wake(),
+                    next_anim,
+                    state.perf.next_wake(),
+                    state.pending_redraw_wake(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),
@@ -2254,6 +2739,17 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
         b = b.italic();
     }
     font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
+}
+
+/// Minimum interval between paints, derived from the window's current monitor
+/// refresh rate. Falls back to 60Hz when the platform can't report a rate.
+/// Returning 1/refresh keeps us from issuing redraws the OS would just drop.
+fn detect_min_frame_interval(window: &Window) -> std::time::Duration {
+    let mhz = window
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz())
+        .unwrap_or(60_000);
+    std::time::Duration::from_nanos(1_000_000_000_000u64 / mhz.max(1) as u64)
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
