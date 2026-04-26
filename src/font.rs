@@ -70,10 +70,22 @@ pub struct Atlas {
     // One glyph map per variant. Bold/italic/bold-italic maps are sparse — a
     // miss falls back to the Regular variant (and finally to `notdef`).
     pub variants: [HashMap<char, AtlasEntry>; 4],
+    // Glyph-id-keyed entries for ligatures (and any other glyphs the
+    // shaper produces that aren't in the per-char maps). Same fallback
+    // semantics as `variants` — Bold/Italic/BoldItalic maps may miss and
+    // Regular is consulted next, otherwise notdef.
+    pub ligatures: [HashMap<u32, AtlasEntry>; 4],
     // The font's .notdef glyph (usually a hollow box). Rendered in place of
     // any character the font doesn't provide, so missing glyphs are visibly
     // "tofu" rather than invisible.
     pub notdef: AtlasEntry,
+    // Packing cursor — kept around so on-demand glyphs (ligatures
+    // discovered at render time) can append to the atlas after the
+    // initial pre-pack. Texture re-uploads are gated by `dirty`.
+    pack_x: usize,
+    pack_y: usize,
+    pack_row_height: usize,
+    pub dirty: bool,
 }
 
 impl Atlas {
@@ -85,6 +97,70 @@ impl Atlas {
             }
         }
         self.variants[0].get(&ch).unwrap_or(&self.notdef)
+    }
+
+    /// Look up a glyph by id (the shaper's output). Falls back through
+    /// styled→regular→notdef like `lookup`. Caller must have populated the
+    /// entry first via `ensure_glyph_id`.
+    pub fn lookup_glyph_id(&self, glyph_id: u32, variant: FaceVariant) -> &AtlasEntry {
+        let i = variant as usize;
+        if i != 0 {
+            if let Some(e) = self.ligatures[i].get(&glyph_id) {
+                return e;
+            }
+        }
+        self.ligatures[0].get(&glyph_id).unwrap_or(&self.notdef)
+    }
+
+    /// Rasterize and pack a glyph by its font-internal id (not codepoint),
+    /// caching the result. No-op when already cached. Sets `dirty` so the
+    /// renderer knows to re-upload the texture before the next draw.
+    pub fn ensure_glyph_id(
+        &mut self,
+        font: &mut Font,
+        variant: FaceVariant,
+        glyph_id: u32,
+    ) -> bool {
+        let vi = variant as usize;
+        if self.ligatures[vi].contains_key(&glyph_id) {
+            return true;
+        }
+        // Compute cell metrics BEFORE loading the glyph. `cell_width`
+        // calls `load_char('M', DEFAULT)` on the Regular face, and the
+        // Regular variant's face shares its single glyph slot with us
+        // when vi == 0 — doing this after `load_glyph(RENDER)` would
+        // overwrite the just-rendered bitmap with an unrendered 'M' and
+        // leave the FT_Bitmap pointer in an indeterminate state.
+        let cell_w = font.cell_width();
+        let metrics = font
+            .face()
+            .size_metrics()
+            .expect("primary face has no size metrics");
+        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        let face = match font.variants[vi].face.as_ref() {
+            Some(f) => f,
+            None => return false,
+        };
+        if face
+            .load_glyph(glyph_id, ft::face::LoadFlag::RENDER)
+            .is_err()
+        {
+            return false;
+        }
+        let entry = pack_glyph(
+            face.glyph(),
+            &mut self.buffer,
+            self.width,
+            self.height,
+            &mut self.pack_x,
+            &mut self.pack_y,
+            &mut self.pack_row_height,
+            cell_w,
+            cell_h,
+        );
+        self.ligatures[vi].insert(glyph_id, entry);
+        self.dirty = true;
+        true
     }
 }
 
@@ -344,7 +420,17 @@ impl Font {
             width,
             height,
             variants: variants_entries,
+            ligatures: [
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ],
             notdef,
+            pack_x: x,
+            pack_y: y,
+            pack_row_height: row_height,
+            dirty: false,
         }
     }
 }
@@ -508,7 +594,17 @@ mod tests {
             height: 0,
             buffer: Vec::new(),
             variants,
+            ligatures: [
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ],
             notdef: entry(99),
+            pack_x: 0,
+            pack_y: 0,
+            pack_row_height: 0,
+            dirty: false,
         }
     }
 

@@ -7,6 +7,7 @@ mod renderer;
 mod ansi;
 mod gpu;
 mod input;
+mod shaper;
 mod style;
 mod terminal;
 
@@ -150,7 +151,15 @@ struct State {
     num_strip_indices: u32,
     blur: renderer::blur::BlurChain,
     font: font::Font,
+    /// rustybuzz shaper, used during update_vertices to detect programming
+    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
+    /// single wide glyph instead of two adjacent characters.
+    shaper: shaper::Shaper,
     font_bind_group: wgpu::BindGroup,
+    /// The actual font atlas texture. Kept around so on-demand-rasterized
+    /// ligature glyphs can be uploaded incrementally via queue.write_texture
+    /// without recreating the texture or bind group.
+    font_texture: renderer::texture::Texture,
     /// Layout for the font texture + sampler. Kept around so we can rebind
     /// after a font-size change rebuilds the atlas texture.
     font_bind_group_layout: wgpu::BindGroupLayout,
@@ -313,10 +322,6 @@ impl Selection {
         let (s, e) = self.range();
         (line, col) >= s && (line, col) <= e
     }
-
-    fn is_empty(&self) -> bool {
-        self.anchor == self.head
-    }
 }
 
 impl State {
@@ -324,6 +329,7 @@ impl State {
         master: i32,
         window: Window,
         mut font: font::Font,
+        shaper: shaper::Shaper,
         config: Config,
         dpi: u32,
     ) -> Self {
@@ -333,7 +339,7 @@ impl State {
         // Font texture setup
         let atlas = font.build_atlas();
 
-        let font_alpha = renderer::texture::Texture::from_memory(
+        let font_texture = renderer::texture::Texture::from_memory(
             &gpu.device,
             &gpu.queue,
             &atlas.buffer,
@@ -371,11 +377,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&font_alpha.view),
+                    resource: wgpu::BindingResource::TextureView(&font_texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&font_alpha.sampler),
+                    resource: wgpu::BindingResource::Sampler(&font_texture.sampler),
                 },
             ],
             label: Some("font bind group"),
@@ -616,7 +622,9 @@ impl State {
             num_strip_indices: 0,
             blur,
             font,
+            shaper,
             font_bind_group,
+            font_texture,
             font_bind_group_layout,
             pt_size,
             dpi,
@@ -808,10 +816,133 @@ impl State {
         let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
+        // Two extra rows above and below the visible grid are rendered so
+        // smooth sub-line scrolling stays populated through the snap. Used
+        // both for shaping (below) and the main emit loop further down.
+        let r_lo: isize = -2;
+        let r_hi: isize = rows as isize + 2;
+
+        // Programming-ligature pass. Walks each visible row, prefix-matches
+        // each cell against the per-variant ligature table the Shaper
+        // pre-built at font load. Mutates atlas (rasterizes ligature
+        // glyphs on demand) so it has to run before the emit closure
+        // captures &self.atlas immutably below.
+        //
+        // Fira Code and friends implement ligatures as 1:1 contextual
+        // alternates (each char substituted to a half-glyph), not N→1
+        // ligature substitutions, so each covered cell still draws at
+        // its own column with normal cell width — only the glyph id
+        // changes. See `shaper.rs` for the longer story.
+        let mut row_overrides: std::collections::HashMap<
+            isize,
+            Vec<Option<(u32, font::FaceVariant)>>,
+        > = std::collections::HashMap::new();
+        // Reused across rows — refilled in place to avoid per-row allocation.
+        let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        for r in r_lo..r_hi {
+            row_chars.clear();
+            for c in 0..cols {
+                row_chars.push(
+                    self.terminal
+                        .extended_cell(r, c)
+                        .map(|cell| cell.ch)
+                        .unwrap_or(' '),
+                );
+            }
+            let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
+            let mut c = 0;
+            while c < cols {
+                let Some(start_cell) = self.terminal.extended_cell(r, c) else {
+                    c += 1;
+                    continue;
+                };
+                let variant =
+                    font::FaceVariant::from_flags(start_cell.style.bold, start_cell.style.italic);
+                let lig = match self.shaper.match_at(&row_chars[c..], variant) {
+                    Some(l) => l,
+                    None => {
+                        c += 1;
+                        continue;
+                    }
+                };
+                let span = lig.chars.len();
+                // All cells in the ligature must share the start cell's
+                // style — a colored or weight-changing split breaks the
+                // visual cohesion that contextual-alternate halves rely on.
+                let style_uniform = (1..span).all(|i| {
+                    self.terminal
+                        .extended_cell(r, c + i)
+                        .map(|cell| cell.style == start_cell.style)
+                        .unwrap_or(false)
+                });
+                if !style_uniform {
+                    c += 1;
+                    continue;
+                }
+                // Rasterize every output glyph into the atlas so the
+                // override lookup at render time is a hit. If any one
+                // glyph fails to load, abandon the substitution for this
+                // span (better to render the chars than render half a
+                // ligature).
+                let all_ok = lig.output_glyphs.iter().all(|gid| {
+                    self.atlas.ensure_glyph_id(&mut self.font, variant, *gid)
+                });
+                if !all_ok {
+                    c += 1;
+                    continue;
+                }
+                let over = row_override.get_or_insert_with(|| (0..cols).map(|_| None).collect());
+                for (i, gid) in lig.output_glyphs.iter().enumerate() {
+                    if c + i < cols {
+                        over[c + i] = Some((*gid, variant));
+                    }
+                }
+                c += span;
+            }
+            if let Some(over) = row_override {
+                row_overrides.insert(r, over);
+            }
+        }
+
+        // Re-upload the atlas texture if the shaping pass rasterized any
+        // new glyphs. write_texture reuses the existing GPU texture and
+        // bind group — no need to recreate either.
+        if self.atlas.dirty {
+            self.gpu.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.font_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.atlas.buffer,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.atlas.width as u32),
+                    rows_per_image: Some(self.atlas.height as u32),
+                },
+                wgpu::Extent3d {
+                    width: self.atlas.width as u32,
+                    height: self.atlas.height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas.dirty = false;
+        }
+
         let atlas = &self.atlas;
+        // Foreground glyph source for a cell: a single char (existing
+        // per-char path) or a font-internal glyph id (contextual
+        // alternate from a programming ligature). Both render at the
+        // cell's own column with normal cell width — Fira Code's
+        // ligatures are per-cell substitutions, not wide N→1 glyphs.
+        enum GlyphSource {
+            Char(char),
+            Substituted(u32),
+        }
         let mut emit_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
                              idxs: &mut Vec<u16>,
-                             ch: char,
+                             fg_source: GlyphSource,
                              variant: font::FaceVariant,
                              r: isize,
                              c: usize,
@@ -839,9 +970,20 @@ impl State {
                 bg,
                 [0.0; 4],
             );
-            // foreground glyph — Atlas::lookup falls back from styled
-            // variant → regular → .notdef so the user always sees *something*.
-            let g = atlas.lookup(ch, variant);
+            // Foreground glyph. The per-cell substitution case (Fira
+            // Code-style contextual alternates) deliberately uses
+            // glyphs whose side bearings extend past the cell edges so
+            // adjacent halves visually fuse. The normal-char path's
+            // fills_h UV-clipping (added for box-drawing) cuts off
+            // exactly that overlap, so we disable it for substituted
+            // glyphs.
+            let (g, allow_overhang) = match fg_source {
+                GlyphSource::Char(ch) => (atlas.lookup(ch, variant), false),
+                GlyphSource::Substituted(glyph_id) => {
+                    (atlas.lookup_glyph_id(glyph_id, variant), true)
+                }
+            };
+            let span_w = cell_w;
             if g.width > 0 && g.height > 0 {
                 // Cell-filling glyphs (Powerline caps, box-drawing,
                 // half-blocks) get the affected axis stretched to the cell's
@@ -854,7 +996,7 @@ impl State {
                 let bx = g.bearing_x as f32;
                 let by = g.bearing_y as f32;
                 let asc_eff = bg_h + descender; // pixels above baseline (descender is negative)
-                let fills_h = g.width as f32 >= cell_w * 0.85;
+                let fills_h = !allow_overhang && g.width as f32 >= span_w * 0.85;
                 let fills_v = g.height as f32 >= line_height * 0.85;
                 let (gx, gw, q_start, q_end) = if fills_h {
                     // Restrict UV to the in-cell columns so a glyph designed
@@ -862,8 +1004,8 @@ impl State {
                     // bitmap_width > cell_w) doesn't put its transparent
                     // overhang at the cell's left/right edge.
                     let q_start = (-bx).max(0.0).min(g.width as f32);
-                    let q_end = (cell_w - bx).max(0.0).min(g.width as f32);
-                    (x, cell_w, q_start, q_end)
+                    let q_end = (span_w - bx).max(0.0).min(g.width as f32);
+                    (x, span_w, q_start, q_end)
                 } else {
                     (x + bx, g.width as f32, 0.0, g.width as f32)
                 };
@@ -913,20 +1055,22 @@ impl State {
         ];
         let selection = self.selection;
 
-        // 1. Terminal grid + phantom rows on each side. We render two extra
-        // rows above (visual_row -2, -1) and two below (rows, rows+1) so that
-        // during a smooth sub-line scroll, the area being uncovered as the
-        // existing top/bottom row slides away is already populated by the
-        // next row sliding into place — no pops at snap boundaries.
-        let r_lo: isize = -2;
-        let r_hi: isize = rows as isize + 2;
+        // 1. Terminal grid + phantom rows on each side (`r_lo..r_hi` defined
+        // above where the shaping pass lives — same range so ligature
+        // covers and emits stay in sync).
         for r in r_lo..r_hi {
+            let over = row_overrides.get(&r);
             for c in 0..cols {
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
                 let fg = cell.style.color_fg.unwrap_or(default_fg);
                 let bg = cell.style.color_bg.unwrap_or(default_bg);
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
-                emit_cell(&mut vertices, &mut indices, cell.ch, variant, r, c, fg, bg);
+                // Ligature pass may have substituted this cell's glyph.
+                let fg_source = match over.and_then(|cs| cs[c]) {
+                    Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
+                    None => GlyphSource::Char(cell.ch),
+                };
+                emit_cell(&mut vertices, &mut indices, fg_source, variant, r, c, fg, bg);
             }
         }
 
@@ -1293,7 +1437,7 @@ impl State {
         self.config.save();
         self.font.set_char_size(self.pt_size, self.dpi);
         self.atlas = self.font.build_atlas();
-        let font_alpha = renderer::texture::Texture::from_memory(
+        self.font_texture = renderer::texture::Texture::from_memory(
             &self.gpu.device,
             &self.gpu.queue,
             &self.atlas.buffer,
@@ -1307,11 +1451,11 @@ impl State {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&font_alpha.view),
+                    resource: wgpu::BindingResource::TextureView(&self.font_texture.view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&font_alpha.sampler),
+                    resource: wgpu::BindingResource::Sampler(&self.font_texture.sampler),
                 },
             ],
             label: Some("font bind group"),
@@ -1562,15 +1706,6 @@ impl State {
     fn handle_mouse_release(&mut self) {
         self.press_cell = None;
         self.press_pixel = None;
-        // A bare click in Cell mode produced an empty range — drop it. Word
-        // and Line clicks always produce a non-empty selection.
-        if self.selection_mode == SelectionMode::Cell {
-            if let Some(sel) = self.selection {
-                if sel.is_empty() {
-                    self.selection = None;
-                }
-            }
-        }
     }
 
     /// Build a selection from two cells under the current `selection_mode`.
@@ -2031,10 +2166,15 @@ async fn run() {
     let installed = font_loader::system_fonts::query_all();
 
     // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let primary_name = mono_fonts
+    // Prefer Fira Code (programming ligatures) when available, fall back
+    // to Iosevka. Match exact family names first so we don't accidentally
+    // pick `Iosevka Term` (intentionally unligated) over plain `Iosevka`.
+    let primary_name = ["Fira Code", "Iosevka", "Iosevka Term", "Menlo"]
         .iter()
-        .find(|f| f.contains("Iosevka"))
-        .expect("no Iosevka font found")
+        .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
+        .or_else(|| mono_fonts.iter().find(|f| f.contains("Fira Code")))
+        .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
+        .expect("no monospace primary font found")
         .clone();
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
@@ -2042,6 +2182,12 @@ async fn run() {
     let config = Config::load();
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
+    // Build the rustybuzz shaper alongside the FreeType font. We keep one
+    // copy of the bytes for shaping (rustybuzz parses tables, doesn't
+    // rasterize) and hand the other to FreeType. Only primary cuts are
+    // shaped — fallbacks aren't asked to ligate.
+    let mut shaper = shaper::Shaper::new();
+    shaper.set_variant(font::FaceVariant::Regular, &primary_data);
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
 
@@ -2057,9 +2203,17 @@ async fn run() {
         let Some(data) = load_family_styled(&primary_name, bold, italic) else {
             continue;
         };
+        shaper.set_variant(variant, &data);
         if font.set_variant(variant, data, pt_size, dpi) {
             println!("primary {:?}: {}", variant, primary_name);
         }
+    }
+
+    // Pre-shape every candidate ligature sequence for each installed
+    // variant. After this, the render loop only needs prefix-matching
+    // against a small per-variant table — no rustybuzz on the hot path.
+    for variant in font::FaceVariant::ALL {
+        shaper.precompute(variant);
     }
 
     // Fallback chain. Each entry is a list of candidate family substrings; the
@@ -2125,7 +2279,7 @@ async fn run() {
         }
     }
 
-    let mut state = State::new(fdm, window, font, config, dpi).await;
+    let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
