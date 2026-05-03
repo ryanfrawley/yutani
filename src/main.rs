@@ -51,6 +51,9 @@ struct Config {
     top_fade_anim_secs: f32,
     bottom_fade_height: f32,
     bottom_fade_anim_secs: f32,
+    /// Ease-in-out duration for cursor position changes. 0 disables the
+    /// animation and the cursor snaps as before.
+    cursor_anim_secs: f32,
     /// Shared by top and bottom strips — both sample the same blur output.
     /// Per-edge would need a second blur chain.
     blur_iterations: usize,
@@ -65,6 +68,7 @@ impl Config {
             top_fade_anim_secs: 0.36,
             bottom_fade_height: DECORATOR_HEIGHT * 2.0,
             bottom_fade_anim_secs: 0.36,
+            cursor_anim_secs: 0.06,
             blur_iterations: 2,
         }
     }
@@ -87,6 +91,7 @@ impl Config {
                 "top_fade_anim_secs" => if let Ok(x) = v.parse() { c.top_fade_anim_secs = x; },
                 "bottom_fade_height" => if let Ok(x) = v.parse() { c.bottom_fade_height = x; },
                 "bottom_fade_anim_secs" => if let Ok(x) = v.parse() { c.bottom_fade_anim_secs = x; },
+                "cursor_anim_secs" => if let Ok(x) = v.parse() { c.cursor_anim_secs = x; },
                 "blur_iterations" => if let Ok(x) = v.parse::<usize>() {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
@@ -108,6 +113,7 @@ impl Config {
              top_fade_anim_secs = {}\n\
              bottom_fade_height = {}\n\
              bottom_fade_anim_secs = {}\n\
+             cursor_anim_secs = {}\n\
              blur_iterations = {}\n",
             self.font_size,
             self.top_fade_height,
@@ -115,6 +121,7 @@ impl Config {
             self.top_fade_anim_secs,
             self.bottom_fade_height,
             self.bottom_fade_anim_secs,
+            self.cursor_anim_secs,
             self.blur_iterations,
         );
         let _ = std::fs::write(p, body);
@@ -202,6 +209,24 @@ struct State {
     top_fade_phase: f32,
     bottom_fade_phase: f32,
     last_anim_tick: std::time::Instant,
+    /// Smooth cursor motion: when the logical cursor moves, the rendered
+    /// quad eases from the previous displayed position toward the new
+    /// target over `config.cursor_anim_secs`. `None` while the cursor is
+    /// off-screen (scrollback) or before the first frame; the next visible
+    /// frame snaps to the target without animating.
+    cursor_anim: Option<CursorAnim>,
+    /// Snapshot of the previous frame's visible cells, plus a viewport key
+    /// (rows / cols / view_offset / alt-screen). Compared on retarget to
+    /// spot cells that just went non-blank → blank so the deleted glyph can
+    /// fade out as a ghost while the cursor slides over it. A key mismatch
+    /// (resize, scrollback, alt-screen toggle) skips ghost detection that
+    /// frame so a wholesale grid shift doesn't spawn ghosts everywhere.
+    prev_visible: Option<GridSnapshot>,
+    /// Glyphs being faded out at their old cell position, captured from
+    /// `prev_visible` when the cursor retargets across them. Each fades to
+    /// alpha 0 over `cursor_anim_secs`; the entry is dropped early if the
+    /// underlying cell becomes non-blank again (a follow-up keystroke).
+    cursor_ghosts: Vec<CursorGhost>,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -469,6 +494,94 @@ fn is_word_char(ch: char) -> bool {
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Eased cursor position in cell-space (col, visual_row) floats. Lerp-with-
+/// retarget chase: when the logical cursor moves while an ease is still in
+/// flight, `from` is rebased to the currently-displayed position so the new
+/// segment starts where the eye last saw the quad.
+#[derive(Copy, Clone)]
+struct CursorAnim {
+    from: (f32, f32),
+    to: (f32, f32),
+    started_at: std::time::Instant,
+}
+
+impl CursorAnim {
+    fn snapped(target: (f32, f32)) -> Self {
+        Self {
+            from: target,
+            to: target,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Smoothstep `t*t*(3 - 2t)` — symmetric ease-in-out, no overshoot.
+    fn current(&self, duration: f32) -> (f32, f32) {
+        if duration <= 0.0 {
+            return self.to;
+        }
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        if elapsed >= duration {
+            return self.to;
+        }
+        let t = elapsed / duration;
+        let e = t * t * (3.0 - 2.0 * t);
+        (
+            self.from.0 + (self.to.0 - self.from.0) * e,
+            self.from.1 + (self.to.1 - self.from.1) * e,
+        )
+    }
+
+    fn animating(&self, duration: f32) -> bool {
+        let moving = (self.from.0 - self.to.0).abs() > f32::EPSILON
+            || (self.from.1 - self.to.1).abs() > f32::EPSILON;
+        moving && self.started_at.elapsed().as_secs_f32() < duration
+    }
+
+    /// Point the ease at a new target, rebasing `from` to whatever is
+    /// currently rendered so the motion is continuous.
+    fn retarget(&mut self, new_target: (f32, f32), duration: f32) {
+        if (new_target.0 - self.to.0).abs() < f32::EPSILON
+            && (new_target.1 - self.to.1).abs() < f32::EPSILON
+        {
+            return;
+        }
+        self.from = self.current(duration);
+        self.to = new_target;
+        self.started_at = std::time::Instant::now();
+    }
+}
+
+/// Identifies which viewport a `GridSnapshot` was taken from. Mismatch on
+/// any field means cell coordinates aren't comparable across frames (the
+/// whole grid was repainted), so ghost detection is skipped.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct ViewportKey {
+    rows: usize,
+    cols: usize,
+    view_offset: usize,
+    on_alt_screen: bool,
+}
+
+struct GridSnapshot {
+    cells: Vec<Vec<style::Cell>>,
+    key: ViewportKey,
+}
+
+/// A glyph being faded out at its old cell position to bridge the gap
+/// between an instantaneous cell clear (e.g. backspace overwriting with a
+/// space) and the cursor's animated slide across that cell.
+struct CursorGhost {
+    ch: char,
+    style: style::Style,
+    visual_row: usize,
+    col: usize,
+    started_at: std::time::Instant,
+}
+
+fn is_blank_cell(cell: &style::Cell) -> bool {
+    matches!(cell.ch, ' ' | '\0')
+}
 
 /// Cell-range selection in absolute-line coordinates. `anchor` is where the
 /// drag started, `head` is where it currently is — they may be in either
@@ -824,6 +937,9 @@ impl State {
             top_fade_phase: 0.0,
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
+            cursor_anim: None,
+            prev_visible: None,
+            cursor_ghosts: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -1415,15 +1531,138 @@ impl State {
 
         // 2. Cursor box, only when the live cursor row is actually visible on
         //    screen (scrollback may have pushed it off the bottom). Shape
-        //    follows DECSCUSR — block, underline, or bar.
+        //    follows DECSCUSR — block, underline, or bar. The displayed
+        //    position eases in cell-space toward the logical position via
+        //    `cursor_anim` so typing/navigation slides instead of snapping.
+        //    Cells along the path that just went non-blank → blank (e.g.
+        //    backspace overwriting with space) are captured as fading
+        //    `cursor_ghosts` so the deleted glyph dissolves under the slide
+        //    instead of vanishing the instant the cursor starts moving.
+        let viewport_key = ViewportKey {
+            rows,
+            cols,
+            view_offset: self.terminal.view_offset(),
+            on_alt_screen: self.terminal.on_alt_screen(),
+        };
+        // A viewport change (resize, scrollback, alt-screen toggle) makes
+        // last frame's snapshot non-comparable cell-for-cell, so we drop
+        // any in-flight ghosts and skip detection until we have a fresh
+        // matching snapshot to compare against.
+        let key_matches = self
+            .prev_visible
+            .as_ref()
+            .map(|s| s.key == viewport_key)
+            .unwrap_or(false);
+        if !key_matches {
+            self.cursor_ghosts.clear();
+        }
+
         if let Some(cur_visual_row) = self.terminal.cursor_visual_row() {
-            if self.cursor_currently_visible() {
-                let cur = self.terminal.cursor();
-                let cur_col = cur.col.min(cols.saturating_sub(1));
-                let block_x = col_x(cur_col);
+            let cur = self.terminal.cursor();
+            let cur_col = cur.col.min(cols.saturating_sub(1));
+            let target = (cur_col as f32, cur_visual_row as f32);
+            let anim_secs = self.config.cursor_anim_secs;
+            let visible = self.cursor_currently_visible();
+
+            // Capture ghosts before retargeting — once `anim.to` advances we
+            // lose the previous-target column/row.
+            if anim_secs > 0.0 && key_matches {
+                if let (Some(prev_anim), Some(snap)) = (
+                    self.cursor_anim.as_ref(),
+                    self.prev_visible.as_ref(),
+                ) {
+                    let (pcol, prow) = prev_anim.to;
+                    let moved = (pcol - target.0).abs() > f32::EPSILON
+                        || (prow - target.1).abs() > f32::EPSILON;
+                    if moved {
+                        let r0 = prow.min(target.1).floor().max(0.0) as usize;
+                        let r1 = prow
+                            .max(target.1)
+                            .ceil()
+                            .min((rows.saturating_sub(1)) as f32)
+                            as usize;
+                        let c0 = pcol.min(target.0).floor().max(0.0) as usize;
+                        let c1 = pcol
+                            .max(target.0)
+                            .ceil()
+                            .min((cols.saturating_sub(1)) as f32)
+                            as usize;
+                        let now = std::time::Instant::now();
+                        for r in r0..=r1 {
+                            for c in c0..=c1 {
+                                if r >= snap.cells.len() || c >= snap.cells[r].len() {
+                                    continue;
+                                }
+                                let prev = snap.cells[r][c];
+                                if is_blank_cell(&prev) {
+                                    continue;
+                                }
+                                let now_cell = self.terminal.visible_cell(r, c);
+                                if !is_blank_cell(&now_cell) {
+                                    continue;
+                                }
+                                self.cursor_ghosts.push(CursorGhost {
+                                    ch: prev.ch,
+                                    style: prev.style,
+                                    visual_row: r,
+                                    col: c,
+                                    started_at: now,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Drop ghosts whose underlying cell got rewritten with new
+            // content (e.g. user typed a replacement after the backspace),
+            // or whose fade has run out.
+            let now = std::time::Instant::now();
+            let terminal = &self.terminal;
+            self.cursor_ghosts.retain(|g| {
+                let elapsed = now.duration_since(g.started_at).as_secs_f32();
+                if anim_secs <= 0.0 || elapsed >= anim_secs {
+                    return false;
+                }
+                is_blank_cell(&terminal.visible_cell(g.visual_row, g.col))
+            });
+
+            // Emit ghost glyphs as foreground-only quads with linearly
+            // decaying alpha. Drawn before the cursor box so the cursor
+            // visually consumes the ghost as it slides over.
+            for ghost in &self.cursor_ghosts {
+                let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
+                let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
+                let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
+                // Premultiplied alpha to match the pipeline's blend mode.
+                fg[0] *= alpha;
+                fg[1] *= alpha;
+                fg[2] *= alpha;
+                fg[3] *= alpha;
+                let variant =
+                    font::FaceVariant::from_flags(ghost.style.bold, ghost.style.italic);
+                emit_cell(
+                    &mut vertices,
+                    &mut indices,
+                    GlyphSource::Char(ghost.ch),
+                    variant,
+                    ghost.visual_row as isize,
+                    ghost.col,
+                    fg,
+                    [0.0; 4],
+                );
+            }
+
+            let anim = self.cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
+            anim.retarget(target, anim_secs);
+
+            if visible {
+                let (eased_col, eased_row) = anim.current(anim_secs);
+                let block_x = WINDOW_PADDING + eased_col * cell_w;
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
-                let cur_baseline = row_y(cur_visual_row as isize);
+                let cur_baseline =
+                    WINDOW_PADDING + decorator_offset + (eased_row + 1.0) * line_height;
                 let block_y =
                     cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5 + scroll_y;
                 let cursor_color = [0.1, 0.0, 0.8, 1.0];
@@ -1449,7 +1688,30 @@ impl State {
                     [0.0; 4],
                 );
             }
+        } else {
+            // Cursor scrolled out of view. Drop the ease so the next time it
+            // returns we snap to the new position instead of sliding in from
+            // a stale one. Ghosts are tied to the cursor's motion so go with it.
+            self.cursor_anim = None;
+            self.cursor_ghosts.clear();
         }
+
+        // Refresh the visible-grid snapshot with the current frame's cells
+        // so the next retarget can spot what just got cleared. Keyed by
+        // viewport so a resize / scrollback / alt-screen flip flushes the
+        // comparison in `key_matches` above.
+        let mut snap_cells: Vec<Vec<style::Cell>> = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let mut row_cells: Vec<style::Cell> = Vec::with_capacity(cols);
+            for c in 0..cols {
+                row_cells.push(self.terminal.visible_cell(r, c));
+            }
+            snap_cells.push(row_cells);
+        }
+        self.prev_visible = Some(GridSnapshot {
+            cells: snap_cells,
+            key: viewport_key,
+        });
 
         // 3. Edge fades: vertical gradient quads pinned to the top and bottom
         // of the window. The top one obscures content sliding up behind the
@@ -1678,6 +1940,7 @@ impl State {
         self.terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.resize_buffers();
+        self.cursor_anim = None;
         self.invalidate();
     }
 
@@ -1704,6 +1967,7 @@ impl State {
         self.terminal.resize(size.char_width, size.char_height);
         self.notify_pty_size(size.char_width, size.char_height);
         self.resize_buffers();
+        self.cursor_anim = None;
         self.invalidate();
     }
 
@@ -1761,6 +2025,17 @@ impl State {
     fn reset_blink(&mut self) {
         self.blink_on = true;
         self.last_blink = std::time::Instant::now();
+    }
+
+    /// True while the cursor quad is mid-ease, or any ghost glyphs are
+    /// still fading. Keeps the event loop ticking until both finish so
+    /// the redraw isn't held up waiting for the next PTY/blink event.
+    fn is_cursor_animating(&self) -> bool {
+        let anim_active = match &self.cursor_anim {
+            Some(a) => a.animating(self.config.cursor_anim_secs),
+            None => false,
+        };
+        anim_active || !self.cursor_ghosts.is_empty()
     }
 
     /// True while either edge-fade phase is still chasing its target —
@@ -2602,9 +2877,10 @@ async fn run() {
                 if state.maybe_blink_tick() {
                     state.invalidate();
                 }
-                // Top edge-fade slide animation: keep ticking frames as long
-                // as the phase hasn't reached its target (0 or 1).
-                let animating = state.is_top_fade_animating();
+                // Edge-fade and cursor-position eases: keep ticking frames
+                // as long as either is still chasing its target.
+                let animating =
+                    state.is_top_fade_animating() || state.is_cursor_animating();
                 if animating {
                     state.invalidate();
                 }
@@ -2686,4 +2962,189 @@ fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
 
 fn main() {
     pollster::block_on(run());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const TOL: f32 = 1e-4;
+
+    fn approx_eq(a: f32, b: f32) -> bool {
+        (a - b).abs() < TOL
+    }
+
+    fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
+        approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    /// Build a `CursorAnim` whose `started_at` is back-dated so that
+    /// `elapsed / duration == t` at the moment of construction. Useful
+    /// for deterministically exercising the smoothstep curve without
+    /// flaky real-time waits.
+    fn anim_at_t(from: (f32, f32), to: (f32, f32), duration: f32, t: f32) -> CursorAnim {
+        let elapsed_secs = duration * t;
+        let elapsed = Duration::from_secs_f32(elapsed_secs);
+        CursorAnim {
+            from,
+            to,
+            started_at: Instant::now() - elapsed,
+        }
+    }
+
+    #[test]
+    fn snapped_has_from_equal_to_target() {
+        let a = CursorAnim::snapped((3.0, 4.0));
+        assert_eq!(a.from, (3.0, 4.0));
+        assert_eq!(a.to, (3.0, 4.0));
+        // current() should immediately return the target regardless of duration.
+        assert!(approx_pair(a.current(0.2), (3.0, 4.0)));
+    }
+
+    #[test]
+    fn current_returns_to_when_duration_zero_or_negative() {
+        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        assert!(approx_pair(a.current(0.0), (10.0, 4.0)));
+        assert!(approx_pair(a.current(-1.0), (10.0, 4.0)));
+    }
+
+    #[test]
+    fn current_returns_to_after_duration_elapses() {
+        // Back-date 10s to guarantee elapsed >= duration for any reasonable duration.
+        let a = CursorAnim {
+            from: (0.0, 0.0),
+            to: (10.0, 4.0),
+            started_at: Instant::now() - Duration::from_secs(10),
+        };
+        assert!(approx_pair(a.current(0.2), (10.0, 4.0)));
+    }
+
+    #[test]
+    fn smoothstep_midpoint_is_half() {
+        // smoothstep(0.5) = 0.25 * (3 - 1) = 0.5
+        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        let p = a.current(0.2);
+        assert!(approx_pair(p, (5.0, 2.0)), "got {:?}", p);
+    }
+
+    #[test]
+    fn smoothstep_quarter_point() {
+        // smoothstep(0.25) = 0.0625 * (3 - 0.5) = 0.15625
+        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.25);
+        let p = a.current(0.2);
+        assert!(approx_pair(p, (1.5625, 0.625)), "got {:?}", p);
+    }
+
+    #[test]
+    fn animating_false_for_snapped() {
+        let a = CursorAnim::snapped((3.0, 4.0));
+        assert!(!a.animating(0.2));
+    }
+
+    #[test]
+    fn animating_true_in_flight_false_after_duration() {
+        let mid = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        assert!(mid.animating(0.2));
+
+        let done = CursorAnim {
+            from: (0.0, 0.0),
+            to: (10.0, 4.0),
+            started_at: Instant::now() - Duration::from_secs(10),
+        };
+        assert!(!done.animating(0.2));
+    }
+
+    #[test]
+    fn retarget_to_same_target_is_noop() {
+        let original_started = Instant::now() - Duration::from_millis(50);
+        let mut a = CursorAnim {
+            from: (1.0, 1.0),
+            to: (5.0, 5.0),
+            started_at: original_started,
+        };
+        a.retarget((5.0, 5.0), 0.2);
+        assert_eq!(a.from, (1.0, 1.0));
+        assert_eq!(a.to, (5.0, 5.0));
+        assert_eq!(a.started_at, original_started);
+    }
+
+    #[test]
+    fn retarget_rebases_from_to_currently_eased_position() {
+        // Midway through a 0.0 -> 10.0 (x) ease, eased x = 5.0.
+        let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        let pre = a.current(0.2);
+        assert!(approx_pair(pre, (5.0, 2.0)));
+
+        a.retarget((20.0, 8.0), 0.2);
+
+        // New `from` should equal the displayed-at-retarget position.
+        assert!(approx_pair(a.from, (5.0, 2.0)), "from = {:?}", a.from);
+        assert_eq!(a.to, (20.0, 8.0));
+        // started_at should be (approximately) "now" — well after the
+        // back-dated original. Elapsed should be very small.
+        assert!(a.started_at.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn is_blank_cell_true_for_space_and_nul() {
+        let space = style::Cell::new(' ', style::Style::new());
+        let nul = style::Cell::new('\0', style::Style::new());
+        assert!(is_blank_cell(&space));
+        assert!(is_blank_cell(&nul));
+    }
+
+    #[test]
+    fn is_blank_cell_false_for_visible_chars() {
+        for ch in ['x', 'a', '1', '.'] {
+            let cell = style::Cell::new(ch, style::Style::new());
+            assert!(!is_blank_cell(&cell), "expected {:?} to be non-blank", ch);
+        }
+    }
+
+    #[test]
+    fn is_blank_cell_ignores_style() {
+        // A space with bold + a foreground color is still blank — only `ch` matters.
+        let mut style = style::Style::new();
+        style.bold = true;
+        style.color_fg = Some([1.0; 4]);
+        let cell = style::Cell::new(' ', style);
+        assert!(is_blank_cell(&cell));
+    }
+
+    #[test]
+    fn viewport_key_equality_and_field_sensitivity() {
+        let base = ViewportKey {
+            rows: 24,
+            cols: 80,
+            view_offset: 0,
+            on_alt_screen: false,
+        };
+        // Identical keys compare equal.
+        let same = ViewportKey {
+            rows: 24,
+            cols: 80,
+            view_offset: 0,
+            on_alt_screen: false,
+        };
+        // `ViewportKey` doesn't derive `Debug`, so use `assert!` over `==`/`!=`
+        // rather than `assert_eq!`/`assert_ne!`.
+        assert!(base == same);
+
+        // Flipping any single field breaks equality.
+        let diff_rows = ViewportKey { rows: 25, ..base };
+        let diff_cols = ViewportKey { cols: 81, ..base };
+        let diff_offset = ViewportKey {
+            view_offset: 1,
+            ..base
+        };
+        let diff_alt = ViewportKey {
+            on_alt_screen: true,
+            ..base
+        };
+        assert!(base != diff_rows);
+        assert!(base != diff_cols);
+        assert!(base != diff_offset);
+        assert!(base != diff_alt);
+    }
 }
