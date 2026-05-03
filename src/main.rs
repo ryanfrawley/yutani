@@ -1056,6 +1056,11 @@ impl State {
 
         let default_fg = [0.0, 0.0, 0.0, 1.0];
         let default_bg = [0.0, 0.0, 0.0, 0.0];
+        // Solid form of the window background, used when reverse-video needs
+        // a concrete bg color to swap into the foreground slot. Pulled from
+        // the same source as the surface clear color so the two stay aligned.
+        let cc = clear_color(theme);
+        let default_bg_solid = [cc.r as f32, cc.g as f32, cc.b as f32, cc.a as f32];
         let atlas_w = self.atlas.width as f32;
         let atlas_h = self.atlas.height as f32;
         let bg_u = 1.0 / atlas_w;
@@ -1399,8 +1404,21 @@ impl State {
             let over = row_overrides.get(&r);
             for c in 0..cols {
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
-                let fg = cell.style.color_fg.unwrap_or(default_fg);
-                let bg = cell.style.color_bg.unwrap_or(default_bg);
+                // SGR 7 (reverse) swaps fg/bg. Resolve unset colors to concrete
+                // theme defaults before swapping — `default_bg` is transparent
+                // so the window shows through, but reverse needs a solid bg
+                // that the swap can move to fg (otherwise reverse-video text
+                // and Claude Code's reverse-space cursor render invisible).
+                let (fg, bg) = if cell.style.reverse {
+                    let rfg = cell.style.color_fg.unwrap_or(default_fg);
+                    let rbg = cell.style.color_bg.unwrap_or(default_bg_solid);
+                    (rbg, rfg)
+                } else {
+                    (
+                        cell.style.color_fg.unwrap_or(default_fg),
+                        cell.style.color_bg.unwrap_or(default_bg),
+                    )
+                };
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
                 let fg_source = match over.and_then(|cs| cs[c]) {
