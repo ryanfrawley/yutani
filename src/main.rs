@@ -54,6 +54,10 @@ struct Config {
     /// Ease-in-out duration for cursor position changes. 0 disables the
     /// animation and the cursor snaps as before.
     cursor_anim_secs: f32,
+    /// When false, the cursor never blinks regardless of what DECSCUSR
+    /// requests. Defaults to false because steady cursors are easier on
+    /// the eyes; opt back in for xterm-faithful behavior.
+    cursor_blink: bool,
     /// Shared by top and bottom strips — both sample the same blur output.
     /// Per-edge would need a second blur chain.
     blur_iterations: usize,
@@ -69,14 +73,19 @@ impl Config {
             bottom_fade_height: DECORATOR_HEIGHT * 2.0,
             bottom_fade_anim_secs: 0.36,
             cursor_anim_secs: 0.06,
+            cursor_blink: false,
             blur_iterations: 2,
         }
     }
 
     fn load() -> Self {
+        let Some(p) = config_path() else { return Self::defaults() };
+        let Ok(s) = std::fs::read_to_string(p) else { return Self::defaults() };
+        Self::parse_str(&s)
+    }
+
+    fn parse_str(s: &str) -> Self {
         let mut c = Self::defaults();
-        let Some(p) = config_path() else { return c };
-        let Ok(s) = std::fs::read_to_string(p) else { return c };
         for line in s.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -92,6 +101,7 @@ impl Config {
                 "bottom_fade_height" => if let Ok(x) = v.parse() { c.bottom_fade_height = x; },
                 "bottom_fade_anim_secs" => if let Ok(x) = v.parse() { c.bottom_fade_anim_secs = x; },
                 "cursor_anim_secs" => if let Ok(x) = v.parse() { c.cursor_anim_secs = x; },
+                "cursor_blink" => if let Ok(x) = v.parse() { c.cursor_blink = x; },
                 "blur_iterations" => if let Ok(x) = v.parse::<usize>() {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
@@ -106,7 +116,11 @@ impl Config {
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let body = format!(
+        let _ = std::fs::write(p, self.serialize());
+    }
+
+    fn serialize(&self) -> String {
+        format!(
             "font_size = {}\n\
              top_fade_height = {}\n\
              top_fade_solid_stop = {}\n\
@@ -114,6 +128,7 @@ impl Config {
              bottom_fade_height = {}\n\
              bottom_fade_anim_secs = {}\n\
              cursor_anim_secs = {}\n\
+             cursor_blink = {}\n\
              blur_iterations = {}\n",
             self.font_size,
             self.top_fade_height,
@@ -122,9 +137,9 @@ impl Config {
             self.bottom_fade_height,
             self.bottom_fade_anim_secs,
             self.cursor_anim_secs,
+            self.cursor_blink,
             self.blur_iterations,
-        );
-        let _ = std::fs::write(p, body);
+        )
     }
 }
 
@@ -2046,17 +2061,23 @@ impl State {
         }
     }
 
+    /// Effective blink state: DECSCUSR's request is gated by the user's
+    /// `cursor_blink` config so opting out disables blinking globally.
+    fn cursor_blink_enabled(&self) -> bool {
+        self.config.cursor_blink && self.terminal.cursor_blink()
+    }
+
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the
     /// cursor exists at all; blink only suppresses it on the "off" half-phase
     /// of the cycle when DECSCUSR has selected a blinking variant.
     fn cursor_currently_visible(&self) -> bool {
-        self.terminal.cursor_visible() && (!self.terminal.cursor_blink() || self.blink_on)
+        self.terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
     }
 
     /// If a blink half-cycle has elapsed, flip the phase and request a redraw.
     /// Returns true when the cursor visibility actually changed.
     fn maybe_blink_tick(&mut self) -> bool {
-        if !self.terminal.cursor_blink() || !self.terminal.cursor_visible() {
+        if !self.cursor_blink_enabled() || !self.terminal.cursor_visible() {
             return false;
         }
         if self.last_blink.elapsed() < BLINK_INTERVAL {
@@ -2070,7 +2091,7 @@ impl State {
     /// Next instant the event loop should wake to flip the blink phase, or
     /// `None` if the cursor isn't blinking right now.
     fn next_blink_wake(&self) -> Option<std::time::Instant> {
-        if self.terminal.cursor_blink() && self.terminal.cursor_visible() {
+        if self.cursor_blink_enabled() && self.terminal.cursor_visible() {
             Some(self.last_blink + BLINK_INTERVAL)
         } else {
             None
@@ -3203,5 +3224,27 @@ mod tests {
         assert!(base != diff_cols);
         assert!(base != diff_offset);
         assert!(base != diff_alt);
+    }
+
+    #[test]
+    fn config_defaults_cursor_blink_is_false() {
+        assert!(!Config::defaults().cursor_blink);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_cursor_blink_true() {
+        let mut c = Config::defaults();
+        c.cursor_blink = true;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.cursor_blink);
+    }
+
+    #[test]
+    fn config_parse_invalid_cursor_blink_keeps_default() {
+        // Garbage value must not poison the rest of the config — the field
+        // stays at its default (false) and other keys still parse.
+        let parsed = Config::parse_str("cursor_blink = banana\nfont_size = 12.5\n");
+        assert!(!parsed.cursor_blink);
+        assert!(approx_eq(parsed.font_size, 12.5));
     }
 }
