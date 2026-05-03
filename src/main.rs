@@ -1314,11 +1314,27 @@ impl State {
                 // sampler stretch the bitmap into it closes the gap. Each
                 // axis is independent so e.g. ▐ (full-height, half-width)
                 // gets vertical stretching without distorting horizontally.
+                //
+                // Gated on codepoint range so a generic glyph that happens to
+                // fill both axes (e.g. ⏺ U+23FA, a near-square circle) isn't
+                // stretched to the non-square cell aspect — that distortion
+                // turns a round glyph into an oval. Only the ranges whose
+                // glyphs are *designed* to tile across cell edges opt in:
+                // box-drawing + block-elements (synthesized in this binary)
+                // and the Powerline/separator slice of PUA.
                 let bx = g.bearing_x as f32;
                 let by = g.bearing_y as f32;
                 let asc_eff = bg_h + descender; // pixels above baseline (descender is negative)
-                let fills_h = !allow_overhang && g.width as f32 >= span_w * 0.85;
-                let fills_v = g.height as f32 >= line_height * 0.85;
+                let cell_filling = match fg_source {
+                    GlyphSource::Char(ch) => {
+                        let cp = ch as u32;
+                        (0x2500..=0x259F).contains(&cp) || (0xE000..=0xE0FF).contains(&cp)
+                    }
+                    GlyphSource::Substituted(_) => false,
+                };
+                let fills_h = cell_filling && !allow_overhang
+                    && g.width as f32 >= span_w * 0.85;
+                let fills_v = cell_filling && g.height as f32 >= line_height * 0.85;
                 let (gx, gw, q_start, q_end) = if fills_h {
                     // Restrict UV to the in-cell columns so a glyph designed
                     // to bleed into an adjacent cell (negative bearing or
