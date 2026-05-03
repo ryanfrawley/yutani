@@ -570,11 +570,14 @@ struct GridSnapshot {
 
 /// A glyph being faded out at its old cell position to bridge the gap
 /// between an instantaneous cell clear (e.g. backspace overwriting with a
-/// space) and the cursor's animated slide across that cell.
+/// space) and the cursor's animated slide across that cell. Stored in
+/// buffer-row coordinates so the ghost stays anchored to the underlying
+/// cell when the user scrolls; the visual row is recomputed each frame
+/// from the current `live_grid_offset`.
 struct CursorGhost {
     ch: char,
     style: style::Style,
-    visual_row: usize,
+    buffer_row: usize,
     col: usize,
     started_at: std::time::Instant,
 }
@@ -1557,15 +1560,31 @@ impl State {
             self.cursor_ghosts.clear();
         }
 
-        if let Some(cur_visual_row) = self.terminal.cursor_visual_row() {
+        // The cursor and its ghosts animate in BUFFER coordinates so changes
+        // to the user's scroll position (which only shift `view_offset`)
+        // don't trigger a slide — they ride along with the rest of the
+        // grid. `live_grid_offset` is the integer visual-row delta to apply
+        // when converting buffer rows back to viewport pixel space; equal
+        // to `scrollback_visible` on the primary screen, 0 on alt screen.
+        let live_grid_offset_i = if self.terminal.on_alt_screen() {
+            0usize
+        } else {
+            self.terminal.view_offset().min(rows)
+        };
+        let live_grid_offset = live_grid_offset_i as f32;
+
+        if let Some(_cur_visual_row) = self.terminal.cursor_visual_row() {
             let cur = self.terminal.cursor();
             let cur_col = cur.col.min(cols.saturating_sub(1));
-            let target = (cur_col as f32, cur_visual_row as f32);
+            let target = (cur_col as f32, cur.row as f32);
             let anim_secs = self.config.cursor_anim_secs;
             let visible = self.cursor_currently_visible();
 
             // Capture ghosts before retargeting — once `anim.to` advances we
-            // lose the previous-target column/row.
+            // lose the previous-target column/row. Bounding-box scan is in
+            // buffer coords; prev_visible uses visual rows, so translate via
+            // `live_grid_offset` (consistent because key_matches implies
+            // view_offset hasn't changed since the snapshot).
             if anim_secs > 0.0 && key_matches {
                 if let (Some(prev_anim), Some(snap)) = (
                     self.cursor_anim.as_ref(),
@@ -1588,23 +1607,24 @@ impl State {
                             .min((cols.saturating_sub(1)) as f32)
                             as usize;
                         let now = std::time::Instant::now();
-                        for r in r0..=r1 {
+                        for buf_r in r0..=r1 {
+                            let vis_r = buf_r + live_grid_offset_i;
                             for c in c0..=c1 {
-                                if r >= snap.cells.len() || c >= snap.cells[r].len() {
+                                if vis_r >= snap.cells.len() || c >= snap.cells[vis_r].len() {
                                     continue;
                                 }
-                                let prev = snap.cells[r][c];
+                                let prev = snap.cells[vis_r][c];
                                 if is_blank_cell(&prev) {
                                     continue;
                                 }
-                                let now_cell = self.terminal.visible_cell(r, c);
+                                let now_cell = self.terminal.visible_cell(vis_r, c);
                                 if !is_blank_cell(&now_cell) {
                                     continue;
                                 }
                                 self.cursor_ghosts.push(CursorGhost {
                                     ch: prev.ch,
                                     style: prev.style,
-                                    visual_row: r,
+                                    buffer_row: buf_r,
                                     col: c,
                                     started_at: now,
                                 });
@@ -1624,7 +1644,8 @@ impl State {
                 if anim_secs <= 0.0 || elapsed >= anim_secs {
                     return false;
                 }
-                is_blank_cell(&terminal.visible_cell(g.visual_row, g.col))
+                let vis_r = g.buffer_row + live_grid_offset_i;
+                is_blank_cell(&terminal.visible_cell(vis_r, g.col))
             });
 
             // Emit ghost glyphs as foreground-only quads with linearly
@@ -1641,12 +1662,13 @@ impl State {
                 fg[3] *= alpha;
                 let variant =
                     font::FaceVariant::from_flags(ghost.style.bold, ghost.style.italic);
+                let vis_r = ghost.buffer_row + live_grid_offset_i;
                 emit_cell(
                     &mut vertices,
                     &mut indices,
                     GlyphSource::Char(ghost.ch),
                     variant,
-                    ghost.visual_row as isize,
+                    vis_r as isize,
                     ghost.col,
                     fg,
                     [0.0; 4],
@@ -1657,12 +1679,13 @@ impl State {
             anim.retarget(target, anim_secs);
 
             if visible {
-                let (eased_col, eased_row) = anim.current(anim_secs);
+                let (eased_col, eased_buf_row) = anim.current(anim_secs);
+                let eased_vis_row = eased_buf_row + live_grid_offset;
                 let block_x = WINDOW_PADDING + eased_col * cell_w;
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
                 let cur_baseline =
-                    WINDOW_PADDING + decorator_offset + (eased_row + 1.0) * line_height;
+                    WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
                 let block_y =
                     cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5 + scroll_y;
                 let cursor_color = [0.1, 0.0, 0.8, 1.0];
