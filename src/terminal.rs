@@ -648,6 +648,13 @@ impl Terminal {
                     self.scrollback.pop_front();
                 }
                 self.scrollback.push_back(line);
+                // Keep the user's view of historical content stable while
+                // new lines stream into scrollback. visible_cell indexes from
+                // the end of scrollback, so without this bump every appended
+                // line would shift the viewport down by one row.
+                if self.view_offset > 0 {
+                    self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+                }
             }
         }
         let blank = self.blank();
@@ -1550,6 +1557,44 @@ mod tests {
         // bottom visible row is what was previously row 0 of the grid (CCCCC).
         assert_eq!(t.visible_cell(0, 0).ch, 'B');
         assert_eq!(t.visible_cell(1, 0).ch, 'C');
+    }
+
+    #[test]
+    fn viewport_stays_anchored_as_new_lines_enter_scrollback() {
+        let mut t = Terminal::new(5, 2, 100);
+        t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\n");
+        // scrollback = [AAAAA, BBBBB], grid = [CCCCC, _]
+        assert_eq!(t.scrollback_len(), 2);
+        assert!(t.scroll_up(2));
+        // Top of viewport pinned to AAAAA; bottom to BBBBB.
+        assert_eq!(t.visible_cell(0, 0).ch, 'A');
+        assert_eq!(t.visible_cell(1, 0).ch, 'B');
+
+        // New lines stream in. The visible content must not shift.
+        t.feed("DDDDD\r\nEEEEE\r\n");
+        assert_eq!(t.visible_cell(0, 0).ch, 'A');
+        assert_eq!(t.visible_cell(1, 0).ch, 'B');
+    }
+
+    #[test]
+    fn viewport_pins_to_top_when_oldest_scrollback_evicts() {
+        // scrollback_limit = 3 — once full, pop_front evicts oldest.
+        let mut t = Terminal::new(5, 2, 3);
+        t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE\r\n");
+        // scrollback = [BBBBB, CCCCC, DDDDD] (AAAAA already evicted),
+        // grid = [EEEEE, _]
+        assert_eq!(t.scrollback_len(), 3);
+        assert!(t.scroll_up(3));
+        assert_eq!(t.visible_cell(0, 0).ch, 'B');
+        assert_eq!(t.visible_cell(1, 0).ch, 'C');
+
+        // Push a new line: BBBBB is evicted. We can no longer show it, so
+        // pin to the new oldest line (CCCCC) without indexing past the buffer.
+        t.feed("FFFFF\r\n");
+        assert_eq!(t.scrollback_len(), 3);
+        assert_eq!(t.view_offset(), 3);
+        assert_eq!(t.visible_cell(0, 0).ch, 'C');
+        assert_eq!(t.visible_cell(1, 0).ch, 'D');
     }
 
     #[test]
