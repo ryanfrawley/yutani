@@ -416,18 +416,19 @@ impl Terminal {
         Some(self.primary.get(primary_row, col))
     }
 
-    /// Visual row of the live cursor, including the row immediately past the
-    /// bottom of the visible viewport (`rows`) so callers can render the
-    /// cursor when it's only halfway off the bottom edge mid-scroll. Returns
-    /// `None` only when the cursor sits more than one row beyond the bottom
-    /// (truly off-screen).
+    /// Visual row of the live cursor. Includes rows up to `rows + 1` — i.e.
+    /// the renderer's phantom-row range below the viewport — so the cursor
+    /// stays drawn whenever any pixel of its row could be visible (smooth
+    /// sub-line scroll, decorator-offset push at the bottom edge, window
+    /// padding slack). Returns `None` only when the cursor is beyond that,
+    /// truly off-screen.
     pub fn cursor_visual_row(&self) -> Option<usize> {
         if self.use_alternate {
             return Some(self.cursor.row);
         }
         let scrollback_visible = self.view_offset.min(self.rows);
         let visual = self.cursor.row + scrollback_visible;
-        if visual <= self.rows {
+        if visual <= self.rows + 1 {
             Some(visual)
         } else {
             None
@@ -1576,21 +1577,24 @@ mod tests {
 
     #[test]
     fn cursor_visual_row_hidden_when_scrolled_off() {
-        let mut t = Terminal::new(5, 2, 100);
-        t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\n"); // cursor now at row 1
-        assert_eq!(t.cursor_visual_row(), Some(1));
-        // One row of scrollback shifts the cursor to visual row 2 (== rows),
-        // i.e. one past the last visible row. We still return Some so the
-        // renderer can keep drawing the cursor while it slides through the
-        // bottom edge during a smooth scroll.
-        t.scroll_up(1);
+        let mut t = Terminal::new(5, 3, 100);
+        // Push 4 lines into scrollback while parking the cursor on the
+        // last row of the live grid (row=2).
+        t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD\r\nEEEEE\r\nFFFFF\r\n");
         assert_eq!(t.cursor_visual_row(), Some(2));
-        // Two rows of scrollback push it to visual row 3 — too far below the
-        // viewport for a phantom-render, so we return None.
+        // 1 line back: visual=3 (== rows). Still drawn at the bottom edge.
+        t.scroll_up(1);
+        assert_eq!(t.cursor_visual_row(), Some(3));
+        // 2 lines back: visual=4 (rows + 1). The renderer's phantom band
+        // covers this so the cursor can still intersect the window at the
+        // bottom edge — keep drawing.
+        t.scroll_up(1);
+        assert_eq!(t.cursor_visual_row(), Some(4));
+        // 3 lines back: visual=5 (rows + 2). Beyond the phantom band; hide.
         t.scroll_up(1);
         assert_eq!(t.cursor_visual_row(), None);
         t.scroll_to_bottom();
-        assert_eq!(t.cursor_visual_row(), Some(1));
+        assert_eq!(t.cursor_visual_row(), Some(2));
     }
 
     #[test]
