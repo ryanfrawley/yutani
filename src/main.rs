@@ -4052,47 +4052,66 @@ impl State {
         // we never call the GPU image pipeline — the half-block fallback
         // (computed in `update_vertices` via `halfblock_overrides`) is
         // the only visible representation in that case.
-        let mut image_draws: Vec<renderer::images::ImageDraw<'_>> =
-            Vec::with_capacity(self.terminal.live_placements().len());
+        //
+        // When images are on, two walks share the same pixel math: live
+        // placements (always) plus, when the user has scrolled history
+        // into view on the primary screen, scrollback placements rebased
+        // into viewport-row coords by `scrollback_placements_in_view`.
+        // Because that accessor returns `top_row` in viewport coords, the
+        // formula below (`top_row * line_height + decorator_offset +
+        // scroll_y`) makes images slide in lockstep with text during
+        // smooth-scroll.
+        let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
         if self.config.images_enabled {
-        for p in self.terminal.live_placements() {
-            let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
-            // pixel_offset shifts the draw inside the anchor cell — phase 2
-            // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
-            // identical so eviction / scroll-region shifting is unaffected.
-            let x_px = WINDOW_PADDING
-                + (p.left_col as f32) * cell_w
-                + p.pixel_offset.0 as f32;
-            let y_px = WINDOW_PADDING
-                + decorator_offset
-                + (p.top_row as f32) * line_height
-                + scroll_y
-                + p.pixel_offset.1 as f32;
-            let w_px = (p.cols as f32) * cell_w;
-            let h_px = (p.rows as f32) * line_height;
-            // src_rect (pixels) → UVs (0..1) against this image's known size.
-            // Guard against zero w/h on the GpuImage to avoid div-by-zero —
-            // shouldn't happen for a successfully uploaded texture, but cheap.
-            let uv_rect = p.src_rect.and_then(|(sx, sy, sw, sh)| {
-                let iw = gpu_img.width_px as f32;
-                let ih = gpu_img.height_px as f32;
-                if iw <= 0.0 || ih <= 0.0 { return None; }
-                Some((
-                    sx as f32 / iw,
-                    sy as f32 / ih,
-                    (sx + sw) as f32 / iw,
-                    (sy + sh) as f32 / ih,
-                ))
-            });
-            image_draws.push(renderer::images::ImageDraw {
-                image: gpu_img,
-                x_px,
-                y_px,
-                w_px,
-                h_px,
-                uv_rect,
-            });
-        }
+            let scrollback_draws = self
+                .terminal
+                .scrollback_placements_in_view(self.terminal.rows);
+            image_draws.reserve(
+                self.terminal.live_placements().len() + scrollback_draws.len(),
+            );
+            let placement_iter = self
+                .terminal
+                .live_placements()
+                .iter()
+                .chain(scrollback_draws.iter());
+            for p in placement_iter {
+                let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
+                // pixel_offset shifts the draw inside the anchor cell — phase 2
+                // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
+                // identical so eviction / scroll-region shifting is unaffected.
+                let x_px = WINDOW_PADDING
+                    + (p.left_col as f32) * cell_w
+                    + p.pixel_offset.0 as f32;
+                let y_px = WINDOW_PADDING
+                    + decorator_offset
+                    + (p.top_row as f32) * line_height
+                    + scroll_y
+                    + p.pixel_offset.1 as f32;
+                let w_px = (p.cols as f32) * cell_w;
+                let h_px = (p.rows as f32) * line_height;
+                // src_rect (pixels) → UVs (0..1) against this image's known size.
+                // Guard against zero w/h on the GpuImage to avoid div-by-zero —
+                // shouldn't happen for a successfully uploaded texture, but cheap.
+                let uv_rect = p.src_rect.and_then(|(sx, sy, sw, sh)| {
+                    let iw = gpu_img.width_px as f32;
+                    let ih = gpu_img.height_px as f32;
+                    if iw <= 0.0 || ih <= 0.0 { return None; }
+                    Some((
+                        sx as f32 / iw,
+                        sy as f32 / ih,
+                        (sx + sw) as f32 / iw,
+                        (sy + sh) as f32 / ih,
+                    ))
+                });
+                image_draws.push(renderer::images::ImageDraw {
+                    image: gpu_img,
+                    x_px,
+                    y_px,
+                    w_px,
+                    h_px,
+                    uv_rect,
+                });
+            }
         }
         let has_images = !image_draws.is_empty();
 
