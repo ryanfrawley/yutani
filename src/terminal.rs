@@ -1760,13 +1760,18 @@ fn compute_cell_extent(
         }
     }
 
-    // Ceiling divide pixels → cells. Fallback to 1 if the spec is
-    // unresolvable (e.g. Auto with no header peek).
+    // Ceiling divide pixels → cells. `saturating_add` because a malformed
+    // protocol payload (Kitty `s=`/`v=`, eventually) could pass a width
+    // close to u32::MAX; a plain `+ cell_w_px - 1` panics in debug and
+    // wraps in release. Saturating clips the result to u16::MAX cells via
+    // the final `.min(...)`, which is the worst case the renderer can
+    // handle. Fallback to 1 if the spec is unresolvable (e.g. Auto with
+    // no header peek).
     let cols = w_px
-        .map(|px| ((px + cell_w_px - 1) / cell_w_px).max(1))
+        .map(|px| (px.saturating_add(cell_w_px - 1) / cell_w_px).max(1))
         .unwrap_or(1);
     let rows = h_px
-        .map(|px| ((px + line_h_px - 1) / line_h_px).max(1))
+        .map(|px| (px.saturating_add(line_h_px - 1) / line_h_px).max(1))
         .unwrap_or(1);
     (
         rows.min(u16::MAX as u32) as u16,
@@ -4137,18 +4142,15 @@ mod tests {
         assert_eq!(cols, u16::MAX);
     }
 
-    // BUG: `(px + cell_w_px - 1) / cell_w_px` in compute_cell_extent
-    // overflows in debug builds (and silently wraps in release) when px is
-    // within (cell - 1) of u32::MAX. A `saturating_add` or pre-clamp before
-    // the ceil-div would fix it. Pinned here as #[should_panic] so the
-    // existence of the bug is visible to whoever fixes it — flip this to
-    // a positive assertion (u16::MAX clamp) once the saturating fix lands.
+    /// A `Pixels(u32::MAX - 1)` spec used to overflow the `+ cell_w_px - 1`
+    /// in the ceil-div (debug panic, release wrap). `saturating_add` makes
+    /// the worst case clip cleanly to `u16::MAX` cells, which is the
+    /// largest extent the renderer can represent.
     #[test]
-    #[should_panic(expected = "attempt to add with overflow")]
-    fn compute_cell_extent_pixels_near_u32_max_overflows_today() {
-        let _ = compute_cell_extent(
+    fn compute_cell_extent_pixels_near_u32_max_clamps_instead_of_overflowing() {
+        let (rows, cols) = compute_cell_extent(
             ImageSizeSpec::Pixels(u32::MAX - 1),
-            ImageSizeSpec::Auto,
+            ImageSizeSpec::Pixels(u32::MAX - 1),
             None,
             8,
             16,
@@ -4156,6 +4158,8 @@ mod tests {
             24,
             false,
         );
+        assert_eq!(rows, u16::MAX);
+        assert_eq!(cols, u16::MAX);
     }
 
     #[test]
