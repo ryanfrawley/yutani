@@ -1866,4 +1866,145 @@ mod tests {
         assert!(store.peek(image_ids[0]).is_some());
         assert!(store.peek(image_ids[1]).is_some());
     }
+
+    #[test]
+    fn e2e_kitty_virtual_placement_through_store_with_placeholder_bbox() {
+        // Full virtual-placement flow end-to-end:
+        //   1. `a=T,U=1,i=N` transmits PNG bytes and registers a client-id
+        //      → store-id mapping. NO Placement is created, cursor stays
+        //      put. Image survives mark-and-sweep via referenced_image_ids
+        //      because the kitty_image_ids map's values feed it.
+        //   2. Printed U+10EEEE placeholder cells with the matching SGR fg
+        //      produce a bbox via `kitty_placeholder_bboxes()`.
+        //   3. The store image registered in step 1 is reachable via
+        //      `Store::peek` for that bbox's id (after main.rs maps client
+        //      → store via `kitty_image_id_lookup`).
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+        let cursor_before = term.cursor();
+
+        // 1. a=T,U=1 — transmit but don't display.
+        let png = make_png(4, 4);
+        let client_id = 0xABCDEFu32;
+        term.feed(&make_kitty_apc(
+            &format!("a=T,U=1,f=100,i={}", client_id),
+            &png,
+        ));
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = uploads.into_iter().next().unwrap();
+        assert!(!up.display_immediately, "U=1 must not display");
+        assert_eq!(up.kitty_image_id, Some(client_id));
+        // No placement created; cursor untouched.
+        assert!(term.live_placements().is_empty());
+        assert_eq!(term.cursor().row, cursor_before.row);
+        assert_eq!(term.cursor().col, cursor_before.col);
+
+        // Hand the bytes off to Store and register the mapping (main.rs's job).
+        let (_pending, image_id) = store.request_insert(
+            up.bytes,
+            100,
+            Duration::from_secs(5),
+            up.label,
+        );
+        term.register_kitty_image_id(client_id, image_id);
+        // Mark-and-sweep simulation: even with no placement, the image
+        // must be in referenced_image_ids so Store::retain keeps it.
+        assert!(term.referenced_image_ids().contains(&image_id));
+
+        // 2. Print placeholder cells encoding `client_id` in SGR fg.
+        let r = ((client_id >> 16) & 0xFF) as u8;
+        let g = ((client_id >> 8) & 0xFF) as u8;
+        let b = (client_id & 0xFF) as u8;
+        term.feed(&format!("\x1b[38;2;{};{};{}m", r, g, b));
+        term.feed("\x1b[3;5H"); // row 2 col 4 (0-based)
+        term.feed("\u{10EEEE}\u{10EEEE}");
+        term.feed("\x1b[4;5H");
+        term.feed("\u{10EEEE}\u{10EEEE}");
+        let bboxes = term.kitty_placeholder_bboxes();
+        assert_eq!(bboxes.len(), 1, "one bbox per distinct id");
+        let (bbox_id, top, left, rows, cols) = bboxes[0];
+        assert_eq!(bbox_id, client_id);
+        assert_eq!((top, left, rows, cols), (2, 4, 2, 2));
+
+        // 3. Drive the decode; the image referenced by the bbox's id maps
+        // through to a peek-able Store entry.
+        let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        let mapped = term.kitty_image_id_lookup(bbox_id).expect("client → store mapping");
+        assert_eq!(mapped, image_id);
+        assert!(store.peek(mapped).is_some(), "virtual-placement image must be peek-able");
+    }
+
+    #[test]
+    fn e2e_kitty_a_d_then_retransmit_same_id_decodes_cleanly() {
+        // Lifecycle stress: transmit id=N, delete with a=d,d=i,i=N, then
+        // re-transmit the SAME client id. The fresh transmission must
+        // produce its own decode (not be poisoned by the prior mapping or
+        // accumulator state).
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        // First transmission (a=t — transmit only, no display so we can
+        // exercise the bare mapping path).
+        let png1 = make_png(4, 4);
+        let client_id = 55u32;
+        term.feed(&make_kitty_apc(
+            &format!("a=t,f=100,i={}", client_id),
+            &png1,
+        ));
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up1 = uploads.into_iter().next().unwrap();
+        let (_, image_id_1) = store.request_insert(
+            up1.bytes,
+            100,
+            Duration::from_secs(5),
+            up1.label,
+        );
+        term.register_kitty_image_id(client_id, image_id_1);
+        let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        assert!(store.peek(image_id_1).is_some(), "first image lands");
+
+        // a=d,d=i,i=55 — drop the placement (none here, but the mapping
+        // gets cleared either way).
+        term.feed("\x1b_Ga=d,d=i,i=55\x1b\\");
+        assert!(
+            term.kitty_image_id_lookup(client_id).is_none(),
+            "delete must clear the client→store mapping",
+        );
+
+        // Re-transmit with the SAME client id and different pixels.
+        let png2 = make_png(2, 2);
+        term.feed(&make_kitty_apc(
+            &format!("a=t,f=100,i={}", client_id),
+            &png2,
+        ));
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "fresh transmission queues one upload");
+        let up2 = uploads.into_iter().next().unwrap();
+        // Pixel size echoes the new 2×2 PNG, not the stale 4×4.
+        assert_eq!(up2.pixel_size, Some((2, 2)));
+        let (_, image_id_2) = store.request_insert(
+            up2.bytes,
+            100,
+            Duration::from_secs(5),
+            up2.label,
+        );
+        // Store mints a fresh ImageId — pin distinctness so a future
+        // store-id reuse doesn't silently alias.
+        assert_ne!(image_id_2, image_id_1);
+        term.register_kitty_image_id(client_id, image_id_2);
+        let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        assert!(store.peek(image_id_2).is_some(), "re-transmission decodes cleanly");
+    }
 }
