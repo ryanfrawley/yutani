@@ -1683,6 +1683,17 @@ impl Terminal {
     /// (`_G<ctrl>;<base64>`) is the only consumer today; other APC
     /// strings drop silently.
     fn handle_apc(&mut self, s: &str) {
+        // Set `YUTANI_LOG_APC=1` to see the control-data portion of
+        // every Kitty APC the terminal receives — useful for figuring
+        // out which protocol subset a tool (icat, ueberzug, etc.) is
+        // actually using when an image doesn't render. The payload
+        // body is elided since it's typically a multi-KB base64 blob.
+        if std::env::var_os("YUTANI_LOG_APC").is_some() {
+            let head: String = s.chars().take(120).collect();
+            let elided = if s.len() > 120 { "…" } else { "" };
+            eprintln!("[apc] {}{}", head, elided);
+        }
+
         // Strip the `G` verb. The `;` separator between control data and
         // payload is optional — a control-only message (e.g. `a=q,...`
         // for capability query) may omit it.
