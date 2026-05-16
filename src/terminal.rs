@@ -64,13 +64,26 @@ impl Placement {
         self.left_col + self.cols as isize
     }
 
-    /// True when no part of the placement intersects the viewport — used to
-    /// drop placements after scroll/resize so the live list stays bounded.
-    pub fn fully_off_grid(&self, grid_rows: usize, grid_cols: usize) -> bool {
-        self.bottom_row() <= 0
-            || self.top_row >= grid_rows as isize
-            || self.right_col() <= 0
-            || self.left_col >= grid_cols as isize
+    /// True when the placement is permanently off the live grid — i.e.
+    /// it has scrolled fully above the top, or its row anchor sits below
+    /// the bottom edge with no way to come back. Used by scroll/resize
+    /// to drop placements that can never be displayed again.
+    ///
+    /// Horizontal position is intentionally NOT checked here: a
+    /// placement anchored past the right edge of the grid is "off
+    /// screen" but still recoverable — if the user widens the window
+    /// the placement comes back into view. We dropped on horizontal
+    /// off-screen for a while and it produced exactly that bug:
+    /// shrinking the window past an image deleted it, and growing
+    /// back never restored it. The renderer's natural viewport
+    /// clipping handles off-screen draw culling, so keeping the
+    /// placement around is cheap.
+    ///
+    /// `grid_cols` is unused but kept on the signature so call sites
+    /// don't need to change shape if we add column-based eviction
+    /// later for a different reason.
+    pub fn fully_off_grid(&self, grid_rows: usize, _grid_cols: usize) -> bool {
+        self.bottom_row() <= 0 || self.top_row >= grid_rows as isize
     }
 
     /// True when the placement's row span has any overlap with [top, bottom]
@@ -4957,15 +4970,33 @@ mod tests {
     }
 
     #[test]
-    fn resize_horizontal_shrink_drops_placements_past_new_width() {
+    fn resize_horizontal_shrink_preserves_off_screen_placements() {
+        // Regression: a placement whose left_col is now past the grid's
+        // right edge MUST survive the shrink. Horizontal off-screen is
+        // recoverable — the user can widen the window and the
+        // placement comes back into view. Dropping on shrink (the old
+        // behavior) made images vanish permanently on any resize that
+        // briefly hid them.
         let mut t = Terminal::new(20, 5, 100);
         place(&mut t, 1, 0, 2, 1, 4); // cols 2..6
         place(&mut t, 2, 0, 15, 1, 2); // cols 15..17
         t.resize(10, 5); // new cols = 10
-        // First survives (left_col=2 < 10, even though right edge=6 fits).
-        // Second's left_col=15 >= 10 → fully_off_grid → dropped.
         let images: Vec<u32> = t.live_placements().iter().map(|p| p.image.0).collect();
-        assert_eq!(images, vec![1]);
+        assert_eq!(
+            images,
+            vec![1, 2],
+            "both placements survive the shrink; the renderer clips off-screen draws",
+        );
+        // Grow back — the off-screen placement is still visible at its
+        // original left_col.
+        t.resize(20, 5);
+        let images: Vec<u32> = t.live_placements().iter().map(|p| p.image.0).collect();
+        assert_eq!(images, vec![1, 2]);
+        assert_eq!(
+            t.live_placements()[1].left_col,
+            15,
+            "left_col preserved across shrink + grow round-trip",
+        );
     }
 
     #[test]
@@ -7012,15 +7043,13 @@ mod tests {
         // Boundary: top_row == grid_rows - 1 → last row, still on.
         assert!(!mk(grid_r as isize - 1, 0, 1, 1).fully_off_grid(grid_r, grid_c));
 
-        // Off left: right_col == 0.
-        assert!(mk(0, -2, 1, 2).fully_off_grid(grid_r, grid_c));
-        // Boundary: right_col == 1 → leftmost column visible.
-        assert!(!mk(0, -1, 1, 2).fully_off_grid(grid_r, grid_c));
-
-        // Off right: left_col == grid_cols.
-        assert!(mk(0, grid_c as isize, 1, 1).fully_off_grid(grid_r, grid_c));
-        // Boundary: left_col == grid_cols - 1 → rightmost column visible.
-        assert!(!mk(0, grid_c as isize - 1, 1, 1).fully_off_grid(grid_r, grid_c));
+        // Horizontal off-screen is intentionally NOT considered off-grid
+        // (those placements come back into view if the user widens the
+        // window). See the rustdoc on `fully_off_grid` and the
+        // `resize_horizontal_shrink_preserves_off_screen_placements`
+        // regression test.
+        assert!(!mk(0, -2, 1, 2).fully_off_grid(grid_r, grid_c));
+        assert!(!mk(0, grid_c as isize, 1, 1).fully_off_grid(grid_r, grid_c));
 
         // Fully inside is the obvious negative case.
         assert!(!mk(2, 2, 1, 1).fully_off_grid(grid_r, grid_c));
