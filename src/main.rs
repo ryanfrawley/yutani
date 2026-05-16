@@ -89,15 +89,16 @@ struct Config {
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
     /// back to defaults.
     color_scheme: Option<String>,
-    /// When true, pixels whose HSV saturation exceeds `glow_threshold`
-    /// contribute to the glow.
-    glow_match_saturation: bool,
+    /// When true, pixels whose HSV value (max channel) exceeds
+    /// `glow_threshold` contribute to the glow. Brightness drives the
+    /// glow intensity — brighter pixels bloom harder.
+    glow_match_brightness: bool,
     /// When true, pixels whose HSV hue is within `glow_hue_tolerance_deg`
     /// of one of the colour scheme's 8 bright ANSI variants contribute
     /// to the glow. Matched on hue only so antialiased glyphs (which blend
     /// toward the background) still register.
     glow_match_bright_ansi: bool,
-    /// HSV-saturation cutoff for `glow_match_saturation` mode.
+    /// HSV-value (brightness) cutoff for `glow_match_brightness` mode.
     glow_threshold: f32,
     /// Additive composite multiplier; 1.0 leaves the glow at original colour
     /// intensity, higher values bloom harder.
@@ -118,6 +119,46 @@ struct Config {
     /// RGB Euclidean radius around the foreground colour for
     /// `glow_match_foreground`. Max meaningful value is √3 ≈ 1.73.
     glow_fg_tolerance: f32,
+    /// When true, the glow composite applies a CRT-style scanline
+    /// knockout: alternating horizontal rows of the halo are alpha'd to
+    /// zero. Affects both bg and fg glow layers.
+    glow_scanlines: bool,
+    /// 0 = no scanline effect, 1 = full knockout on dark rows. Clamped.
+    glow_scanline_strength: f32,
+    /// Scanline cycle in framebuffer pixels (half dark, half bright).
+    /// 4 = 2px dark + 2px bright. On Retina that's ~1 logical-pixel
+    /// alternation. Clamped to >= 1.
+    glow_scanline_period: f32,
+    /// When true, the scanline pattern is *also* applied (multiply
+    /// blend) over all rendered content — bg colors and glyphs — not
+    /// just the glow halo. Shares the period with `glow_scanlines` but
+    /// has its own strength so each layer can be tuned separately.
+    glow_scanlines_content: bool,
+    /// Strength of the content-overlay scanlines. 0 = invisible,
+    /// 1 = dark rows fully knocked to black. Clamped.
+    glow_scanlines_content_strength: f32,
+    /// RGBA multiplier for bright scan rows of the content overlay.
+    /// Default white = no change. Tinted values colour the bright
+    /// stripes (e.g. slight cyan/amber for a CRT phosphor look).
+    /// Parsed from a `0xRRGGBB` literal in the config; alpha = 1.
+    glow_scanline_color_bright: [f32; 4],
+    /// RGBA multiplier for dark scan rows. Default black = full
+    /// knockout. Non-black values let dark stripes show a dim colour
+    /// instead of going pitch black.
+    glow_scanline_color_dark: [f32; 4],
+    /// When true, the content overlay is suppressed wherever the bg
+    /// scene pixel matches the window's primary background colour —
+    /// scanlines fade out over empty areas of the terminal and only
+    /// appear over colored cells, glyphs, and glow. Only effective in
+    /// the layered / strip-only render paths (which have a bg scene
+    /// to sample); fast-path frames render the overlay uniformly.
+    glow_scanlines_skip_primary_bg: bool,
+    /// 0..1 amount to soften the masked content overlay over any
+    /// drawn pixel — colored bg cells AND glyphs alike. 0 = full
+    /// strength on all content; 1 = no overlay on drawn content
+    /// (only empty terminal area gets scanlines). Has no effect when
+    /// `glow_scanlines_skip_primary_bg` is off.
+    glow_scanlines_content_attenuation: f32,
 }
 
 impl Config {
@@ -133,7 +174,7 @@ impl Config {
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
-            glow_match_saturation: false,
+            glow_match_brightness: false,
             glow_match_bright_ansi: false,
             glow_threshold: renderer::glow::DEFAULT_THRESHOLD,
             glow_intensity: renderer::glow::DEFAULT_INTENSITY,
@@ -142,6 +183,15 @@ impl Config {
             glow_iterations: 2,
             glow_match_foreground: false,
             glow_fg_tolerance: renderer::glow::DEFAULT_FG_TOLERANCE,
+            glow_scanlines: false,
+            glow_scanline_strength: renderer::glow::DEFAULT_SCANLINE_STRENGTH,
+            glow_scanline_period: renderer::glow::DEFAULT_SCANLINE_PERIOD,
+            glow_scanlines_content: false,
+            glow_scanlines_content_strength: renderer::glow::DEFAULT_SCANLINE_STRENGTH,
+            glow_scanline_color_bright: renderer::glow::DEFAULT_SCANLINE_COLOR_BRIGHT,
+            glow_scanline_color_dark: renderer::glow::DEFAULT_SCANLINE_COLOR_DARK,
+            glow_scanlines_skip_primary_bg: false,
+            glow_scanlines_content_attenuation: renderer::glow::DEFAULT_CONTENT_SCANLINE_ATTENUATION,
         }
     }
 
@@ -173,7 +223,7 @@ impl Config {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
                 "color_scheme" => c.color_scheme = if v.is_empty() { None } else { Some(v.to_string()) },
-                "glow_match_saturation" => if let Ok(x) = v.parse() { c.glow_match_saturation = x; },
+                "glow_match_brightness" => if let Ok(x) = v.parse() { c.glow_match_brightness = x; },
                 "glow_match_bright_ansi" => if let Ok(x) = v.parse() { c.glow_match_bright_ansi = x; },
                 "glow_threshold" => if let Ok(x) = v.parse::<f32>() {
                     c.glow_threshold = x.clamp(0.0, 1.0);
@@ -193,6 +243,29 @@ impl Config {
                 "glow_match_foreground" => if let Ok(x) = v.parse() { c.glow_match_foreground = x; },
                 "glow_fg_tolerance" => if let Ok(x) = v.parse::<f32>() {
                     c.glow_fg_tolerance = x.clamp(0.0, 3.0_f32.sqrt());
+                },
+                "glow_scanlines" => if let Ok(x) = v.parse() { c.glow_scanlines = x; },
+                "glow_scanline_strength" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_scanline_strength = x.clamp(0.0, 1.0);
+                },
+                "glow_scanline_period" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_scanline_period = x.max(1.0);
+                },
+                "glow_scanlines_content" => if let Ok(x) = v.parse() { c.glow_scanlines_content = x; },
+                "glow_scanlines_content_strength" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_scanlines_content_strength = x.clamp(0.0, 1.0);
+                },
+                "glow_scanline_color_bright" => if let Ok(x) = palette::rgba_from(v) {
+                    c.glow_scanline_color_bright = x;
+                },
+                "glow_scanline_color_dark" => if let Ok(x) = palette::rgba_from(v) {
+                    c.glow_scanline_color_dark = x;
+                },
+                "glow_scanlines_skip_primary_bg" => if let Ok(x) = v.parse() {
+                    c.glow_scanlines_skip_primary_bg = x;
+                },
+                "glow_scanlines_content_attenuation" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_scanlines_content_attenuation = x.clamp(0.0, 1.0);
                 },
                 _ => (),
             }
@@ -233,7 +306,7 @@ impl Config {
             s.push_str(&format!("color_scheme = {}\n", name));
         }
         s.push_str(&format!(
-            "glow_match_saturation = {}\n\
+            "glow_match_brightness = {}\n\
              glow_match_bright_ansi = {}\n\
              glow_match_foreground = {}\n\
              glow_threshold = {}\n\
@@ -241,8 +314,17 @@ impl Config {
              glow_softness = {}\n\
              glow_hue_tolerance_deg = {}\n\
              glow_fg_tolerance = {}\n\
-             glow_iterations = {}\n",
-            self.glow_match_saturation,
+             glow_iterations = {}\n\
+             glow_scanlines = {}\n\
+             glow_scanline_strength = {}\n\
+             glow_scanline_period = {}\n\
+             glow_scanlines_content = {}\n\
+             glow_scanlines_content_strength = {}\n\
+             glow_scanline_color_bright = {}\n\
+             glow_scanline_color_dark = {}\n\
+             glow_scanlines_skip_primary_bg = {}\n\
+             glow_scanlines_content_attenuation = {}\n",
+            self.glow_match_brightness,
             self.glow_match_bright_ansi,
             self.glow_match_foreground,
             self.glow_threshold,
@@ -251,6 +333,15 @@ impl Config {
             self.glow_hue_tolerance_deg,
             self.glow_fg_tolerance,
             self.glow_iterations,
+            self.glow_scanlines,
+            self.glow_scanline_strength,
+            self.glow_scanline_period,
+            self.glow_scanlines_content,
+            self.glow_scanlines_content_strength,
+            format_hex_rgb(self.glow_scanline_color_bright),
+            format_hex_rgb(self.glow_scanline_color_dark),
+            self.glow_scanlines_skip_primary_bg,
+            self.glow_scanlines_content_attenuation,
         ));
         s
     }
@@ -259,6 +350,42 @@ impl Config {
 pub struct ViewportSize {
     char_width: usize,
     char_height: usize,
+}
+
+/// Minimal offscreen render target — texture + view + dims. Used by the
+/// layered glow path for the FG scene; the BG scene lives inside
+/// `BlurChain` already.
+struct SceneTarget {
+    _tex: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+impl SceneTarget {
+    fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+        label: &str,
+    ) -> Self {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        Self { _tex: tex, view }
+    }
 }
 
 struct State {
@@ -278,6 +405,12 @@ struct State {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    /// Boundary inside `index_buffer`: indices `0..num_bg_indices` are the
+    /// per-cell background quads (bg layer); `num_bg_indices..num_indices`
+    /// are glyphs + cursor + selection + URL underline (fg layer). The
+    /// composite pass draws them in two `draw_indexed` calls so glow can
+    /// bloom each layer independently.
+    num_bg_indices: u32,
     // Separate buffer for the edge-fade strip quads. Drawn in the composite
     // pass with the blur sampler bound, so the strips are filled with the
     // dual-Kawase blur of the scene rather than a flat white tint.
@@ -287,8 +420,36 @@ struct State {
     blur: renderer::blur::BlurChain,
     /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
     /// always rendered to the offscreen `blur.scene` texture so the glow
-    /// pass can sample it, even when no edge-fade strips are active.
+    /// pass can sample it, even when no edge-fade strips are active. This
+    /// instance handles the BG layer; `glow_fg` mirrors it for the FG
+    /// layer (glyphs + cursor + selection + URL underline). Both share
+    /// the same parameters and palette/foreground installations; only
+    /// their source textures differ.
     glow: renderer::glow::Glow,
+    /// Second Glow instance, bound to `scene_fg.view`. Always kept in
+    /// param-sync with `glow` — toggling either match mode toggles both.
+    glow_fg: renderer::glow::Glow,
+    /// Offscreen render target for the FG layer (glyphs + cursor +
+    /// overlays). Same format/dimensions as `blur.scene`. Cleared
+    /// transparent before fg quads draw so the BG layer (which already
+    /// landed in the swapchain) shows through everywhere fg is absent.
+    scene_fg: SceneTarget,
+    /// Bind group for blit_pipeline / blit_alpha_pipeline that samples
+    /// `scene_fg`. Rebuilt on resize when the texture is recreated.
+    scene_fg_blit_bg: wgpu::BindGroup,
+    /// Mask bind groups for the masked composite path. Both glows use
+    /// the bg scene as their mask so the halo paints only where the bg
+    /// is transparent — preventing the glow from tinting adjacent
+    /// cells' colored backgrounds. Per-glow because the mask bgl is
+    /// owned per `Glow` instance.
+    glow_bg_mask: wgpu::BindGroup,
+    glow_fg_mask: wgpu::BindGroup,
+    /// Bind group for the scanline overlay's masked variant. Binds
+    /// both the bg scene (binding 0) and the fg scene (binding 2) so
+    /// the shader can detect "truly empty" pixels and only suppress
+    /// the overlay there. Rebuilt on resize when either texture is
+    /// recreated.
+    scanline_overlay_mask: wgpu::BindGroup,
     font: font::Font,
     /// rustybuzz shaper, used during update_vertices to detect programming
     /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
@@ -1212,15 +1373,47 @@ impl State {
             gpu.config.height,
             &blur.scene.view,
         );
-        glow.match_saturation = config.glow_match_saturation;
-        glow.match_bright_ansi = config.glow_match_bright_ansi;
-        glow.match_foreground = config.glow_match_foreground;
-        glow.threshold = config.glow_threshold;
-        glow.intensity = config.glow_intensity;
-        glow.softness = config.glow_softness;
-        glow.hue_tolerance = config.glow_hue_tolerance_deg;
-        glow.fg_tolerance = config.glow_fg_tolerance;
-        glow.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+        // Second offscreen scene for the FG layer (glyphs + cursor + overlays).
+        // Same format/size as `blur.scene` so the same blit and glow shaders
+        // can sample either one without pipeline divergence.
+        let scene_fg = SceneTarget::new(
+            &gpu.device,
+            gpu.config.format,
+            gpu.config.width,
+            gpu.config.height,
+            "scene fg",
+        );
+        let scene_fg_blit_bg =
+            blur.make_blit_bind_group(&gpu.device, &scene_fg.view, "scene fg blit bg");
+
+        // Two Glow instances — one bound to the BG scene, one to the FG
+        // scene. Identical params/palette/foreground, written below.
+        let mut glow_fg = renderer::glow::Glow::new(
+            &gpu.device,
+            gpu.config.format,
+            gpu.config.width,
+            gpu.config.height,
+            &scene_fg.view,
+        );
+        for g in [&mut glow, &mut glow_fg] {
+            g.match_brightness = config.glow_match_brightness;
+            g.match_bright_ansi = config.glow_match_bright_ansi;
+            g.match_foreground = config.glow_match_foreground;
+            g.threshold = config.glow_threshold;
+            g.intensity = config.glow_intensity;
+            g.softness = config.glow_softness;
+            g.hue_tolerance = config.glow_hue_tolerance_deg;
+            g.fg_tolerance = config.glow_fg_tolerance;
+            g.match_scanlines = config.glow_scanlines;
+            g.scanline_strength = config.glow_scanline_strength;
+            g.scanline_period = config.glow_scanline_period;
+            g.match_content_scanlines = config.glow_scanlines_content;
+            g.content_scanline_strength = config.glow_scanlines_content_strength;
+            g.scanline_color_bright = config.glow_scanline_color_bright;
+            g.scanline_color_dark = config.glow_scanline_color_dark;
+            g.content_scanline_attenuation = config.glow_scanlines_content_attenuation;
+            g.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+        }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
         // State::new (see `run()`), so this reads the active scheme — or
@@ -1231,11 +1424,40 @@ impl State {
                 p.ansi[8], p.ansi[9], p.ansi[10], p.ansi[11],
                 p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
             ];
-            glow.set_bright_palette(&gpu.queue, &bright);
-            glow.set_foreground(p.foreground);
+            for g in [&mut glow, &mut glow_fg] {
+                g.set_bright_palette(&gpu.queue, &bright);
+                g.set_foreground(p.foreground);
+                // Masked composite needs the window bg colour to detect
+                // colored cells in the mask texture.
+                g.set_background(p.background);
+            }
         }
-        glow.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
-        glow.write_glow_params(&gpu.queue);
+        for g in [&glow, &glow_fg] {
+            g.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+            g.write_glow_params(&gpu.queue);
+        }
+        // Both glows mask against the bg scene: the halo only appears
+        // where bg is transparent (the window's default background), so
+        // it can't paint over colored cell backgrounds and visually
+        // shift their apparent colour.
+        let glow_bg_mask = glow.make_mask_bind_group(
+            &gpu.device,
+            &blur.scene.view,
+            "glow bg mask (bg scene)",
+        );
+        let glow_fg_mask = glow_fg.make_mask_bind_group(
+            &gpu.device,
+            &blur.scene.view,
+            "glow fg mask (bg scene)",
+        );
+        // Scanline overlay's masked mask samples both layers so it can
+        // tell glyphs on default-bg cells from truly empty pixels.
+        let scanline_overlay_mask = glow.make_overlay_mask_bind_group(
+            &gpu.device,
+            &blur.scene.view,
+            &scene_fg.view,
+            "scanline overlay mask (bg + fg)",
+        );
 
         Self {
             window,
@@ -1247,11 +1469,18 @@ impl State {
             vertex_buffer,
             index_buffer,
             num_indices: 0,
+            num_bg_indices: 0,
             strip_vertex_buffer,
             strip_index_buffer,
             num_strip_indices: 0,
             blur,
             glow,
+            glow_fg,
+            scene_fg,
+            scene_fg_blit_bg,
+            glow_bg_mask,
+            glow_fg_mask,
+            scanline_overlay_mask,
             font,
             shaper,
             font_bind_group,
@@ -1638,18 +1867,23 @@ impl State {
         // alternate from a programming ligature). Both render at the
         // cell's own column with normal cell width — Fira Code's
         // ligatures are per-cell substitutions, not wide N→1 glyphs.
+        #[derive(Copy, Clone)]
         enum GlyphSource {
             Char(char),
             Substituted(u32),
         }
-        let mut emit_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
-                             idxs: &mut Vec<u16>,
-                             fg_source: GlyphSource,
-                             variant: font::FaceVariant,
-                             r: isize,
-                             c: usize,
-                             fg: [f32; 4],
-                             bg: [f32; 4]| {
+        // BG quad only — used by the bg-layer pass. Pulled out so we can
+        // emit all cell backgrounds contiguously, record the boundary in
+        // `num_bg_indices`, then emit all foreground content (glyphs,
+        // cursor, overlays) after. The renderer issues two draw_indexed
+        // calls against the resulting buffer so the glow pipeline can
+        // bloom each layer independently.
+        let strip_pad = (line_height - bg_h) * 0.5;
+        let mut emit_bg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
+                                    idxs: &mut Vec<u16>,
+                                    r: isize,
+                                    c: usize,
+                                    bg: [f32; 4]| {
             let x = col_x(c);
             let baseline_y = row_y(r);
             // Background quad spans one line-height strip, centered on the
@@ -1658,7 +1892,6 @@ impl State {
             // glyphs to the bottom of the strip on tall-line fonts, while
             // anchoring to the glyph extent risks overlap on tight-line ones.
             // Strip stride = line_height, so adjacent rows still tile cleanly.
-            let strip_pad = (line_height - bg_h) * 0.5;
             let bg_y = baseline_y - bg_h - descender - strip_pad + scroll_y;
             push_quad(
                 verts,
@@ -1672,6 +1905,20 @@ impl State {
                 bg,
                 [0.0; 4],
             );
+        };
+
+        // FG quad only — glyph for the cell. See `emit_bg_for_cell` above
+        // for why bg/fg are split.
+        let mut emit_fg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
+                                    idxs: &mut Vec<u16>,
+                                    fg_source: GlyphSource,
+                                    variant: font::FaceVariant,
+                                    r: isize,
+                                    c: usize,
+                                    fg: [f32; 4]| {
+            let x = col_x(c);
+            let baseline_y = row_y(r);
+            let bg_y = baseline_y - bg_h - descender - strip_pad + scroll_y;
             // Foreground glyph. The per-cell substitution case (Fira
             // Code-style contextual alternates) deliberately uses
             // glyphs whose side bearings extend past the cell edges so
@@ -1777,6 +2024,19 @@ impl State {
         // 1. Terminal grid + phantom rows on each side (`r_lo..r_hi` defined
         // above where the shaping pass lives — same range so ligature
         // covers and emits stay in sync).
+        //
+        // Resolve every visible cell once, emit all bg quads, record the
+        // boundary index, then emit all fg glyphs. The renderer issues two
+        // draw_indexed calls against the resulting buffer (bg layer +
+        // fg-and-overlays layer) so glow can bloom each layer independently.
+        struct ResolvedCell {
+            fg_source: GlyphSource,
+            variant: font::FaceVariant,
+            r: isize,
+            c: usize,
+            fg: [f32; 4],
+        }
+        let mut resolved: Vec<ResolvedCell> = Vec::with_capacity(rows * cols);
         for r in r_lo..r_hi {
             let over = row_overrides.get(&r);
             for c in 0..cols {
@@ -1802,8 +2062,24 @@ impl State {
                     Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
                     None => GlyphSource::Char(cell.ch),
                 };
-                emit_cell(&mut vertices, &mut indices, fg_source, variant, r, c, fg, bg);
+                emit_bg_for_cell(&mut vertices, &mut indices, r, c, bg);
+                resolved.push(ResolvedCell { fg_source, variant, r, c, fg });
             }
+        }
+        // Everything emitted before this point is the BG layer. Glow runs
+        // separately on bg vs fg, so the renderer needs this split index
+        // to know where one layer's draw call ends and the next begins.
+        let num_bg_indices = indices.len() as u32;
+        for rc in &resolved {
+            emit_fg_for_cell(
+                &mut vertices,
+                &mut indices,
+                rc.fg_source,
+                rc.variant,
+                rc.r,
+                rc.c,
+                rc.fg,
+            );
         }
 
         // 1a. Cmd-hover URL underline. Drawn on top of the glyph row so the
@@ -2135,7 +2411,7 @@ impl State {
                 let variant =
                     font::FaceVariant::from_flags(ghost.style.bold, ghost.style.italic);
                 let vis_r = ghost.buffer_row + live_grid_offset_i;
-                emit_cell(
+                emit_fg_for_cell(
                     &mut vertices,
                     &mut indices,
                     GlyphSource::Char(ghost.ch),
@@ -2143,7 +2419,6 @@ impl State {
                     vis_r as isize,
                     ghost.col,
                     fg,
-                    [0.0; 4],
                 );
             }
 
@@ -2352,6 +2627,7 @@ impl State {
             .queue
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
+        self.num_bg_indices = num_bg_indices;
 
         // Strip overlay: blur-only (tint = 0). The glyph fade already pulls
         // foreground text toward the bg color near each edge; the blur sits
@@ -2444,14 +2720,54 @@ impl State {
         if size.width > 0 && size.height > 0 {
             self.blur
                 .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
-            // Glow samples the (just-recreated) blur scene texture, so its
-            // bright-pass bind group has to be rebuilt against the new view.
+            // FG scene mirrors the BG scene's size/format. Recreate the
+            // texture and rebuild every bind group that samples it.
+            self.scene_fg = SceneTarget::new(
+                &self.gpu.device,
+                self.gpu.config.format,
+                size.width,
+                size.height,
+                "scene fg",
+            );
+            self.scene_fg_blit_bg = self.blur.make_blit_bind_group(
+                &self.gpu.device,
+                &self.scene_fg.view,
+                "scene fg blit bg",
+            );
+            // Each Glow's bright-pass bind group is bound to a specific
+            // scene view — resize rebuilds it against the (potentially
+            // recreated) texture handle.
             self.glow.resize(
                 &self.gpu.device,
                 &self.gpu.queue,
                 size.width,
                 size.height,
                 &self.blur.scene.view,
+            );
+            self.glow_fg.resize(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size.width,
+                size.height,
+                &self.scene_fg.view,
+            );
+            // Mask bind groups sample the (just-recreated) bg scene
+            // texture, so they have to be rebuilt against the new view.
+            self.glow_bg_mask = self.glow.make_mask_bind_group(
+                &self.gpu.device,
+                &self.blur.scene.view,
+                "glow bg mask (bg scene)",
+            );
+            self.glow_fg_mask = self.glow_fg.make_mask_bind_group(
+                &self.gpu.device,
+                &self.blur.scene.view,
+                "glow fg mask (bg scene)",
+            );
+            self.scanline_overlay_mask = self.glow.make_overlay_mask_bind_group(
+                &self.gpu.device,
+                &self.blur.scene.view,
+                &self.scene_fg.view,
+                "scanline overlay mask (bg + fg)",
             );
         }
         self.camera_uniform
@@ -3148,22 +3464,135 @@ impl State {
                     label: Some("terminal"),
                 });
 
-        // Fast path: when no edge-fade strips are visible AND glow is off,
-        // the offscreen scene texture would never be sampled. Render the
-        // scene directly to the swapchain and skip the composite pass
-        // entirely (saves ~5 fullscreen passes per frame, the dominant cost
-        // during PTY bursts).
+        // Three paths, chosen on the fly:
+        //   - Fast path (no glow, no strips): one render pass straight to
+        //     the swapchain, no offscreen anything. Saves ~5 fullscreen
+        //     passes per frame — the dominant cost during PTY bursts.
+        //   - Layered path (glow_on): bg quads → `blur.scene`, fg quads →
+        //     `scene_fg`, then glow each independently and composite
+        //     stacked. Lets bg glow bloom under fg text without washing
+        //     the glyphs out, and keeps fg glow above its source.
+        //   - Strip-only path (strips on, glow off): single scene render
+        //     into `blur.scene`, blur, blit + strip overlay. The original
+        //     behaviour from before the glow layering.
         let needs_strips = self.num_strip_indices > 0;
         let glow_on = self.glow.enabled();
         let needs_offscreen = needs_strips || glow_on;
-        let scene_target = if needs_offscreen { &self.blur.scene.view } else { &view };
+        // Content scanlines paint over bg + fg (but not strips/UI). Runs
+        // via a multiply-blend overlay pass; in the layered / strip-only
+        // paths it's inserted into the composite render pass between
+        // content and strips, in the fast path it's a second pass on
+        // the swapchain with LoadOp::Load.
+        let content_overlay_on = self.glow.match_content_scanlines;
 
-        // 1. Scene → swapchain (fast path) or → offscreen (blur path).
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene pass"),
+        let bg_index_range = 0..self.num_bg_indices;
+        let fg_index_range = self.num_bg_indices..self.num_indices;
+
+        let grid_pipeline = if self.wireframe {
+            self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
+        } else {
+            &self.render_pipeline
+        };
+
+        // Helper to issue a draw of part of the cell vertex buffer into
+        // `target`, with the given load op. Sharing the body keeps the
+        // three paths' grid draws byte-for-byte identical aside from
+        // load/store and index range.
+        let draw_grid = |encoder: &mut wgpu::CommandEncoder,
+                         target: &wgpu::TextureView,
+                         load: wgpu::LoadOp<wgpu::Color>,
+                         range: std::ops::Range<u32>,
+                         label: &str| {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_target,
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(grid_pipeline);
+            pass.set_bind_group(0, &self.font_bind_group, &[]);
+            pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.fade_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            if range.start < range.end {
+                pass.draw_indexed(range, 0, 0..1);
+            }
+        };
+
+        if !needs_offscreen {
+            // Fast path.
+            draw_grid(
+                &mut encoder,
+                &view,
+                wgpu::LoadOp::Clear(clear),
+                0..self.num_indices,
+                "scene pass",
+            );
+            // Content overlay, fast path: separate render pass on the
+            // swapchain with LoadOp::Load so it darkens what we just
+            // drew. Only entered when scanlines are enabled but glow
+            // and strips are off.
+            if content_overlay_on {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scanline overlay pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_bind_group(0, &self.glow.composite_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        } else if glow_on {
+            // Layered path. Pass 1: bg quads → bg scene.
+            draw_grid(
+                &mut encoder,
+                &self.blur.scene.view,
+                wgpu::LoadOp::Clear(clear),
+                bg_index_range,
+                "scene bg pass",
+            );
+            // Pass 2: fg quads → fg scene. Transparent clear so anything
+            // the fg layer doesn't touch shows the bg layer through.
+            draw_grid(
+                &mut encoder,
+                &self.scene_fg.view,
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                fg_index_range,
+                "scene fg pass",
+            );
+            // Pass 3: glow each layer against its own un-blurred scene
+            // so the bright pass extracts crisp colour, not post-blur smear.
+            self.glow.run(&mut encoder);
+            self.glow_fg.run(&mut encoder);
+            // Strip blur still samples the bg scene — strips live near
+            // the window edges where there's rarely text, so a bg-only
+            // blur source reads close to the legacy combined-scene blur.
+            if needs_strips {
+                self.blur.run(&mut encoder);
+            }
+
+            // Pass 4: composite to swapchain. Order is bg → bg glow →
+            // fg → fg glow → strips. Strips stay on top so the toolbar
+            // / edge fade reads cleanly over everything.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("composite pass (layered)"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(clear),
@@ -3175,35 +3604,78 @@ impl State {
                 timestamp_writes: None,
             });
 
-            let pipeline = if self.wireframe {
-                self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
-            } else {
-                &self.render_pipeline
-            };
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, &self.font_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            render_pass.set_bind_group(2, &self.fade_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
-        }
+            // bg scene (opaque blit).
+            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
+            pass.draw(0..3, 0..1);
 
-        if needs_offscreen {
-            // 2a. Glow runs against the (un-blurred) scene first so its
-            // bright pass extracts crisp colour, not the post-blur smear.
-            if glow_on {
-                self.glow.run(&mut encoder);
+            // bg glow (alpha-blended, masked by bg). Mask suppresses the
+            // halo over colored cells so the bg's own pixels aren't
+            // re-tinted by their bloom; the halo still appears in
+            // transparent areas adjacent to colored cells.
+            pass.set_pipeline(&self.glow.composite_masked_pipeline);
+            pass.set_bind_group(0, &self.glow.composite_bg, &[]);
+            pass.set_bind_group(1, &self.glow_bg_mask, &[]);
+            pass.draw(0..3, 0..1);
+
+            // fg scene (alpha-blended on top of bg + bg glow).
+            pass.set_pipeline(&self.blur.blit_alpha_pipeline);
+            pass.set_bind_group(0, &self.scene_fg_blit_bg, &[]);
+            pass.draw(0..3, 0..1);
+
+            // fg glow (alpha-blended, masked by bg). Without the mask
+            // the bloom paints over adjacent cells' colored backgrounds
+            // and visually shifts them; this keeps the halo only in
+            // areas where bg is transparent.
+            pass.set_pipeline(&self.glow_fg.composite_masked_pipeline);
+            pass.set_bind_group(0, &self.glow_fg.composite_bg, &[]);
+            pass.set_bind_group(1, &self.glow_fg_mask, &[]);
+            pass.draw(0..3, 0..1);
+
+            // Content scanlines: multiply-blend overlay across bg + glow
+            // + fg + fg glow. Drawn before strips so the edge fades
+            // aren't darkened (they're UI, not content). The masked
+            // variant additionally fades the overlay to identity where
+            // the bg scene matches the window's primary background
+            // colour — scanlines disappear over empty areas.
+            if content_overlay_on {
+                if self.config.glow_scanlines_skip_primary_bg {
+                    // Layered path has both scene textures — mask
+                    // samples bg + fg so glyphs on default-bg cells
+                    // still get scanlines.
+                    pass.set_pipeline(&self.glow.scanline_overlay_masked_pipeline);
+                    pass.set_bind_group(0, &self.glow.composite_bg, &[]);
+                    pass.set_bind_group(1, &self.scanline_overlay_mask, &[]);
+                } else {
+                    pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                    pass.set_bind_group(0, &self.glow.composite_bg, &[]);
+                }
+                pass.draw(0..3, 0..1);
             }
-            // 2b. Dual-Kawase down/up over the scene for the strip pass.
+
             if needs_strips {
-                self.blur.run(&mut encoder);
+                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+                pass.set_bind_group(1, &self.camera_bind_group, &[]);
+                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+                pass.set_index_buffer(
+                    self.strip_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
             }
+        } else {
+            // Strip-only path: legacy single-scene render + blur + composite.
+            draw_grid(
+                &mut encoder,
+                &self.blur.scene.view,
+                wgpu::LoadOp::Clear(clear),
+                0..self.num_indices,
+                "scene pass",
+            );
+            self.blur.run(&mut encoder);
 
-            // 3. Composite to swapchain: blit the scene, additively layer
-            // glow on top (if enabled), then alpha-blend the blur-sampled
-            // strip quads (if any). Order matters: glow under strips so the
-            // toolbar/edge fade reads cleanly over the bloom.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3223,24 +3695,28 @@ impl State {
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
-            if glow_on {
-                pass.set_pipeline(&self.glow.composite_pipeline);
+            // Content scanlines, strip-only path: overlay between scene
+            // blit and the strip quads. Always unmasked here because
+            // the layered fg scene is stale in this path — the masked
+            // variant would suppress scanlines based on outdated fg
+            // content, producing artifacts. `skip_primary_bg` therefore
+            // only takes effect in the layered (glow-on) path.
+            if content_overlay_on {
+                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
 
-            if needs_strips {
-                pass.set_pipeline(&self.blur.strip_pipeline);
-                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
-                pass.set_bind_group(1, &self.camera_bind_group, &[]);
-                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
-                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
-                pass.set_index_buffer(
-                    self.strip_index_buffer.slice(..),
-                    wgpu::IndexFormat::Uint16,
-                );
-                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
-            }
+            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+            pass.set_bind_group(1, &self.camera_bind_group, &[]);
+            pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+            pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+            pass.set_index_buffer(
+                self.strip_index_buffer.slice(..),
+                wgpu::IndexFormat::Uint16,
+            );
+            pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
@@ -3563,6 +4039,16 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
     font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
 }
 
+/// Serialize a linear-space RGBA back to a `0xRRGGBB` literal so the
+/// scanline-colour config round-trips cleanly. Reuses palette's sRGB
+/// conversion so the byte we emit matches the byte the user typed.
+fn format_hex_rgb(c: [f32; 4]) -> String {
+    let r = palette::linear_to_srgb_u8(c[0]);
+    let g = palette::linear_to_srgb_u8(c[1]);
+    let b = palette::linear_to_srgb_u8(c[2]);
+    format!("0x{:02x}{:02x}{:02x}", r, g, b)
+}
+
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;
     wgpu::Color {
@@ -3786,20 +4272,26 @@ mod tests {
     #[test]
     fn config_defaults_glow_disabled() {
         let c = Config::defaults();
-        assert!(!c.glow_match_saturation);
+        assert!(!c.glow_match_brightness);
         assert!(!c.glow_match_bright_ansi);
         assert!(!c.glow_match_foreground);
+        assert!(!c.glow_scanlines);
+        assert!(!c.glow_scanlines_content);
+        assert!(!c.glow_scanlines_skip_primary_bg);
+        assert!((0.0..=1.0).contains(&c.glow_scanlines_content_strength));
         assert!((0.0..=1.0).contains(&c.glow_threshold));
         assert!(c.glow_intensity > 0.0);
         assert!((0.0..=180.0).contains(&c.glow_hue_tolerance_deg));
         assert!(c.glow_fg_tolerance >= 0.0 && c.glow_fg_tolerance <= 3.0_f32.sqrt());
+        assert!((0.0..=1.0).contains(&c.glow_scanline_strength));
+        assert!(c.glow_scanline_period >= 1.0);
         assert!(c.glow_iterations >= 1);
     }
 
     #[test]
     fn config_round_trip_preserves_glow_fields() {
         let mut c = Config::defaults();
-        c.glow_match_saturation = true;
+        c.glow_match_brightness = true;
         c.glow_match_bright_ansi = true;
         c.glow_match_foreground = true;
         c.glow_threshold = 0.42;
@@ -3808,8 +4300,14 @@ mod tests {
         c.glow_hue_tolerance_deg = 22.5;
         c.glow_fg_tolerance = 0.20;
         c.glow_iterations = 5;
+        c.glow_scanlines = true;
+        c.glow_scanline_strength = 0.65;
+        c.glow_scanline_period = 6.0;
+        c.glow_scanlines_content = true;
+        c.glow_scanlines_content_strength = 0.40;
+        c.glow_scanlines_skip_primary_bg = true;
         let parsed = Config::parse_str(&c.serialize());
-        assert!(parsed.glow_match_saturation);
+        assert!(parsed.glow_match_brightness);
         assert!(parsed.glow_match_bright_ansi);
         assert!(parsed.glow_match_foreground);
         assert!(approx_eq(parsed.glow_threshold, 0.42));
@@ -3818,6 +4316,68 @@ mod tests {
         assert!(approx_eq(parsed.glow_hue_tolerance_deg, 22.5));
         assert!(approx_eq(parsed.glow_fg_tolerance, 0.20));
         assert_eq!(parsed.glow_iterations, 5);
+        assert!(parsed.glow_scanlines);
+        assert!(approx_eq(parsed.glow_scanline_strength, 0.65));
+        assert!(approx_eq(parsed.glow_scanline_period, 6.0));
+        assert!(parsed.glow_scanlines_content);
+        assert!(approx_eq(parsed.glow_scanlines_content_strength, 0.40));
+        assert!(parsed.glow_scanlines_skip_primary_bg);
+    }
+
+    #[test]
+    fn config_glow_scanline_strength_clamped() {
+        let parsed = Config::parse_str("glow_scanline_strength = 5\n");
+        assert!((0.0..=1.0).contains(&parsed.glow_scanline_strength));
+        let parsed = Config::parse_str("glow_scanline_strength = -2\n");
+        assert!((0.0..=1.0).contains(&parsed.glow_scanline_strength));
+    }
+
+    #[test]
+    fn config_glow_scanline_period_clamped() {
+        let parsed = Config::parse_str("glow_scanline_period = 0.1\n");
+        assert!(parsed.glow_scanline_period >= 1.0);
+    }
+
+    #[test]
+    fn config_glow_scanline_colors_parse_hex() {
+        let parsed = Config::parse_str(
+            "glow_scanline_color_bright = 0xff0000\n\
+             glow_scanline_color_dark = 0x00ff00\n",
+        );
+        // sRGB → linear: 0xff → 1.0, 0x00 → 0.0. The whole-channel
+        // values survive the round-trip exactly.
+        assert!(approx_eq(parsed.glow_scanline_color_bright[0], 1.0));
+        assert!(approx_eq(parsed.glow_scanline_color_bright[1], 0.0));
+        assert!(approx_eq(parsed.glow_scanline_color_dark[1], 1.0));
+        assert!(approx_eq(parsed.glow_scanline_color_dark[2], 0.0));
+    }
+
+    #[test]
+    fn config_glow_scanline_color_invalid_keeps_default() {
+        let parsed = Config::parse_str("glow_scanline_color_bright = notahex\n");
+        let d = Config::defaults();
+        assert!(approx_eq(parsed.glow_scanline_color_bright[0], d.glow_scanline_color_bright[0]));
+    }
+
+    #[test]
+    fn config_round_trip_preserves_scanline_colors() {
+        let mut c = Config::defaults();
+        c.glow_scanline_color_bright = palette::rgba_from("0xff8800").unwrap();
+        c.glow_scanline_color_dark = palette::rgba_from("0x110022").unwrap();
+        let parsed = Config::parse_str(&c.serialize());
+        // sRGB byte round-trip is exact (palette ensures this).
+        assert_eq!(
+            palette::linear_to_srgb_u8(parsed.glow_scanline_color_bright[0]),
+            0xff,
+        );
+        assert_eq!(
+            palette::linear_to_srgb_u8(parsed.glow_scanline_color_bright[1]),
+            0x88,
+        );
+        assert_eq!(
+            palette::linear_to_srgb_u8(parsed.glow_scanline_color_dark[2]),
+            0x22,
+        );
     }
 
     #[test]
@@ -3854,10 +4414,10 @@ mod tests {
     #[test]
     fn config_invalid_glow_value_keeps_default() {
         let parsed = Config::parse_str(
-            "glow_match_saturation = nope\nglow_match_bright_ansi = ?\nglow_intensity = abc\n",
+            "glow_match_brightness = nope\nglow_match_bright_ansi = ?\nglow_intensity = abc\n",
         );
         let d = Config::defaults();
-        assert_eq!(parsed.glow_match_saturation, d.glow_match_saturation);
+        assert_eq!(parsed.glow_match_brightness, d.glow_match_brightness);
         assert_eq!(parsed.glow_match_bright_ansi, d.glow_match_bright_ansi);
         assert!(approx_eq(parsed.glow_intensity, d.glow_intensity));
     }
