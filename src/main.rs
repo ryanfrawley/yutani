@@ -5029,15 +5029,38 @@ mod tests {
 
     #[test]
     fn retarget_rebases_from_to_currently_eased_position() {
-        // Midway through a 0.0 -> 10.0 (x) ease, eased x = 5.0.
+        // The contract being pinned is *continuity*: after retarget,
+        // `from` equals whatever was visually displayed at the moment
+        // of retarget, so the next ease starts where the previous frame
+        // ended. The exact eased value depends on `Instant::now()`
+        // drift between `anim_at_t` and `a.current()` — sub-millisecond
+        // on most hardware, much more under CI load — so compare
+        // `from` against the value `current()` actually returned, not a
+        // hardcoded smoothstep result.
         let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
         let pre = a.current(0.2);
-        assert!(approx_pair(pre, (5.0, 2.0)));
+        // Sanity: midway through a forward ease, pre is somewhere
+        // between (0,0) and (10,4). Loose bounds — the precise value
+        // is what `current()` decides at this exact moment.
+        assert!(pre.0 > 0.0 && pre.0 < 10.0, "pre.0 = {}", pre.0);
+        assert!(pre.1 > 0.0 && pre.1 < 4.0, "pre.1 = {}", pre.1);
 
         a.retarget((20.0, 8.0), 0.2);
 
-        // New `from` should equal the displayed-at-retarget position.
-        assert!(approx_pair(a.from, (5.0, 2.0)), "from = {:?}", a.from);
+        // Continuity: new `from` matches whatever `current()` returned.
+        // `retarget` calls `current()` again internally, so a few
+        // microseconds of `Instant::now()` drift between the test's
+        // `current()` call and retarget's internal one produce a
+        // sub-thousandth-of-a-percent difference. Tolerance generous
+        // enough to swallow CI scheduler jitter but tight enough to
+        // catch a continuity bug (which would shift `from` by units,
+        // not millionths).
+        let drift = ((a.from.0 - pre.0).abs(), (a.from.1 - pre.1).abs());
+        assert!(
+            drift.0 < 0.05 && drift.1 < 0.05,
+            "continuity broken: from={:?} pre={:?}",
+            a.from, pre,
+        );
         assert_eq!(a.to, (20.0, 8.0));
         // started_at should be (approximately) "now" — well after the
         // back-dated original. Elapsed should be very small.
