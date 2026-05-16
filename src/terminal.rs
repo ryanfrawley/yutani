@@ -444,6 +444,15 @@ pub struct Terminal {
     // completes the upload. Only the FIRST chunk's sizing / cursor
     // params are kept — that's what the Kitty spec says wins.
     kitty_chunks: std::collections::HashMap<u32, KittyChunks>,
+    // Chunked transmission without an image_id. The Kitty spec says
+    // chunked transmissions MUST use `i=`, but `kitty +kitten icat`
+    // doesn't in practice — when sending raw RGB/JPG it omits the id
+    // and expects the terminal to thread the chunks together as a
+    // singular anonymous in-flight image. Only one can be in flight at
+    // a time; a new `m=1` without an id while one's open silently
+    // overwrites (matching the implicit "only one anonymous stream"
+    // contract).
+    kitty_chunks_anon: Option<KittyChunks>,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -502,6 +511,7 @@ impl Terminal {
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
             kitty_chunks: std::collections::HashMap::new(),
+            kitty_chunks_anon: None,
             cell_w_px: 1,
             line_h_px: 1,
         }
@@ -1804,9 +1814,11 @@ impl Terminal {
             .filter(|c| !c.is_ascii_whitespace())
             .collect();
 
-        // Branch on chunking. With `i=` and `m=1` we accumulate; with
-        // `m=0` (or omitted) and an in-flight buffer for this id we
-        // finalize; with no in-flight buffer it's a single-chunk image.
+        // Branch on chunking. Four states: (id present, more chunks),
+        // (id present, last chunk), (no id, more chunks), (no id, last
+        // chunk). The two id-less branches use `kitty_chunks_anon`
+        // because `kitty +kitten icat` omits `i=` for raw / JPG
+        // streams but still expects accumulation.
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
                 let entry = self.kitty_chunks.entry(id).or_insert(KittyChunks {
@@ -1833,7 +1845,38 @@ impl Terminal {
                     acc.do_not_move_cursor,
                 );
             }
+            (None, true) => {
+                // Anonymous chunk. The first one establishes the
+                // sizing/format; later ones just append base64. A new
+                // first-chunk while one's open overwrites — there's no
+                // way to distinguish them otherwise.
+                let entry = self.kitty_chunks_anon.get_or_insert(KittyChunks {
+                    b64: String::new(),
+                    format: ctrl.format,
+                    source_w: ctrl.source_w,
+                    source_h: ctrl.source_h,
+                    cells_cols: ctrl.cells_cols,
+                    cells_rows: ctrl.cells_rows,
+                    do_not_move_cursor: ctrl.do_not_move_cursor,
+                });
+                entry.b64.push_str(&chunk);
+            }
+            (None, false) if self.kitty_chunks_anon.is_some() => {
+                let mut acc = self.kitty_chunks_anon.take().expect("is_some");
+                acc.b64.push_str(&chunk);
+                self.finalize_kitty_image(
+                    &acc.b64,
+                    acc.format,
+                    acc.source_w,
+                    acc.source_h,
+                    acc.cells_cols,
+                    acc.cells_rows,
+                    acc.do_not_move_cursor,
+                );
+            }
             _ => {
+                // Single-chunk: id present (or not) with m=0 and no
+                // in-flight buffer.
                 self.finalize_kitty_image(
                     &chunk,
                     ctrl.format,
@@ -4736,6 +4779,61 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
         t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
         assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_anonymous_chunked_transmission_assembles() {
+        // kitty +kitten icat omits `i=` on its chunked transmissions —
+        // the spec says chunked MUST have an id, but reality differs.
+        // Use the `kitty_chunks_anon` slot to thread chunks together.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+        let (c1, c2) = b64.split_at(mid);
+
+        // First chunk: m=1, no `i=`. Carries the sizing.
+        t.feed(&format!("\x1b_Ga=T,q=2,f=100,m=1,c=2,r=1;{}\x1b\\", c1));
+        assert!(t.take_pending_image_uploads().is_empty(),
+            "first anon chunk must not flush");
+        // Terminal chunk: m=0 (or omitted), no `i=`.
+        t.feed(&format!("\x1b_Ga=T,m=0;{}\x1b\\", c2));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "anonymous chunks should coalesce");
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_anonymous_chunked_does_not_collide_with_id_keyed() {
+        // Anonymous and id-keyed chunked transmissions use separate
+        // slots so they can be in-flight at the same time. Pin that
+        // by interleaving and verifying both land independently.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png_anon = kitty_png(2, 2);
+        let png_keyed = kitty_png(3, 3);
+        use base64::Engine;
+        let b_anon = base64::engine::general_purpose::STANDARD.encode(&png_anon);
+        let b_keyed = base64::engine::general_purpose::STANDARD.encode(&png_keyed);
+
+        let (a1, a2) = b_anon.split_at(b_anon.len() / 2);
+        let (k1, k2) = b_keyed.split_at(b_keyed.len() / 2);
+
+        t.feed(&format!("\x1b_Ga=T,f=100,m=1,c=1,r=1;{}\x1b\\", a1));
+        t.feed(&format!("\x1b_Ga=T,f=100,m=1,i=99,c=2,r=2;{}\x1b\\", k1));
+        t.feed(&format!("\x1b_Ga=T,i=99,m=0;{}\x1b\\", k2));
+        t.feed(&format!("\x1b_Ga=T,m=0;{}\x1b\\", a2));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 2);
+        // Both should have valid pixel data — proves the buffers didn't
+        // cross-contaminate.
+        for up in &uploads {
+            assert!(up.pixel_size.is_some(), "decoded cleanly: {:?}", up.cell_extent);
+        }
     }
 
     #[test]
