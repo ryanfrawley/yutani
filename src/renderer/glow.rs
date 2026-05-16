@@ -1,14 +1,17 @@
-//! Two-mode glow / bloom effect.
+//! Three-mode glow / bloom effect.
 //!
 //! Pipeline:
 //!   1. Bright pass — reads the rendered scene, writes a half-resolution
-//!      "bright" target. A fragment contributes when EITHER (or both) of:
+//!      "bright" target. A fragment contributes when ANY of:
 //!        - HSV saturation exceeds [`Glow::threshold`] (saturation mode);
 //!        - HSV hue is within [`Glow::hue_tolerance`] degrees of one of the
-//!          colour scheme's 8 bright ANSI variants (bright-ANSI mode).
-//!      Both modes are toggled independently via `match_saturation` /
-//!      `match_bright_ansi`. When both are off, `enabled()` is false and the
-//!      caller can skip running the chain entirely.
+//!          colour scheme's 8 bright ANSI variants (bright-ANSI mode);
+//!        - RGB distance to the palette's primary foreground colour is within
+//!          [`Glow::fg_tolerance`] (foreground mode — catches default text
+//!          even when it's achromatic, which the other two modes ignore).
+//!      All three modes are toggled independently. When all are off,
+//!      `enabled()` is false and the caller can skip running the chain
+//!      entirely.
 //!   2. Dual-Kawase down/up chain — blurs the bright target. Owns a single
 //!      quarter-resolution scratch slot. Iteration count widens the kernel
 //!      without adding deeper mip levels.
@@ -33,6 +36,11 @@ pub const DEFAULT_HUE_TOLERANCE_DEG: f32 = 18.0;
 /// "bright black" and "bright white" don't drag every grey pixel into the
 /// glow). Also used in the shader as the per-pixel saturation floor.
 pub const DEFAULT_MIN_PALETTE_SAT: f32 = 0.25;
+/// RGB Euclidean radius around the foreground colour. 0.12 is roughly a
+/// `~30/255` per-channel slop — enough to catch antialiased glyph edges that
+/// have blended a little toward the background, without bleeding into
+/// neighbouring palette entries.
+pub const DEFAULT_FG_TOLERANCE: f32 = 0.12;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -51,7 +59,12 @@ struct GlowParams {
     use_saturation: f32,
     use_bright_ansi: f32,
     min_palette_sat: f32,
-    _pad: f32,
+    use_foreground: f32,
+    // fg_color.rgb is the foreground RGB; .a is unused. Held as vec4 so it
+    // takes a 16-byte slot in WGSL's std140 layout without surprises.
+    fg_color: [f32; 4],
+    fg_tolerance: f32,
+    _pad: [f32; 3],
 }
 
 /// One entry per bright ANSI slot. Layout matches the WGSL `BrightHues`:
@@ -105,15 +118,20 @@ pub struct Glow {
     up_bg: wgpu::BindGroup,        // samples scratch
     pub composite_bg: wgpu::BindGroup, // samples bright (final blurred)
 
-    /// Independent mode toggles. `enabled()` returns true if either is set.
+    /// Independent mode toggles. `enabled()` returns true if any is set.
     pub match_saturation: bool,
     pub match_bright_ansi: bool,
+    pub match_foreground: bool,
 
     pub threshold: f32,
     pub intensity: f32,
     pub softness: f32,
     pub hue_tolerance: f32,
     pub min_palette_sat: f32,
+    /// Foreground colour the bright pass compares against. Set via
+    /// [`Glow::set_foreground`]; alpha is ignored.
+    pub fg_color: [f32; 4],
+    pub fg_tolerance: f32,
     pub iterations: usize,
 }
 
@@ -238,7 +256,10 @@ impl Glow {
                 use_saturation: 0.0,
                 use_bright_ansi: 0.0,
                 min_palette_sat: DEFAULT_MIN_PALETTE_SAT,
-                _pad: 0.0,
+                use_foreground: 0.0,
+                fg_color: [0.0, 0.0, 0.0, 1.0],
+                fg_tolerance: DEFAULT_FG_TOLERANCE,
+                _pad: [0.0; 3],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -297,21 +318,24 @@ impl Glow {
             composite_bg,
             match_saturation: false,
             match_bright_ansi: false,
+            match_foreground: false,
             threshold: DEFAULT_THRESHOLD,
             intensity: DEFAULT_INTENSITY,
             softness: DEFAULT_SOFTNESS,
             hue_tolerance: DEFAULT_HUE_TOLERANCE_DEG,
             min_palette_sat: DEFAULT_MIN_PALETTE_SAT,
+            fg_color: [0.0, 0.0, 0.0, 1.0],
+            fg_tolerance: DEFAULT_FG_TOLERANCE,
             iterations: DEFAULT_ITERATIONS,
         }
         // Caller must invoke `write_uniforms` and `write_glow_params` once
         // the queue and final dimensions are known.
     }
 
-    /// True when either match mode is active. Used by the renderer to skip
+    /// True when any match mode is active. Used by the renderer to skip
     /// the offscreen scene render entirely on the fast path.
     pub fn enabled(&self) -> bool {
-        self.match_saturation || self.match_bright_ansi
+        self.match_saturation || self.match_bright_ansi || self.match_foreground
     }
 
     /// Call after [`Self::new`] or any swapchain resize. Rebuilds the bright
@@ -392,9 +416,20 @@ impl Glow {
                 use_saturation: if self.match_saturation { 1.0 } else { 0.0 },
                 use_bright_ansi: if self.match_bright_ansi { 1.0 } else { 0.0 },
                 min_palette_sat: self.min_palette_sat.clamp(0.0, 1.0),
-                _pad: 0.0,
+                use_foreground: if self.match_foreground { 1.0 } else { 0.0 },
+                fg_color: self.fg_color,
+                // Max distance in RGB unit cube is √3; clamp keeps values
+                // sane if the user supplies something absurd.
+                fg_tolerance: self.fg_tolerance.clamp(0.0, 3.0_f32.sqrt()),
+                _pad: [0.0; 3],
             }]),
         );
+    }
+
+    /// Install the foreground colour the bright pass compares against.
+    /// Alpha is preserved in the uniform but unused by the shader.
+    pub fn set_foreground(&mut self, fg: [f32; 4]) {
+        self.fg_color = fg;
     }
 
     /// Install the 8 bright ANSI variants (linear RGB, alpha ignored).
@@ -584,6 +619,20 @@ fn bright_weight(sat: f32, threshold: f32, softness: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// CPU mirror of the shader's `foreground_weight`. Returns a 0..=1 weight
+/// from RGB Euclidean distance, ramped down across a `softness`-wide band
+/// past `tolerance`.
+fn foreground_weight(rgb: [f32; 3], fg: [f32; 3], tolerance: f32, softness: f32) -> f32 {
+    let dx = rgb[0] - fg[0];
+    let dy = rgb[1] - fg[1];
+    let dz = rgb[2] - fg[2];
+    let d = (dx * dx + dy * dy + dz * dz).sqrt();
+    let lo = tolerance.max(0.0);
+    let hi = lo + softness.max(0.0001);
+    let t = ((d - lo) / (hi - lo)).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
 /// CPU mirror of the shader's `hsv_hue`. Returns `Some(degrees)` in
 /// `[0, 360)` for chromatic colours and `None` when max == min (grey).
 fn hsv_hue(rgb: [f32; 3]) -> Option<f32> {
@@ -676,7 +725,100 @@ mod tests {
         assert!((0.0..=1.0).contains(&DEFAULT_SOFTNESS));
         assert!((0.0..=180.0).contains(&DEFAULT_HUE_TOLERANCE_DEG));
         assert!((0.0..=1.0).contains(&DEFAULT_MIN_PALETTE_SAT));
+        assert!(DEFAULT_FG_TOLERANCE.is_finite() && DEFAULT_FG_TOLERANCE >= 0.0);
         assert!(MAX_ITERATIONS >= 1);
+    }
+
+    #[test]
+    fn foreground_weight_exact_match_is_one() {
+        let fg = [0.18, 0.15, 0.10];
+        approx(foreground_weight(fg, fg, 0.12, 0.15), 1.0);
+    }
+
+    #[test]
+    fn foreground_weight_far_pixel_is_zero() {
+        // Pure white vs near-black foreground — way past tolerance + softness.
+        let fg = [0.0, 0.0, 0.0];
+        approx(foreground_weight([1.0, 1.0, 1.0], fg, 0.12, 0.15), 0.0);
+    }
+
+    #[test]
+    fn foreground_weight_inside_tolerance_is_one() {
+        let fg = [0.5, 0.5, 0.5];
+        // Distance √(0.05² × 3) ≈ 0.0866, well under tolerance = 0.12.
+        let near = [0.55, 0.45, 0.55];
+        approx(foreground_weight(near, fg, 0.12, 0.15), 1.0);
+    }
+
+    #[test]
+    fn foreground_weight_outside_band_is_zero() {
+        let fg = [0.0, 0.0, 0.0];
+        // Distance √(0.3² × 3) ≈ 0.52, past tolerance 0.12 + softness 0.15.
+        let far = [0.3, 0.3, 0.3];
+        approx(foreground_weight(far, fg, 0.12, 0.15), 0.0);
+    }
+
+    #[test]
+    fn foreground_weight_monotonic_across_band() {
+        // Walking outward from the foreground colour, the weight must
+        // never increase — once we leave the tolerance band, it should
+        // drop monotonically to zero.
+        let fg = [0.18, 0.15, 0.10];
+        let mut prev = 1.0;
+        for step in 0..30 {
+            let t = step as f32 * 0.04;
+            let probe = [fg[0] + t, fg[1] + t, fg[2] + t];
+            let w = foreground_weight(probe, fg, 0.12, 0.15);
+            assert!(
+                w <= prev + 1e-5,
+                "weight rose at step {step}: {prev} → {w}"
+            );
+            prev = w;
+        }
+        approx(prev, 0.0);
+    }
+
+    #[test]
+    fn foreground_weight_zero_softness_is_finite() {
+        // Hard cutoff: tolerance 0.1, softness 0. The shader uses a 0.0001
+        // floor so the result stays finite either side of the boundary.
+        let fg = [0.5, 0.5, 0.5];
+        let just_inside = [0.55, 0.5, 0.5]; // dist 0.05 < 0.1
+        let just_outside = [0.7, 0.5, 0.5]; // dist 0.2 > 0.1
+        let w_in = foreground_weight(just_inside, fg, 0.1, 0.0);
+        let w_out = foreground_weight(just_outside, fg, 0.1, 0.0);
+        assert!(w_in.is_finite() && w_out.is_finite());
+        approx(w_in, 1.0);
+        approx(w_out, 0.0);
+    }
+
+    #[test]
+    fn foreground_weight_catches_aa_toward_background() {
+        // The whole point of this mode: an achromatic foreground glyph
+        // antialiased toward the background still registers near the
+        // glyph centre — catching cases the saturation and bright-ANSI
+        // modes can't (both fail when fg is grey/white/black).
+        //
+        // Math sanity check: with fg = [0,0,0], bg = white, the RGB
+        // distance from blended back to fg is (1 - alpha) * √3. At
+        // alpha = 0.85 that's ≈ 0.26, which still lands in the
+        // tolerance + softness band (0.12 + 0.15 = 0.27). The deeper
+        // AA fringe (alpha < ~0.85) falls past the band, which is fine
+        // — those pixels are visually closer to background than to fg.
+        let fg = [0.0, 0.0, 0.0];
+        let bg = 1.0;
+        for alpha in [1.0_f32, 0.97, 0.95, 0.9, 0.86] {
+            let blended = [
+                fg[0] * alpha + bg * (1.0 - alpha),
+                fg[1] * alpha + bg * (1.0 - alpha),
+                fg[2] * alpha + bg * (1.0 - alpha),
+            ];
+            let w = foreground_weight(blended, fg, 0.12, 0.15);
+            assert!(
+                w > 0.0,
+                "AA fringe at coverage {alpha} should still register, got {w}"
+            );
+        }
     }
 
     #[test]

@@ -111,6 +111,13 @@ struct Config {
     /// Dual-Kawase iterations applied to the bright extraction. Higher =
     /// wider, softer halo at the cost of fill rate.
     glow_iterations: usize,
+    /// When true, pixels whose RGB distance to the palette's foreground
+    /// colour is within `glow_fg_tolerance` contribute to the glow. The
+    /// only mode that catches achromatic default text.
+    glow_match_foreground: bool,
+    /// RGB Euclidean radius around the foreground colour for
+    /// `glow_match_foreground`. Max meaningful value is √3 ≈ 1.73.
+    glow_fg_tolerance: f32,
 }
 
 impl Config {
@@ -133,6 +140,8 @@ impl Config {
             glow_softness: renderer::glow::DEFAULT_SOFTNESS,
             glow_hue_tolerance_deg: renderer::glow::DEFAULT_HUE_TOLERANCE_DEG,
             glow_iterations: 2,
+            glow_match_foreground: false,
+            glow_fg_tolerance: renderer::glow::DEFAULT_FG_TOLERANCE,
         }
     }
 
@@ -181,6 +190,10 @@ impl Config {
                 "glow_iterations" => if let Ok(x) = v.parse::<usize>() {
                     c.glow_iterations = x.clamp(1, renderer::glow::MAX_ITERATIONS);
                 },
+                "glow_match_foreground" => if let Ok(x) = v.parse() { c.glow_match_foreground = x; },
+                "glow_fg_tolerance" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_fg_tolerance = x.clamp(0.0, 3.0_f32.sqrt());
+                },
                 _ => (),
             }
         }
@@ -222,17 +235,21 @@ impl Config {
         s.push_str(&format!(
             "glow_match_saturation = {}\n\
              glow_match_bright_ansi = {}\n\
+             glow_match_foreground = {}\n\
              glow_threshold = {}\n\
              glow_intensity = {}\n\
              glow_softness = {}\n\
              glow_hue_tolerance_deg = {}\n\
+             glow_fg_tolerance = {}\n\
              glow_iterations = {}\n",
             self.glow_match_saturation,
             self.glow_match_bright_ansi,
+            self.glow_match_foreground,
             self.glow_threshold,
             self.glow_intensity,
             self.glow_softness,
             self.glow_hue_tolerance_deg,
+            self.glow_fg_tolerance,
             self.glow_iterations,
         ));
         s
@@ -1197,16 +1214,17 @@ impl State {
         );
         glow.match_saturation = config.glow_match_saturation;
         glow.match_bright_ansi = config.glow_match_bright_ansi;
+        glow.match_foreground = config.glow_match_foreground;
         glow.threshold = config.glow_threshold;
         glow.intensity = config.glow_intensity;
         glow.softness = config.glow_softness;
         glow.hue_tolerance = config.glow_hue_tolerance_deg;
+        glow.fg_tolerance = config.glow_fg_tolerance;
         glow.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
-        glow.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
-        glow.write_glow_params(&gpu.queue);
-        // Bright-ANSI matching needs the palette's hue table. Palette is
-        // installed before State::new (see `run()`), so this reads the
-        // active scheme — or the defaults if no scheme was configured.
+        // Bright-ANSI matching needs the palette's hue table; foreground
+        // matching needs the foreground RGB. Palette is installed before
+        // State::new (see `run()`), so this reads the active scheme — or
+        // the defaults if no scheme was configured.
         {
             let p = palette::get();
             let bright: [[f32; 4]; 8] = [
@@ -1214,7 +1232,10 @@ impl State {
                 p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
             ];
             glow.set_bright_palette(&gpu.queue, &bright);
+            glow.set_foreground(p.foreground);
         }
+        glow.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        glow.write_glow_params(&gpu.queue);
 
         Self {
             window,
@@ -3763,9 +3784,11 @@ mod tests {
         let c = Config::defaults();
         assert!(!c.glow_match_saturation);
         assert!(!c.glow_match_bright_ansi);
+        assert!(!c.glow_match_foreground);
         assert!((0.0..=1.0).contains(&c.glow_threshold));
         assert!(c.glow_intensity > 0.0);
         assert!((0.0..=180.0).contains(&c.glow_hue_tolerance_deg));
+        assert!(c.glow_fg_tolerance >= 0.0 && c.glow_fg_tolerance <= 3.0_f32.sqrt());
         assert!(c.glow_iterations >= 1);
     }
 
@@ -3774,19 +3797,31 @@ mod tests {
         let mut c = Config::defaults();
         c.glow_match_saturation = true;
         c.glow_match_bright_ansi = true;
+        c.glow_match_foreground = true;
         c.glow_threshold = 0.42;
         c.glow_intensity = 1.75;
         c.glow_softness = 0.25;
         c.glow_hue_tolerance_deg = 22.5;
+        c.glow_fg_tolerance = 0.20;
         c.glow_iterations = 5;
         let parsed = Config::parse_str(&c.serialize());
         assert!(parsed.glow_match_saturation);
         assert!(parsed.glow_match_bright_ansi);
+        assert!(parsed.glow_match_foreground);
         assert!(approx_eq(parsed.glow_threshold, 0.42));
         assert!(approx_eq(parsed.glow_intensity, 1.75));
         assert!(approx_eq(parsed.glow_softness, 0.25));
         assert!(approx_eq(parsed.glow_hue_tolerance_deg, 22.5));
+        assert!(approx_eq(parsed.glow_fg_tolerance, 0.20));
         assert_eq!(parsed.glow_iterations, 5);
+    }
+
+    #[test]
+    fn config_glow_fg_tolerance_clamped() {
+        let parsed = Config::parse_str("glow_fg_tolerance = 99\n");
+        assert!(parsed.glow_fg_tolerance <= 3.0_f32.sqrt());
+        let parsed = Config::parse_str("glow_fg_tolerance = -1\n");
+        assert!(parsed.glow_fg_tolerance >= 0.0);
     }
 
     #[test]

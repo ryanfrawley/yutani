@@ -1,14 +1,17 @@
-// Saturation- and/or palette-driven bloom.
+// Saturation-, palette-, and foreground-driven bloom.
 //
-// Two independent match modes feed the bright pass:
+// Three independent match modes feed the bright pass:
 //   - SATURATION: keep fragments whose HSV saturation exceeds `threshold`.
 //   - BRIGHT-ANSI: keep fragments whose hue matches one of the colour
 //     scheme's 8 bright ANSI variants, ignoring brightness/lightness so
 //     antialiased glyphs still register even when blended toward the
 //     background. Greyscale bright variants (sat < `min_palette_sat`) are
 //     skipped on the host side (their slot's `.w` is set to 0).
-// When both modes are on, the per-pixel weight is `max(sat, palette)` so a
-// pixel only has to satisfy one to glow.
+//   - FOREGROUND: keep fragments whose RGB distance to the configured
+//     foreground colour is within `fg_tolerance`. Catches default text,
+//     which is usually achromatic and so invisible to the other two modes.
+// Per-pixel weight is the max across all enabled modes — a pixel only has
+// to satisfy one to glow.
 // The blur chain and additive composite below are dual-Kawase, matching
 // `blur.wgsl`.
 
@@ -21,12 +24,17 @@ struct BlurParams {
 struct GlowParams {
     threshold: f32,        // HSV-saturation cutoff for SATURATION mode.
     intensity: f32,        // Multiplier applied at additive composite.
-    softness: f32,         // Smoothstep width above `threshold` (SAT mode).
+    softness: f32,         // Smoothstep width — shared by all three modes.
     hue_tolerance: f32,    // Degrees of hue slop for BRIGHT-ANSI mode.
     use_saturation: f32,   // 0 = off, 1 = on.
     use_bright_ansi: f32,  // 0 = off, 1 = on.
     min_palette_sat: f32,  // Pixel sat below this never matches a palette hue.
-    _pad: f32,
+    use_foreground: f32,   // 0 = off, 1 = on (FOREGROUND mode).
+    fg_color: vec4<f32>,   // .rgb = foreground RGB target; .a unused.
+    fg_tolerance: f32,     // RGB Euclidean radius around fg_color.
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 // One entry per bright ANSI slot. Stored as (hue_deg, sat, _, active):
@@ -133,6 +141,16 @@ fn bright_ansi_weight(rgb: vec3<f32>) -> f32 {
     return best;
 }
 
+// Pixel matches the configured foreground when its RGB Euclidean distance
+// to `fg_color.rgb` is within `fg_tolerance`. A `softness`-wide smoothstep
+// past tolerance ramps to 0 so AA fringes don't drop off abruptly.
+fn foreground_weight(rgb: vec3<f32>) -> f32 {
+    let d = distance(rgb, glow_params.fg_color.rgb);
+    let lo = max(glow_params.fg_tolerance, 0.0);
+    let hi = lo + max(glow_params.softness, 0.0001);
+    return 1.0 - smoothstep(lo, hi, d);
+}
+
 @fragment
 fn fs_bright(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(src_tex, src_smp, in.uv);
@@ -142,6 +160,9 @@ fn fs_bright(in: VsOut) -> @location(0) vec4<f32> {
     }
     if (glow_params.use_bright_ansi > 0.5) {
         weight = max(weight, bright_ansi_weight(c.rgb));
+    }
+    if (glow_params.use_foreground > 0.5) {
+        weight = max(weight, foreground_weight(c.rgb));
     }
     return vec4<f32>(c.rgb * weight, 1.0);
 }
