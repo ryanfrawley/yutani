@@ -1806,22 +1806,19 @@ impl Terminal {
     /// Direct base64 transmission: payload is the image bytes (possibly
     /// chunked across multiple APCs and reassembled by `kitty_chunks`).
     fn handle_apc_direct(&mut self, payload: &str, ctrl: &KittyControl) {
-        // Strip APC-internal whitespace from the payload (some apps wrap
-        // base64 lines for readability). The base64 alphabet doesn't
-        // include whitespace, so this is unambiguous.
-        let chunk: String = payload
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .collect();
-
         // Branch on chunking. Four states: (id present, more chunks),
         // (id present, last chunk), (no id, more chunks), (no id, last
         // chunk). The two id-less branches use `kitty_chunks_anon`
         // because `kitty +kitten icat` omits `i=` for raw / JPG
         // streams but still expects accumulation.
+        //
+        // Hot path: a typical 1MB image arrives in ~250 chunks, so the
+        // per-chunk work has to stay minimal. Stream the whitespace
+        // filter directly into the accumulator's existing String instead
+        // of allocating a per-chunk staging buffer.
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
-                let entry = self.kitty_chunks.entry(id).or_insert(KittyChunks {
+                let entry = self.kitty_chunks.entry(id).or_insert_with(|| KittyChunks {
                     b64: String::new(),
                     format: ctrl.format,
                     source_w: ctrl.source_w,
@@ -1830,11 +1827,11 @@ impl Terminal {
                     cells_rows: ctrl.cells_rows,
                     do_not_move_cursor: ctrl.do_not_move_cursor,
                 });
-                entry.b64.push_str(&chunk);
+                append_b64_filtered(&mut entry.b64, payload);
             }
             (Some(id), false) if self.kitty_chunks.contains_key(&id) => {
                 let mut acc = self.kitty_chunks.remove(&id).expect("contains_key");
-                acc.b64.push_str(&chunk);
+                append_b64_filtered(&mut acc.b64, payload);
                 self.finalize_kitty_image(
                     &acc.b64,
                     acc.format,
@@ -1850,7 +1847,7 @@ impl Terminal {
                 // sizing/format; later ones just append base64. A new
                 // first-chunk while one's open overwrites — there's no
                 // way to distinguish them otherwise.
-                let entry = self.kitty_chunks_anon.get_or_insert(KittyChunks {
+                let entry = self.kitty_chunks_anon.get_or_insert_with(|| KittyChunks {
                     b64: String::new(),
                     format: ctrl.format,
                     source_w: ctrl.source_w,
@@ -1859,11 +1856,11 @@ impl Terminal {
                     cells_rows: ctrl.cells_rows,
                     do_not_move_cursor: ctrl.do_not_move_cursor,
                 });
-                entry.b64.push_str(&chunk);
+                append_b64_filtered(&mut entry.b64, payload);
             }
             (None, false) if self.kitty_chunks_anon.is_some() => {
                 let mut acc = self.kitty_chunks_anon.take().expect("is_some");
-                acc.b64.push_str(&chunk);
+                append_b64_filtered(&mut acc.b64, payload);
                 self.finalize_kitty_image(
                     &acc.b64,
                     acc.format,
@@ -1876,9 +1873,12 @@ impl Terminal {
             }
             _ => {
                 // Single-chunk: id present (or not) with m=0 and no
-                // in-flight buffer.
+                // in-flight buffer. Build a one-off filtered string
+                // since the accumulator path isn't involved.
+                let mut buf = String::with_capacity(payload.len());
+                append_b64_filtered(&mut buf, payload);
                 self.finalize_kitty_image(
-                    &chunk,
+                    &buf,
                     ctrl.format,
                     ctrl.source_w,
                     ctrl.source_h,
@@ -2394,6 +2394,29 @@ struct KittyChunks {
     cells_cols: Option<u32>,
     cells_rows: Option<u32>,
     do_not_move_cursor: bool,
+}
+
+/// Append `payload`'s base64 chars to `dest`, skipping ASCII whitespace.
+/// Some apps wrap base64 inside an APC at 76 chars per line for
+/// readability; the base64 alphabet doesn't include whitespace, so the
+/// skip is unambiguous.
+///
+/// Pulled out of `handle_apc_direct` because it runs on the hot path —
+/// a typical 1MB image arrives in ~250 chunks and the old `chunk:
+/// String = ... .collect()` path allocated a fresh String per chunk
+/// then copied it into the accumulator. Streaming directly into the
+/// destination is one pass, no allocation.
+fn append_b64_filtered(dest: &mut String, payload: &str) {
+    // Base64 is pure ASCII so we can byte-iterate without UTF-8 decoding.
+    // Reserving up-front amortizes the growth cost across many chunks.
+    dest.reserve(payload.len());
+    for &b in payload.as_bytes() {
+        if !b.is_ascii_whitespace() {
+            // SAFETY-equivalent: pushing an ASCII byte into a String is
+            // always valid UTF-8.
+            dest.push(b as char);
+        }
+    }
 }
 
 /// Normalize a Kitty graphics payload into the PNG-bytes format the
