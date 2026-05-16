@@ -147,6 +147,9 @@ impl Atlas {
         {
             return false;
         }
+        // If the atlas is full, fall back to notdef and remember that — so
+        // we don't keep retrying the same glyph on every frame and so the
+        // renderer picks up a sane (if blank) UV instead of garbage.
         let entry = pack_glyph(
             face.glyph(),
             &mut self.buffer,
@@ -157,7 +160,8 @@ impl Atlas {
             &mut self.pack_row_height,
             cell_w,
             cell_h,
-        );
+        )
+        .unwrap_or(self.notdef);
         self.ligatures[vi].insert(glyph_id, entry);
         self.dirty = true;
         true
@@ -294,7 +298,54 @@ impl Font {
     }
 
     pub fn build_atlas(&mut self) -> Atlas {
-        let size = 4096;
+        let cell_w = self.cell_width();
+        let metrics = self
+            .face()
+            .size_metrics()
+            .expect("primary face has no size metrics");
+        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        let ascender_px = (metrics.ascender >> 6) as isize;
+
+        // Ranges we care about rendering. Control chars are excluded — the
+        // terminal model strips them before they ever reach a cell. PUA is
+        // included to cover Powerline + Nerd Font prompt glyphs.
+        let ranges: &[std::ops::RangeInclusive<u32>] = &[
+            0x0020..=0x007E, // printable ASCII
+            0x00A0..=0x00FF, // Latin-1 supplement printable
+            0x0100..=0x024F, // Latin Extended-A/B
+            0x2000..=0x27BF, // punctuation, arrows, math, box-drawing, shapes, dingbats
+            0x2900..=0x29FF, // supplemental arrows + math
+            0xE000..=0xE0FF, // PUA: Powerline, common Nerd Font separators
+        ];
+
+        // Pick atlas dimensions from cell metrics so very large fonts don't
+        // overflow the texture and start sampling stale glyphs from the top.
+        // Estimate area needed as installed_variants × glyphs_per_variant ×
+        // (cell_w + gutter) × (cell_h + gutter), with packing slack, then
+        // pick the smallest power-of-two ≤ 8192 (wgpu's default
+        // `max_texture_dimension_2d`) that fits. 2048 is the lower bound so
+        // small fonts still get a comfortable cache.
+        let installed_variants = self
+            .variants
+            .iter()
+            .filter(|v| v.face.is_some())
+            .count()
+            .max(1);
+        let glyphs_per_variant: usize = ranges.iter().map(|r| r.clone().count()).sum();
+        // +256 for ligatures we'll discover at render time, +1 for notdef.
+        let total_glyphs = glyphs_per_variant * installed_variants + 257;
+        let cell_footprint = (cell_w + 1) * (cell_h + 1);
+        let needed_area = total_glyphs * cell_footprint * 3 / 2;
+        let needed_side = (needed_area as f64).sqrt().ceil() as usize;
+        // Floor: must hold at least the largest single glyph.
+        let min_side = (cell_w + 4).max(cell_h + 4);
+        let target = needed_side.max(min_side);
+        let mut size: usize = 2048;
+        while size < target && size < 8192 {
+            size *= 2;
+        }
+        let size = size.min(8192);
+
         let width = size;
         let height = size;
         let mut row_height = 0;
@@ -311,16 +362,9 @@ impl Font {
         let mut x = 2;
         let mut y = 0;
 
-        let cell_w = self.cell_width();
-        let metrics = self
-            .face()
-            .size_metrics()
-            .expect("primary face has no size metrics");
-        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
-        let ascender_px = (metrics.ascender >> 6) as isize;
-
         // The font's .notdef glyph (index 0). Rendered in place of any
-        // character the font doesn't provide — usually a hollow box.
+        // character the font doesn't provide — usually a hollow box. Packed
+        // first so it always fits even when the atlas is tight.
         self.face()
             .load_glyph(0, ft::face::LoadFlag::RENDER)
             .expect("font has no .notdef glyph");
@@ -334,25 +378,14 @@ impl Font {
             &mut row_height,
             cell_w,
             cell_h,
-        );
+        )
+        .expect("notdef must fit in a freshly-built atlas");
 
         let mut variants_entries: [HashMap<char, AtlasEntry>; 4] = [
             HashMap::with_capacity(4096),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),
-        ];
-
-        // Ranges we care about rendering. Control chars are excluded — the
-        // terminal model strips them before they ever reach a cell. PUA is
-        // included to cover Powerline + Nerd Font prompt glyphs.
-        let ranges: &[std::ops::RangeInclusive<u32>] = &[
-            0x0020..=0x007E, // printable ASCII
-            0x00A0..=0x00FF, // Latin-1 supplement printable
-            0x0100..=0x024F, // Latin Extended-A/B
-            0x2000..=0x27BF, // punctuation, arrows, math, box-drawing, shapes, dingbats
-            0x2900..=0x29FF, // supplemental arrows + math
-            0xE000..=0xE0FF, // PUA: Powerline, common Nerd Font separators
         ];
 
         for variant in FaceVariant::ALL {
@@ -374,7 +407,7 @@ impl Font {
                     // Atlas::lookup to the regular synthesized entry.
                     if variant == FaceVariant::Regular {
                         if let Some(bm) = box_drawing::synth(ch, cell_w, cell_h, ascender_px) {
-                            let entry = pack_synth(
+                            if let Some(entry) = pack_synth(
                                 &bm,
                                 &mut texture,
                                 width,
@@ -382,8 +415,12 @@ impl Font {
                                 &mut x,
                                 &mut y,
                                 &mut row_height,
-                            );
-                            variants_entries[vi].insert(ch, entry);
+                            ) {
+                                variants_entries[vi].insert(ch, entry);
+                            }
+                            // Atlas full → leave the slot empty so lookup
+                            // falls back to notdef instead of writing past
+                            // the texture and corrupting earlier glyphs.
                             continue;
                         }
                     } else if box_drawing::synth(ch, cell_w, cell_h, ascender_px).is_some() {
@@ -399,7 +436,7 @@ impl Font {
                     if face.load_char(ch as usize, ft::face::LoadFlag::RENDER).is_err() {
                         continue;
                     }
-                    let entry = pack_glyph(
+                    if let Some(entry) = pack_glyph(
                         face.glyph(),
                         &mut texture,
                         width,
@@ -409,8 +446,9 @@ impl Font {
                         &mut row_height,
                         cell_w,
                         cell_h,
-                    );
-                    variants_entries[vi].insert(ch, entry);
+                    ) {
+                        variants_entries[vi].insert(ch, entry);
+                    }
                 }
             }
         }
@@ -437,7 +475,9 @@ impl Font {
 
 // Pack a procedurally-generated bitmap into the atlas. Skips the edge-
 // hardening logic in `pack_glyph` because synthesized strokes are already
-// pixel-aligned at full coverage by construction.
+// pixel-aligned at full coverage by construction. Returns `None` when the
+// glyph won't fit in the remaining atlas space — caller falls back to
+// notdef rather than corrupting earlier glyphs by writing past the texture.
 fn pack_synth(
     bm: &box_drawing::Bitmap,
     texture: &mut [u8],
@@ -446,15 +486,27 @@ fn pack_synth(
     x: &mut usize,
     y: &mut usize,
     row_height: &mut usize,
-) -> AtlasEntry {
+) -> Option<AtlasEntry> {
     let w = bm.width;
     let h = bm.height;
+    let stride = bm.advance_x.max(w).max(1) + 1;
+
+    // Wrap to the next row if the glyph won't fit on the current one.
+    if *x + stride > width {
+        *x = 0;
+        *y += *row_height + 1;
+        *row_height = 0;
+    }
+    // Atlas full vertically — caller must fall back. Don't write anything.
+    if *y + h > size {
+        return None;
+    }
     if h > *row_height {
         *row_height = h;
     }
     for p in 0..h {
         for q in 0..w {
-            texture[((p + *y) % size) * width + (q + *x) % size] = bm.data[p * w + q];
+            texture[(p + *y) * width + (q + *x)] = bm.data[p * w + q];
         }
     }
     let entry = AtlasEntry {
@@ -466,13 +518,8 @@ fn pack_synth(
         bearing_y: bm.bearing_y,
         advance_x: bm.advance_x,
     };
-    *x += bm.advance_x.max(w).max(1) + 1;
-    if *x + w >= size {
-        *x = 0;
-        *y += *row_height + 1;
-        *row_height = 0;
-    }
-    entry
+    *x += stride;
+    Some(entry)
 }
 
 fn pack_glyph(
@@ -485,12 +532,28 @@ fn pack_glyph(
     row_height: &mut usize,
     cell_w: usize,
     cell_h: usize,
-) -> AtlasEntry {
+) -> Option<AtlasEntry> {
     let bitmap = glyph.bitmap();
     let metrics = glyph.metrics();
     let w = bitmap.width() as usize;
     let h = bitmap.rows() as usize;
     let advance = (metrics.horiAdvance >> 6) as usize;
+    let stride = w.max(advance).max(1) + 1;
+
+    // Wrap to the next row if this glyph won't fit on the current one. Done
+    // before the row-height bump so we never grow the row past the wrap.
+    if *x + stride > width {
+        *x = 0;
+        *y += *row_height + 1;
+        *row_height = 0;
+    }
+    // Atlas is full vertically. Returning None lets the caller fall back to
+    // notdef instead of writing past the texture (the previous modular
+    // wrap silently sampled stale glyphs from the top of the atlas, which
+    // showed up as garbled text at large font sizes).
+    if *y + h > size {
+        return None;
+    }
     if h > *row_height {
         *row_height = h;
     }
@@ -532,7 +595,7 @@ fn pack_glyph(
             if on_solid_edge && value > 0 {
                 value = 255;
             }
-            texture[((p + *y) % size) * width + (q + *x) % size] = value;
+            texture[(p + *y) * width + (q + *x)] = value;
         }
     }
     // Use the post-rasterization pixel offsets (bitmap_left/top) rather than
@@ -556,16 +619,11 @@ fn pack_glyph(
     // halves) are designed with bitmap.width > horiAdvance so adjacent halves
     // fuse across cells — advancing only by `advance` leaves the next packed
     // glyph stomping on the previous glyph's right overhang in the atlas. The
-    // `+ 1` keeps a one-pixel gutter so the renderer's linear sampler can't
-    // bleed across glyphs at sub-pixel UVs.
-    let stride = w.max(advance).max(1) + 1;
+    // `+ 1` (already baked into `stride` above) keeps a one-pixel gutter so
+    // the renderer's linear sampler can't bleed across glyphs at sub-pixel
+    // UVs. Row wrapping is handled by the next call's leading bounds check.
     *x += stride;
-    if *x + stride >= size {
-        *x = 0;
-        *y += *row_height + 1;
-        *row_height = 0;
-    }
-    entry
+    Some(entry)
 }
 
 #[cfg(test)]
@@ -684,8 +742,10 @@ mod tests {
 
         let a = make(18, 20, 12);
         let b = make(18, 20, 12);
-        let e1 = pack_synth(&a, &mut texture, width, size, &mut x, &mut y, &mut row_height);
-        let e2 = pack_synth(&b, &mut texture, width, size, &mut x, &mut y, &mut row_height);
+        let e1 = pack_synth(&a, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("first glyph fits");
+        let e2 = pack_synth(&b, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("second glyph fits");
 
         assert!(
             e2.x >= e1.x + e1.width,
@@ -694,5 +754,180 @@ mod tests {
             e1.x,
             e1.x + e1.width,
         );
+    }
+
+    // Regression: the atlas used to write pixels with a modular `% size`
+    // wrap, so a glyph that didn't fit silently overwrote glyphs at the
+    // top and produced UVs > 1.0. The fix returns `None` on vertical
+    // overflow and writes nothing — caller falls back to notdef.
+    #[test]
+    fn pack_synth_returns_none_and_writes_nothing_on_vertical_overflow() {
+        let size = 32;
+        let width = size;
+        let mut texture = vec![0u8; width * size];
+        let mut x = 0;
+        let mut y = 0;
+        let mut row_height = 0;
+
+        let make = |w: usize, h: usize, advance: usize| crate::box_drawing::Bitmap {
+            data: vec![255u8; w * h],
+            width: w,
+            height: h,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance_x: advance,
+        };
+
+        // First glyph fits — fills (roughly) the whole atlas height.
+        let big = make(30, 30, 30);
+        let e1 = pack_synth(&big, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("first glyph fits");
+
+        // Snapshot the buffer so we can prove the second call doesn't
+        // clobber anything past the first glyph's footprint.
+        let before = texture.clone();
+
+        // Second glyph won't fit vertically (row wrap pushes y past `size`).
+        let second = make(30, 30, 30);
+        let result = pack_synth(
+            &second,
+            &mut texture,
+            width,
+            size,
+            &mut x,
+            &mut y,
+            &mut row_height,
+        );
+        assert!(result.is_none(), "overflowing glyph must return None");
+        assert_eq!(
+            texture, before,
+            "failed pack must not modify the texture buffer"
+        );
+        // Sanity: first glyph's pixels are intact at their original location.
+        for p in 0..e1.height {
+            for q in 0..e1.width {
+                assert_eq!(
+                    texture[(p + e1.y) * width + (q + e1.x)],
+                    255,
+                    "first glyph pixel at ({}, {}) clobbered",
+                    e1.x + q,
+                    e1.y + p,
+                );
+            }
+        }
+    }
+
+    // When the next glyph won't fit on the current row, pack_synth must
+    // bump to the next row and place the entry there — not overlap the
+    // previous row and not modular-wrap back to x=0 on the same row.
+    #[test]
+    fn pack_synth_row_wraps_when_glyph_overflows_horizontally() {
+        let size = 64;
+        let width = size;
+        let mut texture = vec![0u8; width * size];
+        let mut x = 0;
+        let mut y = 0;
+        let mut row_height = 0;
+
+        let make = |w: usize, h: usize, advance: usize| crate::box_drawing::Bitmap {
+            data: vec![255u8; w * h],
+            width: w,
+            height: h,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance_x: advance,
+        };
+
+        // First glyph: 40 wide, height 10. Stride = 41 → leaves x=41.
+        let a = make(40, 10, 40);
+        let e1 = pack_synth(&a, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("first glyph fits");
+        assert_eq!(e1.y, 0, "first glyph sits on row 0");
+
+        // Second glyph: 40 wide. 41 + 41 > 64 → must wrap to next row.
+        let b = make(40, 10, 40);
+        let e2 = pack_synth(&b, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("second glyph fits on the next row");
+
+        assert_eq!(e2.x, 0, "wrapped glyph starts at x=0");
+        assert!(
+            e2.y >= e1.y + e1.height,
+            "wrapped glyph at y={} must sit below first row ending at y={}",
+            e2.y,
+            e1.y + e1.height,
+        );
+    }
+
+    // Row-wrap then vertical overflow: the glyph would wrap to a row that
+    // doesn't fit. Must return None without touching the buffer.
+    #[test]
+    fn pack_synth_row_wrap_then_vertical_overflow_returns_none() {
+        let size = 32;
+        let width = size;
+        let mut texture = vec![0u8; width * size];
+        let mut x = 0;
+        let mut y = 0;
+        let mut row_height = 0;
+
+        let make = |w: usize, h: usize, advance: usize| crate::box_drawing::Bitmap {
+            data: vec![255u8; w * h],
+            width: w,
+            height: h,
+            bearing_x: 0,
+            bearing_y: 0,
+            advance_x: advance,
+        };
+
+        // Pack one glyph that fills most of the atlas height. Stride = 21
+        // → x advances to 21, leaving room for nothing else 20 wide.
+        let first = make(20, 25, 20);
+        pack_synth(&first, &mut texture, width, size, &mut x, &mut y, &mut row_height)
+            .expect("first glyph fits");
+
+        let before = texture.clone();
+
+        // Second glyph: 20 wide. 21 + 21 > 32 → row-wraps to y = 26, which
+        // plus h=25 exceeds size=32 → vertical overflow → None.
+        let second = make(20, 25, 20);
+        let result = pack_synth(
+            &second,
+            &mut texture,
+            width,
+            size,
+            &mut x,
+            &mut y,
+            &mut row_height,
+        );
+        assert!(
+            result.is_none(),
+            "row-wrap that lands past the atlas bottom must return None"
+        );
+        assert_eq!(
+            texture, before,
+            "failed pack must not modify the texture buffer"
+        );
+    }
+
+    // ensure_glyph_id may fall back to notdef when the atlas is full and
+    // store that under the glyph id. Independently, lookup_glyph_id with
+    // an unknown id (ligature not yet rasterized) must also return notdef
+    // — that's the fallback the renderer relies on whenever shaping
+    // produces a glyph id we haven't packed.
+    #[test]
+    fn lookup_glyph_id_falls_back_to_notdef_when_unknown() {
+        let a = atlas_with(&[], &[]);
+        // No ligatures populated → any glyph id returns notdef.
+        let g = a.lookup_glyph_id(42, FaceVariant::Regular);
+        assert_eq!(g.x, 99, "unknown glyph id → notdef");
+
+        // Same fallback path for styled variants.
+        let g = a.lookup_glyph_id(42, FaceVariant::Bold);
+        assert_eq!(g.x, 99, "unknown glyph id on bold → notdef (via regular miss)");
+
+        let g = a.lookup_glyph_id(42, FaceVariant::Italic);
+        assert_eq!(g.x, 99, "unknown glyph id on italic → notdef");
+
+        let g = a.lookup_glyph_id(42, FaceVariant::BoldItalic);
+        assert_eq!(g.x, 99, "unknown glyph id on bold-italic → notdef");
     }
 }
