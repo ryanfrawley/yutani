@@ -3000,11 +3000,21 @@ impl State {
     }
 
     fn notify_pty_size(&self, cols: usize, rows: usize) {
+        // Pixel dimensions are what `kitty +kitten icat` (and any other
+        // image-protocol-aware tool that reads `TIOCGWINSZ`) uses to
+        // discover the cell-pixel size. Zero here would make those
+        // tools refuse to send images with "Terminal does not support
+        // reporting screen sizes in pixels."
+        let metrics = self.font.face().size_metrics().unwrap();
+        let cell_w = self.font.cell_width() as u32;
+        let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
+        let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
+        let ypixel = (rows as u32).saturating_mul(line_h).min(u16::MAX as u32) as u16;
         let ws = libc::winsize {
             ws_row: rows as u16,
             ws_col: cols as u16,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
         unsafe {
             libc::ioctl(self.master, libc::TIOCSWINSZ, &ws);
