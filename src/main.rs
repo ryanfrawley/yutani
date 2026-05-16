@@ -3658,7 +3658,23 @@ impl State {
             // send `a=p` later to display. We still queue the upload
             // so the decode runs and the store gets the pixels.
             if up.display_immediately {
-                self.terminal.insert_placement(image_id, row, col, rows, cols, 0);
+                // Route through the Kitty-aware variant so X=/Y= offsets,
+                // z-index, source crops, and the client's image/placement
+                // ids all thread onto the Placement. For iTerm OSCs all
+                // the Kitty-only fields are at their defaults so this
+                // produces the same result as `insert_placement`.
+                self.terminal.insert_placement_kitty(
+                    image_id,
+                    row,
+                    col,
+                    rows,
+                    cols,
+                    up.z_index,
+                    up.pixel_offset,
+                    up.src_rect,
+                    up.kitty_image_id,
+                    up.kitty_placement_id,
+                );
             }
             self.pending_placements.push(PendingImagePlacement {
                 request: pending,
