@@ -71,6 +71,11 @@ pub struct ImageDraw<'a> {
     pub y_px: f32,
     pub w_px: f32,
     pub h_px: f32,
+    /// UV sub-rect to sample, as `(u0, v0, u1, v1)`. `None` defaults to the
+    /// full `(0, 0, 1, 1)` quad — preserves phase 1 "draw the whole image"
+    /// behavior. Set by callers that converted a `Placement.src_rect`
+    /// (pixel coords) to UVs against this `GpuImage`'s known size.
+    pub uv_rect: Option<(f32, f32, f32, f32)>,
 }
 
 pub struct ImagePipeline {
@@ -286,7 +291,8 @@ impl ImagePipeline {
         let n = draws.len().min(MAX_PLACEMENTS_PER_FRAME);
         let mut verts: Vec<ImageVertex> = Vec::with_capacity(n * 4);
         for d in &draws[..n] {
-            push_quad_verts(&mut verts, d.x_px, d.y_px, d.w_px, d.h_px);
+            let (u0, v0, u1, v1) = d.uv_rect.unwrap_or((0.0, 0.0, 1.0, 1.0));
+            push_quad_verts(&mut verts, d.x_px, d.y_px, d.w_px, d.h_px, u0, v0, u1, v1);
         }
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
 
@@ -313,18 +319,24 @@ impl ImagePipeline {
     }
 }
 
-/// Push four `ImageVertex`es for one quad in CW winding (TL, TR, BR, BL), with
-/// UVs at the obvious corners. Pulled out of `render` so the math is testable
-/// without a wgpu device.
-fn push_quad_verts(out: &mut Vec<ImageVertex>, x: f32, y: f32, w: f32, h: f32) {
+/// Push four `ImageVertex`es for one quad in CW winding (TL, TR, BR, BL),
+/// with UV corners `(u0,v0)`..`(u1,v1)`. UVs are caller-supplied so a
+/// `Placement.src_rect` translates straight to a textured sub-rect without
+/// touching the shader. Phase 1 callers pass `0..1` for full-image draws.
+#[allow(clippy::too_many_arguments)]
+fn push_quad_verts(
+    out: &mut Vec<ImageVertex>,
+    x: f32, y: f32, w: f32, h: f32,
+    u0: f32, v0: f32, u1: f32, v1: f32,
+) {
     let l = x;
     let t = y;
     let r = x + w;
     let b = y + h;
-    out.push(ImageVertex { position: [l, t, 0.0], uv: [0.0, 0.0] });
-    out.push(ImageVertex { position: [r, t, 0.0], uv: [1.0, 0.0] });
-    out.push(ImageVertex { position: [r, b, 0.0], uv: [1.0, 1.0] });
-    out.push(ImageVertex { position: [l, b, 0.0], uv: [0.0, 1.0] });
+    out.push(ImageVertex { position: [l, t, 0.0], uv: [u0, v0] });
+    out.push(ImageVertex { position: [r, t, 0.0], uv: [u1, v0] });
+    out.push(ImageVertex { position: [r, b, 0.0], uv: [u1, v1] });
+    out.push(ImageVertex { position: [l, b, 0.0], uv: [u0, v1] });
 }
 
 #[cfg(test)]
@@ -338,7 +350,7 @@ mod tests {
     #[test]
     fn quad_verts_cw_winding_and_corner_uvs() {
         let mut v = Vec::new();
-        push_quad_verts(&mut v, 10.0, 20.0, 100.0, 50.0);
+        push_quad_verts(&mut v, 10.0, 20.0, 100.0, 50.0, 0.0, 0.0, 1.0, 1.0);
         assert_eq!(v.len(), 4);
 
         // Positions: TL, TR, BR, BL (CW from top-left in screen space where
@@ -368,8 +380,8 @@ mod tests {
         // call must append (not stomp) so per-placement draws hit the right
         // vertex offsets.
         let mut v = Vec::new();
-        push_quad_verts(&mut v, 0.0, 0.0, 10.0, 10.0);
-        push_quad_verts(&mut v, 50.0, 60.0, 20.0, 30.0);
+        push_quad_verts(&mut v, 0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 1.0, 1.0);
+        push_quad_verts(&mut v, 50.0, 60.0, 20.0, 30.0, 0.0, 0.0, 1.0, 1.0);
         assert_eq!(v.len(), 8);
         assert!(approx([v[4].position[0], v[4].position[1]], [50.0, 60.0]));
         assert!(approx([v[6].position[0], v[6].position[1]], [70.0, 90.0]));
@@ -381,10 +393,36 @@ mod tests {
         // produce a degenerate quad, not panic. The render pass will draw it
         // and the rasterizer drops it.
         let mut v = Vec::new();
-        push_quad_verts(&mut v, 5.0, 7.0, 0.0, 0.0);
+        push_quad_verts(&mut v, 5.0, 7.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0);
         for vert in &v {
             assert_eq!(vert.position[0], 5.0);
             assert_eq!(vert.position[1], 7.0);
+        }
+    }
+
+    #[test]
+    fn quad_verts_custom_uv_rect_lands_on_corners() {
+        // A `Placement.src_rect` resolved against a 100x100 image with
+        // (10,10,50,30) becomes UVs (0.1, 0.1, 0.6, 0.4). Pin the UV-per-corner
+        // mapping so a future refactor that reorders the corner pushes (or
+        // flips which UV the BR corner gets) trips this test.
+        let mut v = Vec::new();
+        push_quad_verts(&mut v, 0.0, 0.0, 200.0, 100.0, 0.1, 0.1, 0.6, 0.4);
+        assert!(approx(v[0].uv, [0.1, 0.1])); // TL
+        assert!(approx(v[1].uv, [0.6, 0.1])); // TR
+        assert!(approx(v[2].uv, [0.6, 0.4])); // BR
+        assert!(approx(v[3].uv, [0.1, 0.4])); // BL
+    }
+
+    #[test]
+    fn quad_verts_degenerate_uv_rect_does_not_panic() {
+        // A `src_rect` of (0,0,0,0) collapses to u0==u1, v0==v1 — every
+        // corner samples the same texel and the quad is a UV point. Must
+        // not panic; renderer feeds whatever the parser produced.
+        let mut v = Vec::new();
+        push_quad_verts(&mut v, 0.0, 0.0, 50.0, 50.0, 0.0, 0.0, 0.0, 0.0);
+        for vert in &v {
+            assert_eq!(vert.uv, [0.0, 0.0]);
         }
     }
 
