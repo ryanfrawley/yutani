@@ -1742,15 +1742,20 @@ impl Terminal {
             return;
         }
 
-        // Format gating. Only PNG is wired up in K1.
-        if !matches!(ctrl.format, KittyFormat::Png) {
-            return;
-        }
-
         // `a=t` (transmit-only, no display) requires deferred placement,
         // which means tracking image_id → ImageId mapping for a later
         // `a=p`. Not in K1; drop.
         if !matches!(ctrl.action, KittyAction::TransmitAndDisplay) {
+            return;
+        }
+
+        // Format/transmission pair must be in our supported set.
+        // `kitty_query_supported` is the source of truth — the query
+        // branch above tells the app exactly which combos work, and
+        // here we enforce the same set on the actual transmission.
+        // Anything outside (raw over file, shared memory, etc.) drops
+        // silently.
+        if !self.kitty_query_supported(ctrl.format, ctrl.transmission) {
             return;
         }
 
@@ -1765,16 +1770,27 @@ impl Terminal {
     /// can actually serve. Used both by the capability-query reply and
     /// by the transmission branch — keeps the two paths in lockstep so
     /// we never say OK to something the dispatcher would then drop.
+    ///
+    /// Supported:
+    /// - PNG over direct base64 OR file path. PNG is the default for
+    ///   most apps and is what `t=f` ships as.
+    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64. icat
+    ///   uses these for non-PNG sources (JPG, GIF) — it decodes locally
+    ///   then ships raw bytes to skip a PNG re-encode round-trip.
+    ///
+    /// Unsupported (silently dropped both in query and transmission):
+    /// - Shared memory (`t=s`) and temp-file (`t=t`) transmissions.
+    /// - Raw formats from a file path (`f=24/32, t=f`) — rare in practice.
     fn kitty_query_supported(
         &self,
         format: KittyFormat,
         transmission: KittyTransmission,
     ) -> bool {
-        matches!(format, KittyFormat::Png)
-            && matches!(
-                transmission,
-                KittyTransmission::Direct | KittyTransmission::File
-            )
+        match (format, transmission) {
+            (KittyFormat::Png, KittyTransmission::Direct | KittyTransmission::File) => true,
+            (KittyFormat::Rgb | KittyFormat::Rgba, KittyTransmission::Direct) => true,
+            _ => false,
+        }
     }
 
     /// Direct base64 transmission: payload is the image bytes (possibly
@@ -1795,6 +1811,9 @@ impl Terminal {
             (Some(id), true) => {
                 let entry = self.kitty_chunks.entry(id).or_insert(KittyChunks {
                     b64: String::new(),
+                    format: ctrl.format,
+                    source_w: ctrl.source_w,
+                    source_h: ctrl.source_h,
                     cells_cols: ctrl.cells_cols,
                     cells_rows: ctrl.cells_rows,
                     do_not_move_cursor: ctrl.do_not_move_cursor,
@@ -1806,6 +1825,9 @@ impl Terminal {
                 acc.b64.push_str(&chunk);
                 self.finalize_kitty_image(
                     &acc.b64,
+                    acc.format,
+                    acc.source_w,
+                    acc.source_h,
                     acc.cells_cols,
                     acc.cells_rows,
                     acc.do_not_move_cursor,
@@ -1814,6 +1836,9 @@ impl Terminal {
             _ => {
                 self.finalize_kitty_image(
                     &chunk,
+                    ctrl.format,
+                    ctrl.source_w,
+                    ctrl.source_h,
                     ctrl.cells_cols,
                     ctrl.cells_rows,
                     ctrl.do_not_move_cursor,
@@ -1860,21 +1885,29 @@ impl Terminal {
         );
     }
 
-    /// Base64-decode `b64` and hand the bytes to `finalize_kitty_image_bytes`.
-    /// The direct-transmission path uses this; file transmission skips
-    /// the base64 step since the bytes are read straight from disk.
+    /// Base64-decode `b64`, transform per `format` (PNG bytes pass
+    /// through; raw RGB/RGBA bytes get PNG-encoded so they flow
+    /// through the same `image::load_from_memory` worker path), then
+    /// hand off to `finalize_kitty_image_bytes`.
     fn finalize_kitty_image(
         &mut self,
         b64: &str,
+        format: KittyFormat,
+        source_w: Option<u32>,
+        source_h: Option<u32>,
         cells_cols: Option<u32>,
         cells_rows: Option<u32>,
         do_not_move_cursor: bool,
     ) {
         use base64::Engine;
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
             return;
         };
-        let pixel_size = crate::images::peek_dimensions(&bytes);
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(format, &raw, source_w, source_h)
+        else {
+            return;
+        };
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -2200,14 +2233,23 @@ pub enum KittyAction {
     Other,
 }
 
-/// Pixel-format identifier from `f=`. Only PNG is implemented in slice 1.
-/// RGBA/RGB raw (32/24) require knowing dimensions via `s=`,`v=` and are
-/// deferred — most apps send PNG anyway.
+/// Pixel-format identifier from `f=`.
+///
+/// PNG (`f=100`) is the universal format. Raw RGB (`f=24`) and RGBA
+/// (`f=32`) are what `kitty +kitten icat` uses for non-PNG sources
+/// (JPG, GIF, etc.) — it decodes to raw and ships those bytes rather
+/// than re-encoding to PNG. Raw formats require source dimensions
+/// (`s=` / `v=`); we PNG-encode them on the receiving side so they
+/// flow through the same decoder path.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KittyFormat {
     Png,
-    /// Anything other than `f=100`. Parser captures the value but
-    /// `handle_apc` discards the payload silently.
+    /// `f=24` — bytes are `s * v * 3` straight RGB.
+    Rgb,
+    /// `f=32` — bytes are `s * v * 4` straight RGBA.
+    Rgba,
+    /// Unknown / unsupported `f=` value. Parser captures it but
+    /// `handle_apc` drops the payload silently.
     Other,
 }
 
@@ -2257,6 +2299,12 @@ pub struct KittyControl {
     /// `q=` quiet mode. `q=0` (default) — always reply, `q=1` —
     /// suppress success responses, `q=2` — suppress all. K1.5 honors this.
     pub quiet: u8,
+    /// `s=` source pixel width. Required for raw RGB/RGBA formats so we
+    /// know how to reshape the byte stream; ignored for PNG (the header
+    /// supplies the dimensions).
+    pub source_w: Option<u32>,
+    /// `v=` source pixel height. Same story as `source_w`.
+    pub source_h: Option<u32>,
 }
 
 impl Default for KittyControl {
@@ -2275,6 +2323,8 @@ impl Default for KittyControl {
             more_chunks: false,
             do_not_move_cursor: false,
             quiet: 0,
+            source_w: None,
+            source_h: None,
         }
     }
 }
@@ -2291,11 +2341,73 @@ struct KittyChunks {
     /// Concatenated base64 payload across all chunks so far. Decoded
     /// once at the terminal chunk.
     b64: String,
-    /// Sizing / cursor params from the *first* chunk — the Kitty spec
-    /// says only the first chunk's display attributes matter.
+    /// Format and source dimensions from the *first* chunk — the Kitty
+    /// spec says only the first chunk's attributes matter, so chunked
+    /// raw RGB/RGBA payloads still know how to reshape their bytes.
+    format: KittyFormat,
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+    /// Sizing / cursor params from the first chunk.
     cells_cols: Option<u32>,
     cells_rows: Option<u32>,
     do_not_move_cursor: bool,
+}
+
+/// Normalize a Kitty graphics payload into the PNG-bytes format the
+/// `image::load_from_memory` decoder accepts.
+///
+/// - PNG payloads pass through unchanged, with `pixel_size` from the
+///   PNG header peek.
+/// - Raw RGB (`f=24`) and RGBA (`f=32`) payloads get PNG-encoded here.
+///   The encode runs on the PTY thread (a few ms for typical images);
+///   the alternative would be plumbing a "skip decode, here are raw
+///   pixels" code path through the worker, which doubles the API
+///   surface for one rare case.
+///
+/// Returns `None` when raw formats are missing required `s=` / `v=`
+/// dimensions, when raw byte counts don't match the declared geometry,
+/// or when PNG re-encoding fails.
+fn normalize_kitty_payload(
+    format: KittyFormat,
+    raw: &[u8],
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+) -> Option<(Vec<u8>, Option<(u32, u32)>)> {
+    match format {
+        KittyFormat::Png => {
+            let pixel_size = crate::images::peek_dimensions(raw);
+            Some((raw.to_vec(), pixel_size))
+        }
+        KittyFormat::Rgb | KittyFormat::Rgba => {
+            let w = source_w?;
+            let h = source_h?;
+            let bytes_per_px = if matches!(format, KittyFormat::Rgba) { 4 } else { 3 };
+            let expected = (w as usize)
+                .checked_mul(h as usize)?
+                .checked_mul(bytes_per_px)?;
+            if raw.len() != expected {
+                return None;
+            }
+            let dyn_img = match format {
+                KittyFormat::Rgba => image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(w, h, raw.to_vec())?,
+                ),
+                KittyFormat::Rgb => image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(w, h, raw.to_vec())?,
+                ),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::new();
+            dyn_img
+                .write_to(
+                    &mut std::io::Cursor::new(&mut out),
+                    image::ImageOutputFormat::Png,
+                )
+                .ok()?;
+            Some((out, Some((w, h))))
+        }
+        KittyFormat::Other => None,
+    }
 }
 
 /// Parse the comma-separated `key=value` portion of a Kitty graphics
@@ -2320,8 +2432,12 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
             },
             "f" => ctrl.format = match v {
                 "100" => KittyFormat::Png,
+                "24" => KittyFormat::Rgb,
+                "32" => KittyFormat::Rgba,
                 _ => KittyFormat::Other,
             },
+            "s" => ctrl.source_w = v.parse().ok(),
+            "v" => ctrl.source_h = v.parse().ok(),
             "t" => ctrl.transmission = match v {
                 "d" => KittyTransmission::Direct,
                 "f" => KittyTransmission::File,
@@ -4368,8 +4484,9 @@ mod tests {
     #[test]
     fn parse_kitty_control_format_and_transmission() {
         assert_eq!(parse_kitty_control("f=100").unwrap().format, KittyFormat::Png);
-        assert_eq!(parse_kitty_control("f=32").unwrap().format, KittyFormat::Other);
-        assert_eq!(parse_kitty_control("f=24").unwrap().format, KittyFormat::Other);
+        assert_eq!(parse_kitty_control("f=32").unwrap().format, KittyFormat::Rgba);
+        assert_eq!(parse_kitty_control("f=24").unwrap().format, KittyFormat::Rgb);
+        assert_eq!(parse_kitty_control("f=99").unwrap().format, KittyFormat::Other);
         assert_eq!(parse_kitty_control("t=d").unwrap().transmission, KittyTransmission::Direct);
         assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::File);
         assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::Other);
@@ -4622,6 +4739,78 @@ mod tests {
     }
 
     #[test]
+    fn kitty_apc_raw_rgb_direct_decodes_via_png_round_trip() {
+        // What `kitty +kitten icat` does for a JPG: decode locally to
+        // raw RGB, ship over t=d, count on the terminal to handle f=24.
+        // We PNG-encode on the receiving side; downstream this looks
+        // like any other PNG upload.
+        use base64::Engine;
+        let w = 4u32;
+        let h = 4u32;
+        let rgb: Vec<u8> = (0..(w * h * 3) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgb);
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=24,s={},v={},c=2,r=1;{}\x1b\\",
+            w, h, b64
+        ));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        // PNG round-trip should preserve the declared dimensions.
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        // First two bytes of a real PNG are 0x89 0x50 (PNG signature) —
+        // proves the payload was re-encoded, not passed raw.
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn kitty_apc_raw_rgba_direct_decodes_via_png_round_trip() {
+        use base64::Engine;
+        let w = 2u32;
+        let h = 2u32;
+        let rgba: Vec<u8> = (0..(w * h * 4) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=32,s={},v={};{}\x1b\\",
+            w, h, b64
+        ));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn kitty_apc_raw_format_with_mismatched_byte_count_drops() {
+        // s*v*3 mismatch — declared 4x4 RGB (48 bytes) but payload is
+        // only 12. Reject so a buggy app can't crash the decoder.
+        use base64::Engine;
+        let too_few = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 12]);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=24,s=4,v=4;{}\x1b\\", too_few));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_raw_format_without_source_dims_drops() {
+        // s= / v= are required for raw — there's no header to fall back on.
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 48]);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=24;{}\x1b\\", bytes));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
     fn parse_kitty_control_t_f_is_file() {
         assert_eq!(
             parse_kitty_control("t=f").unwrap().transmission,
@@ -4661,12 +4850,22 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_query_replies_enotsupported_for_raw_format() {
-        // f=24 (raw RGB) isn't implemented — say so. Otherwise icat
-        // picks raw + shared memory for large images and our dispatcher
-        // silently drops the transmission.
+    fn kitty_apc_query_replies_ok_for_raw_rgb_direct() {
+        // f=24 (raw RGB) over direct base64 IS supported — we PNG-encode
+        // the raw bytes on the way in. icat uses this for JPG and other
+        // non-PNG sources.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&kitty_apc_control_only("a=q,i=5,f=24,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_enotsupported_for_raw_over_file() {
+        // f=24 + t=f is a weird combo (file containing raw RGB bytes
+        // with no header to know dimensions) and we don't handle it.
+        // Pin the negative response.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=5,f=24,t=f,s=1,v=1"));
         let reply = t.take_response();
         let s = std::str::from_utf8(&reply).unwrap();
         assert!(s.starts_with("\x1b_Gi=5;ENOTSUPPORTED"), "got: {s}");
@@ -4702,7 +4901,8 @@ mod tests {
         t.feed(&kitty_apc_control_only("a=q,i=1,q=1")); // supported + q=1
         assert!(t.take_response().is_empty(), "q=1 should suppress OK");
 
-        t.feed(&kitty_apc_control_only("a=q,i=2,f=24,q=1")); // error + q=1
+        // Trigger an actual error via t=s (shared memory not supported).
+        t.feed(&kitty_apc_control_only("a=q,i=2,f=100,t=s,q=1")); // error + q=1
         let reply = t.take_response();
         assert!(
             std::str::from_utf8(&reply).unwrap().contains("ENOTSUPPORTED"),
@@ -4710,7 +4910,7 @@ mod tests {
             reply,
         );
 
-        t.feed(&kitty_apc_control_only("a=q,i=3,f=24,q=2")); // error + q=2
+        t.feed(&kitty_apc_control_only("a=q,i=3,f=100,t=s,q=2")); // error + q=2
         assert!(t.take_response().is_empty(), "q=2 must silence everything");
     }
 
