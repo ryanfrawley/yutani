@@ -43,6 +43,11 @@ pub struct BlurChain {
     blur_bgl: wgpu::BindGroupLayout,            // group(0) for fullscreen passes
 
     pub blit_pipeline: wgpu::RenderPipeline,
+    /// Same shader as `blit_pipeline`, but with premultiplied-alpha
+    /// blending so a transparent-cleared layer can be composited *over*
+    /// existing framebuffer contents. Used by the layered glow render
+    /// path to lay the fg scene on top of (bg scene + bg glow).
+    pub blit_alpha_pipeline: wgpu::RenderPipeline,
     pub down_pipeline: wgpu::RenderPipeline,
     pub up_pipeline: wgpu::RenderPipeline,
     pub strip_pipeline: wgpu::RenderPipeline,
@@ -133,7 +138,7 @@ impl BlurChain {
             push_constant_ranges: &[],
         });
 
-        let make_fs_pipeline = |entry: &str, label: &str| {
+        let make_fs_pipeline = |entry: &str, label: &str, blend: Option<wgpu::BlendState>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&fs_layout),
@@ -147,7 +152,7 @@ impl BlurChain {
                     entry_point: entry,
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
-                        blend: None,
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -161,9 +166,14 @@ impl BlurChain {
             })
         };
 
-        let blit_pipeline = make_fs_pipeline("fs_blit", "blur blit pipeline");
-        let down_pipeline = make_fs_pipeline("fs_down", "blur down pipeline");
-        let up_pipeline = make_fs_pipeline("fs_up", "blur up pipeline");
+        let blit_pipeline = make_fs_pipeline("fs_blit", "blur blit pipeline", None);
+        let blit_alpha_pipeline = make_fs_pipeline(
+            "fs_blit",
+            "blur blit-alpha pipeline",
+            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+        );
+        let down_pipeline = make_fs_pipeline("fs_down", "blur down pipeline", None);
+        let up_pipeline = make_fs_pipeline("fs_up", "blur up pipeline", None);
 
         // --- Strip pipeline (group 0 = blur tex, group 1 = camera, group 2 = uniform). ---
         let strip_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -259,6 +269,7 @@ impl BlurChain {
             strip_uniform_bg,
             blur_bgl,
             blit_pipeline,
+            blit_alpha_pipeline,
             down_pipeline,
             up_pipeline,
             strip_pipeline,
@@ -431,6 +442,37 @@ impl BlurChain {
     /// Bind group that samples `self.scene` (used to blit scene → swap).
     pub fn blit_bind_group(&self) -> &wgpu::BindGroup {
         &self.blit_scene_bg
+    }
+
+    /// Bind group compatible with `blit_pipeline` / `blit_alpha_pipeline`
+    /// for an arbitrary same-format texture view. Used by the layered
+    /// render path to blit a second offscreen scene (the fg layer) to
+    /// the swapchain with alpha blending. The shared `blit_uniform` is
+    /// unused by the blit shader but the bind-group layout requires it.
+    pub fn make_blit_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_uniform.as_entire_binding(),
+                },
+            ],
+        })
     }
 }
 

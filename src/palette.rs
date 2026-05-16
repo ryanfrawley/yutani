@@ -160,7 +160,7 @@ fn set_pair(ansi: &mut [[f32; 4]; 16], hue: usize, value: &str) -> Result<(), St
     Ok(())
 }
 
-fn rgba_from(s: &str) -> Result<[f32; 4], String> {
+pub fn rgba_from(s: &str) -> Result<[f32; 4], String> {
     let rgb = parse_hex(s)?;
     let r = srgb_to_linear(((rgb >> 16) & 0xff) as u8);
     let g = srgb_to_linear(((rgb >> 8) & 0xff) as u8);
