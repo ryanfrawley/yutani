@@ -2684,6 +2684,7 @@ dependencies = [
  "core-foundation",
  "core-text",
  "env_logger",
+ "flate2",
  "freetype-rs",
  "harfbuzz_rs",
  "image 0.24.9",

@@ -143,6 +143,15 @@ pub struct PendingImageUpload {
     /// `false` for `a=t` (transmit only) — the image becomes addressable
     /// via `kitty_image_id` for a later `a=p`, but no placement is made.
     pub display_immediately: bool,
+    /// Kitty `X=`/`Y=` sub-cell pixel offsets, in framebuffer pixels.
+    /// `(0, 0)` snaps to the cell grid (the common case).
+    pub pixel_offset: (i32, i32),
+    /// Kitty `z=` z-index for stacking. `0` is the default; higher
+    /// draws later (on top). Can be negative.
+    pub z_index: i32,
+    /// Kitty `x=` / `y=` / `w=` / `h=` source crop in image pixels.
+    /// `None` samples the whole image (the common case).
+    pub src_rect: Option<(u32, u32, u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -1818,6 +1827,11 @@ impl Terminal {
             kitty_placement_id: None,
             // OSC 1337 always displays — there's no transmit-only variant.
             display_immediately: true,
+            // iTerm OSC 1337 doesn't expose sub-cell offsets, z-index,
+            // or source crops — all default.
+            pixel_offset: (0, 0),
+            z_index: 0,
+            src_rect: None,
         });
     }
 
@@ -1960,7 +1974,11 @@ impl Terminal {
         // failure, attempt cleanup so a malformed sender doesn't
         // leak SHM objects.
         unlink_kitty_shm(&name);
-        let Some(raw) = bytes_opt else { return };
+        let Some(mut raw) = bytes_opt else { return };
+        if ctrl.compressed_zlib {
+            let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+            raw = inflated;
+        }
         let Some((bytes, pixel_size)) =
             normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
         else {
@@ -1968,6 +1986,7 @@ impl Terminal {
         };
         let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay)
             && !ctrl.virtual_placement;
+        let (pixel_offset, z_index, src_rect) = kitty_placement_params(ctrl);
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -1977,6 +1996,9 @@ impl Terminal {
             ctrl.image_id,
             ctrl.placement_id,
             display,
+            pixel_offset,
+            z_index,
+            src_rect,
         );
     }
 
@@ -2014,15 +2036,16 @@ impl Terminal {
         };
         let top_row = original_row - scrolls;
 
+        let (pixel_offset, z_index, src_rect) = kitty_placement_params(ctrl);
         self.insert_placement_kitty(
             image_id,
             top_row,
             original_col,
             rows,
             cols,
-            0,
-            (0, 0),
-            None,
+            z_index,
+            pixel_offset,
+            src_rect,
             Some(client_id),
             ctrl.placement_id,
         );
@@ -2143,6 +2166,7 @@ impl Terminal {
                     kitty_image_id: ctrl.image_id,
                     kitty_placement_id: ctrl.placement_id,
                     display_immediately: display,
+                    compressed_zlib: ctrl.compressed_zlib,
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
@@ -2167,6 +2191,7 @@ impl Terminal {
                     kitty_image_id: ctrl.image_id,
                     kitty_placement_id: ctrl.placement_id,
                     display_immediately: display,
+                    compressed_zlib: ctrl.compressed_zlib,
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
@@ -2190,14 +2215,19 @@ impl Terminal {
     /// with parameters lifted out of the current `KittyControl`.
     fn finalize_kitty_image_from_b64(&mut self, b64: &str, ctrl: &KittyControl, display: bool) {
         use base64::Engine;
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+        let Ok(mut raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
             return;
         };
+        if ctrl.compressed_zlib {
+            let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+            raw = inflated;
+        }
         let Some((bytes, pixel_size)) =
             normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
+        let (pixel_offset, z_index, src_rect) = kitty_placement_params(ctrl);
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -2207,18 +2237,27 @@ impl Terminal {
             ctrl.image_id,
             ctrl.placement_id,
             display,
+            pixel_offset,
+            z_index,
+            src_rect,
         );
     }
 
     /// Chunked dispatch: same as `finalize_kitty_image_from_b64` but
     /// reads parameters from the first-chunk snapshot stored in
     /// `KittyChunks` (Kitty spec says only the first chunk's display
-    /// attributes matter).
+    /// attributes matter). Placement-side params (`X=`/`Y=`/`z=`/`x=`
+    /// etc.) aren't stored on `KittyChunks` for now — apps that chunk
+    /// rarely use them — so we pass defaults.
     fn finalize_kitty_image_from_chunks(&mut self, acc: &KittyChunks) {
         use base64::Engine;
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(acc.b64.as_bytes()) else {
+        let Ok(mut raw) = base64::engine::general_purpose::STANDARD.decode(acc.b64.as_bytes()) else {
             return;
         };
+        if acc.compressed_zlib {
+            let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+            raw = inflated;
+        }
         let Some((bytes, pixel_size)) =
             normalize_kitty_payload(acc.format, &raw, acc.source_w, acc.source_h)
         else {
@@ -2233,6 +2272,9 @@ impl Terminal {
             acc.kitty_image_id,
             acc.kitty_placement_id,
             acc.display_immediately,
+            (0, 0),
+            0,
+            None,
         );
     }
 
@@ -2247,11 +2289,15 @@ impl Terminal {
     /// app pointing us at arbitrary paths.
     fn handle_apc_file(&mut self, payload: &str, ctrl: &KittyControl, delete: bool) {
         let Some(path) = decode_kitty_file_path(payload) else { return };
-        let Some(raw) = read_kitty_file(&path) else { return };
+        let Some(mut raw) = read_kitty_file(&path) else { return };
         if delete && path_is_under_temp_dir(&path) {
             // Best-effort delete — if it fails (file already gone,
             // permission issue), there's nothing useful to do.
             let _ = std::fs::remove_file(&path);
+        }
+        if ctrl.compressed_zlib {
+            let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+            raw = inflated;
         }
 
         // Run through the same normalizer the direct path uses so
@@ -2263,6 +2309,7 @@ impl Terminal {
         };
         let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay)
             && !ctrl.virtual_placement;
+        let (pixel_offset, z_index, src_rect) = kitty_placement_params(ctrl);
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -2272,6 +2319,9 @@ impl Terminal {
             ctrl.image_id,
             ctrl.placement_id,
             display,
+            pixel_offset,
+            z_index,
+            src_rect,
         );
     }
 
@@ -2290,6 +2340,9 @@ impl Terminal {
         kitty_image_id: Option<u32>,
         kitty_placement_id: Option<u32>,
         display_immediately: bool,
+        pixel_offset: (i32, i32),
+        z_index: i32,
+        src_rect: Option<(u32, u32, u32, u32)>,
     ) {
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
         // falling back to Auto (image's native cell extent) when not.
@@ -2346,6 +2399,9 @@ impl Terminal {
             kitty_image_id,
             kitty_placement_id,
             display_immediately,
+            pixel_offset,
+            z_index,
+            src_rect,
         });
     }
 
@@ -2737,6 +2793,31 @@ pub struct KittyControl {
     /// the fg color) to position the image. nvim's `image.nvim` and
     /// other modern viewers default to this path.
     pub virtual_placement: bool,
+    /// `X=` — sub-cell pixel x-offset within the anchor cell. Lets
+    /// apps position images at sub-cell precision. Plumbed straight
+    /// to `Placement::pixel_offset.0`.
+    pub pixel_offset_x: Option<u32>,
+    /// `Y=` — sub-cell pixel y-offset within the anchor cell.
+    pub pixel_offset_y: Option<u32>,
+    /// `z=` — z-index for tie-breaking overlapping placements.
+    /// Higher draws later (on top). Can be negative (per the Kitty
+    /// spec — apps use negative z to put images "behind" text).
+    pub z_index: Option<i32>,
+    /// `x=` — source crop start, x in image pixels. Together with
+    /// `y=` / `w=` / `h=` selects a sub-rect of the image to draw.
+    pub crop_x: Option<u32>,
+    /// `y=` — source crop start, y in image pixels.
+    pub crop_y: Option<u32>,
+    /// `w=` — source crop width in pixels. Independent from `c=`
+    /// (target column count); `w=` is about WHICH pixels to draw,
+    /// `c=` is about HOW MANY CELLS they cover on screen.
+    pub crop_w: Option<u32>,
+    /// `h=` — source crop height in pixels.
+    pub crop_h: Option<u32>,
+    /// `o=z` — zlib-compressed payload. After base64 decode (or file
+    /// read), the bytes need to be inflated before being treated as
+    /// image data.
+    pub compressed_zlib: bool,
 }
 
 impl Default for KittyControl {
@@ -2759,6 +2840,14 @@ impl Default for KittyControl {
             source_h: None,
             delete_selector: None,
             virtual_placement: false,
+            pixel_offset_x: None,
+            pixel_offset_y: None,
+            z_index: None,
+            crop_x: None,
+            crop_y: None,
+            crop_w: None,
+            crop_h: None,
+            compressed_zlib: false,
         }
     }
 }
@@ -2794,6 +2883,9 @@ struct KittyChunks {
     /// create a `Placement` (display) or just register the image-id
     /// mapping (transmit-for-later).
     display_immediately: bool,
+    /// `o=z` from the first chunk: payload should be zlib-inflated
+    /// before normalizing. Set on the first chunk only (spec contract).
+    compressed_zlib: bool,
 }
 
 /// Decode a Kitty virtual-placement image id from a cell's foreground
@@ -2957,6 +3049,48 @@ fn append_b64_filtered(dest: &mut String, payload: &str) {
     }
 }
 
+/// Extract the placement-side fields (`X=`/`Y=` pixel offset, `z=`
+/// z-index, `x=`/`y=`/`w=`/`h=` source crop) from a `KittyControl` in
+/// the format `finalize_kitty_image_bytes` and `insert_placement_kitty`
+/// expect. Centralizes the defaults so all dispatch sites agree.
+fn kitty_placement_params(
+    ctrl: &KittyControl,
+) -> ((i32, i32), i32, Option<(u32, u32, u32, u32)>) {
+    let pixel_offset = (
+        ctrl.pixel_offset_x.unwrap_or(0).min(i32::MAX as u32) as i32,
+        ctrl.pixel_offset_y.unwrap_or(0).min(i32::MAX as u32) as i32,
+    );
+    let z_index = ctrl.z_index.unwrap_or(0);
+    // A crop rect requires all four x/y/w/h. Partial sets are ignored
+    // (per spec — defining only w but not x is undefined). w=0 / h=0
+    // also fall through to None since a zero-size crop is degenerate.
+    let src_rect = match (ctrl.crop_x, ctrl.crop_y, ctrl.crop_w, ctrl.crop_h) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => Some((x, y, w, h)),
+        _ => None,
+    };
+    (pixel_offset, z_index, src_rect)
+}
+
+/// Inflate a zlib-compressed payload (`o=z` in the Kitty control
+/// data). Returns `None` on malformed input or if the inflated size
+/// would exceed the same 256 MiB cap the file readers use — guards
+/// against zip-bomb-style attacks where a small APC payload inflates
+/// to gigabytes.
+fn inflate_kitty_zlib(compressed: &[u8]) -> Option<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+    const MAX_INFLATED_BYTES: usize = 256 * 1024 * 1024;
+    let mut dec = ZlibDecoder::new(compressed);
+    let mut out = Vec::new();
+    // `read_to_end` will pull until the decoder reports EOF. We
+    // can't bound it via a stock reader, so check after the read.
+    dec.read_to_end(&mut out).ok()?;
+    if out.len() > MAX_INFLATED_BYTES {
+        return None;
+    }
+    Some(out)
+}
+
 /// Normalize a Kitty graphics payload into the PNG-bytes format the
 /// `image::load_from_memory` decoder accepts.
 ///
@@ -3071,6 +3205,14 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
             "C" => ctrl.do_not_move_cursor = v == "1",
             "q" => ctrl.quiet = v.parse().unwrap_or(0),
             "U" => ctrl.virtual_placement = v == "1",
+            "X" => ctrl.pixel_offset_x = v.parse().ok(),
+            "Y" => ctrl.pixel_offset_y = v.parse().ok(),
+            "z" => ctrl.z_index = v.parse().ok(),
+            "x" => ctrl.crop_x = v.parse().ok(),
+            "y" => ctrl.crop_y = v.parse().ok(),
+            "w" => ctrl.crop_w = v.parse().ok(),
+            "h" => ctrl.crop_h = v.parse().ok(),
+            "o" => ctrl.compressed_zlib = v == "z",
             // s, v, x, y, w, h, X, Y, z, I, o, etc. — accepted but unused
             // in K1. Future slices wire them up.
             _ => {}
@@ -5363,6 +5505,151 @@ mod tests {
         // also be rejected — kitty's spec implies UTF-8 paths.)
         let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
         t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    //
+    // K6: spec corners (X/Y, z, x/y/w/h source crops, o=z zlib).
+    //
+
+    #[test]
+    fn parse_kitty_control_pixel_offset_and_z() {
+        let c = parse_kitty_control("X=3,Y=7,z=-5").unwrap();
+        assert_eq!(c.pixel_offset_x, Some(3));
+        assert_eq!(c.pixel_offset_y, Some(7));
+        assert_eq!(c.z_index, Some(-5));
+    }
+
+    #[test]
+    fn parse_kitty_control_source_crop_quad() {
+        let c = parse_kitty_control("x=10,y=20,w=100,h=80").unwrap();
+        assert_eq!(c.crop_x, Some(10));
+        assert_eq!(c.crop_y, Some(20));
+        assert_eq!(c.crop_w, Some(100));
+        assert_eq!(c.crop_h, Some(80));
+    }
+
+    #[test]
+    fn parse_kitty_control_zlib_compression() {
+        let c = parse_kitty_control("o=z").unwrap();
+        assert!(c.compressed_zlib);
+        // Only `o=z` enables — other values (none defined yet) don't.
+        let c = parse_kitty_control("o=q").unwrap();
+        assert!(!c.compressed_zlib);
+    }
+
+    #[test]
+    fn kitty_placement_params_partial_crop_returns_none() {
+        // x/y/w/h is all-or-nothing per spec. Partial sets fall back to
+        // None so the renderer samples the whole image.
+        let mut ctrl = KittyControl::default();
+        ctrl.crop_x = Some(10);
+        ctrl.crop_w = Some(50);
+        let (_, _, src) = kitty_placement_params(&ctrl);
+        assert!(src.is_none());
+    }
+
+    #[test]
+    fn kitty_placement_params_full_crop_passes_through() {
+        let mut ctrl = KittyControl::default();
+        ctrl.crop_x = Some(1);
+        ctrl.crop_y = Some(2);
+        ctrl.crop_w = Some(3);
+        ctrl.crop_h = Some(4);
+        let (_, _, src) = kitty_placement_params(&ctrl);
+        assert_eq!(src, Some((1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn kitty_placement_params_zero_crop_size_falls_back_to_none() {
+        // A degenerate w=0 / h=0 crop is treated as "no crop" — the
+        // renderer can't sample a zero-size rect.
+        let mut ctrl = KittyControl::default();
+        ctrl.crop_x = Some(0);
+        ctrl.crop_y = Some(0);
+        ctrl.crop_w = Some(0);
+        ctrl.crop_h = Some(10);
+        let (_, _, src) = kitty_placement_params(&ctrl);
+        assert!(src.is_none());
+    }
+
+    #[test]
+    fn kitty_placement_params_defaults_zero() {
+        let ctrl = KittyControl::default();
+        let (offset, z, src) = kitty_placement_params(&ctrl);
+        assert_eq!(offset, (0, 0));
+        assert_eq!(z, 0);
+        assert!(src.is_none());
+    }
+
+    #[test]
+    fn kitty_apc_with_pixel_offset_and_z_lands_on_pending_upload() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,f=100,c=2,r=1,X=4,Y=8,z=42", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_offset, (4, 8));
+        assert_eq!(uploads[0].z_index, 42);
+    }
+
+    #[test]
+    fn kitty_apc_with_source_crop_lands_on_pending_upload() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(10, 10);
+        t.feed(&kitty_apc("a=T,f=100,c=2,r=1,x=2,y=3,w=5,h=4", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].src_rect, Some((2, 3, 5, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_a_p_threads_pixel_offset_and_z_to_placement() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(7, ImageId(99));
+        t.feed(&kitty_apc_control_only("a=p,i=7,c=2,r=1,X=3,Y=5,z=-2"));
+        let placements = t.live_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].pixel_offset, (3, 5));
+        assert_eq!(placements[0].z, -2);
+    }
+
+    #[test]
+    fn kitty_apc_o_z_zlib_inflates_before_decode() {
+        // Compress a real PNG with zlib, send via t=d,o=z, assert the
+        // inflated bytes round-trip into a working upload.
+        use base64::Engine;
+        use std::io::Write;
+        let png = kitty_png(4, 4);
+        let mut encoder = flate2::write::ZlibEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        );
+        encoder.write_all(&png).unwrap();
+        let compressed = encoder.finish().unwrap();
+        // Compression of a tiny PNG often INFLATES because of headers
+        // — that's fine for the test; the inflate path still has to work.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,o=z,c=2,r=1;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_o_z_malformed_zlib_silently_dropped() {
+        // Garbage bytes claimed as zlib — inflate fails, no panic, no
+        // partial upload.
+        use base64::Engine;
+        let bogus = base64::engine::general_purpose::STANDARD.encode(b"not zlib at all");
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,o=z;{}\x1b\\", bogus));
         assert!(t.take_pending_image_uploads().is_empty());
     }
 
