@@ -89,6 +89,28 @@ struct Config {
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
     /// back to defaults.
     color_scheme: Option<String>,
+    /// When true, pixels whose HSV saturation exceeds `glow_threshold`
+    /// contribute to the glow.
+    glow_match_saturation: bool,
+    /// When true, pixels whose HSV hue is within `glow_hue_tolerance_deg`
+    /// of one of the colour scheme's 8 bright ANSI variants contribute
+    /// to the glow. Matched on hue only so antialiased glyphs (which blend
+    /// toward the background) still register.
+    glow_match_bright_ansi: bool,
+    /// HSV-saturation cutoff for `glow_match_saturation` mode.
+    glow_threshold: f32,
+    /// Additive composite multiplier; 1.0 leaves the glow at original colour
+    /// intensity, higher values bloom harder.
+    glow_intensity: f32,
+    /// Width of the smoothstep band above `glow_threshold` (and the hue
+    /// tolerance for bright-ANSI mode). Larger values give a softer cutoff.
+    glow_softness: f32,
+    /// Degrees of hue slop allowed by `glow_match_bright_ansi`. Default 18°
+    /// covers small palette drift; larger values catch tinted variants.
+    glow_hue_tolerance_deg: f32,
+    /// Dual-Kawase iterations applied to the bright extraction. Higher =
+    /// wider, softer halo at the cost of fill rate.
+    glow_iterations: usize,
 }
 
 impl Config {
@@ -104,6 +126,13 @@ impl Config {
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
+            glow_match_saturation: false,
+            glow_match_bright_ansi: false,
+            glow_threshold: renderer::glow::DEFAULT_THRESHOLD,
+            glow_intensity: renderer::glow::DEFAULT_INTENSITY,
+            glow_softness: renderer::glow::DEFAULT_SOFTNESS,
+            glow_hue_tolerance_deg: renderer::glow::DEFAULT_HUE_TOLERANCE_DEG,
+            glow_iterations: 2,
         }
     }
 
@@ -135,6 +164,23 @@ impl Config {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
                 "color_scheme" => c.color_scheme = if v.is_empty() { None } else { Some(v.to_string()) },
+                "glow_match_saturation" => if let Ok(x) = v.parse() { c.glow_match_saturation = x; },
+                "glow_match_bright_ansi" => if let Ok(x) = v.parse() { c.glow_match_bright_ansi = x; },
+                "glow_threshold" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_threshold = x.clamp(0.0, 1.0);
+                },
+                "glow_intensity" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_intensity = x.max(0.0);
+                },
+                "glow_softness" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_softness = x.clamp(0.0, 1.0);
+                },
+                "glow_hue_tolerance_deg" => if let Ok(x) = v.parse::<f32>() {
+                    c.glow_hue_tolerance_deg = x.clamp(0.0, 180.0);
+                },
+                "glow_iterations" => if let Ok(x) = v.parse::<usize>() {
+                    c.glow_iterations = x.clamp(1, renderer::glow::MAX_ITERATIONS);
+                },
                 _ => (),
             }
         }
@@ -173,6 +219,22 @@ impl Config {
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", name));
         }
+        s.push_str(&format!(
+            "glow_match_saturation = {}\n\
+             glow_match_bright_ansi = {}\n\
+             glow_threshold = {}\n\
+             glow_intensity = {}\n\
+             glow_softness = {}\n\
+             glow_hue_tolerance_deg = {}\n\
+             glow_iterations = {}\n",
+            self.glow_match_saturation,
+            self.glow_match_bright_ansi,
+            self.glow_threshold,
+            self.glow_intensity,
+            self.glow_softness,
+            self.glow_hue_tolerance_deg,
+            self.glow_iterations,
+        ));
         s
     }
 }
@@ -206,6 +268,10 @@ struct State {
     strip_index_buffer: wgpu::Buffer,
     num_strip_indices: u32,
     blur: renderer::blur::BlurChain,
+    /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
+    /// always rendered to the offscreen `blur.scene` texture so the glow
+    /// pass can sample it, even when no edge-fade strips are active.
+    glow: renderer::glow::Glow,
     font: font::Font,
     /// rustybuzz shaper, used during update_vertices to detect programming
     /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
@@ -1122,6 +1188,34 @@ impl State {
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
 
+        let mut glow = renderer::glow::Glow::new(
+            &gpu.device,
+            gpu.config.format,
+            gpu.config.width,
+            gpu.config.height,
+            &blur.scene.view,
+        );
+        glow.match_saturation = config.glow_match_saturation;
+        glow.match_bright_ansi = config.glow_match_bright_ansi;
+        glow.threshold = config.glow_threshold;
+        glow.intensity = config.glow_intensity;
+        glow.softness = config.glow_softness;
+        glow.hue_tolerance = config.glow_hue_tolerance_deg;
+        glow.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+        glow.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        glow.write_glow_params(&gpu.queue);
+        // Bright-ANSI matching needs the palette's hue table. Palette is
+        // installed before State::new (see `run()`), so this reads the
+        // active scheme — or the defaults if no scheme was configured.
+        {
+            let p = palette::get();
+            let bright: [[f32; 4]; 8] = [
+                p.ansi[8], p.ansi[9], p.ansi[10], p.ansi[11],
+                p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
+            ];
+            glow.set_bright_palette(&gpu.queue, &bright);
+        }
+
         Self {
             window,
             gpu,
@@ -1136,6 +1230,7 @@ impl State {
             strip_index_buffer,
             num_strip_indices: 0,
             blur,
+            glow,
             font,
             shaper,
             font_bind_group,
@@ -2324,6 +2419,15 @@ impl State {
         if size.width > 0 && size.height > 0 {
             self.blur
                 .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
+            // Glow samples the (just-recreated) blur scene texture, so its
+            // bright-pass bind group has to be rebuilt against the new view.
+            self.glow.resize(
+                &self.gpu.device,
+                &self.gpu.queue,
+                size.width,
+                size.height,
+                &self.blur.scene.view,
+            );
         }
         self.camera_uniform
             .update_view_proj(&self.camera, size.width as f32, size.height as f32);
@@ -3019,12 +3123,15 @@ impl State {
                     label: Some("terminal"),
                 });
 
-        // Fast path: when no edge-fade strips are visible, the blur chain
-        // produces output that nothing samples. Render the scene directly to
-        // the swapchain and skip blur + composite (saves ~5 fullscreen passes
-        // per frame, the dominant cost during PTY bursts).
-        let needs_blur = self.num_strip_indices > 0;
-        let scene_target = if needs_blur { &self.blur.scene.view } else { &view };
+        // Fast path: when no edge-fade strips are visible AND glow is off,
+        // the offscreen scene texture would never be sampled. Render the
+        // scene directly to the swapchain and skip the composite pass
+        // entirely (saves ~5 fullscreen passes per frame, the dominant cost
+        // during PTY bursts).
+        let needs_strips = self.num_strip_indices > 0;
+        let glow_on = self.glow.enabled();
+        let needs_offscreen = needs_strips || glow_on;
+        let scene_target = if needs_offscreen { &self.blur.scene.view } else { &view };
 
         // 1. Scene → swapchain (fast path) or → offscreen (blur path).
         {
@@ -3057,12 +3164,21 @@ impl State {
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
         }
 
-        if needs_blur {
-            // 2. Dual-Kawase down/up chain over the (already-faded) scene.
-            self.blur.run(&mut encoder);
+        if needs_offscreen {
+            // 2a. Glow runs against the (un-blurred) scene first so its
+            // bright pass extracts crisp colour, not the post-blur smear.
+            if glow_on {
+                self.glow.run(&mut encoder);
+            }
+            // 2b. Dual-Kawase down/up over the scene for the strip pass.
+            if needs_strips {
+                self.blur.run(&mut encoder);
+            }
 
-            // 3. Composite to swapchain: blit the scene, then alpha-blend the
-            // blur-sampled strip quads on top.
+            // 3. Composite to swapchain: blit the scene, additively layer
+            // glow on top (if enabled), then alpha-blend the blur-sampled
+            // strip quads (if any). Order matters: glow under strips so the
+            // toolbar/edge fade reads cleanly over the bloom.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3082,22 +3198,30 @@ impl State {
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
-            pass.set_pipeline(&self.blur.strip_pipeline);
-            pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
-            pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
-            pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
-            pass.set_index_buffer(
-                self.strip_index_buffer.slice(..),
-                wgpu::IndexFormat::Uint16,
-            );
-            pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
+            if glow_on {
+                pass.set_pipeline(&self.glow.composite_pipeline);
+                pass.set_bind_group(0, &self.glow.composite_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            if needs_strips {
+                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
+                pass.set_bind_group(1, &self.camera_bind_group, &[]);
+                pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
+                pass.set_vertex_buffer(0, self.strip_vertex_buffer.slice(..));
+                pass.set_index_buffer(
+                    self.strip_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint16,
+                );
+                pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
+            }
         }
 
         self.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
-        Ok((surface_wait, !needs_blur))
+        Ok((surface_wait, !needs_offscreen))
     }
 }
 
@@ -3632,6 +3756,71 @@ mod tests {
         let parsed = Config::parse_str("cursor_blink = banana\nfont_size = 12.5\n");
         assert!(!parsed.cursor_blink);
         assert!(approx_eq(parsed.font_size, 12.5));
+    }
+
+    #[test]
+    fn config_defaults_glow_disabled() {
+        let c = Config::defaults();
+        assert!(!c.glow_match_saturation);
+        assert!(!c.glow_match_bright_ansi);
+        assert!((0.0..=1.0).contains(&c.glow_threshold));
+        assert!(c.glow_intensity > 0.0);
+        assert!((0.0..=180.0).contains(&c.glow_hue_tolerance_deg));
+        assert!(c.glow_iterations >= 1);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_glow_fields() {
+        let mut c = Config::defaults();
+        c.glow_match_saturation = true;
+        c.glow_match_bright_ansi = true;
+        c.glow_threshold = 0.42;
+        c.glow_intensity = 1.75;
+        c.glow_softness = 0.25;
+        c.glow_hue_tolerance_deg = 22.5;
+        c.glow_iterations = 5;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.glow_match_saturation);
+        assert!(parsed.glow_match_bright_ansi);
+        assert!(approx_eq(parsed.glow_threshold, 0.42));
+        assert!(approx_eq(parsed.glow_intensity, 1.75));
+        assert!(approx_eq(parsed.glow_softness, 0.25));
+        assert!(approx_eq(parsed.glow_hue_tolerance_deg, 22.5));
+        assert_eq!(parsed.glow_iterations, 5);
+    }
+
+    #[test]
+    fn config_glow_threshold_clamped_on_parse() {
+        let parsed = Config::parse_str("glow_threshold = 2.5\nglow_threshold = -1\n");
+        assert!((0.0..=1.0).contains(&parsed.glow_threshold));
+    }
+
+    #[test]
+    fn config_glow_hue_tolerance_clamped() {
+        let parsed = Config::parse_str("glow_hue_tolerance_deg = 500\n");
+        assert!((0.0..=180.0).contains(&parsed.glow_hue_tolerance_deg));
+        let parsed = Config::parse_str("glow_hue_tolerance_deg = -10\n");
+        assert!((0.0..=180.0).contains(&parsed.glow_hue_tolerance_deg));
+    }
+
+    #[test]
+    fn config_glow_iterations_clamped_to_max() {
+        let parsed = Config::parse_str(&format!(
+            "glow_iterations = {}\n",
+            renderer::glow::MAX_ITERATIONS * 4
+        ));
+        assert_eq!(parsed.glow_iterations, renderer::glow::MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn config_invalid_glow_value_keeps_default() {
+        let parsed = Config::parse_str(
+            "glow_match_saturation = nope\nglow_match_bright_ansi = ?\nglow_intensity = abc\n",
+        );
+        let d = Config::defaults();
+        assert_eq!(parsed.glow_match_saturation, d.glow_match_saturation);
+        assert_eq!(parsed.glow_match_bright_ansi, d.glow_match_bright_ansi);
+        assert!(approx_eq(parsed.glow_intensity, d.glow_intensity));
     }
 
     /// Build a row of cells from a string for URL-detection tests. Each
