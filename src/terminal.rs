@@ -1771,7 +1771,8 @@ impl Terminal {
 
         match ctrl.transmission {
             KittyTransmission::Direct => self.handle_apc_direct(payload, &ctrl),
-            KittyTransmission::File => self.handle_apc_file(payload, &ctrl),
+            KittyTransmission::File => self.handle_apc_file(payload, &ctrl, /*delete=*/ false),
+            KittyTransmission::TempFile => self.handle_apc_file(payload, &ctrl, /*delete=*/ true),
             KittyTransmission::Other => {} // unsupported medium → drop
         }
     }
@@ -1782,23 +1783,29 @@ impl Terminal {
     /// we never say OK to something the dispatcher would then drop.
     ///
     /// Supported:
-    /// - PNG over direct base64 OR file path. PNG is the default for
-    ///   most apps and is what `t=f` ships as.
-    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64. icat
-    ///   uses these for non-PNG sources (JPG, GIF) — it decodes locally
-    ///   then ships raw bytes to skip a PNG re-encode round-trip.
+    /// - PNG over direct base64, file path, OR temp file.
+    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64 OR temp
+    ///   file. icat uses these for non-PNG sources (JPG, GIF) — temp
+    ///   file skips the ~250-chunk base64 stream for large images.
     ///
     /// Unsupported (silently dropped both in query and transmission):
-    /// - Shared memory (`t=s`) and temp-file (`t=t`) transmissions.
-    /// - Raw formats from a file path (`f=24/32, t=f`) — rare in practice.
+    /// - Shared memory (`t=s`) — needs `shm_open` plumbing; future slice.
+    /// - Raw formats from a regular file path (`f=24/32, t=f`) — rare in
+    ///   practice and would need out-of-protocol dimension hints.
     fn kitty_query_supported(
         &self,
         format: KittyFormat,
         transmission: KittyTransmission,
     ) -> bool {
         match (format, transmission) {
-            (KittyFormat::Png, KittyTransmission::Direct | KittyTransmission::File) => true,
-            (KittyFormat::Rgb | KittyFormat::Rgba, KittyTransmission::Direct) => true,
+            (
+                KittyFormat::Png,
+                KittyTransmission::Direct | KittyTransmission::File | KittyTransmission::TempFile,
+            ) => true,
+            (
+                KittyFormat::Rgb | KittyFormat::Rgba,
+                KittyTransmission::Direct | KittyTransmission::TempFile,
+            ) => true,
             _ => false,
         }
     }
@@ -1890,35 +1897,31 @@ impl Terminal {
         }
     }
 
-    /// File transmission (`t=f`): payload is a base64-encoded UTF-8
-    /// filesystem path. We read the file ourselves rather than the
-    /// app shipping its bytes over the PTY. Cheaper for large images
-    /// (no base64 round-trip, no chunked reassembly), which is why
-    /// `kitty +kitten icat` picks this path by default for local files.
-    fn handle_apc_file(&mut self, payload: &str, ctrl: &KittyControl) {
-        use base64::Engine;
-        // Path may have internal whitespace from base64 line wrapping —
-        // strip before decode.
-        let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        let Ok(path_bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())
+    /// File-based transmission (`t=f` or `t=t`). Payload is a
+    /// base64-encoded UTF-8 filesystem path. We read the file ourselves
+    /// rather than the app shipping its bytes over the PTY. Cheaper for
+    /// large images (no base64 round-trip, no chunked reassembly).
+    ///
+    /// When `delete` is true (`t=t`, temp file), we unlink the file
+    /// after reading, but only if it actually lives under
+    /// `std::env::temp_dir()` — defense-in-depth against a malformed
+    /// app pointing us at arbitrary paths.
+    fn handle_apc_file(&mut self, payload: &str, ctrl: &KittyControl, delete: bool) {
+        let Some(path) = decode_kitty_file_path(payload) else { return };
+        let Some(raw) = read_kitty_file(&path) else { return };
+        if delete && path_is_under_temp_dir(&path) {
+            // Best-effort delete — if it fails (file already gone,
+            // permission issue), there's nothing useful to do.
+            let _ = std::fs::remove_file(&path);
+        }
+
+        // Run through the same normalizer the direct path uses so
+        // raw formats over temp file (icat for big JPGs) work too.
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
-        let Ok(path) = std::str::from_utf8(&path_bytes) else { return };
-
-        // Bound the read so a malformed app pointing at /dev/zero or a
-        // multi-GB log file can't OOM us. 256 MiB is huge for any real
-        // image; oversized files are silently dropped.
-        const MAX_FILE_READ_BYTES: u64 = 256 * 1024 * 1024;
-        let Ok(meta) = std::fs::metadata(path) else { return };
-        if meta.len() > MAX_FILE_READ_BYTES {
-            return;
-        }
-        let Ok(bytes) = std::fs::read(path) else { return };
-
-        // File transmission bypasses base64 entirely — the bytes are
-        // ready to peek and queue. Reuse the post-decode shared path.
-        let pixel_size = crate::images::peek_dimensions(&bytes);
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -2297,18 +2300,28 @@ pub enum KittyFormat {
 }
 
 /// Transmission medium from `t=`. `Direct` is the base64-in-APC default;
-/// `File` reads the image from a path the app supplies (the path itself
-/// is base64'd in the payload). `Temp` and `Shared` (shared memory) are
-/// not yet implemented.
+/// `File` reads the image from a path the app supplies; `TempFile`
+/// reads-then-deletes. `Other` (shared memory) is not yet implemented.
 ///
-/// File read is safe from a privilege standpoint — the app is already
+/// File reads are safe from a privilege standpoint — the app is already
 /// running as the user; it could read the file directly. We just shift
 /// the read across the PTY so chunked base64 of a multi-MB image
 /// doesn't have to traverse the byte stream.
+///
+/// Temp-file is the path `kitty +kitten icat` prefers for large images:
+/// one APC + one file read instead of ~250 chunked APCs, which closes
+/// most of the perf gap with iTerm OSC 1337 for big payloads.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KittyTransmission {
     Direct,
     File,
+    /// `t=t` — read the file at the given path, then delete it. Per
+    /// spec the terminal owns the unlink (apps may use unique temp
+    /// filenames per send and assume they're cleaned up). We only
+    /// delete files actually under `std::env::temp_dir()` as
+    /// defense-in-depth against a malformed app pointing us at
+    /// arbitrary paths.
+    TempFile,
     Other,
 }
 
@@ -2394,6 +2407,44 @@ struct KittyChunks {
     cells_cols: Option<u32>,
     cells_rows: Option<u32>,
     do_not_move_cursor: bool,
+}
+
+/// Decode the base64-encoded UTF-8 filesystem path that file-based Kitty
+/// transmissions (`t=f` / `t=t`) carry in their payload. Returns `None`
+/// on bad base64 or non-UTF-8 bytes.
+fn decode_kitty_file_path(payload: &str) -> Option<std::path::PathBuf> {
+    use base64::Engine;
+    // Strip ASCII whitespace — apps may wrap base64 lines for readability.
+    let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .ok()?;
+    let s = std::str::from_utf8(&raw).ok()?;
+    Some(std::path::PathBuf::from(s))
+}
+
+/// Read a file at `path` with a 256 MiB cap. Guards against an app
+/// pointing us at `/dev/zero` or a multi-GB log file. Oversized or
+/// unreadable files return `None`.
+fn read_kitty_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    const MAX_FILE_READ_BYTES: u64 = 256 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_FILE_READ_BYTES {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+/// True when `path` resolves under `std::env::temp_dir()`. Used by `t=t`
+/// to gate file deletion — we'll read any path the app gives us (it
+/// could read the file itself anyway), but only delete inside the temp
+/// hierarchy. Returns false if either side fails to canonicalize
+/// (path doesn't exist, permission denied, symlink loop) — safer than
+/// guessing.
+fn path_is_under_temp_dir(path: &std::path::Path) -> bool {
+    let Ok(c_path) = std::fs::canonicalize(path) else { return false };
+    let Ok(c_temp) = std::fs::canonicalize(std::env::temp_dir()) else { return false };
+    c_path.starts_with(&c_temp)
 }
 
 /// Append `payload`'s base64 chars to `dest`, skipping ASCII whitespace.
@@ -2507,6 +2558,7 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
             "t" => ctrl.transmission = match v {
                 "d" => KittyTransmission::Direct,
                 "f" => KittyTransmission::File,
+                "t" => KittyTransmission::TempFile,
                 _ => KittyTransmission::Other,
             },
             "i" => ctrl.image_id = v.parse().ok(),
@@ -4556,7 +4608,7 @@ mod tests {
         assert_eq!(parse_kitty_control("t=d").unwrap().transmission, KittyTransmission::Direct);
         assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::File);
         assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::Other);
-        assert_eq!(parse_kitty_control("t=t").unwrap().transmission, KittyTransmission::Other);
+        assert_eq!(parse_kitty_control("t=t").unwrap().transmission, KittyTransmission::TempFile);
     }
 
     #[test]
@@ -4802,6 +4854,103 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
         t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
         assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    //
+    // K2: temp-file transmission (`t=t`). Same shape as `t=f` but
+    // deletes the file after read, gated on the path being under
+    // `std::env::temp_dir()`. This is what icat prefers for large
+    // images — one APC + one file read instead of ~250 chunked APCs.
+    //
+
+    #[test]
+    fn kitty_apc_t_t_reads_and_deletes_temp_file() {
+        use base64::Engine;
+        let png = kitty_png(4, 4);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("yutani-kitty-t-test-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write temp png");
+        let path_b64 = base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap());
+        // Sanity: file exists before the APC.
+        assert!(path.exists(), "fixture should exist pre-test");
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=t,c=2,r=1;{}\x1b\\", path_b64));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "temp-file upload should land");
+        assert_eq!(uploads[0].bytes, png);
+        // Per spec the terminal owns the unlink — file should be gone.
+        assert!(!path.exists(), "t=t must delete the file after read");
+    }
+
+    #[test]
+    fn kitty_apc_t_t_does_not_delete_files_outside_temp_dir() {
+        // Defense-in-depth: even when the app asks for `t=t`, we only
+        // delete files that actually live under temp_dir. A path
+        // pointing outside is read (no privilege escalation — the app
+        // could read it itself) but left in place.
+        use base64::Engine;
+        let png = kitty_png(2, 2);
+        // Use the cargo target dir (definitely not under temp_dir) so
+        // the test doesn't depend on writeable /tmp behaviour.
+        let dir = std::env::current_dir().unwrap().join("target");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(format!("yutani-outside-temp-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write fixture");
+        let path_b64 = base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap());
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=t,c=1,r=1;{}\x1b\\", path_b64));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "non-temp file should still be read");
+        assert!(path.exists(), "non-temp file must NOT be deleted");
+
+        // Clean up after ourselves since the terminal won't.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn kitty_apc_t_t_with_raw_rgb_reads_and_pngencodes() {
+        // icat's preferred path for big JPGs: f=24 (raw RGB) over t=t
+        // (temp file). The temp file contains raw `s*v*3` bytes; we
+        // PNG-encode on read so the downstream decoder sees a PNG.
+        use base64::Engine;
+        let w = 4u32;
+        let h = 4u32;
+        let raw: Vec<u8> = (0..(w * h * 3) as u8).collect();
+        let path = std::env::temp_dir().join(format!("yutani-raw-t-test-{}.rgb", std::process::id()));
+        std::fs::write(&path, &raw).expect("write fixture");
+        let path_b64 = base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap());
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=24,t=t,s={},v={},c=2,r=1;{}\x1b\\",
+            w, h, path_b64
+        ));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        // PNG signature after re-encode.
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        assert!(!path.exists(), "temp file should be deleted");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_ok_for_t_t_temp_file() {
+        // Capability handshake: must advertise `t=t` so icat will use
+        // it instead of falling back to ~250 chunked direct APCs.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=8,f=100,t=t,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=8;OK\x1b\\");
+        // And for raw RGB over temp file (the big-JPG fast path).
+        t.feed(&kitty_apc_control_only("a=q,i=9,f=24,t=t,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=9;OK\x1b\\");
     }
 
     #[test]
