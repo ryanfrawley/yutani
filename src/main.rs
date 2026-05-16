@@ -1215,10 +1215,14 @@ impl State {
             char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
             // Content extends full-height (behind the translucent title bar
             // on macOS's fullsize_content_view), gaining ~1–2 rows of
-            // scrollable area at the top.
+            // scrollable area at the top. Reserve DECORATOR_HEIGHT in the
+            // row count so the boundary push-down (see `decorator_offset`
+            // in `update_vertices`) never shoves the bottom row past the
+            // window edge when the height isn't an integer multiple of
+            // `line_height`.
             char_height: usize::max(
                 1,
-                (height - WINDOW_PADDING * 2.0) as usize / line_height,
+                (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT) as usize / line_height,
             ),
         }
     }
