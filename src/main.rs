@@ -7,6 +7,7 @@ mod renderer;
 mod ansi;
 mod gpu;
 mod input;
+mod palette;
 mod shaper;
 mod style;
 mod terminal;
@@ -35,16 +36,38 @@ const DECORATOR_HEIGHT: f32 = 24.0;
 
 const DEFAULT_FONT_SIZE: f32 = 10.0;
 
-fn config_path() -> Option<std::path::PathBuf> {
+fn config_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let mut p = std::path::PathBuf::from(home);
     p.push(".config");
-    p.push("aria-terminal");
+    p.push("yutani");
+    Some(p)
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    let mut p = config_dir()?;
     p.push("config");
     Some(p)
 }
 
-#[derive(Clone, Copy)]
+/// Resolve a scheme name to an on-disk path. Accepts either `.yml` or
+/// `.yaml`; `.yml` wins when both exist so users can pick the shorter
+/// extension without surprise.
+fn scheme_path(name: &str) -> Option<std::path::PathBuf> {
+    let mut dir = config_dir()?;
+    dir.push("schemes");
+    for ext in ["yml", "yaml"] {
+        let p = dir.join(format!("{}.{}", name, ext));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Fall through to the .yaml form so the error message points at a
+    // canonical path (the loader will report "failed to read ...").
+    Some(dir.join(format!("{}.yaml", name)))
+}
+
+#[derive(Clone)]
 struct Config {
     font_size: f32,
     top_fade_height: f32,
@@ -62,6 +85,10 @@ struct Config {
     /// Shared by top and bottom strips — both sample the same blur output.
     /// Per-edge would need a second blur chain.
     blur_iterations: usize,
+    /// Name of a YAML scheme under ~/.config/yutani/schemes/. `None` keeps
+    /// the built-in defaults; a missing file with `Some(_)` warns and falls
+    /// back to defaults.
+    color_scheme: Option<String>,
 }
 
 impl Config {
@@ -76,6 +103,7 @@ impl Config {
             cursor_anim_secs: 0.06,
             cursor_blink: false,
             blur_iterations: 2,
+            color_scheme: None,
         }
     }
 
@@ -106,6 +134,7 @@ impl Config {
                 "blur_iterations" => if let Ok(x) = v.parse::<usize>() {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
+                "color_scheme" => c.color_scheme = if v.is_empty() { None } else { Some(v.to_string()) },
                 _ => (),
             }
         }
@@ -121,7 +150,7 @@ impl Config {
     }
 
     fn serialize(&self) -> String {
-        format!(
+        let mut s = format!(
             "font_size = {}\n\
              top_fade_height = {}\n\
              top_fade_solid_stop = {}\n\
@@ -140,7 +169,11 @@ impl Config {
             self.cursor_anim_secs,
             self.cursor_blink,
             self.blur_iterations,
-        )
+        );
+        if let Some(name) = &self.color_scheme {
+            s.push_str(&format!("color_scheme = {}\n", name));
+        }
+        s
     }
 }
 
@@ -1276,13 +1309,14 @@ impl State {
             descender * 0.5
         };
 
-        let default_fg = [0.0, 0.0, 0.0, 1.0];
+        let pal = palette::get();
+        let default_fg = pal.foreground;
+        // `default_bg` stays fully transparent so the window can show
+        // through cells with no SGR background; `default_bg_solid` is the
+        // concrete window background, used when reverse-video needs to
+        // swap a real color into the foreground slot.
         let default_bg = [0.0, 0.0, 0.0, 0.0];
-        // Solid form of the window background, used when reverse-video needs
-        // a concrete bg color to swap into the foreground slot. Pulled from
-        // the same source as the surface clear color so the two stay aligned.
-        let cc = clear_color(theme);
-        let default_bg_solid = [cc.r as f32, cc.g as f32, cc.b as f32, cc.a as f32];
+        let default_bg_solid = pal.background;
         let atlas_w = self.atlas.width as f32;
         let atlas_h = self.atlas.height as f32;
         let bg_u = 1.0 / atlas_w;
@@ -1611,10 +1645,11 @@ impl State {
             winit::window::Theme::Light => 0.30,
             winit::window::Theme::Dark => 0.35,
         };
+        let sel = palette::get().selection;
         let selection_bg = [
-            0.20 * selection_alpha,
-            0.40 * selection_alpha,
-            0.85 * selection_alpha,
+            sel[0] * selection_alpha,
+            sel[1] * selection_alpha,
+            sel[2] * selection_alpha,
             selection_alpha,
         ];
         let selection = self.selection;
@@ -2005,7 +2040,7 @@ impl State {
                     WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
                 let block_y =
                     cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5 + scroll_y;
-                let cursor_color = [0.1, 0.0, 0.8, 1.0];
+                let cursor_color = palette::get().cursor;
                 // Underline / bar use a 2-px stripe; block fills the full cell.
                 let stripe = 2.0_f32;
                 let (cx, cy, cw, ch) = match self.terminal.cursor_shape() {
@@ -2408,10 +2443,16 @@ impl State {
     /// the terminal so OSC 10/11/12 queries report something consistent with
     /// what the user actually sees.
     fn sync_theme_colors(&mut self) {
-        let fg = [0x00, 0x00, 0x00];
-        let bg = [0xff, 0xff, 0xff]; // matches clear_color
-        let cur = [0x1a, 0x00, 0xcc];
-        self.terminal.set_default_colors(fg, bg, cur);
+        let p = palette::get();
+        // Palette values are stored linear (sRGB-decoded) so the GPU's
+        // gamma-encoding lands on the user's intended hex. Re-encode here
+        // for OSC 10/11/12 so reports match the scheme's hex literals.
+        let to_u8 = |c: [f32; 4]| [
+            palette::linear_to_srgb_u8(c[0]),
+            palette::linear_to_srgb_u8(c[1]),
+            palette::linear_to_srgb_u8(c[2]),
+        ];
+        self.terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
     }
 
     /// 1-based (col, row) form of `pixel_to_visual_cell` for mouse reporting.
@@ -3118,6 +3159,18 @@ async fn run() {
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
 
     let config = Config::load();
+    // Install the color scheme before constructing State so style.rs and the
+    // renderer see the right palette on their first read. Missing file is a
+    // soft failure: warn and keep defaults so a typo in the config name
+    // doesn't take the terminal down.
+    if let Some(name) = &config.color_scheme {
+        if let Some(path) = scheme_path(name) {
+            match std::fs::read_to_string(&path) {
+                Ok(src) => palette::install(palette::parse_yaml(&src)),
+                Err(e) => eprintln!("palette: failed to read {}: {}", path.display(), e),
+            }
+        }
+    }
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
     // Build the rustybuzz shaper alongside the FreeType font. We keep one
@@ -3362,11 +3415,12 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
+    let bg = palette::get().background;
     wgpu::Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
+        r: bg[0] as f64,
+        g: bg[1] as f64,
+        b: bg[2] as f64,
+        a: bg[3] as f64,
     }
 }
 
