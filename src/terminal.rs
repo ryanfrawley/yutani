@@ -588,8 +588,22 @@ impl Terminal {
     }
 
     fn print(&mut self, ch: char) {
+        // With DECLRMM enabled, autowrap pivots on the right margin instead
+        // of the screen edge, and wraps back to the left margin. We detect
+        // the "inside LRM" case so that cursor positions sitting *outside*
+        // the margins (apps can CUP anywhere) still wrap at the screen edge
+        // the way xterm does.
+        let inside_lrm =
+            self.cursor.col >= self.scroll_left && self.cursor.col <= self.scroll_right;
+        let wrap_at = if inside_lrm {
+            self.scroll_right
+        } else {
+            self.cols - 1
+        };
+        let wrap_to = if inside_lrm { self.scroll_left } else { 0 };
+
         if self.cursor.wrap_pending && self.autowrap {
-            self.cursor.col = 0;
+            self.cursor.col = wrap_to;
             self.cursor.wrap_pending = false;
             self.line_feed_no_cr();
         }
@@ -599,11 +613,11 @@ impl Terminal {
         if row < self.rows && col < self.cols {
             self.active_grid_mut().set(row, col, cell);
         }
-        if self.cursor.col + 1 >= self.cols {
+        if self.cursor.col >= wrap_at {
             if self.autowrap {
                 self.cursor.wrap_pending = true;
             }
-            // when autowrap is off, cursor sticks at the last column
+            // when autowrap is off, cursor sticks at the wrap column
         } else {
             self.cursor.col += 1;
         }
@@ -1391,6 +1405,54 @@ mod tests {
         // Force a scroll inside the LRM via SU on the full scroll region.
         t.feed("\x1b[3;1H\x1b[3S");
         assert_eq!(t.scrollback_len(), prior, "narrow LRM must not push to scrollback");
+    }
+
+    #[test]
+    fn autowrap_inside_lrm_wraps_at_right_margin() {
+        // 10 cols, 4 rows. LRM cols 1..5 (0..4). Print 7 chars starting at
+        // col 0 row 0: chars 1-5 land in row 0 cols 0..4, char 6 wraps to
+        // row 1 col 0 (the LEFT margin), char 7 lands at row 1 col 1.
+        // Crucially: row 0 cols 5..9 stay blank — without LRM-aware wrap,
+        // the run would have spilled into the neighbor pane.
+        let mut t = Terminal::new(10, 4, 100);
+        t.feed("\x1b[?69h\x1b[1;5s\x1b[1;1H"); // LRM, cursor to (0,0)
+        t.feed("abcdefg");
+        let r0: String = t.row(0).iter().map(|c| c.ch).collect();
+        let r1: String = t.row(1).iter().map(|c| c.ch).collect();
+        assert_eq!(r0, "abcde     ", "row 0 must not bleed past right margin");
+        assert_eq!(r1, "fg        ", "wrap target column must be left margin");
+    }
+
+    #[test]
+    fn autowrap_outside_lrm_uses_screen_edge() {
+        // xterm-compat: when the cursor is sitting OUTSIDE the LRM (because
+        // CUP placed it there — CUP isn't clipped), the wrap should fall
+        // back to the screen edge rather than snapping to the left margin.
+        let mut t = Terminal::new(10, 4, 100);
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 1..5
+        t.feed("\x1b[1;7H"); // CUP to (0, 6) — outside LRM (col 6 > right=4)
+        t.feed("xyzw");      // prints at cols 6,7,8,9 → wrap_pending
+        t.feed("Q");         // wraps to (1, 0), prints 'Q'
+        let r0: String = t.row(0).iter().map(|c| c.ch).collect();
+        let r1: String = t.row(1).iter().map(|c| c.ch).collect();
+        assert_eq!(r0, "      xyzw");
+        assert_eq!(&r1[..2], "Q ", "outside-LRM wrap targets screen col 0, not left margin");
+    }
+
+    #[test]
+    fn autowrap_disabled_sticks_at_right_margin() {
+        // With DECAWM off, printing past the right margin should overwrite
+        // the rightmost cell in place — same shape as the existing screen-
+        // edge behavior, but pinned to the LRM right edge.
+        let mut t = Terminal::new(10, 2, 100);
+        t.feed("\x1b[?69h\x1b[1;5s\x1b[?7l\x1b[1;1H"); // LRM + DECAWM off
+        t.feed("abcdefg");
+        let r0: String = t.row(0).iter().map(|c| c.ch).collect();
+        // Cols 0..3 keep their original chars; col 4 (right margin) ends up
+        // holding the last char printed; rest of the row stays blank.
+        assert_eq!(&r0[..4], "abcd");
+        assert_eq!(r0.chars().nth(4), Some('g'));
+        assert_eq!(&r0[5..], "     ");
     }
 
     #[test]
