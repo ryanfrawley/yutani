@@ -632,11 +632,20 @@ impl Terminal {
         // Equivalently: shift = view_off - sb_len; viewport_row = sb_r + shift.
         let shift = view_off - sb_len;
         let vp_rows = viewport_rows as isize;
+        // 2-row slack on each side matches `update_vertices`'s `r_lo = -2`
+        // / `r_hi = rows + 2` window. Smooth-scroll's `scroll_y` shifts
+        // content by up to ±line_height between discrete view_offset ticks,
+        // and the decorator-offset push at the boundaries adds another
+        // partial-row. Without the slack, a placement whose bottom edge
+        // is just peeking in from the top during smooth-scroll gets
+        // filtered out — the image then "snaps" into view a frame later
+        // when view_offset increments.
+        const ROW_SLACK: isize = 2;
         let mut out = Vec::new();
         for sp in &self.scrollback_placements {
             let top = sp.scrollback_row + shift;
             let bottom = top + sp.placement.rows as isize;
-            if bottom <= 0 || top >= vp_rows {
+            if bottom <= -ROW_SLACK || top >= vp_rows + ROW_SLACK {
                 continue;
             }
             let mut p = sp.placement.clone();
@@ -3370,20 +3379,66 @@ mod tests {
 
     #[test]
     fn scrollback_in_view_filters_two_distinct_rows() {
-        // Two placements at distinct scrollback rows. With view_offset=1
-        // only the most-recently-evicted (highest scrollback_row) is in
-        // the visible scrollback strip; the older one sits above row 0
-        // by more than its height and is filtered.
+        // Place image 1, scroll it into history, push enough more
+        // scrollback that image 1 is well above the 2-row smooth-scroll
+        // slack window; then place image 2 and scroll just one row back.
+        // image 1 is filtered (far above the slack), image 2 is at
+        // viewport row 0.
         let mut t = Terminal::new(20, 5, 100);
         place(&mut t, 1, 0, 0, 1, 1);
-        t.feed("\x1b[1S"); // promotes first
+        t.feed("\x1b[1S"); // image 1 → scrollback row 0
+        t.feed("\x1b[5S"); // push image 1 further above the slack window
         place(&mut t, 2, 0, 0, 1, 1);
-        t.feed("\x1b[1S"); // promotes second
-        assert_eq!(t.scrollback_len(), 2);
+        t.feed("\x1b[1S"); // image 2 → newest scrollback row
+        let sb_len = t.scrollback_len();
+        assert!(sb_len >= 7);
         assert!(t.scroll_up(1));
         let in_view = t.scrollback_placements_in_view(t.rows);
         assert_eq!(in_view.len(), 1);
         assert_eq!(in_view[0].image.0, 2);
+        assert_eq!(in_view[0].top_row, 0);
+    }
+
+    #[test]
+    fn scrollback_in_view_keeps_placement_within_top_slack() {
+        // Placement whose discrete viewport position is 1 row above the
+        // top of the viewport — fully off-screen by integer math, but
+        // smooth-scroll can move it down by up to one line_height before
+        // the next view_offset tick. Filter must keep it in the slack
+        // window so the image fades in smoothly from the top edge instead
+        // of snapping into view when view_offset increments.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // sb_row=0
+        t.feed("\x1b[1S"); // push image to sb shift territory: sb_len=2
+        assert_eq!(t.scrollback_len(), 2);
+        assert!(t.scroll_up(1));
+        // sb_len=2, view_off=1 → shift=-1; image at sb_row=0 → top=-1,
+        // bottom=0. Old filter (bottom <= 0) excluded; new slack keeps it.
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        assert_eq!(in_view.len(), 1);
+        assert_eq!(in_view[0].top_row, -1);
+    }
+
+    #[test]
+    fn scrollback_in_view_keeps_placement_within_bottom_slack() {
+        // Mirror image of the above: placement just past the bottom of
+        // the viewport stays in the slack window so smooth-scroll up can
+        // reveal its top edge.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // sb_row=0
+        // Build scrollback so the image lands one row below viewport
+        // after scrolling all the way back. With viewport_rows=5 and slack=2,
+        // a top_row of 5 or 6 must still be returned.
+        for _ in 0..5 {
+            t.feed("\n");
+        }
+        let sb_len = t.scrollback_len();
+        assert!(t.scroll_up(sb_len));
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        // sb_row=0, shift=0 → top=0; with slack we expect it kept.
+        assert_eq!(in_view.len(), 1);
         assert_eq!(in_view[0].top_row, 0);
     }
 
@@ -3423,20 +3478,24 @@ mod tests {
 
     #[test]
     fn scrollback_in_view_filters_below_grid() {
-        // Image at the newest scrollback row. Scroll all the way back: it
-        // slides off the bottom of the viewport (top_row >= viewport_rows)
-        // and gets filtered.
+        // To make an image filtered when scrolled fully back, it has to
+        // sit at a scrollback row past `viewport_rows + ROW_SLACK`. Once
+        // promoted the image's scrollback_row is fixed, so we have to
+        // build up lots of scrollback BEFORE placing it.
         let mut t = Terminal::new(20, 5, 100);
-        for _ in 0..10 {
+        // 15 newlines from row 0 scroll the bottom 11 times, putting
+        // 11 rows in scrollback.
+        for _ in 0..15 {
             t.feed("\n");
         }
-        place(&mut t, 1, 0, 0, 1, 1);
-        t.feed("\x1b[1S"); // newest scrollback row
+        place(&mut t, 1, 0, 0, 1, 1); // image at grid row 0
+        t.feed("\x1b[1S"); // promotes; image sits at scrollback_row ~11
         let sb_len = t.scrollback_len();
-        assert!(sb_len > t.rows);
+        assert!(sb_len > t.rows + 2);
         assert!(t.scroll_up(sb_len));
-        // view_off == sb_len → shift = 0. Newest sb_row = sb_len-1, so
-        // top_row = sb_len-1 >= viewport_rows → filtered.
+        // view_off == sb_len → shift = 0. Image's scrollback_row is past
+        // viewport_rows + slack (5 + 2 = 7), so it's off the bottom and
+        // filtered.
         assert!(t.scrollback_placements_in_view(t.rows).is_empty());
     }
 
