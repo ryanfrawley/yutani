@@ -41,6 +41,15 @@ pub struct Placement {
     /// Renderer converts to UVs against the GpuImage's known width/height.
     /// Future home for Kitty's source-rectangle / animated-frame slicing.
     pub src_rect: Option<(u32, u32, u32, u32)>,
+    /// Kitty graphics-protocol `i=` image id this placement was created
+    /// with. `None` for iTerm OSC 1337 / Cmd-Shift-I / any other
+    /// non-Kitty source. Lets `a=d,d=i,i=N` find every placement that
+    /// references a given client image without scanning the entire grid.
+    pub kitty_image_id: Option<u32>,
+    /// Kitty graphics-protocol `p=` placement id. `None` for
+    /// non-Kitty placements or Kitty placements where the client
+    /// omitted `p=`. Lets `a=d,d=p,p=N` target one specific placement.
+    pub kitty_placement_id: Option<u32>,
 }
 
 impl Placement {
@@ -119,6 +128,21 @@ pub struct PendingImageUpload {
     /// Cell extent (rows, cols) computed by the OSC handler from the
     /// size spec + image dims + current cell-pixel size.
     pub cell_extent: (u16, u16),
+    /// Kitty graphics-protocol `i=` image id when the upload came from
+    /// a Kitty APC. `None` for iTerm / Cmd-Shift-I. When `Some`, main.rs
+    /// registers the resulting store ImageId via
+    /// `Terminal::register_kitty_image_id` so future `a=p` / `a=d`
+    /// ops can find the image.
+    pub kitty_image_id: Option<u32>,
+    /// Kitty graphics-protocol `p=` placement id. Flows into the
+    /// `Placement.kitty_placement_id` field so `a=d,d=p,p=N` can target
+    /// it. `None` for non-Kitty paths or when the client omitted `p=`.
+    pub kitty_placement_id: Option<u32>,
+    /// `true` for `a=T` (transmit AND display, the default) — main.rs
+    /// creates a `Placement` at `cell_anchor` after the decode lands.
+    /// `false` for `a=t` (transmit only) — the image becomes addressable
+    /// via `kitty_image_id` for a later `a=p`, but no placement is made.
+    pub display_immediately: bool,
 }
 
 #[derive(Clone)]
@@ -453,6 +477,17 @@ pub struct Terminal {
     // overwrites (matching the implicit "only one anonymous stream"
     // contract).
     kitty_chunks_anon: Option<KittyChunks>,
+    // Kitty client image-id → our store ImageId. Populated when a
+    // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
+    // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
+    // populated across a=t (transmit only) → a=p (place later)
+    // round-trips, which is the whole point of the protocol's
+    // image-id mechanism — clients re-display without re-uploading.
+    //
+    // `referenced_image_ids` includes the values from this map so
+    // mark-and-sweep doesn't drop a transmitted-but-not-yet-placed
+    // image between a=t and a=p.
+    kitty_image_ids: std::collections::HashMap<u32, ImageId>,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -512,6 +547,7 @@ impl Terminal {
             pending_image_uploads: Vec::new(),
             kitty_chunks: std::collections::HashMap::new(),
             kitty_chunks_anon: None,
+            kitty_image_ids: std::collections::HashMap::new(),
             cell_w_px: 1,
             line_h_px: 1,
         }
@@ -578,14 +614,80 @@ impl Terminal {
         pixel_offset: (i32, i32),
         src_rect: Option<(u32, u32, u32, u32)>,
     ) -> PlacementId {
+        self.insert_placement_full(
+            image, top_row, left_col, rows, cols, z, pixel_offset, src_rect,
+            None, None,
+        )
+    }
+
+    /// Insertion path for Kitty graphics-protocol placements. Threads
+    /// the client's `i=` / `p=` IDs through so `a=d,d=i,...` and
+    /// `a=d,d=p,...` can find the placement later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_placement_kitty(
+        &mut self,
+        image: ImageId,
+        top_row: isize,
+        left_col: isize,
+        rows: u16,
+        cols: u16,
+        z: i32,
+        pixel_offset: (i32, i32),
+        src_rect: Option<(u32, u32, u32, u32)>,
+        kitty_image_id: Option<u32>,
+        kitty_placement_id: Option<u32>,
+    ) -> PlacementId {
+        self.insert_placement_full(
+            image, top_row, left_col, rows, cols, z, pixel_offset, src_rect,
+            kitty_image_id, kitty_placement_id,
+        )
+    }
+
+    /// One shared implementation behind the three insertion entry points
+    /// so all callers route through identical id allocation + placement
+    /// construction. Kept private; callers pick one of the three public
+    /// shapes based on which fields they care about.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_placement_full(
+        &mut self,
+        image: ImageId,
+        top_row: isize,
+        left_col: isize,
+        rows: u16,
+        cols: u16,
+        z: i32,
+        pixel_offset: (i32, i32),
+        src_rect: Option<(u32, u32, u32, u32)>,
+        kitty_image_id: Option<u32>,
+        kitty_placement_id: Option<u32>,
+    ) -> PlacementId {
         let id = self.next_placement_id;
         self.next_placement_id = self.next_placement_id.wrapping_add(1).max(1);
         let placement = Placement {
             id, image, top_row, left_col, rows, cols, z,
             pixel_offset, src_rect,
+            kitty_image_id, kitty_placement_id,
         };
         self.active_grid_mut().placements.push(placement);
         id
+    }
+
+    /// Register a Kitty client image-id → store ImageId mapping. Called
+    /// by main.rs immediately after `Store::request_insert` returns,
+    /// for any upload carrying a Kitty `i=` id. Subsequent
+    /// `a=p,i=N` / `a=d,d=i,i=N` look the image up here.
+    ///
+    /// Idempotent — re-registering the same client id with a new
+    /// store id overwrites (a client that re-transmits with the same
+    /// `i=` expects the new image to replace the old).
+    pub fn register_kitty_image_id(&mut self, client_id: u32, store_id: ImageId) {
+        self.kitty_image_ids.insert(client_id, store_id);
+    }
+
+    /// Look up the store ImageId for a Kitty client `i=` id, if known.
+    /// Used by the `a=p` placement path.
+    pub fn kitty_image_id_lookup(&self, client_id: u32) -> Option<ImageId> {
+        self.kitty_image_ids.get(&client_id).copied()
     }
 
     /// Remove every placement that references `image_id`, across both
@@ -686,6 +788,13 @@ impl Terminal {
         }
         for sp in &self.scrollback_placements {
             out.insert(sp.placement.image);
+        }
+        // Kitty `a=t` (transmit without display) lands here. The image
+        // has no placement yet — the client will send `a=p,i=N` later
+        // to display it. Without this branch, mark-and-sweep would drop
+        // the image between the two ops.
+        for &iid in self.kitty_image_ids.values() {
+            out.insert(iid);
         }
         out
     }
@@ -1652,6 +1761,11 @@ impl Terminal {
             label: name,
             cell_anchor,
             cell_extent,
+            // iTerm OSC 1337 doesn't use Kitty's id system.
+            kitty_image_id: None,
+            kitty_placement_id: None,
+            // OSC 1337 always displays — there's no transmit-only variant.
+            display_immediately: true,
         });
     }
 
@@ -1752,11 +1866,15 @@ impl Terminal {
             return;
         }
 
-        // `a=t` (transmit-only, no display) requires deferred placement,
-        // which means tracking image_id → ImageId mapping for a later
-        // `a=p`. Not in K1; drop.
-        if !matches!(ctrl.action, KittyAction::TransmitAndDisplay) {
-            return;
+        // Place / Delete don't carry image data — handle and return.
+        match ctrl.action {
+            KittyAction::Place => return self.handle_apc_place(&ctrl),
+            KittyAction::Delete => return self.handle_apc_delete(&ctrl),
+            KittyAction::Other => return,
+            // Fall through for Transmit / TransmitAndDisplay; both
+            // accept an image payload.
+            KittyAction::Transmit | KittyAction::TransmitAndDisplay => {}
+            KittyAction::Query => unreachable!("handled above"),
         }
 
         // Format/transmission pair must be in our supported set.
@@ -1774,6 +1892,90 @@ impl Terminal {
             KittyTransmission::File => self.handle_apc_file(payload, &ctrl, /*delete=*/ false),
             KittyTransmission::TempFile => self.handle_apc_file(payload, &ctrl, /*delete=*/ true),
             KittyTransmission::Other => {} // unsupported medium → drop
+        }
+    }
+
+    /// `a=p` — place a previously-transmitted image at the cursor.
+    /// Requires `i=` to identify which image, and `c=` / `r=` for cell
+    /// extent (we don't track the image's native cell size in
+    /// Terminal). Without one we drop silently per the Kitty contract.
+    fn handle_apc_place(&mut self, ctrl: &KittyControl) {
+        let Some(client_id) = ctrl.image_id else { return };
+        let Some(image_id) = self.kitty_image_id_lookup(client_id) else { return };
+
+        // Cell extent: prefer the explicit c/r values, fall back to
+        // (1, 1) as a visible placeholder. (A future slice could track
+        // the image's pixel size in Terminal so we can compute Auto.)
+        let cols = ctrl.cells_cols.unwrap_or(1).clamp(1, u16::MAX as u32) as u16;
+        let rows = ctrl.cells_rows.unwrap_or(1).clamp(1, u16::MAX as u32) as u16;
+
+        let original_row = self.cursor.row as isize;
+        let original_col = self.cursor.col as isize;
+        if !ctrl.do_not_move_cursor {
+            for _ in 0..rows {
+                self.line_feed();
+            }
+        }
+        let cursor_advance = self.cursor.row as isize - original_row;
+        let scrolls = if ctrl.do_not_move_cursor {
+            0
+        } else {
+            rows as isize - cursor_advance
+        };
+        let top_row = original_row - scrolls;
+
+        self.insert_placement_kitty(
+            image_id,
+            top_row,
+            original_col,
+            rows,
+            cols,
+            0,
+            (0, 0),
+            None,
+            Some(client_id),
+            ctrl.placement_id,
+        );
+    }
+
+    /// `a=d` — delete placements (and optionally drop the underlying
+    /// store entries via mark-and-sweep). Selector + relevant ids
+    /// come from `d=` / `i=` / `p=`.
+    fn handle_apc_delete(&mut self, ctrl: &KittyControl) {
+        let selector = ctrl.delete_selector.unwrap_or(KittyDeleteSelector::All);
+        match selector {
+            KittyDeleteSelector::All => {
+                // Every Kitty placement (those carrying a kitty_image_id)
+                // drops. iTerm/Cmd-Shift-I placements survive — `a=d,d=a`
+                // is a Kitty-specific cleanup, not a global one.
+                self.primary
+                    .placements
+                    .retain(|p| p.kitty_image_id.is_none());
+                self.alternate
+                    .placements
+                    .retain(|p| p.kitty_image_id.is_none());
+                self.scrollback_placements
+                    .retain(|sp| sp.placement.kitty_image_id.is_none());
+                self.kitty_image_ids.clear();
+            }
+            KittyDeleteSelector::Image => {
+                let Some(client_id) = ctrl.image_id else { return };
+                let Some(image_id) = self.kitty_image_id_lookup(client_id) else { return };
+                self.remove_placements_with_image(image_id);
+                self.kitty_image_ids.remove(&client_id);
+            }
+            KittyDeleteSelector::Placement => {
+                let Some(pid) = ctrl.placement_id else { return };
+                self.primary
+                    .placements
+                    .retain(|p| p.kitty_placement_id != Some(pid));
+                self.alternate
+                    .placements
+                    .retain(|p| p.kitty_placement_id != Some(pid));
+                self.scrollback_placements
+                    .retain(|sp| sp.placement.kitty_placement_id != Some(pid));
+            }
+            KittyDeleteSelector::Other => {} // unimplemented selector → drop
         }
     }
 
@@ -1823,6 +2025,7 @@ impl Terminal {
         // per-chunk work has to stay minimal. Stream the whitespace
         // filter directly into the accumulator's existing String instead
         // of allocating a per-chunk staging buffer.
+        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay);
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
                 let entry = self.kitty_chunks.entry(id).or_insert_with(|| KittyChunks {
@@ -1833,21 +2036,16 @@ impl Terminal {
                     cells_cols: ctrl.cells_cols,
                     cells_rows: ctrl.cells_rows,
                     do_not_move_cursor: ctrl.do_not_move_cursor,
+                    kitty_image_id: ctrl.image_id,
+                    kitty_placement_id: ctrl.placement_id,
+                    display_immediately: display,
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
             (Some(id), false) if self.kitty_chunks.contains_key(&id) => {
                 let mut acc = self.kitty_chunks.remove(&id).expect("contains_key");
                 append_b64_filtered(&mut acc.b64, payload);
-                self.finalize_kitty_image(
-                    &acc.b64,
-                    acc.format,
-                    acc.source_w,
-                    acc.source_h,
-                    acc.cells_cols,
-                    acc.cells_rows,
-                    acc.do_not_move_cursor,
-                );
+                self.finalize_kitty_image_from_chunks(&acc);
             }
             (None, true) => {
                 // Anonymous chunk. The first one establishes the
@@ -1862,21 +2060,16 @@ impl Terminal {
                     cells_cols: ctrl.cells_cols,
                     cells_rows: ctrl.cells_rows,
                     do_not_move_cursor: ctrl.do_not_move_cursor,
+                    kitty_image_id: ctrl.image_id,
+                    kitty_placement_id: ctrl.placement_id,
+                    display_immediately: display,
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
             (None, false) if self.kitty_chunks_anon.is_some() => {
                 let mut acc = self.kitty_chunks_anon.take().expect("is_some");
                 append_b64_filtered(&mut acc.b64, payload);
-                self.finalize_kitty_image(
-                    &acc.b64,
-                    acc.format,
-                    acc.source_w,
-                    acc.source_h,
-                    acc.cells_cols,
-                    acc.cells_rows,
-                    acc.do_not_move_cursor,
-                );
+                self.finalize_kitty_image_from_chunks(&acc);
             }
             _ => {
                 // Single-chunk: id present (or not) with m=0 and no
@@ -1884,17 +2077,59 @@ impl Terminal {
                 // since the accumulator path isn't involved.
                 let mut buf = String::with_capacity(payload.len());
                 append_b64_filtered(&mut buf, payload);
-                self.finalize_kitty_image(
-                    &buf,
-                    ctrl.format,
-                    ctrl.source_w,
-                    ctrl.source_h,
-                    ctrl.cells_cols,
-                    ctrl.cells_rows,
-                    ctrl.do_not_move_cursor,
-                );
+                self.finalize_kitty_image_from_b64(&buf, ctrl, display);
             }
         }
+    }
+
+    /// Single-chunk dispatch: just bridges to the per-byte finalize
+    /// with parameters lifted out of the current `KittyControl`.
+    fn finalize_kitty_image_from_b64(&mut self, b64: &str, ctrl: &KittyControl, display: bool) {
+        use base64::Engine;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+            return;
+        };
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
+        else {
+            return;
+        };
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            ctrl.cells_cols,
+            ctrl.cells_rows,
+            ctrl.do_not_move_cursor,
+            ctrl.image_id,
+            ctrl.placement_id,
+            display,
+        );
+    }
+
+    /// Chunked dispatch: same as `finalize_kitty_image_from_b64` but
+    /// reads parameters from the first-chunk snapshot stored in
+    /// `KittyChunks` (Kitty spec says only the first chunk's display
+    /// attributes matter).
+    fn finalize_kitty_image_from_chunks(&mut self, acc: &KittyChunks) {
+        use base64::Engine;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(acc.b64.as_bytes()) else {
+            return;
+        };
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(acc.format, &raw, acc.source_w, acc.source_h)
+        else {
+            return;
+        };
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            acc.cells_cols,
+            acc.cells_rows,
+            acc.do_not_move_cursor,
+            acc.kitty_image_id,
+            acc.kitty_placement_id,
+            acc.display_immediately,
+        );
     }
 
     /// File-based transmission (`t=f` or `t=t`). Payload is a
@@ -1922,51 +2157,24 @@ impl Terminal {
         else {
             return;
         };
+        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay);
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
             ctrl.cells_cols,
             ctrl.cells_rows,
             ctrl.do_not_move_cursor,
-        );
-    }
-
-    /// Base64-decode `b64`, transform per `format` (PNG bytes pass
-    /// through; raw RGB/RGBA bytes get PNG-encoded so they flow
-    /// through the same `image::load_from_memory` worker path), then
-    /// hand off to `finalize_kitty_image_bytes`.
-    fn finalize_kitty_image(
-        &mut self,
-        b64: &str,
-        format: KittyFormat,
-        source_w: Option<u32>,
-        source_h: Option<u32>,
-        cells_cols: Option<u32>,
-        cells_rows: Option<u32>,
-        do_not_move_cursor: bool,
-    ) {
-        use base64::Engine;
-        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
-            return;
-        };
-        let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(format, &raw, source_w, source_h)
-        else {
-            return;
-        };
-        self.finalize_kitty_image_bytes(
-            bytes,
-            pixel_size,
-            cells_cols,
-            cells_rows,
-            do_not_move_cursor,
+            ctrl.image_id,
+            ctrl.placement_id,
+            display,
         );
     }
 
     /// Shared finalize for both direct-base64 and file transmissions —
     /// computes cell extent, advances the cursor with scroll
-    /// compensation, queues the upload. Mirrors `handle_osc_1337`'s
-    /// post-decode plumbing.
+    /// compensation (only for `a=T`), queues the upload. Mirrors
+    /// `handle_osc_1337`'s post-decode plumbing.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_kitty_image_bytes(
         &mut self,
         bytes: Vec<u8>,
@@ -1974,6 +2182,9 @@ impl Terminal {
         cells_cols: Option<u32>,
         cells_rows: Option<u32>,
         do_not_move_cursor: bool,
+        kitty_image_id: Option<u32>,
+        kitty_placement_id: Option<u32>,
+        display_immediately: bool,
     ) {
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
         // falling back to Auto (image's native cell extent) when not.
@@ -1996,16 +2207,25 @@ impl Terminal {
             true, // Kitty's default is to preserve aspect when one axis is omitted.
         );
 
+        // For `a=t` (transmit only) we DON'T touch the cursor — the
+        // image is being stored for a later `a=p` and the cursor should
+        // stay where the app put it. cell_anchor is still populated
+        // (with the current cursor) so main.rs has a sensible default
+        // if it ever decides to display anyway.
         let original_row = self.cursor.row as isize;
         let original_col = self.cursor.col as isize;
         let rows = cell_extent.0 as isize;
-        if !do_not_move_cursor {
+        if display_immediately && !do_not_move_cursor {
             for _ in 0..rows {
                 self.line_feed();
             }
         }
         let cursor_advance = self.cursor.row as isize - original_row;
-        let scrolls = if do_not_move_cursor { 0 } else { rows - cursor_advance };
+        let scrolls = if display_immediately && !do_not_move_cursor {
+            rows - cursor_advance
+        } else {
+            0
+        };
         let cell_anchor = (original_row - scrolls, original_col);
 
         self.pending_image_uploads.push(PendingImageUpload {
@@ -2018,6 +2238,9 @@ impl Terminal {
             label: Some("kitty graphics".into()),
             cell_anchor,
             cell_extent,
+            kitty_image_id,
+            kitty_placement_id,
+            display_immediately,
         });
     }
 
@@ -2274,8 +2497,41 @@ pub enum KittyAction {
     /// `a=q` — query capability. Reply with `OK` so the app proceeds to
     /// send real images (K1.5).
     Query,
-    /// `a=p` / `a=d` / `a=a` / unknown — accepted into the parser but
+    /// `a=p` — place a previously-transmitted image (by `i=` id) at the
+    /// current cursor. Pairs with `Transmit` to let an app re-display
+    /// an image without re-uploading it. Requires `Terminal::kitty_image_ids`
+    /// to have a mapping for the requested id.
+    Place,
+    /// `a=d` — delete placement(s) or image(s). The actual selector
+    /// comes from `d=` (and the relevant `i=` / `p=` keys).
+    Delete,
+    /// `a=a` (animation) / unknown — accepted into the parser but
     /// produces no observable behavior in K1.
+    Other,
+}
+
+/// `d=` delete selector. We implement the subset that real apps use:
+/// by image id, by placement id, and the "all images" sweep. Other
+/// selectors (`c` under cursor, `n` by image number, `f` / `F` by
+/// frame, etc.) drop silently for now.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KittyDeleteSelector {
+    /// `d=a` — delete all visible placements (and their backing
+    /// images). The capital `A` variant also removes images from the
+    /// store; we treat both as "remove placements + drop store
+    /// entries via mark-and-sweep on the next frame" since our
+    /// architecture doesn't distinguish.
+    All,
+    /// `d=i` — delete placements + image for the given `i=` id.
+    /// Lowercase `i` removes placements but keeps the image stored;
+    /// uppercase `I` also removes the image. We implement only the
+    /// remove-everything semantics (uppercase) — saves a code path
+    /// and matches what `kitty +kitten icat --transfer-mode=memory`
+    /// expects on cleanup.
+    Image,
+    /// `d=p` — delete placement with the given `p=` id.
+    Placement,
+    /// Unknown / unimplemented selector. The dispatcher drops these.
     Other,
 }
 
@@ -2361,6 +2617,9 @@ pub struct KittyControl {
     pub source_w: Option<u32>,
     /// `v=` source pixel height. Same story as `source_w`.
     pub source_h: Option<u32>,
+    /// `d=` selector for the delete action. Only meaningful when
+    /// `action == Delete`; ignored otherwise.
+    pub delete_selector: Option<KittyDeleteSelector>,
 }
 
 impl Default for KittyControl {
@@ -2381,6 +2640,7 @@ impl Default for KittyControl {
             quiet: 0,
             source_w: None,
             source_h: None,
+            delete_selector: None,
         }
     }
 }
@@ -2407,6 +2667,15 @@ struct KittyChunks {
     cells_cols: Option<u32>,
     cells_rows: Option<u32>,
     do_not_move_cursor: bool,
+    /// Client's `i=` / `p=` ids from the first chunk. Plumbed through
+    /// to the eventual `Placement` so `a=d,d=i,…` / `a=d,d=p,…` can
+    /// find it later. `None` when the client omitted the key.
+    kitty_image_id: Option<u32>,
+    kitty_placement_id: Option<u32>,
+    /// `true` for `a=T`, `false` for `a=t`. Tells main.rs whether to
+    /// create a `Placement` (display) or just register the image-id
+    /// mapping (transmit-for-later).
+    display_immediately: bool,
 }
 
 /// Decode the base64-encoded UTF-8 filesystem path that file-based Kitty
@@ -2545,8 +2814,16 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
                 "t" => KittyAction::Transmit,
                 "T" => KittyAction::TransmitAndDisplay,
                 "q" => KittyAction::Query,
+                "p" => KittyAction::Place,
+                "d" => KittyAction::Delete,
                 _ => KittyAction::Other,
             },
+            "d" => ctrl.delete_selector = Some(match v {
+                "a" | "A" => KittyDeleteSelector::All,
+                "i" | "I" => KittyDeleteSelector::Image,
+                "p" | "P" => KittyDeleteSelector::Placement,
+                _ => KittyDeleteSelector::Other,
+            }),
             "f" => ctrl.format = match v {
                 "100" => KittyFormat::Png,
                 "24" => KittyFormat::Rgb,
@@ -4592,10 +4869,13 @@ mod tests {
         assert_eq!(parse_kitty_control("a=t").unwrap().action, KittyAction::Transmit);
         assert_eq!(parse_kitty_control("a=T").unwrap().action, KittyAction::TransmitAndDisplay);
         assert_eq!(parse_kitty_control("a=q").unwrap().action, KittyAction::Query);
-        // Unknown actions land on Other — the Kitty contract says
-        // "unknown action = no-op", which we encode as Other + dispatcher drop.
-        assert_eq!(parse_kitty_control("a=p").unwrap().action, KittyAction::Other);
-        assert_eq!(parse_kitty_control("a=d").unwrap().action, KittyAction::Other);
+        assert_eq!(parse_kitty_control("a=p").unwrap().action, KittyAction::Place);
+        assert_eq!(parse_kitty_control("a=d").unwrap().action, KittyAction::Delete);
+        // Unknown / not-yet-implemented actions land on Other — the
+        // Kitty contract says "unknown action = no-op", which we encode
+        // as Other + dispatcher drop. `a=a` (animation) is still
+        // unimplemented and falls here.
+        assert_eq!(parse_kitty_control("a=a").unwrap().action, KittyAction::Other);
         assert_eq!(parse_kitty_control("a=Z").unwrap().action, KittyAction::Other);
     }
 
@@ -5089,14 +5369,189 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_transmit_only_action_does_not_display() {
-        // `a=t` (lowercase) is "transmit only, hold for later a=p" —
-        // deferred placement isn't implemented in K1. Drop silently.
+    fn kitty_apc_transmit_only_queues_upload_with_display_false() {
+        // `a=t` (lowercase) — transmit-only, hold for a later `a=p`.
+        // The upload IS queued (so the decode runs and the store gets
+        // the pixels), but with display_immediately=false so main.rs
+        // skips placement creation. Cursor stays put.
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
+        t.feed("\x1b[5;1H"); // cursor at row 5 col 1
+        let cursor_before = t.cursor().row;
         let png = kitty_png(4, 4);
         t.feed(&kitty_apc("a=t,f=100,c=2,r=1,i=1", &png));
-        assert!(t.take_pending_image_uploads().is_empty());
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(!uploads[0].display_immediately);
+        assert_eq!(uploads[0].kitty_image_id, Some(1));
+        // `a=t` MUST NOT advance the cursor — the placement happens
+        // later via `a=p` and that's what moves the cursor.
+        assert_eq!(t.cursor().row, cursor_before);
+    }
+
+    //
+    // K4: image / placement ids + a=t / a=p / a=d
+    //
+
+    #[test]
+    fn kitty_apc_a_p_places_previously_transmitted_image() {
+        // Lifecycle test: a=t deposits the image with i=7 (no
+        // placement); a=p,i=7,c=4,r=2 places it at the cursor.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // a=t
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=t,f=100,c=4,r=2,i=7", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(!uploads[0].display_immediately);
+        // main.rs would call register_kitty_image_id here. Simulate.
+        t.register_kitty_image_id(7, ImageId(99));
+        // No placement yet.
+        assert!(t.live_placements().is_empty());
+
+        // a=p — place at cursor.
+        t.feed("\x1b[5;1H");
+        t.feed(&kitty_apc_control_only("a=p,i=7,c=4,r=2"));
+        let placements = t.live_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].image, ImageId(99));
+        assert_eq!(placements[0].kitty_image_id, Some(7));
+        // Cursor advanced by 2 rows (cell_extent).
+        assert_eq!(t.cursor().row, 4 + 2);
+    }
+
+    #[test]
+    fn kitty_apc_a_p_unknown_id_silently_drops() {
+        // Per spec, placing an unknown image is a no-op.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&kitty_apc_control_only("a=p,i=999,c=2,r=1"));
+        assert!(t.live_placements().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_a_p_with_c_one_default_is_visible_placeholder() {
+        // c=/r= omitted on a=p — fall back to (1,1) so the placement
+        // is at least visible. The Kitty spec allows omitting c/r but
+        // expects the terminal to know the image's natural cell size;
+        // we don't track that yet, so (1,1) is the safer default.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(3, ImageId(50));
+        t.feed(&kitty_apc_control_only("a=p,i=3"));
+        let placements = t.live_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].rows, 1);
+        assert_eq!(placements[0].cols, 1);
+    }
+
+    #[test]
+    fn kitty_apc_a_p_records_placement_id() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(5, ImageId(10));
+        t.feed(&kitty_apc_control_only("a=p,i=5,p=42,c=1,r=1"));
+        let placements = t.live_placements();
+        assert_eq!(placements.len(), 1);
+        assert_eq!(placements[0].kitty_placement_id, Some(42));
+    }
+
+    #[test]
+    fn kitty_apc_a_p_with_capital_c_skips_cursor_advance() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(1, ImageId(1));
+        t.feed("\x1b[5;1H");
+        t.feed(&kitty_apc_control_only("a=p,i=1,c=4,r=3,C=1"));
+        // C=1 → cursor doesn't move.
+        assert_eq!(t.cursor().row, 4);
+    }
+
+    #[test]
+    fn kitty_apc_a_d_by_image_removes_all_placements_for_image() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(7, ImageId(99));
+        // Place the same image twice at different cells.
+        t.feed(&kitty_apc_control_only("a=p,i=7,c=2,r=1"));
+        t.feed(&kitty_apc_control_only("a=p,i=7,c=2,r=1"));
+        assert_eq!(t.live_placements().len(), 2);
+
+        t.feed(&kitty_apc_control_only("a=d,d=i,i=7"));
+        assert!(t.live_placements().is_empty());
+        // Mapping also gone — subsequent a=p,i=7 won't resurrect.
+        assert!(t.kitty_image_id_lookup(7).is_none());
+    }
+
+    #[test]
+    fn kitty_apc_a_d_by_placement_removes_only_matching() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.register_kitty_image_id(7, ImageId(99));
+        t.feed(&kitty_apc_control_only("a=p,i=7,p=1,c=1,r=1"));
+        t.feed(&kitty_apc_control_only("a=p,i=7,p=2,c=1,r=1"));
+        t.feed(&kitty_apc_control_only("a=p,i=7,p=3,c=1,r=1"));
+        assert_eq!(t.live_placements().len(), 3);
+
+        t.feed(&kitty_apc_control_only("a=d,d=p,p=2"));
+        let surviving: Vec<Option<u32>> = t
+            .live_placements()
+            .iter()
+            .map(|p| p.kitty_placement_id)
+            .collect();
+        // p=2 is gone; p=1 and p=3 survive (order preserved).
+        assert_eq!(surviving, vec![Some(1), Some(3)]);
+        // Image mapping kept — only the placement was deleted.
+        assert_eq!(t.kitty_image_id_lookup(7), Some(ImageId(99)));
+    }
+
+    #[test]
+    fn kitty_apc_a_d_all_removes_kitty_only_not_iterm() {
+        // a=d,d=a sweeps Kitty placements; iTerm / Cmd-Shift-I
+        // placements (those without a kitty_image_id) survive.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // iTerm-style placement (no kitty IDs).
+        t.insert_placement(ImageId(1), 0, 0, 1, 1, 0);
+        // Kitty placement.
+        t.register_kitty_image_id(5, ImageId(50));
+        t.feed(&kitty_apc_control_only("a=p,i=5,c=1,r=1"));
+        assert_eq!(t.live_placements().len(), 2);
+
+        t.feed(&kitty_apc_control_only("a=d,d=a"));
+        let remaining = t.live_placements();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].kitty_image_id, None);
+        // All Kitty mappings gone.
+        assert!(t.kitty_image_id_lookup(5).is_none());
+    }
+
+    #[test]
+    fn kitty_apc_referenced_image_ids_keeps_transmitted_only_images() {
+        // `a=t` registers an image-id mapping but creates no placement.
+        // The bare placement list would not reference the store id, so
+        // mark-and-sweep would drop the GPU image. The map's values
+        // need to make it into `referenced_image_ids` so the image
+        // survives until either `a=p` references it or `a=d` clears it.
+        let mut t = Terminal::new(80, 24, 100);
+        t.register_kitty_image_id(7, ImageId(99));
+        assert!(t.referenced_image_ids().contains(&ImageId(99)));
+    }
+
+    #[test]
+    fn kitty_apc_register_idempotent_overwrites_with_new_store_id() {
+        // Client retransmits the same `i=` with new pixels → mapping
+        // updates to the new store id. Both the new and stale ids
+        // appear in referenced until mark-and-sweep prunes the stale.
+        let mut t = Terminal::new(80, 24, 100);
+        t.register_kitty_image_id(7, ImageId(1));
+        t.register_kitty_image_id(7, ImageId(2));
+        assert_eq!(t.kitty_image_id_lookup(7), Some(ImageId(2)));
+        let refs = t.referenced_image_ids();
+        assert!(refs.contains(&ImageId(2)));
+        // The old id is no longer reachable through the map.
+        assert!(!refs.contains(&ImageId(1)));
     }
 
     #[test]
@@ -5766,6 +6221,8 @@ mod tests {
             z: 0,
             pixel_offset: (0, 0),
             src_rect: None,
+            kitty_image_id: None,
+            kitty_placement_id: None,
         };
         let grid_r = 10usize;
         let grid_c = 8usize;
@@ -5804,6 +6261,7 @@ mod tests {
         let mk = |top: isize, rows: u16| Placement {
             id: 1, image: ImageId(1), top_row: top, left_col: 0, rows, cols: 1, z: 0,
             pixel_offset: (0, 0), src_rect: None,
+            kitty_image_id: None, kitty_placement_id: None,
         };
         // Region [5..=9].
         // Placement at rows 3..=4 → bottom_row=5 == top → no overlap.
@@ -5859,6 +6317,7 @@ mod tests {
         let p_zero = Placement {
             id: 1, image: ImageId(1), top_row: 5, left_col: 0,
             rows: 1, cols: 1, z: 0, pixel_offset: (0, 0), src_rect: None,
+            kitty_image_id: None, kitty_placement_id: None,
         };
         let p_offset = Placement {
             pixel_offset: (999, -999), ..p_zero.clone()

@@ -3645,14 +3645,30 @@ impl State {
                 std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
                 up.label,
             );
+            // Kitty `a=t` / `a=T` may carry an `i=` id the client uses
+            // to refer back to this image via `a=p` (place) or `a=d`
+            // (delete). Register the mapping immediately so those ops
+            // resolve even before the decode completes.
+            if let Some(client_id) = up.kitty_image_id {
+                self.terminal.register_kitty_image_id(client_id, image_id);
+            }
             let (rows, cols) = up.cell_extent;
             let (row, col) = up.cell_anchor;
-            self.terminal.insert_placement(image_id, row, col, rows, cols, 0);
+            // `a=t` (transmit-only): no placement yet; the client will
+            // send `a=p` later to display. We still queue the upload
+            // so the decode runs and the store gets the pixels.
+            if up.display_immediately {
+                self.terminal.insert_placement(image_id, row, col, rows, cols, 0);
+            }
             self.pending_placements.push(PendingImagePlacement {
                 request: pending,
                 row,
                 col,
-                preplaced_image_id: Some(image_id),
+                preplaced_image_id: if up.display_immediately {
+                    Some(image_id)
+                } else {
+                    None
+                },
             });
         }
         // A placement just appeared; trigger a redraw so the (still-empty)
