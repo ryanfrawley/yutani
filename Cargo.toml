@@ -19,6 +19,8 @@ cgmath = "0.18.0"
 nix = { version = "0.27.1", features = ["process"] }
 arboard = "3"
 harfbuzz_rs = { version = "2", default-features = false, features = ["build-native-harfbuzz"] }
+image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64 = "0.21"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", default-features = false, features = ["winuser", "wingdi"] }

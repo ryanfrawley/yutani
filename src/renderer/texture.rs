@@ -29,6 +29,11 @@ impl Texture {
             label,
             view_formats: &[],
         });
+        // bytes-per-pixel from the format, so this works for R8 atlases and
+        // RGBA8 image uploads alike. Block-compressed formats aren't used here.
+        let bpp = format
+            .block_size(None)
+            .expect("from_memory only supports uncompressed formats");
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &texture,
@@ -39,7 +44,7 @@ impl Texture {
             bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(width),
+                bytes_per_row: Some(width * bpp),
                 rows_per_image: Some(height),
             },
             texture_size,
