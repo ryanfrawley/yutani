@@ -562,11 +562,50 @@ impl Terminal {
 
     /// Snapshot of placements anchored to the *live* grid (active screen).
     /// The renderer uses this each frame to build draw rectangles. Does NOT
-    /// include placements that have scrolled into scrollback — those are
-    /// only visible when the viewport offset pulls them back into view, and
-    /// that path lands in a later slice.
+    /// include placements that have scrolled into scrollback — for those use
+    /// `scrollback_placements_in_view`, which maps a scrollback-row anchor
+    /// onto a viewport row based on the current view_offset.
     pub fn live_placements(&self) -> &[Placement] {
         &self.active_grid().placements
+    }
+
+    /// Scrollback placements that intersect the visible scrollback strip,
+    /// rebased into viewport coordinates. Returned `Placement`s are clones
+    /// of the originals with `top_row` adjusted so the renderer can apply
+    /// the same `top_row * line_height + decorator_offset + scroll_y` math
+    /// it already uses for `live_placements()`. `top_row` may be negative
+    /// when the placement straddles the top of the viewport — that's fine,
+    /// the camera ortho clips it.
+    ///
+    /// Returns an empty Vec on the alt screen (scrollback is primary-only)
+    /// or when `view_offset == 0` (no scrollback visible). Intersection is
+    /// against `[0, viewport_rows)`; a placement entirely above the visible
+    /// scrollback strip or entirely below the live grid is filtered out.
+    pub fn scrollback_placements_in_view(
+        &self,
+        viewport_rows: usize,
+    ) -> Vec<Placement> {
+        if self.use_alternate || self.view_offset == 0 {
+            return Vec::new();
+        }
+        let sb_len = self.scrollback.len() as isize;
+        let view_off = self.view_offset as isize;
+        // Scrollback row sb_r appears at viewport row sb_r - (sb_len - view_off).
+        // Equivalently: shift = view_off - sb_len; viewport_row = sb_r + shift.
+        let shift = view_off - sb_len;
+        let vp_rows = viewport_rows as isize;
+        let mut out = Vec::new();
+        for sp in &self.scrollback_placements {
+            let top = sp.scrollback_row + shift;
+            let bottom = top + sp.placement.rows as isize;
+            if bottom <= 0 || top >= vp_rows {
+                continue;
+            }
+            let mut p = sp.placement.clone();
+            p.top_row = top;
+            out.push(p);
+        }
+        out
     }
 
     /// Union of ImageIds referenced by every live + scrollback placement,
@@ -3234,6 +3273,144 @@ mod tests {
         assert_eq!(sb.len(), 1);
         assert_eq!(sb[0].0, 0); // anchor at oldest scrollback row
         assert_eq!(sb[0].1.id, id);
+    }
+
+    // ---- scrollback_placements_in_view: viewport-row mapping ----
+    //
+    // The renderer uses this to draw images that have scrolled into history
+    // when the user scrolls back. The mapping puts scrollback row sb_r at
+    // viewport row sb_r - (sb_len - view_off). Tests below pin that down
+    // for the three interesting positions plus alt-screen / no-offset
+    // short-circuits.
+
+    #[test]
+    fn scrollback_in_view_empty_when_not_scrolled() {
+        // view_offset == 0: even with promoted placements, nothing renders
+        // through this path — the live grid (now empty of them) is what
+        // the user sees.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 2, 2);
+        t.feed("\x1b[2S");
+        assert_eq!(t.view_offset(), 0);
+        assert!(t.scrollback_placements_in_view(t.rows).is_empty());
+    }
+
+    #[test]
+    fn scrollback_in_view_empty_on_alt_screen() {
+        // Alt screen has no scrollback. Even if entries existed (they
+        // don't — alt promotions are blocked upstream), this accessor
+        // refuses to surface them.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 2, 2);
+        t.feed("\x1b[2S");
+        t.feed("\x1b[?1049h"); // enter alt screen
+        assert!(t.on_alt_screen());
+        assert!(t.scrollback_placements_in_view(t.rows).is_empty());
+    }
+
+    #[test]
+    fn scrollback_in_view_maps_anchor_to_viewport_row() {
+        // Image lands at oldest scrollback row (0). Scroll back by the
+        // full scrollback length and that row sits at the top of the
+        // viewport (viewport_row == 0).
+        let mut t = Terminal::new(20, 5, 100);
+        let id = place(&mut t, 1, 0, 0, 2, 2);
+        t.feed("\x1b[2S"); // promote to scrollback, sb_len now 2
+        assert_eq!(t.scrollback_len(), 2);
+        assert!(t.scroll_up(2));
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        assert_eq!(in_view.len(), 1);
+        assert_eq!(in_view[0].image.0, id);
+        assert_eq!(in_view[0].top_row, 0);
+        assert_eq!(in_view[0].rows, 2);
+    }
+
+    #[test]
+    fn scrollback_in_view_filters_two_distinct_rows() {
+        // Two placements at distinct scrollback rows. With view_offset=1
+        // only the most-recently-evicted (highest scrollback_row) is in
+        // the visible scrollback strip; the older one sits above row 0
+        // by more than its height and is filtered.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // promotes first
+        place(&mut t, 2, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // promotes second
+        assert_eq!(t.scrollback_len(), 2);
+        assert!(t.scroll_up(1));
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        assert_eq!(in_view.len(), 1);
+        assert_eq!(in_view[0].image.0, 2);
+        assert_eq!(in_view[0].top_row, 0);
+    }
+
+    #[test]
+    fn scrollback_in_view_straddles_live_boundary() {
+        // 2-row image promoted, then scroll back by 1. Its anchor row is
+        // one row above the viewport top but bottom_row=1 still spills
+        // into the visible area. The renderer relies on this — it draws
+        // the whole image, the camera ortho clips above row 0.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 2, 2);
+        t.feed("\x1b[2S");
+        assert!(t.scroll_up(1));
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        assert_eq!(in_view.len(), 1);
+        // sb_len=2, view_off=1 → shift=-1; sb_row=0 → viewport_row=-1
+        assert_eq!(in_view[0].top_row, -1);
+        assert_eq!(in_view[0].rows, 2);
+    }
+
+    #[test]
+    fn scrollback_in_view_filters_above_top() {
+        // Scroll back by 1 only, but image was promoted many rows ago.
+        // Anchor + height land entirely above viewport row 0 → filtered.
+        let mut t = Terminal::new(20, 5, 100);
+        place(&mut t, 1, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // promotes (scrollback_row = 0)
+        // Push more scrollback so view_offset=1 leaves the placement above.
+        // SU evicts the top row of the live grid into scrollback.
+        t.feed("\x1b[5S");
+        assert!(t.scrollback_len() >= 6);
+        assert!(t.scroll_up(1));
+        // sb_len>=6, view_off=1 → shift<=-5; sb_row=0 → top_row<=-5;
+        // bottom_row = top_row + 1 <= -4 → filtered.
+        assert!(t.scrollback_placements_in_view(t.rows).is_empty());
+    }
+
+    #[test]
+    fn scrollback_in_view_filters_below_grid() {
+        // Image at the newest scrollback row. Scroll all the way back: it
+        // slides off the bottom of the viewport (top_row >= viewport_rows)
+        // and gets filtered.
+        let mut t = Terminal::new(20, 5, 100);
+        for _ in 0..10 {
+            t.feed("\n");
+        }
+        place(&mut t, 1, 0, 0, 1, 1);
+        t.feed("\x1b[1S"); // newest scrollback row
+        let sb_len = t.scrollback_len();
+        assert!(sb_len > t.rows);
+        assert!(t.scroll_up(sb_len));
+        // view_off == sb_len → shift = 0. Newest sb_row = sb_len-1, so
+        // top_row = sb_len-1 >= viewport_rows → filtered.
+        assert!(t.scrollback_placements_in_view(t.rows).is_empty());
+    }
+
+    #[test]
+    fn scrollback_in_view_walks_back_into_view() {
+        // End-to-end: place + scroll into scrollback + walk back via
+        // scroll_up, then assert the placement reappears in the in-view
+        // list. Mirrors the user flow `kitty +kitten icat ; wheel up`.
+        let mut t = Terminal::new(20, 5, 100);
+        let id = place(&mut t, 1, 0, 0, 2, 2);
+        t.feed("\x1b[3S"); // image is gone from live; now in scrollback
+        assert!(t.live_placements().is_empty());
+        assert!(t.scrollback_placements_in_view(t.rows).is_empty()); // no scroll yet
+        assert!(t.scroll_up(3));
+        let in_view = t.scrollback_placements_in_view(t.rows);
+        assert_eq!(in_view.len(), 1);
+        assert_eq!(in_view[0].image.0, id);
     }
 
     #[test]

@@ -3878,9 +3878,27 @@ impl State {
         // the upcoming `&mut encoder` calls. Placements whose image was
         // already evicted (shouldn't happen with mark-and-sweep, but
         // defensible) are silently skipped.
+        //
+        // Two walks share the same pixel math: live placements (always)
+        // plus, when the user has scrolled history into view on the
+        // primary screen, scrollback placements rebased into viewport-row
+        // coords by `scrollback_placements_in_view`. Because that accessor
+        // returns `top_row` in viewport coords, the formula below
+        // (`top_row * line_height + decorator_offset + scroll_y`) makes
+        // images slide in lockstep with text during smooth-scroll.
+        let scrollback_draws = self
+            .terminal
+            .scrollback_placements_in_view(self.terminal.rows);
         let mut image_draws: Vec<renderer::images::ImageDraw<'_>> =
-            Vec::with_capacity(self.terminal.live_placements().len());
-        for p in self.terminal.live_placements() {
+            Vec::with_capacity(
+                self.terminal.live_placements().len() + scrollback_draws.len(),
+            );
+        let placement_iter = self
+            .terminal
+            .live_placements()
+            .iter()
+            .chain(scrollback_draws.iter());
+        for p in placement_iter {
             let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
             let x_px = WINDOW_PADDING + (p.left_col as f32) * cell_w;
             let y_px = WINDOW_PADDING
