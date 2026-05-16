@@ -18,6 +18,7 @@ use winit::{
     event_loop::EventLoopBuilder,
     event_loop::EventLoopWindowTarget,
     platform::macos::WindowBuilderExtMacOS,
+    platform::modifier_supplement::KeyEventExtModifierSupplement,
     window::{Window, WindowBuilder},
 };
 
@@ -2601,9 +2602,24 @@ impl State {
                             }
                         }
                     }
+                    // macOS Option-as-Meta: with Option held, winit reports the
+                    // layout-composed char (e.g. Option+A → "å"). For terminal
+                    // meta-bindings we want the base key, so `Option+A` sends
+                    // `ESC a` rather than `ESC 0xC3 0xA5`. `key_without_modifiers`
+                    // also resolves dead keys (Option+E → "e" instead of Dead('´')).
+                    let alt_stripped = self
+                        .modifiers
+                        .alt_key()
+                        .then(|| event.key_without_modifiers());
+                    let logical_key = alt_stripped.as_ref().unwrap_or(&event.logical_key);
+                    let text = if alt_stripped.is_some() {
+                        None
+                    } else {
+                        event.text.as_deref()
+                    };
                     let bytes = input::encode_key(
-                        &event.logical_key,
-                        event.text.as_deref(),
+                        logical_key,
+                        text,
                         self.modifiers,
                         self.terminal.app_cursor_keys(),
                     );
