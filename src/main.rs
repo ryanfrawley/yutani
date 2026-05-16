@@ -3516,6 +3516,19 @@ impl State {
         opted_in
     }
 
+    /// Convert a live placement's grid-coord `top_row` into the viewport
+    /// row the renderer should draw at, given the current scrollback
+    /// view offset. Mirrors what `extended_cell` does for cells: when the
+    /// user has pulled `view_offset` rows of history into the top of the
+    /// viewport, live content shifts down by `min(view_offset, rows)`.
+    ///
+    /// Scrollback placements come pre-shifted out of
+    /// `Terminal::scrollback_placements_in_view`, so this helper applies
+    /// only to live placements.
+    fn live_placement_viewport_row(top_row: isize, view_offset: usize, rows: usize) -> isize {
+        top_row + view_offset.min(rows) as isize
+    }
+
     /// Build the per-cell half-block override map for the upcoming vertex
     /// rebuild. Empty in the common case (images enabled and decoded), so
     /// the lookup in the cell loop is a single hash miss per cell.
@@ -3546,6 +3559,8 @@ impl State {
             return out;
         }
         let cols = self.terminal.cols;
+        let view_offset = self.terminal.view_offset();
+        let rows = self.terminal.rows;
         for p in self.terminal.live_placements() {
             let is_pending = self.image_store.is_pending(p.image);
             let gpu_ok = self.image_store.peek(p.image).is_some();
@@ -3559,9 +3574,12 @@ impl State {
                 // sub-slice that synthesizes a generic frame.
                 continue;
             };
+            // Grid → viewport row shift matches what cells get; see
+            // `live_placement_viewport_row`.
+            let top_vp = Self::live_placement_viewport_row(p.top_row, view_offset, rows);
             let cells = images::halfblock_cells(preview, p.rows, p.cols);
             for hb in cells {
-                let r = p.top_row + hb.row_offset as isize;
+                let r = top_vp + hb.row_offset as isize;
                 let c = p.left_col + hb.col_offset as isize;
                 // Clip to viewport — phantom rows above/below are still
                 // valid (`extended_cell` reads them), but a placement
@@ -4057,24 +4075,36 @@ impl State {
         // placements (always) plus, when the user has scrolled history
         // into view on the primary screen, scrollback placements rebased
         // into viewport-row coords by `scrollback_placements_in_view`.
-        // Because that accessor returns `top_row` in viewport coords, the
-        // formula below (`top_row * line_height + decorator_offset +
-        // scroll_y`) makes images slide in lockstep with text during
-        // smooth-scroll.
+        // The two walks differ in one thing: live placements carry GRID
+        // coords in `top_row`, while scrollback placements come pre-
+        // shifted into viewport coords. Live placements need the same
+        // grid→visual shift `update_vertices` gives cells (history rows
+        // fill the top of the viewport when `view_offset > 0`, pushing
+        // live content down); scrollback placements already have it baked
+        // in.
         let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
         if self.config.images_enabled {
+            let view_offset = self.terminal.view_offset();
+            let rows = self.terminal.rows;
             let scrollback_draws = self
                 .terminal
                 .scrollback_placements_in_view(self.terminal.rows);
             image_draws.reserve(
                 self.terminal.live_placements().len() + scrollback_draws.len(),
             );
-            let placement_iter = self
-                .terminal
-                .live_placements()
-                .iter()
-                .chain(scrollback_draws.iter());
-            for p in placement_iter {
+            // `(viewport_row, placement)` tuples — by the time the pixel
+            // math runs, the row index is in viewport coords. Live
+            // placements get the same shift `extended_cell` applies to
+            // cells (history rows push live content down); scrollback
+            // placements arrive pre-shifted from `scrollback_placements_in_view`.
+            let live_iter = self.terminal.live_placements().iter().map(|p| {
+                (
+                    Self::live_placement_viewport_row(p.top_row, view_offset, rows),
+                    p,
+                )
+            });
+            let scrollback_iter = scrollback_draws.iter().map(|p| (p.top_row, p));
+            for (viewport_row, p) in live_iter.chain(scrollback_iter) {
                 let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
@@ -4084,7 +4114,7 @@ impl State {
                     + p.pixel_offset.0 as f32;
                 let y_px = WINDOW_PADDING
                     + decorator_offset
-                    + (p.top_row as f32) * line_height
+                    + (viewport_row as f32) * line_height
                     + scroll_y
                     + p.pixel_offset.1 as f32;
                 let w_px = (p.cols as f32) * cell_w;
@@ -5211,6 +5241,40 @@ mod tests {
         // cleanup hasn't fired. Only honored when the user opts in.
         assert!(!State::should_halfblock(true, false, false, false));
         assert!(State::should_halfblock(true, true, false, false));
+    }
+
+    //
+    // Grid → viewport row shift for live image placements. Originally
+    // missed (placement rendered using grid row directly); when the user
+    // scrolled history into view, images stayed pinned to the viewport
+    // row they were initially drawn at while the surrounding text shifted
+    // down. The pure helper makes the math testable without firing up a
+    // GPU adapter.
+    //
+
+    #[test]
+    fn live_placement_viewport_row_passes_through_with_no_offset() {
+        // The no-scrollback-in-view common case — image at grid row 5 in
+        // a 24-row viewport renders at viewport row 5.
+        assert_eq!(State::live_placement_viewport_row(5, 0, 24), 5);
+    }
+
+    #[test]
+    fn live_placement_viewport_row_shifts_down_by_view_offset() {
+        // 3 scrollback rows pulled into view → live content shifts down 3.
+        assert_eq!(State::live_placement_viewport_row(5, 3, 24), 8);
+        // Negative grid rows (placement straddling above the viewport)
+        // shift the same way — clipping happens downstream.
+        assert_eq!(State::live_placement_viewport_row(-2, 3, 24), 1);
+    }
+
+    #[test]
+    fn live_placement_viewport_row_clamps_at_rows() {
+        // When `view_offset` exceeds the viewport height, the entire
+        // viewport is scrollback and live content is fully off-screen
+        // below. The shift saturates at `rows`, matching the cap
+        // `cursor_visual_row` and the cell iteration apply.
+        assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 24);
     }
 
     #[test]
