@@ -1685,25 +1685,43 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Rebuild the vertex/index buffers if they're stale, recording the cost
-    /// in `perf`. Called from the redraw handler before `render`.
+    /// Per-frame setup. Runs in the redraw handler between `update` (input
+    /// processing) and `render` (GPU encode). Resolves the image store's
+    /// async state, then rebuilds vertices if stale.
     ///
-    /// Polls pending image decodes *before* updating vertices so that any
-    /// placement whose decode just landed is correctly classified by the
-    /// half-block fallback path (which needs to know whether `Store::peek`
-    /// will return Some this frame). Without this ordering, a decode that
-    /// completed during this frame would be both half-block-rendered (from
-    /// stale "peek is None" data) and GPU-rendered (from `render`'s post-
-    /// poll image_draws), producing a one-frame ghost overlay.
-    fn flush_vertices(&mut self) {
-        // Image decodes resolve here so subsequent vertex / image-draw
-        // logic sees a consistent store state. `poll_pending_images` is
-        // cheap when there's nothing to drain.
+    /// The ordering matters: poll → retain → vertex build → render. Both
+    /// the vertex builder (half-block fallback path) and `render` (GPU
+    /// image_draws) consult `Store::peek` for the same set of placements.
+    /// If they disagreed on `peek`'s return value within a frame, a decode
+    /// that resolved between the two would either double-draw (half-block
+    /// behind GPU pixels) or vanish for a frame (vertex builder saw Some,
+    /// then mark-and-sweep dropped the slot before render). Doing both
+    /// store mutations before either consumer reads guarantees one snapshot
+    /// per frame.
+    ///
+    /// **Invariant:** no caller may mutate `terminal.placements` between
+    /// `prepare_frame` and `render` — `retain` has already been computed
+    /// against the snapshot we hand to `render`, and any new placement
+    /// would slip past it.
+    fn prepare_frame(&mut self) {
+        // Resolve worker decodes that completed since the last frame. May
+        // call `insert_placement` (deferred path success) or
+        // `remove_placements_with_image` (pre-placed path failure), both of
+        // which mark vertices dirty internally.
         self.poll_pending_images();
-        // Mark-and-sweep happens after poll so an image that just landed
-        // and is now referenced by a placement isn't immediately swept.
+        // Mark-and-sweep AFTER poll so a freshly-landed image referenced
+        // by a placement created in this same `poll_pending_images` call
+        // is kept alive.
         let referenced = self.terminal.referenced_image_ids();
         self.image_store.retain(&referenced);
+        self.flush_vertices();
+    }
+
+    /// Rebuild the vertex/index buffers if they're stale, recording the
+    /// cost in `perf`. Called from `prepare_frame`; production code should
+    /// not call this directly — the image-store snapshot has to be set up
+    /// first.
+    fn flush_vertices(&mut self) {
         if !self.vertices_dirty {
             return;
         }
@@ -4000,7 +4018,7 @@ impl State {
         let bg_index_range = 0..self.num_bg_indices;
         let fg_index_range = self.num_bg_indices..self.num_indices;
 
-        // `flush_vertices` (called by the redraw handler before `render`)
+        // `prepare_frame` (called by the redraw handler before `render`)
         // already polled the image store and ran mark-and-sweep, so the
         // store's state here matches what `update_vertices` saw. This
         // matters for the half-block fallback: vertex emission and image
@@ -4618,7 +4636,7 @@ async fn run() {
                         }
                         WindowEvent::RedrawRequested => {
                             state.update();
-                            state.flush_vertices();
+                            state.prepare_frame();
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
