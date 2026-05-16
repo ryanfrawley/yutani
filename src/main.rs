@@ -6,6 +6,7 @@ mod renderer;
 
 mod ansi;
 mod gpu;
+mod images;
 mod input;
 mod palette;
 mod shaper;
@@ -159,6 +160,42 @@ struct Config {
     /// (only empty terminal area gets scanlines). Has no effect when
     /// `glow_scanlines_skip_primary_bg` is off.
     glow_scanlines_content_attenuation: f32,
+    /// Master switch for the image-placement feature. When false, the
+    /// Cmd-Shift-I keybind and the `YUTANI_TEST_IMAGE` startup hook
+    /// silently no-op, and image-protocol payloads (once parsers land
+    /// in phase 2) will be discarded. The render pipeline itself stays
+    /// loaded — there's no measurable cost when no placements exist.
+    images_enabled: bool,
+    /// Hard upper bound on the total bytes the image `Store` holds. New
+    /// uploads past this cap are refused (logged as BudgetExceeded);
+    /// mark-and-sweep keeps actually-used images alive. 0 effectively
+    /// disables image residency. Stored as megabytes so the config file
+    /// stays readable.
+    images_memory_cap_mb: usize,
+    /// Per-decode rejection threshold. A header-check inside
+    /// `decode_to_rgba` fires before pixel allocation, so a malicious
+    /// 100MB-pixel PNG is rejected without touching memory. Default
+    /// 16M pixels = 4096×4096 — fits any sane screenshot.
+    images_max_pixels: u64,
+    /// Per-decode deadline. The worker can't be interrupted mid-decode,
+    /// but a pending request older than this is dropped on the main
+    /// thread and the late result is discarded. Protects against the
+    /// queue backing up when a parser-driven payload hits a slow path.
+    images_decode_timeout_ms: u64,
+    /// When false, placements that fully scroll off the top of the
+    /// primary grid are dropped instead of promoted to scrollback. Saves
+    /// memory in long-running shells with lots of image traffic; the
+    /// trade-off is that scrolling back into history doesn't recover the
+    /// image. (Scrollback rendering of placements isn't implemented in
+    /// phase 1 anyway, so the toggle is mostly about retention cost
+    /// today.)
+    images_in_scrollback: bool,
+    /// Sampler choice for new image uploads: "linear" smooths under
+    /// scaling, "nearest" preserves crisp pixel edges (useful for
+    /// pixel-art / sprite content). Existing GpuImages keep whichever
+    /// sampler their bind group was built with — a flip applies to
+    /// subsequent decodes only.
+    images_filter: String,
 }
 
 impl Config {
@@ -192,6 +229,12 @@ impl Config {
             glow_scanline_color_dark: renderer::glow::DEFAULT_SCANLINE_COLOR_DARK,
             glow_scanlines_skip_primary_bg: false,
             glow_scanlines_content_attenuation: renderer::glow::DEFAULT_CONTENT_SCANLINE_ATTENUATION,
+            images_enabled: true,
+            images_memory_cap_mb: images::DEFAULT_CAP_BYTES / (1024 * 1024),
+            images_max_pixels: 16 * 1024 * 1024,
+            images_decode_timeout_ms: 2000,
+            images_in_scrollback: true,
+            images_filter: "linear".to_string(),
         }
     }
 
@@ -266,6 +309,30 @@ impl Config {
                 },
                 "glow_scanlines_content_attenuation" => if let Ok(x) = v.parse::<f32>() {
                     c.glow_scanlines_content_attenuation = x.clamp(0.0, 1.0);
+                },
+                "images_enabled" => if let Ok(x) = v.parse() { c.images_enabled = x; },
+                "images_memory_cap_mb" => if let Ok(x) = v.parse::<usize>() {
+                    c.images_memory_cap_mb = x;
+                },
+                "images_max_pixels" => if let Ok(x) = v.parse::<u64>() {
+                    // Cap at u32::MAX^2 wouldn't fit a meaningful image
+                    // anyway; just protect against zero by clamping low.
+                    c.images_max_pixels = x.max(1);
+                },
+                "images_decode_timeout_ms" => if let Ok(x) = v.parse::<u64>() {
+                    // 50ms floor — anything lower defeats the worker since
+                    // even a tiny PNG decode takes a millisecond or two.
+                    c.images_decode_timeout_ms = x.max(50);
+                },
+                "images_in_scrollback" => if let Ok(x) = v.parse() {
+                    c.images_in_scrollback = x;
+                },
+                "images_filter" => {
+                    if v == "linear" || v == "nearest" {
+                        c.images_filter = v.to_string();
+                    }
+                    // Silently keep the default on unknown values — same
+                    // contract as the `color_scheme` slot above.
                 },
                 _ => (),
             }
@@ -343,6 +410,20 @@ impl Config {
             self.glow_scanlines_skip_primary_bg,
             self.glow_scanlines_content_attenuation,
         ));
+        s.push_str(&format!(
+            "images_enabled = {}\n\
+             images_memory_cap_mb = {}\n\
+             images_max_pixels = {}\n\
+             images_decode_timeout_ms = {}\n\
+             images_in_scrollback = {}\n\
+             images_filter = {}\n",
+            self.images_enabled,
+            self.images_memory_cap_mb,
+            self.images_max_pixels,
+            self.images_decode_timeout_ms,
+            self.images_in_scrollback,
+            self.images_filter,
+        ));
         s
     }
 }
@@ -388,6 +469,26 @@ impl SceneTarget {
     }
 }
 
+/// Where an in-flight image decode is supposed to land once the worker
+/// thread finishes. Two modes:
+///
+/// - **Deferred (Cmd-Shift-I path):** `preplaced_image_id == None`. The
+///   placement hasn't been created yet; `poll_pending_images` computes
+///   cell extent from the image's pixel size and calls
+///   `Terminal::insert_placement` on success. Failure just logs.
+///
+/// - **Pre-placed (OSC 1337 path):** `preplaced_image_id == Some(id)`. The
+///   placement is already in `Grid::placements` because the OSC handler
+///   needed to advance the cursor synchronously. Success is a no-op (the
+///   renderer's next `peek` finds the freshly-uploaded pixels); failure
+///   calls `Terminal::remove_placements_with_image` to drop the orphan.
+struct PendingImagePlacement {
+    request: images::PendingId,
+    row: isize,
+    col: isize,
+    preplaced_image_id: Option<images::ImageId>,
+}
+
 struct State {
     gpu: gpu::GpuContext,
 
@@ -417,6 +518,20 @@ struct State {
     strip_vertex_buffer: wgpu::Buffer,
     strip_index_buffer: wgpu::Buffer,
     num_strip_indices: u32,
+    /// Textured-quad pipeline for image placements. Owns the per-frame
+    /// vertex/index buffers and is invoked once per frame between the bg
+    /// and fg cell passes (when there are placements to draw).
+    image_pipeline: renderer::images::ImagePipeline,
+    /// Decode + GPU residency cache for images. Populated by parsers and
+    /// the debug-keybind path; queried by the renderer via `Store::peek`.
+    /// Mark-and-sweep eviction keyed on the live + scrollback placement
+    /// set runs at the start of each `render()`.
+    image_store: images::Store,
+    /// Cell anchors waiting on async decode. When the worker finishes a
+    /// decode and `Store::poll` yields the result, we match it back by
+    /// `PendingId` and call `Terminal::insert_placement` at the stored row
+    /// / col. Survives the in-flight decode interval — typically <100ms.
+    pending_placements: Vec<PendingImagePlacement>,
     blur: renderer::blur::BlurChain,
     /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
     /// always rendered to the offscreen `blur.scene` texture so the glow
@@ -1464,6 +1579,16 @@ impl State {
             "scanline overlay mask (bg + fg)",
         );
 
+        // Image pipeline — drawn into `blur.scene` between bg cells and the
+        // fg layer, so images participate in glow + edge blur the same way
+        // colored bg cells do.
+        let image_pipeline = renderer::images::ImagePipeline::new(
+            &gpu.device,
+            gpu.config.format,
+            &camera_bind_group_layout,
+        );
+        let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
+
         Self {
             window,
             gpu,
@@ -1478,6 +1603,9 @@ impl State {
             strip_vertex_buffer,
             strip_index_buffer,
             num_strip_indices: 0,
+            image_pipeline,
+            image_store,
+            pending_placements: Vec::new(),
             blur,
             glow,
             glow_fg,
@@ -2715,6 +2843,7 @@ impl State {
         );
         self.terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
+        self.sync_terminal_cell_size();
         self.resize_buffers();
         self.cursor_anim = None;
         self.invalidate();
@@ -3150,6 +3279,203 @@ impl State {
 
     /// Read the system clipboard and write it to the PTY, wrapped in
     /// bracketed-paste markers if the host has enabled them.
+    /// Read `path` from disk and fire a decode job. The placement on the
+    /// active grid lands later, when `poll_pending_images` (called each
+    /// frame) sees the worker's result and computes the cell extent from
+    /// the now-known image dimensions + current font metrics.
+    fn load_image_at_cell(&mut self, path: &str, row: isize, col: isize, label: &str) {
+        if !self.config.images_enabled {
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("image load failed: {path}: {e}");
+                return;
+            }
+        };
+        // Cmd-Shift-I uses the deferred-placement path because no cell
+        // extent was specified — `poll_pending_images` computes it from
+        // the decoded image's pixel dimensions. The pre-allocated
+        // ImageId is therefore discarded here; the OSC 1337 path uses it.
+        let (pending, _image_id) = self.image_store.request_insert(
+            bytes,
+            self.config.images_max_pixels,
+            std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
+            Some(label.to_string()),
+        );
+        self.pending_placements.push(PendingImagePlacement {
+            request: pending,
+            row,
+            col,
+            preplaced_image_id: None,
+        });
+        // Tick the loop until the decode completes (or times out).
+        // Otherwise an idle window would never re-enter `render()` to call
+        // `poll_pending_images`. The follow-up redraw in
+        // `poll_pending_images` keeps polling until pending_placements
+        // drains.
+        self.window.request_redraw();
+    }
+
+    /// Drain finished decode results from `image_store.poll` and turn the
+    /// successful ones into placements. Errors log and the pending entry
+    /// is dropped; the render loop is otherwise unaffected.
+    fn poll_pending_images(&mut self) {
+        if self.pending_placements.is_empty() {
+            return;
+        }
+        let nearest = self.config.images_filter == "nearest";
+        let results = self.image_store.poll(
+            &self.image_pipeline,
+            &self.gpu.device,
+            &self.gpu.queue,
+            nearest,
+        );
+        // CRITICAL: must request_redraw if there are still pending decodes,
+        // even when this poll returned empty — otherwise the render loop
+        // stalls and the request only completes when some unrelated event
+        // (mouse move, keystroke) wakes the loop. Symptom: decode "timeouts"
+        // at multi-second elapsed times that don't match the configured
+        // timeout. Has to happen before the early-return when no results.
+        if !self.pending_placements.is_empty() || !results.is_empty() {
+            self.window.request_redraw();
+        }
+        if results.is_empty() {
+            return;
+        }
+        let metrics = self.font.face().size_metrics().unwrap();
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as u32;
+        let cell_w = self.font.cell_width() as u32;
+        let mut any_placed = false;
+        for (pending_id, outcome) in results {
+            let Some(i) = self
+                .pending_placements
+                .iter()
+                .position(|p| p.request == pending_id)
+            else {
+                // Result with no pending entry — caller did request_insert
+                // but never registered a placement (shouldn't happen in
+                // current code paths). Drop the GPU upload on the floor.
+                continue;
+            };
+            let pp = self.pending_placements.remove(i);
+            match (outcome, pp.preplaced_image_id) {
+                // Deferred path success: compute extent from pixel dims
+                // and create the placement now.
+                (Ok(image_id), None) => {
+                    let img = self
+                        .image_store
+                        .peek(image_id)
+                        .expect("just-inserted image");
+                    let rows = (img.height_px + line_height - 1) / line_height;
+                    let cols = (img.width_px + cell_w - 1) / cell_w;
+                    let rows = rows.clamp(1, u16::MAX as u32) as u16;
+                    let cols = cols.clamp(1, u16::MAX as u32) as u16;
+                    self.terminal
+                        .insert_placement(image_id, pp.row, pp.col, rows, cols, 0);
+                    any_placed = true;
+                }
+                // Pre-placed path success: the placement already exists
+                // referencing this image_id; renderer's next `peek` will
+                // start drawing pixels. Just force a redraw.
+                (Ok(_image_id), Some(_)) => {
+                    any_placed = true;
+                }
+                // Deferred path failure: nothing to clean up — placement
+                // was never created.
+                (Err(e), None) => eprintln!("image decode failed: {e}"),
+                // Pre-placed path failure: drop the orphaned placement so
+                // the user doesn't stare at a blank space forever.
+                (Err(e), Some(image_id)) => {
+                    eprintln!("image decode failed: {e}");
+                    let removed = self.terminal.remove_placements_with_image(image_id);
+                    if removed > 0 {
+                        any_placed = true; // grid changed; redraw
+                    }
+                }
+            }
+        }
+        if any_placed {
+            self.window.request_redraw();
+        }
+        // (The "keep ticking while pending" redraw was issued up-front,
+        // before the early-return for empty `results` — see the comment
+        // there. Avoid double-requesting the same frame.)
+    }
+
+    /// Wrap `Terminal::feed` so any OSC-1337 payloads parsed in this PTY
+    /// chunk are turned into real Store reservations + Placements before
+    /// the next chunk is processed. Without this, a follow-up chunk
+    /// containing scroll/text could mutate the grid between cursor
+    /// advance and placement insertion — leaving the placement at a
+    /// stale anchor. See sub-slice P2.4 design notes.
+    fn feed_terminal(&mut self, bytes: &str) {
+        self.terminal.feed(bytes);
+        self.drain_pending_image_uploads();
+    }
+
+    /// Pull every iTerm2 OSC-1337 (and future protocol) payload off the
+    /// Terminal's outbox, fire a decode job per upload with the
+    /// pre-allocated ImageId, and insert the placement at the cell
+    /// anchor the parser captured. Placement creation happens *before*
+    /// the worker finishes the decode; `Store::peek` returns `None`
+    /// until then so the renderer skips drawing for one or two frames.
+    fn drain_pending_image_uploads(&mut self) {
+        if !self.config.images_enabled {
+            // Drain anyway so the queue doesn't grow unboundedly if the
+            // config is toggled at runtime.
+            let _ = self.terminal.take_pending_image_uploads();
+            return;
+        }
+        let uploads = self.terminal.take_pending_image_uploads();
+        if uploads.is_empty() {
+            return;
+        }
+        for up in uploads {
+            let (pending, image_id) = self.image_store.request_insert(
+                up.bytes,
+                self.config.images_max_pixels,
+                std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
+                up.label,
+            );
+            let (rows, cols) = up.cell_extent;
+            let (row, col) = up.cell_anchor;
+            self.terminal.insert_placement(image_id, row, col, rows, cols, 0);
+            self.pending_placements.push(PendingImagePlacement {
+                request: pending,
+                row,
+                col,
+                preplaced_image_id: Some(image_id),
+            });
+        }
+        // A placement just appeared; trigger a redraw so the (still-empty)
+        // reservation gets a chance to fill on the next poll.
+        self.window.request_redraw();
+    }
+
+    /// Push current font cell metrics into the terminal so the OSC-1337
+    /// sizing math can resolve `Npx` / `N%` / `Auto` specs. Called on
+    /// init and on every font-size change.
+    fn sync_terminal_cell_size(&mut self) {
+        let metrics = self.font.face().size_metrics().unwrap();
+        let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
+        let cell_w = self.font.cell_width() as u32;
+        self.terminal.set_cell_size_px(cell_w, line_h);
+    }
+
+    /// Path used by the Cmd-Shift-I keybind. Env var override beats the
+    /// config-dir default so a quick `YUTANI_DEBUG_IMAGE=foo.png cargo run`
+    /// works without touching the file system.
+    fn debug_image_path() -> Option<std::path::PathBuf> {
+        if let Ok(p) = std::env::var("YUTANI_DEBUG_IMAGE") {
+            return Some(std::path::PathBuf::from(p));
+        }
+        let mut p = config_dir()?;
+        p.push("debug_image.png");
+        Some(p)
+    }
+
     fn paste_from_clipboard(&self) {
         let text = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
             Ok(s) => s,
@@ -3384,6 +3710,27 @@ impl State {
                                 }
                                 return true;
                             }
+                            // Cmd-Shift-I: load and place a debug image at
+                            // the cursor. Path comes from `YUTANI_DEBUG_IMAGE`
+                            // or `~/.config/yutani/debug_image.png`. Silent
+                            // no-op (with stderr message) if neither exists.
+                            if self.modifiers.shift_key()
+                                && (s.eq_ignore_ascii_case("i"))
+                            {
+                                if let Some(path) = Self::debug_image_path() {
+                                    let cur = self.terminal.cursor();
+                                    let row = cur.row as isize;
+                                    let col = cur.col as isize;
+                                    let path_str = path.to_string_lossy().to_string();
+                                    self.load_image_at_cell(
+                                        &path_str,
+                                        row,
+                                        col,
+                                        "debug image (Cmd-Shift-I)",
+                                    );
+                                }
+                                return true;
+                            }
                             // Cmd-[ / Cmd-] tune the dual-Kawase iteration
                             // count live so the user can scrub through blur
                             // radii without recompiling.
@@ -3493,6 +3840,65 @@ impl State {
         let bg_index_range = 0..self.num_bg_indices;
         let fg_index_range = self.num_bg_indices..self.num_indices;
 
+        // Finalize any image decodes that completed since the last frame —
+        // this calls `insert_placement` for successes and frees the
+        // pending slot in either outcome. Runs before mark-and-sweep so
+        // the new image isn't immediately reclaimed.
+        self.poll_pending_images();
+
+        // Mark-and-sweep on the image store: drop any image whose last
+        // placement has gone away (scrolled past scrollback, full reset,
+        // alt-screen wipe, etc.). One-frame-deferred — invisible at frame
+        // rates we care about.
+        let referenced = self.terminal.referenced_image_ids();
+        self.image_store.retain(&referenced);
+
+        // Build per-frame image draw list from `live_placements()`. Cell
+        // anchor → pixel rect uses the same font metrics + decorator_offset
+        // + scroll_y that `update_vertices` applies to cell quads, so
+        // images scroll smoothly alongside text.
+        let metrics = self.font.face().size_metrics().unwrap();
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+        let cell_w = self.font.cell_width() as f32;
+        let view_offset = self.terminal.view_offset() as f32;
+        let scrollback_len = if self.terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.terminal.scrollback_len() as f32
+        };
+        let dist_from_bottom = view_offset * line_height + self.scroll_y as f32;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y as f32;
+        let near = (dist_from_bottom / line_height)
+            .min(dist_from_top / line_height)
+            .clamp(0.0, 1.0);
+        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        let scroll_y = self.scroll_y as f32;
+
+        // Resolve store entries up front so the borrow can live alongside
+        // the upcoming `&mut encoder` calls. Placements whose image was
+        // already evicted (shouldn't happen with mark-and-sweep, but
+        // defensible) are silently skipped.
+        let mut image_draws: Vec<renderer::images::ImageDraw<'_>> =
+            Vec::with_capacity(self.terminal.live_placements().len());
+        for p in self.terminal.live_placements() {
+            let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
+            let x_px = WINDOW_PADDING + (p.left_col as f32) * cell_w;
+            let y_px = WINDOW_PADDING
+                + decorator_offset
+                + (p.top_row as f32) * line_height
+                + scroll_y;
+            let w_px = (p.cols as f32) * cell_w;
+            let h_px = (p.rows as f32) * line_height;
+            image_draws.push(renderer::images::ImageDraw {
+                image: gpu_img,
+                x_px,
+                y_px,
+                w_px,
+                h_px,
+            });
+        }
+        let has_images = !image_draws.is_empty();
+
         let grid_pipeline = if self.wireframe {
             self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
         } else {
@@ -3531,14 +3937,42 @@ impl State {
         };
 
         if !needs_offscreen {
-            // Fast path.
-            draw_grid(
-                &mut encoder,
-                &view,
-                wgpu::LoadOp::Clear(clear),
-                0..self.num_indices,
-                "scene pass",
-            );
+            // Fast path. When no image is on screen we issue the original
+            // single grid pass; when one is, we split into bg + image + fg
+            // so glyphs land on top of the image. The one-extra-pass cost
+            // is paid only on frames that actually draw images.
+            if has_images {
+                draw_grid(
+                    &mut encoder,
+                    &view,
+                    wgpu::LoadOp::Clear(clear),
+                    bg_index_range.clone(),
+                    "scene bg pass (fast+img)",
+                );
+                self.image_pipeline.render(
+                    &mut encoder,
+                    &self.gpu.queue,
+                    &self.camera_bind_group,
+                    &view,
+                    wgpu::LoadOp::Load,
+                    &image_draws,
+                );
+                draw_grid(
+                    &mut encoder,
+                    &view,
+                    wgpu::LoadOp::Load,
+                    fg_index_range.clone(),
+                    "scene fg pass (fast+img)",
+                );
+            } else {
+                draw_grid(
+                    &mut encoder,
+                    &view,
+                    wgpu::LoadOp::Clear(clear),
+                    0..self.num_indices,
+                    "scene pass",
+                );
+            }
             // Content overlay, fast path: separate render pass on the
             // swapchain with LoadOp::Load so it darkens what we just
             // drew. Only entered when scanlines are enabled but glow
@@ -3571,6 +4005,20 @@ impl State {
                 bg_index_range,
                 "scene bg pass",
             );
+            // Pass 1b: image placements → bg scene (composite over bg
+            // cells). Putting images in `blur.scene` means glow and edge
+            // blur treat them as scene content; fg glyphs that overlap
+            // an image will still composite on top via the next pass.
+            if has_images {
+                self.image_pipeline.render(
+                    &mut encoder,
+                    &self.gpu.queue,
+                    &self.camera_bind_group,
+                    &self.blur.scene.view,
+                    wgpu::LoadOp::Load,
+                    &image_draws,
+                );
+            }
             // Pass 2: fg quads → fg scene. Transparent clear so anything
             // the fg layer doesn't touch shows the bg layer through.
             draw_grid(
@@ -3672,13 +4120,41 @@ impl State {
             }
         } else {
             // Strip-only path: legacy single-scene render + blur + composite.
-            draw_grid(
-                &mut encoder,
-                &self.blur.scene.view,
-                wgpu::LoadOp::Clear(clear),
-                0..self.num_indices,
-                "scene pass",
-            );
+            // When images are on screen we split the grid pass into bg + fg
+            // so the image quads land between them — same trick as the fast
+            // path. Otherwise we keep the original single-pass behaviour.
+            if has_images {
+                draw_grid(
+                    &mut encoder,
+                    &self.blur.scene.view,
+                    wgpu::LoadOp::Clear(clear),
+                    bg_index_range,
+                    "scene bg pass (strip+img)",
+                );
+                self.image_pipeline.render(
+                    &mut encoder,
+                    &self.gpu.queue,
+                    &self.camera_bind_group,
+                    &self.blur.scene.view,
+                    wgpu::LoadOp::Load,
+                    &image_draws,
+                );
+                draw_grid(
+                    &mut encoder,
+                    &self.blur.scene.view,
+                    wgpu::LoadOp::Load,
+                    fg_index_range,
+                    "scene fg pass (strip+img)",
+                );
+            } else {
+                draw_grid(
+                    &mut encoder,
+                    &self.blur.scene.view,
+                    wgpu::LoadOp::Clear(clear),
+                    0..self.num_indices,
+                    "scene pass",
+                );
+            }
             self.blur.run(&mut encoder);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3801,6 +4277,10 @@ async fn run() {
             }
         }
     }
+    // Match the NSAppearance to the palette so the title-bar text the OS
+    // draws over our transparent chrome reads against the actual bg —
+    // otherwise dark schemes render black "Terminal" text on a dark fill.
+    window.set_theme(Some(theme_for_bg(palette::get().background)));
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
     // Build the rustybuzz shaper alongside the FreeType font. We keep one
@@ -3904,6 +4384,16 @@ async fn run() {
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
+    state
+        .terminal
+        .set_keep_placements_in_scrollback(state.config.images_in_scrollback);
+    state.sync_terminal_cell_size();
+    // Developer smoke-test hook: drop a placement at the top-left on
+    // startup if `YUTANI_TEST_IMAGE` is set. Goes through the same path
+    // as the Cmd-Shift-I keybind so both are exercised together.
+    if let Ok(path) = std::env::var("YUTANI_TEST_IMAGE") {
+        state.load_image_at_cell(&path, 0, 0, "YUTANI_TEST_IMAGE");
+    }
     state.invalidate();
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
@@ -3914,7 +4404,7 @@ async fn run() {
                 app_window::CustomEvent::PtyInput(z) => {
                     let bytes = z.len();
                     let t0 = std::time::Instant::now();
-                    state.terminal.feed(&z);
+                    state.feed_terminal(&z);
                     let reply = state.terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
@@ -4054,6 +4544,20 @@ fn format_hex_rgb(c: [f32; 4]) -> String {
     format!("0x{:02x}{:02x}{:02x}", r, g, b)
 }
 
+/// Pick a window NSAppearance to match a background color. Title-bar text is
+/// drawn by the OS using that appearance, so a dark scheme must report Dark
+/// or "Terminal" comes out black on near-black.
+fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
+    // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray
+    // (sRGB 0.5). Below that, dark chrome reads better.
+    let luma = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
+    if luma < 0.18 {
+        winit::window::Theme::Dark
+    } else {
+        winit::window::Theme::Light
+    }
+}
+
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;
     wgpu::Color {
@@ -4081,6 +4585,28 @@ mod tests {
 
     fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
         approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    #[test]
+    fn theme_for_bg_picks_dark_on_dark_palette() {
+        // near-black bg (linear) → Dark so the OS draws light title text.
+        let bg = [0.02, 0.02, 0.02, 1.0];
+        assert_eq!(theme_for_bg(bg), winit::window::Theme::Dark);
+    }
+
+    #[test]
+    fn theme_for_bg_picks_light_on_light_palette() {
+        // white default bg → Light, the original behavior.
+        let bg = [1.0, 1.0, 1.0, 1.0];
+        assert_eq!(theme_for_bg(bg), winit::window::Theme::Light);
+    }
+
+    #[test]
+    fn theme_for_bg_treats_dark_blue_as_dark() {
+        // Solarized-dark-ish background: not pure black but well below
+        // perceptual midgray — must still trigger the dark chrome.
+        let bg = [0.0, 0.05, 0.07, 1.0];
+        assert_eq!(theme_for_bg(bg), winit::window::Theme::Dark);
     }
 
     /// Build a `CursorAnim` whose `started_at` is back-dated so that
@@ -4336,6 +4862,67 @@ mod tests {
         assert!(parsed.glow_scanlines_content);
         assert!(approx_eq(parsed.glow_scanlines_content_strength, 0.40));
         assert!(parsed.glow_scanlines_skip_primary_bg);
+    }
+
+    #[test]
+    fn config_image_defaults_match_design() {
+        let c = Config::defaults();
+        assert!(c.images_enabled);
+        assert!(c.images_in_scrollback);
+        assert_eq!(c.images_memory_cap_mb, 256);
+        assert_eq!(c.images_max_pixels, 16 * 1024 * 1024);
+        assert_eq!(c.images_decode_timeout_ms, 2000);
+        assert_eq!(c.images_filter, "linear");
+    }
+
+    #[test]
+    fn config_round_trip_preserves_image_fields() {
+        let mut c = Config::defaults();
+        c.images_enabled = false;
+        c.images_in_scrollback = false;
+        c.images_memory_cap_mb = 128;
+        c.images_max_pixels = 8 * 1024 * 1024;
+        c.images_decode_timeout_ms = 500;
+        c.images_filter = "nearest".into();
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(!parsed.images_enabled);
+        assert!(!parsed.images_in_scrollback);
+        assert_eq!(parsed.images_memory_cap_mb, 128);
+        assert_eq!(parsed.images_max_pixels, 8 * 1024 * 1024);
+        assert_eq!(parsed.images_decode_timeout_ms, 500);
+        assert_eq!(parsed.images_filter, "nearest");
+    }
+
+    #[test]
+    fn config_image_decode_timeout_floor() {
+        // 50ms floor — anything lower defeats the worker since even a
+        // tiny PNG takes a millisecond or two to decode.
+        let parsed = Config::parse_str("images_decode_timeout_ms = 0\n");
+        assert_eq!(parsed.images_decode_timeout_ms, 50);
+        let parsed = Config::parse_str("images_decode_timeout_ms = 10\n");
+        assert_eq!(parsed.images_decode_timeout_ms, 50);
+    }
+
+    #[test]
+    fn config_image_max_pixels_floor_avoids_zero() {
+        // Zero would disable decoding entirely without an obvious error;
+        // we clamp to at least 1 pixel so the rejection path stays
+        // observable.
+        let parsed = Config::parse_str("images_max_pixels = 0\n");
+        assert_eq!(parsed.images_max_pixels, 1);
+    }
+
+    #[test]
+    fn config_image_filter_rejects_unknown_value() {
+        let parsed = Config::parse_str("images_filter = bicubic\n");
+        // Unknown values keep the default — matches `color_scheme` semantics.
+        assert_eq!(parsed.images_filter, "linear");
+    }
+
+    #[test]
+    fn config_image_invalid_bool_keeps_default() {
+        let parsed = Config::parse_str("images_enabled = banana\n");
+        assert!(parsed.images_enabled);
     }
 
     #[test]
