@@ -84,11 +84,17 @@ impl Style {
 pub struct Cell {
     pub ch: char,
     pub style: Style,
+    /// Kitty virtual-placement image id when this cell holds a
+    /// U+10EEEE placeholder. The renderer scans for these to
+    /// reconstruct the per-image bounding box and draw the tile.
+    /// `None` for every other cell (the common case), so the existing
+    /// `Cell::new(' ', _)` defaults are unchanged.
+    pub placeholder_image_id: Option<u32>,
 }
 
 impl Cell {
     pub fn new(ch: char, style: Style) -> Self {
-        Self { ch, style }
+        Self { ch, style, placeholder_image_id: None }
     }
 }
 

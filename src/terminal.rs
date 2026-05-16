@@ -690,6 +690,51 @@ impl Terminal {
         self.kitty_image_ids.get(&client_id).copied()
     }
 
+    /// Scan the active grid for Kitty virtual-placement cells (U+10EEEE
+    /// with an encoded image id) and return one bounding box per
+    /// distinct image id. The renderer draws each image into its box,
+    /// reusing the existing image-pipeline path.
+    ///
+    /// MVP simplification: cells encoding the same image id are merged
+    /// into a single bounding box. Real Kitty uses diacritics on the
+    /// placeholder char to position sub-tiles within an image; we don't
+    /// decode those yet, so multiple instances of the same image render
+    /// as one merged rect. Works for the common nvim `image.nvim` /
+    /// `snacks.image` pattern of one image per id.
+    ///
+    /// Returns `(client_image_id, top_row, left_col, rows, cols)`.
+    pub fn kitty_placeholder_bboxes(&self) -> Vec<(u32, isize, isize, u16, u16)> {
+        use std::collections::HashMap;
+        // Per-image: min/max row/col observed.
+        let mut bboxes: HashMap<u32, (isize, isize, isize, isize)> = HashMap::new();
+        let grid = self.active_grid();
+        for r in 0..grid.rows {
+            for c in 0..grid.cols {
+                let cell = grid.get(r, c);
+                let Some(id) = cell.placeholder_image_id else { continue };
+                let r = r as isize;
+                let c = c as isize;
+                bboxes
+                    .entry(id)
+                    .and_modify(|b| {
+                        if r < b.0 { b.0 = r; }
+                        if c < b.1 { b.1 = c; }
+                        if r > b.2 { b.2 = r; }
+                        if c > b.3 { b.3 = c; }
+                    })
+                    .or_insert((r, c, r, c));
+            }
+        }
+        bboxes
+            .into_iter()
+            .map(|(id, (top, left, bottom, right))| {
+                let rows = (bottom - top + 1) as u16;
+                let cols = (right - left + 1) as u16;
+                (id, top, left, rows, cols)
+            })
+            .collect()
+    }
+
     /// Remove every placement that references `image_id`, across both
     /// grids and scrollback. Returns the number removed. Used by main.rs
     /// on decode failure: the placement was inserted optimistically at
@@ -1283,7 +1328,14 @@ impl Terminal {
             self.cursor.wrap_pending = false;
             self.line_feed_no_cr();
         }
-        let cell = Cell::new(ch, self.cursor.style);
+        let mut cell = Cell::new(ch, self.cursor.style);
+        // Kitty virtual placement: U+10EEEE is the placeholder
+        // codepoint. The image id is encoded in the cell's foreground
+        // color (24-bit truecolor); the renderer scans for these
+        // cells and reconstructs the per-image bounding box.
+        if ch == '\u{10EEEE}' {
+            cell.placeholder_image_id = decode_kitty_placeholder_image_id(&cell.style);
+        }
         let row = self.cursor.row;
         let col = self.cursor.col;
         if row < self.rows && col < self.cols {
@@ -2025,7 +2077,13 @@ impl Terminal {
         // per-chunk work has to stay minimal. Stream the whitespace
         // filter directly into the accumulator's existing String instead
         // of allocating a per-chunk staging buffer.
-        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay);
+        // U=1 (virtual placement) suppresses the immediate placement
+        // even when `a=T` was sent — the image is registered for later
+        // unicode-placeholder positioning. Without this override, a=T,U=1
+        // would create a duplicate placement at the cursor on top of
+        // wherever the placeholders eventually land.
+        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay)
+            && !ctrl.virtual_placement;
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
                 let entry = self.kitty_chunks.entry(id).or_insert_with(|| KittyChunks {
@@ -2157,7 +2215,8 @@ impl Terminal {
         else {
             return;
         };
-        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay);
+        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay)
+            && !ctrl.virtual_placement;
         self.finalize_kitty_image_bytes(
             bytes,
             pixel_size,
@@ -2620,6 +2679,12 @@ pub struct KittyControl {
     /// `d=` selector for the delete action. Only meaningful when
     /// `action == Delete`; ignored otherwise.
     pub delete_selector: Option<KittyDeleteSelector>,
+    /// `U=1` — virtual placement mode. The transmission registers an
+    /// image but creates no `Placement`. The app then writes
+    /// `U+10EEEE` placeholder cells (with the image id encoded in
+    /// the fg color) to position the image. nvim's `image.nvim` and
+    /// other modern viewers default to this path.
+    pub virtual_placement: bool,
 }
 
 impl Default for KittyControl {
@@ -2641,6 +2706,7 @@ impl Default for KittyControl {
             source_w: None,
             source_h: None,
             delete_selector: None,
+            virtual_placement: false,
         }
     }
 }
@@ -2676,6 +2742,35 @@ struct KittyChunks {
     /// create a `Placement` (display) or just register the image-id
     /// mapping (transmit-for-later).
     display_immediately: bool,
+}
+
+/// Decode a Kitty virtual-placement image id from a cell's foreground
+/// color. The Kitty spec packs the high 24 bits of the image id into
+/// the truecolor RGB bytes:
+///
+/// - R (high 8 bits): bits 16..23 of the id
+/// - G (mid  8 bits): bits  8..15 of the id
+/// - B (low  8 bits): bits  0..7 of the id
+///
+/// The 4th byte (bits 24..31) comes from an optional 3rd diacritic on
+/// the placeholder char, which we don't decode yet — so this is a
+/// 24-bit id in practice. Most apps stay within that range.
+///
+/// Style colors are stored as linear-space `[f32; 4]`; we round-trip
+/// through sRGB to recover the original u8 channels. `color_fg`
+/// `None` (cell didn't explicitly set a fg color) returns `None`.
+fn decode_kitty_placeholder_image_id(style: &crate::style::Style) -> Option<u32> {
+    let fg = style.color_fg?;
+    let r = crate::palette::linear_to_srgb_u8(fg[0]) as u32;
+    let g = crate::palette::linear_to_srgb_u8(fg[1]) as u32;
+    let b = crate::palette::linear_to_srgb_u8(fg[2]) as u32;
+    let id = (r << 16) | (g << 8) | b;
+    // id == 0 is the "no id" sentinel — the placeholder has no
+    // meaningful image to reference. Treat as absent.
+    if id == 0 {
+        return None;
+    }
+    Some(id)
 }
 
 /// Decode the base64-encoded UTF-8 filesystem path that file-based Kitty
@@ -2845,6 +2940,7 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
             "m" => ctrl.more_chunks = v == "1",
             "C" => ctrl.do_not_move_cursor = v == "1",
             "q" => ctrl.quiet = v.parse().unwrap_or(0),
+            "U" => ctrl.virtual_placement = v == "1",
             // s, v, x, y, w, h, X, Y, z, I, o, etc. — accepted but unused
             // in K1. Future slices wire them up.
             _ => {}
@@ -5387,6 +5483,140 @@ mod tests {
         // `a=t` MUST NOT advance the cursor — the placement happens
         // later via `a=p` and that's what moves the cursor.
         assert_eq!(t.cursor().row, cursor_before);
+    }
+
+    //
+    // K5: virtual placements (U=1 + U+10EEEE placeholder cells)
+    //
+
+    /// Build the SGR truecolor escape for an image-id placeholder. The
+    /// 24-bit id maps to RGB as (high, mid, low) bytes — matches what
+    /// `decode_kitty_placeholder_image_id` reverses.
+    fn placeholder_sgr_fg(image_id: u32) -> String {
+        let r = ((image_id >> 16) & 0xFF) as u8;
+        let g = ((image_id >> 8) & 0xFF) as u8;
+        let b = (image_id & 0xFF) as u8;
+        format!("\x1b[38;2;{};{};{}m", r, g, b)
+    }
+
+    #[test]
+    fn parse_kitty_control_u_one_sets_virtual_placement() {
+        let c = parse_kitty_control("U=1,i=1,a=T").unwrap();
+        assert!(c.virtual_placement);
+        let c = parse_kitty_control("a=T,i=1").unwrap();
+        assert!(!c.virtual_placement, "default is false");
+    }
+
+    #[test]
+    fn kitty_apc_virtual_placement_transmits_without_displaying() {
+        // a=T,U=1,i=N: image goes into the store + kitty_image_ids
+        // map, but no Placement is created. The cursor doesn't move
+        // either — placeholders position it later.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b[5;1H");
+        let cursor_before = t.cursor().row;
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,U=1,f=100,i=42", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(!uploads[0].display_immediately, "U=1 must not display");
+        assert_eq!(uploads[0].kitty_image_id, Some(42));
+        // No placement; cursor put.
+        assert!(t.live_placements().is_empty());
+        assert_eq!(t.cursor().row, cursor_before);
+    }
+
+    #[test]
+    fn placeholder_cells_record_image_id_from_fg_color() {
+        // SGR truecolor encodes a 24-bit id; print one placeholder
+        // and read the cell back.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0xABCDEF));
+        t.feed("\u{10EEEE}");
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.placeholder_image_id, Some(0xABCDEF));
+    }
+
+    #[test]
+    fn placeholder_cells_without_fg_color_have_no_image_id() {
+        // Without an SGR fg, the cell's fg defaults to None — there's
+        // no id to extract. Pin the contract so an accidental
+        // placeholder doesn't act on whatever color was last printed.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\u{10EEEE}");
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.placeholder_image_id, None);
+    }
+
+    #[test]
+    fn placeholder_cells_with_zero_id_treated_as_no_id() {
+        // (0, 0, 0) is the sentinel "no id" color. Print one such
+        // placeholder and verify it's not picked up.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[38;2;0;0;0m");
+        t.feed("\u{10EEEE}");
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.placeholder_image_id, None);
+    }
+
+    #[test]
+    fn placeholder_bbox_spans_consecutive_cells() {
+        // Print a 3-col × 2-row block of placeholders all encoding
+        // the same image id. The bbox covers exactly those cells.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        // Row 2, cols 5..8.
+        t.feed("\x1b[3;6H"); // CUP row 3 col 6 (1-based) → (2, 5) 0-based
+        t.feed("\u{10EEEE}\u{10EEEE}\u{10EEEE}");
+        // Row 3, cols 5..8.
+        t.feed("\x1b[4;6H");
+        t.feed("\u{10EEEE}\u{10EEEE}\u{10EEEE}");
+        let bboxes = t.kitty_placeholder_bboxes();
+        assert_eq!(bboxes.len(), 1);
+        let (id, top, left, rows, cols) = bboxes[0];
+        assert_eq!(id, 7);
+        assert_eq!((top, left), (2, 5));
+        assert_eq!((rows, cols), (2, 3));
+    }
+
+    #[test]
+    fn placeholder_bbox_two_distinct_image_ids_produce_two_boxes() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        t.feed("\u{10EEEE}\u{10EEEE}");
+        t.feed(&placeholder_sgr_fg(9));
+        t.feed("\x1b[5;10H");
+        t.feed("\u{10EEEE}");
+        let bboxes = t.kitty_placeholder_bboxes();
+        assert_eq!(bboxes.len(), 2);
+        let by_id: std::collections::HashMap<u32, (isize, isize, u16, u16)> =
+            bboxes.into_iter().map(|(id, t, l, r, c)| (id, (t, l, r, c))).collect();
+        assert_eq!(by_id[&7], (0, 0, 1, 2));
+        assert_eq!(by_id[&9], (4, 9, 1, 1));
+    }
+
+    #[test]
+    fn placeholder_bbox_empty_when_no_placeholders() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("hello world");
+        assert!(t.kitty_placeholder_bboxes().is_empty());
+    }
+
+    #[test]
+    fn placeholder_cells_scroll_with_grid() {
+        // Placeholders ARE just cells — they move with scroll exactly
+        // like any other content. After SU 1, our row=2 placeholder
+        // appears at row 1.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(42));
+        t.feed("\x1b[3;1H"); // row 2 (0-based)
+        t.feed("\u{10EEEE}\u{10EEEE}");
+        t.feed("\x1b[1S"); // SU 1
+        let bboxes = t.kitty_placeholder_bboxes();
+        assert_eq!(bboxes.len(), 1);
+        assert_eq!(bboxes[0].1, 1); // top row shifted from 2 → 1
     }
 
     //

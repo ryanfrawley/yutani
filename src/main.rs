@@ -4168,6 +4168,37 @@ impl State {
                     uv_rect,
                 });
             }
+
+            // Kitty virtual placements (U+10EEEE cells). Each distinct
+            // image id encoded across placeholder cells produces one
+            // bounding-box draw. Grid → viewport shift mirrors live
+            // placements; scrollback bboxes aren't computed yet (the
+            // scan is on the active grid only).
+            for (client_id, top, left, prows, pcols) in
+                self.terminal.kitty_placeholder_bboxes()
+            {
+                let Some(store_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+                    continue;
+                };
+                let Some(gpu_img) = self.image_store.peek(store_id) else { continue };
+                let viewport_row =
+                    Self::live_placement_viewport_row(top, view_offset, rows);
+                let x_px = WINDOW_PADDING + (left as f32) * cell_w;
+                let y_px = WINDOW_PADDING
+                    + decorator_offset
+                    + (viewport_row as f32) * line_height
+                    + scroll_y;
+                let w_px = (pcols as f32) * cell_w;
+                let h_px = (prows as f32) * line_height;
+                image_draws.push(renderer::images::ImageDraw {
+                    image: gpu_img,
+                    x_px,
+                    y_px,
+                    w_px,
+                    h_px,
+                    uv_rect: None,
+                });
+            }
         }
         let has_images = !image_draws.is_empty();
 
