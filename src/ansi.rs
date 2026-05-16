@@ -32,6 +32,10 @@ pub enum Event {
     ScrollDown(u16),
     // top/bottom 1-based. None = default (full screen / no region).
     SetScrollRegion(Option<u16>, Option<u16>),
+    // DECSLRM — CSI Pl ; Pr s. left/right 1-based. None for both = the
+    // ambiguous CSI s form: either reset-margins (when DECLRMM is on) or
+    // SCOSC save-cursor (when DECLRMM is off). The terminal disambiguates.
+    SetLeftRightMargin(Option<u16>, Option<u16>),
 
     // Editing — all params clamped to >= 1
     InsertLine(u16),  // CSI L (IL)
@@ -396,6 +400,12 @@ impl Parser {
             'n' => emit(Event::DeviceStatusReport(p0.unwrap_or(0))),
             'c' => emit(Event::DeviceAttributes),
             'r' => emit(Event::SetScrollRegion(
+                p0.filter(|&v| v != 0),
+                p1.filter(|&v| v != 0),
+            )),
+            // DECSLRM. Always emit — the terminal layer decides whether to
+            // apply it as margin-set or interpret bare `s` as SCOSC.
+            's' => emit(Event::SetLeftRightMargin(
                 p0.filter(|&v| v != 0),
                 p1.filter(|&v| v != 0),
             )),

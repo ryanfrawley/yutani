@@ -50,38 +50,82 @@ impl Grid {
         }
     }
 
-    /// Shift rows `[top..=bottom]` up by `n`, filling freed rows at the bottom
-    /// with `blank`. No-op if `n == 0`.
-    pub fn scroll_region_up(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+    /// Shift rows `[top..=bottom]` up by `n` within columns `[left..=right]`,
+    /// filling freed cells with `blank`. Cells outside the column range are
+    /// untouched — that's what makes tmux-style per-pane scrolling work.
+    pub fn scroll_region_up(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        n: usize,
+        blank: Cell,
+    ) {
         let region = bottom - top + 1;
         let n = n.min(region);
-        if n == 0 {
+        if n == 0 || left > right || right >= self.cols {
             return;
         }
-        for r in top..=bottom - n {
-            let src = (r + n) * self.cols;
-            let dst = r * self.cols;
-            self.cells.copy_within(src..src + self.cols, dst);
+        let width = right - left + 1;
+        let full_width = left == 0 && right == self.cols - 1;
+        // Copy only if there's something to shift. When n == region, every
+        // row of the region gets cleared and nothing moves.
+        if n < region {
+            for r in top..=bottom - n {
+                let src = (r + n) * self.cols + left;
+                let dst = r * self.cols + left;
+                if full_width {
+                    self.cells.copy_within(src..src + self.cols, dst);
+                } else {
+                    self.cells.copy_within(src..src + width, dst);
+                }
+            }
         }
         for r in bottom + 1 - n..=bottom {
-            self.clear_row(r, 0, self.cols, blank);
+            if full_width {
+                self.clear_row(r, 0, self.cols, blank);
+            } else {
+                self.clear_row(r, left, right + 1, blank);
+            }
         }
     }
 
-    /// Shift rows `[top..=bottom]` down by `n`, filling freed rows at the top.
-    pub fn scroll_region_down(&mut self, top: usize, bottom: usize, n: usize, blank: Cell) {
+    /// Shift rows `[top..=bottom]` down by `n` within columns `[left..=right]`,
+    /// filling freed cells at the top of the region with `blank`.
+    pub fn scroll_region_down(
+        &mut self,
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+        n: usize,
+        blank: Cell,
+    ) {
         let region = bottom - top + 1;
         let n = n.min(region);
-        if n == 0 {
+        if n == 0 || left > right || right >= self.cols {
             return;
         }
-        for r in (top + n..=bottom).rev() {
-            let src = (r - n) * self.cols;
-            let dst = r * self.cols;
-            self.cells.copy_within(src..src + self.cols, dst);
+        let width = right - left + 1;
+        let full_width = left == 0 && right == self.cols - 1;
+        if n < region {
+            for r in (top + n..=bottom).rev() {
+                let src = (r - n) * self.cols + left;
+                let dst = r * self.cols + left;
+                if full_width {
+                    self.cells.copy_within(src..src + self.cols, dst);
+                } else {
+                    self.cells.copy_within(src..src + width, dst);
+                }
+            }
         }
         for r in top..top + n {
-            self.clear_row(r, 0, self.cols, blank);
+            if full_width {
+                self.clear_row(r, 0, self.cols, blank);
+            } else {
+                self.clear_row(r, left, right + 1, blank);
+            }
         }
     }
 }
@@ -145,6 +189,11 @@ pub struct Terminal {
     saved_alternate: Option<Cursor>,
     scroll_top: usize,    // inclusive, 0-based
     scroll_bottom: usize, // inclusive, 0-based
+    // DECLRMM (`?69`). When false (default) the next two fields are forced
+    // to full width and CSI `s` with no params is SCOSC save-cursor.
+    lrmm_enabled: bool,
+    scroll_left: usize,  // inclusive, 0-based
+    scroll_right: usize, // inclusive, 0-based
     autowrap: bool,
     cursor_visible: bool,
     // DECCKM (private mode 1). When true, unmodified cursor keys send SS3
@@ -193,6 +242,9 @@ impl Terminal {
             saved_alternate: None,
             scroll_top: 0,
             scroll_bottom: rows - 1,
+            lrmm_enabled: false,
+            scroll_left: 0,
+            scroll_right: cols - 1,
             autowrap: true,
             cursor_visible: true,
             app_cursor_keys: false,
@@ -449,6 +501,9 @@ impl Terminal {
         self.cursor.wrap_pending = false;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
+        self.scroll_left = 0;
+        self.scroll_right = cols - 1;
+        self.lrmm_enabled = false;
         self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
@@ -503,10 +558,13 @@ impl Terminal {
                 let blank = self.blank();
                 let top = self.scroll_top;
                 let bottom = self.scroll_bottom;
+                let left = self.scroll_left;
+                let right = self.scroll_right;
                 self.active_grid_mut()
-                    .scroll_region_down(top, bottom, n as usize, blank);
+                    .scroll_region_down(top, bottom, left, right, n as usize, blank);
             }
             Event::SetScrollRegion(top, bottom) => self.set_scroll_region(top, bottom),
+            Event::SetLeftRightMargin(l, r) => self.set_left_right_margin(l, r),
             Event::InsertLine(n) => self.insert_lines(n as usize),
             Event::DeleteLine(n) => self.delete_lines(n as usize),
             Event::InsertChar(n) => self.insert_chars(n as usize),
@@ -638,9 +696,13 @@ impl Terminal {
     }
 
     fn scroll_region_up_by(&mut self, n: usize) {
-        // When the scroll region covers the full primary screen, the lines
-        // rolling off the top are appended to scrollback.
-        let full_region = self.scroll_top == 0 && self.scroll_bottom == self.rows - 1;
+        // Lines rolling off the top only become scrollback when the *whole*
+        // grid is the scroll region — partial regions (DECSTBM or DECSLRM
+        // narrower than the screen) just shift in place.
+        let full_region = self.scroll_top == 0
+            && self.scroll_bottom == self.rows - 1
+            && self.scroll_left == 0
+            && self.scroll_right == self.cols - 1;
         if !self.use_alternate && full_region && self.scrollback_limit > 0 {
             for _ in 0..n.min(self.rows) {
                 let line = self.primary.row(self.scroll_top).to_vec();
@@ -660,50 +722,69 @@ impl Terminal {
         let blank = self.blank();
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
+        let left = self.scroll_left;
+        let right = self.scroll_right;
         self.active_grid_mut()
-            .scroll_region_up(top, bottom, n, blank);
+            .scroll_region_up(top, bottom, left, right, n, blank);
     }
 
     // IL: blank lines pushed in at the cursor row; rows below shift down and
-    // anything past scroll_bottom is lost. No-op outside the scroll region.
+    // anything past scroll_bottom is lost. No-op outside the scroll region —
+    // including outside the LRM column range when DECLRMM is on.
     fn insert_lines(&mut self, n: usize) {
-        if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
+        if self.cursor.row < self.scroll_top
+            || self.cursor.row > self.scroll_bottom
+            || self.cursor.col < self.scroll_left
+            || self.cursor.col > self.scroll_right
+        {
             return;
         }
         let blank = self.blank();
         let top = self.cursor.row;
         let bottom = self.scroll_bottom;
-        self.active_grid_mut().scroll_region_down(top, bottom, n, blank);
+        let left = self.scroll_left;
+        let right = self.scroll_right;
+        self.active_grid_mut()
+            .scroll_region_down(top, bottom, left, right, n, blank);
         self.cursor.wrap_pending = false;
     }
 
     // DL: cursor row and below shift up by n; bottom of region filled blank.
     fn delete_lines(&mut self, n: usize) {
-        if self.cursor.row < self.scroll_top || self.cursor.row > self.scroll_bottom {
+        if self.cursor.row < self.scroll_top
+            || self.cursor.row > self.scroll_bottom
+            || self.cursor.col < self.scroll_left
+            || self.cursor.col > self.scroll_right
+        {
             return;
         }
         let blank = self.blank();
         let top = self.cursor.row;
         let bottom = self.scroll_bottom;
-        self.active_grid_mut().scroll_region_up(top, bottom, n, blank);
+        let left = self.scroll_left;
+        let right = self.scroll_right;
+        self.active_grid_mut()
+            .scroll_region_up(top, bottom, left, right, n, blank);
         self.cursor.wrap_pending = false;
     }
 
     // ICH: shift cells at and right of cursor n columns to the right; fill the
-    // gap with blanks. Cells pushed past the right edge are lost.
+    // gap with blanks. With DECLRMM on, cells stop at the right margin instead
+    // of the screen edge, so per-pane edits don't leak past the divider.
     fn insert_chars(&mut self, n: usize) {
         let row = self.cursor.row;
         let col = self.cursor.col;
         let cols = self.cols;
-        if col >= cols {
+        let right = self.scroll_right;
+        if col >= cols || col > right {
             return;
         }
-        let n = n.min(cols - col);
+        let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
         let base = row * cols;
-        if col + n < cols {
-            grid.cells.copy_within(base + col..base + cols - n, base + col + n);
+        if col + n <= right {
+            grid.cells.copy_within(base + col..base + right + 1 - n, base + col + n);
         }
         for i in col..col + n {
             grid.cells[base + i] = blank;
@@ -711,35 +792,71 @@ impl Terminal {
         self.cursor.wrap_pending = false;
     }
 
-    // DCH: cells right of cursor shift left by n; right edge filled blank.
+    // DCH: cells right of cursor shift left by n; right margin filled blank.
     fn delete_chars(&mut self, n: usize) {
         let row = self.cursor.row;
         let col = self.cursor.col;
         let cols = self.cols;
-        if col >= cols {
+        let right = self.scroll_right;
+        if col >= cols || col > right {
             return;
         }
-        let n = n.min(cols - col);
+        let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
         let base = row * cols;
-        if col + n < cols {
-            grid.cells.copy_within(base + col + n..base + cols, base + col);
+        if col + n <= right {
+            grid.cells.copy_within(base + col + n..base + right + 1, base + col);
         }
-        for i in cols - n..cols {
+        for i in right + 1 - n..=right {
             grid.cells[base + i] = blank;
         }
         self.cursor.wrap_pending = false;
     }
 
     // ECH: replace n cells starting at the cursor with blanks. Cursor unchanged.
+    // Clipped to the right margin so per-pane erases don't reach into the
+    // neighbor.
     fn erase_chars(&mut self, n: usize) {
         let row = self.cursor.row;
         let col = self.cursor.col;
-        let cols = self.cols;
-        let end = (col + n).min(cols);
+        let right = self.scroll_right;
+        if col > right {
+            return;
+        }
+        let end = (col + n).min(right + 1);
         let blank = self.blank();
         self.active_grid_mut().clear_row(row, col, end, blank);
+    }
+
+    /// DECSLRM (`CSI Pl ; Pr s`). When DECLRMM is enabled, sets the column
+    /// margins and homes the cursor like DECSTBM does for rows. When DECLRMM
+    /// is disabled, the bare `CSI s` form is SCOSC (save cursor) — that's the
+    /// classic xterm overload; with params it's silently ignored.
+    fn set_left_right_margin(&mut self, left: Option<u16>, right: Option<u16>) {
+        if !self.lrmm_enabled {
+            if left.is_none() && right.is_none() {
+                self.save_cursor();
+            }
+            return;
+        }
+        let l = left.map(|v| v as usize).unwrap_or(1).saturating_sub(1);
+        let r = right
+            .map(|v| v as usize)
+            .unwrap_or(self.cols)
+            .saturating_sub(1);
+        if l < r && r < self.cols {
+            self.scroll_left = l;
+            self.scroll_right = r;
+        } else {
+            // Spec says invalid range resets to full width.
+            self.scroll_left = 0;
+            self.scroll_right = self.cols - 1;
+        }
+        // DECSLRM homes the cursor.
+        self.cursor.row = 0;
+        self.cursor.col = 0;
+        self.cursor.wrap_pending = false;
     }
 
     fn set_scroll_region(&mut self, top: Option<u16>, bottom: Option<u16>) {
@@ -766,6 +883,13 @@ impl Terminal {
             1006 => self.mouse_sgr = set,
             2004 => self.bracketed_paste = set,
             1049 | 1047 | 47 => self.switch_screen(set, code == 1049),
+            // DECLRMM. Enabling/disabling resets the margins to the full
+            // screen — apps must re-issue DECSLRM after enabling.
+            69 => {
+                self.lrmm_enabled = set;
+                self.scroll_left = 0;
+                self.scroll_right = self.cols - 1;
+            }
             _ => {}
         }
     }
@@ -899,6 +1023,9 @@ impl Terminal {
         self.use_alternate = false;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.lrmm_enabled = false;
+        self.scroll_left = 0;
+        self.scroll_right = self.cols - 1;
         self.autowrap = true;
         self.cursor_visible = true;
         self.app_cursor_keys = false;
@@ -1138,6 +1265,318 @@ mod tests {
         t.feed("\x1b8"); // restore
         assert_eq!(t.cursor().row, 1);
         assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn decslrm_ignored_when_lrmm_off() {
+        // CSI 1;5s with DECLRMM disabled is silently dropped — margins stay
+        // full-width.
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("\x1b[1;5s");
+        // Prove margins are still full: fill a row, scroll the region down,
+        // and confirm the rightmost cols moved (they wouldn't if clipped).
+        t.feed("\x1b[1;1H");
+        for c in 0..10 {
+            t.feed(&format!("{}", (b'a' + c) as char));
+        }
+        // SU 1 row — without LRM, the whole row clears.
+        t.feed("\x1b[S");
+        assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "          ");
+    }
+
+    #[test]
+    fn csi_s_no_params_is_save_cursor_when_lrmm_off() {
+        // With DECLRMM off, bare `ESC[s` is SCOSC: save the cursor in the same
+        // slot DECSC (ESC 7) uses, so ESC 8 restores it.
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("\x1b[3;5H\x1b[s\x1b[1;1H\x1b8");
+        assert_eq!(t.cursor().row, 2);
+        assert_eq!(t.cursor().col, 4);
+    }
+
+    #[test]
+    fn decslrm_clips_scroll_up_to_margins() {
+        // Reproduce tmux's per-pane scroll: enable DECLRMM, set LRM to the
+        // "left pane" columns, scroll up — cells outside the LRM (the
+        // divider + right pane) must NOT move.
+        let mut t = Terminal::new(10, 5, 100);
+        // Fill row 0 with "abcdefghij" (cols 0..9).
+        t.feed("abcdefghij");
+        // Mark a divider in col 6 on rows 1..4 by direct CUP+Print.
+        for r in 2..=5 {
+            t.feed(&format!("\x1b[{};7H|", r));
+        }
+        // Enable DECLRMM, set left=1, right=6 (1-based: cols 0..5).
+        t.feed("\x1b[?69h\x1b[1;6s");
+        // Set scroll region to rows 1..5 (1-based), put cursor inside.
+        t.feed("\x1b[1;5r\x1b[1;1H");
+        // SU 5 — should blank cols 0..5 of all 5 rows but leave col 6+
+        // untouched (the divider remains).
+        t.feed("\x1b[5S");
+        for r in 1..=4 {
+            assert_eq!(t.row(r)[6].ch, '|', "row {r}: divider should survive LRM scroll");
+        }
+        // And cols 0..5 of row 0 (with our 'abcdef') should now be blank
+        // since SU consumed them.
+        for c in 0..6 {
+            assert_eq!(t.row(0)[c].ch, ' ', "col {c} should be blank after SU");
+        }
+        // Col 6 of row 0 stays 'g' — outside LRM, untouched.
+        assert_eq!(t.row(0)[6].ch, 'g');
+    }
+
+    #[test]
+    fn decslrm_clips_linefeed_scroll_to_margins() {
+        // Same setup but the scroll is triggered by `\n` at scroll_bottom
+        // (the path tmux actually uses while painting per-pane content).
+        let mut t = Terminal::new(8, 4, 100);
+        // Put 'X' in col 5 across every row as a "divider".
+        for r in 1..=4 {
+            t.feed(&format!("\x1b[{};6HX", r));
+        }
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 1..5 (0..4)
+        // Position cursor inside LRM at scroll_bottom, then LF — should
+        // scroll within LRM only.
+        t.feed("\x1b[4;1H\n");
+        for r in 0..4 {
+            assert_eq!(t.row(r)[5].ch, 'X', "row {r}: divider must survive LF scroll");
+        }
+    }
+
+    #[test]
+    fn decslrm_clips_insert_and_delete_char() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("abcdefghij");
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 1..5 (0..4)
+        // ICH 2 at col 0 — cells shift within LRM only; cols 5..9 untouched.
+        t.feed("\x1b[1;1H\x1b[2@");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "  abcfghij");
+        // DCH 2 at col 0 — pulls cells from within LRM only.
+        t.feed("\x1b[2P");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "abc  fghij");
+    }
+
+    #[test]
+    fn decslrm_clips_erase_char_to_right_margin() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("abcdefghij");
+        t.feed("\x1b[?69h\x1b[1;5s");
+        t.feed("\x1b[1;3H\x1b[10X"); // ECH 10 at col 3 — clip to col 5
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "ab   fghij");
+    }
+
+    #[test]
+    fn decslrm_69l_disables_and_resets() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("abcdefghij");
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM on, cols 1..5
+        t.feed("\x1b[?69l"); // disable LRMM → margins reset, future DECSLRM ignored
+        // Now SU should affect the full width again.
+        t.feed("\x1b[1S");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "          ");
+    }
+
+    #[test]
+    fn full_region_scrollback_requires_full_lrm() {
+        // With a narrowed LRM the "full region" rule that pushes lines to
+        // scrollback shouldn't fire — scrollback should stay empty.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("row1\n\rrow2\n\rrow3");
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 1..5
+        let prior = t.scrollback_len();
+        // Force a scroll inside the LRM via SU on the full scroll region.
+        t.feed("\x1b[3;1H\x1b[3S");
+        assert_eq!(t.scrollback_len(), prior, "narrow LRM must not push to scrollback");
+    }
+
+    #[test]
+    fn decslrm_invalid_range_resets_to_full_width() {
+        // VT spec: a DECSLRM request with left >= right (or out-of-bounds
+        // right) must reset margins to the full screen rather than leaving
+        // a previously-narrowed range in place. Apps rely on this to "clear"
+        // margins by sending e.g. `CSI 1;1s`.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("abcdefghij");
+        // Establish a narrow LRM first so we can prove the next request
+        // *resets* rather than no-ops.
+        t.feed("\x1b[?69h\x1b[1;5s");
+        // Now an invalid range: left == right (both 1-based '3'), which is
+        // l >= r in the parsed form. Per spec, this should reset to full.
+        t.feed("\x1b[3;3s");
+        // SU 1 — if margins were reset, the entire row clears; if the old
+        // narrow LRM survived, cols 5..9 would remain "fghij".
+        t.feed("\x1b[1S");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "          ", "invalid DECSLRM must reset margins to full width");
+    }
+
+    #[test]
+    fn decslrm_right_beyond_cols_resets_to_full_width() {
+        // Similar to above but tests the other invalid form: right > cols.
+        // tmux occasionally emits `CSI 1;<huge>s` when computing margins
+        // against a stale geometry; we must treat that as "reset to full".
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("abcdefghij");
+        t.feed("\x1b[?69h\x1b[1;5s"); // narrow first
+        t.feed("\x1b[1;99s"); // right > cols → reset
+        t.feed("\x1b[1S");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "          ");
+    }
+
+    #[test]
+    fn decslrm_homes_the_cursor() {
+        // Per VT spec, DECSLRM (like DECSTBM) homes the cursor to (0,0)
+        // after setting margins. Apps depend on this when bootstrapping a
+        // per-pane drawing context — they don't issue a separate CUP.
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("\x1b[3;7H"); // park cursor mid-screen
+        assert_eq!(t.cursor().row, 2);
+        assert_eq!(t.cursor().col, 6);
+        t.feed("\x1b[?69h\x1b[2;6s"); // DECSLRM
+        assert_eq!(t.cursor().row, 0, "DECSLRM should home cursor row");
+        assert_eq!(t.cursor().col, 0, "DECSLRM should home cursor col");
+    }
+
+    #[test]
+    fn cup_is_not_clipped_to_lrm() {
+        // xterm behavior: DECSLRM only constrains scroll-style *operations*;
+        // CUP/HVP can still address any cell on the screen. tmux relies on
+        // this — it sets a left-pane LRM, then CUPs to the right pane to
+        // draw the divider/right-pane content.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 0..4 (narrow)
+        // CUP to col 8 (1-based 9), well outside the LRM range.
+        t.feed("\x1b[1;9HZ");
+        assert_eq!(t.row(0)[8].ch, 'Z', "CUP must place cell outside LRM");
+        // And the cursor itself should sit there, not get clamped to col 4.
+        // After printing 'Z' at col 8 the cursor advances to col 9.
+        assert_eq!(t.cursor().col, 9);
+    }
+
+    #[test]
+    fn decslrm_clips_scroll_down_to_margins() {
+        // Symmetric coverage to decslrm_clips_scroll_up_to_margins: SD (CSI T)
+        // must also respect LRM so reverse-scroll inside a pane doesn't
+        // disturb cells in neighboring panes.
+        let mut t = Terminal::new(10, 5, 100);
+        // Fill row 4 with content inside the LRM and a divider in col 6.
+        t.feed("\x1b[5;1Habcdef|hij");
+        // Mark the divider on the other rows too so we can detect leakage.
+        for r in 1..=4 {
+            t.feed(&format!("\x1b[{};7H|", r));
+        }
+        t.feed("\x1b[?69h\x1b[1;6s"); // LRM cols 0..5
+        t.feed("\x1b[1;5r\x1b[1;1H"); // scroll region rows 0..4
+        t.feed("\x1b[5T"); // SD 5 — should blank cols 0..5 within region
+        for r in 0..=4 {
+            assert_eq!(t.row(r)[6].ch, '|', "row {r}: divider must survive SD");
+        }
+        // Cols 0..5 of every row should now be blank (SD pushed content out).
+        for c in 0..6 {
+            assert_eq!(t.row(4)[c].ch, ' ', "row 4 col {c} should be blank after SD");
+        }
+    }
+
+    #[test]
+    fn insert_line_noop_when_cursor_outside_lrm_columns() {
+        // IL/DL are documented as no-ops when the cursor is outside the
+        // scroll region. With DECLRMM that "scroll region" is 2D — the
+        // cursor must be inside the column range too. This matters because
+        // an app drawing into the right pane should not accidentally
+        // shift rows in the left pane just because it issued IL with the
+        // cursor parked over there.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("row1xxxxxx\n\rrow2xxxxxx\n\rrow3xxxxxx");
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 0..4
+        // Park cursor at col 7 (outside LRM), then IL 1.
+        t.feed("\x1b[1;8H\x1b[L");
+        // Row 0 should still read "row1xxxxx" — IL was a no-op.
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "row1xxxxxx", "IL must be a no-op when cursor is outside LRM cols");
+    }
+
+    #[test]
+    fn delete_line_noop_when_cursor_outside_lrm_columns() {
+        // Mirror of the IL test above for DL.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("row1xxxxxx\n\rrow2xxxxxx\n\rrow3xxxxxx");
+        t.feed("\x1b[?69h\x1b[1;5s"); // LRM cols 0..4
+        t.feed("\x1b[1;8H\x1b[M"); // DL 1 with cursor outside LRM
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "row1xxxxxx", "DL must be a no-op when cursor is outside LRM cols");
+    }
+
+    #[test]
+    fn full_reset_clears_lrmm_state() {
+        // RIS (`ESC c`) must restore DECLRMM to disabled and margins to
+        // full width. Without this, an app that crashes mid-session and
+        // issues RIS would still see a narrowed scroll region — a classic
+        // "terminal stuck" symptom.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b[?69h\x1b[1;5s"); // narrow LRM
+        t.feed("\x1bc"); // RIS
+        // Now reprint and SU — should clear the whole row, proving LRM
+        // reset to full width AND DECLRMM is disabled (so a subsequent
+        // bare `CSI s` is SCOSC again, not reset-margins).
+        t.feed("abcdefghij\x1b[1S");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "          ", "RIS must reset LRM to full width");
+        // Verify DECLRMM was disabled too: bare CSI s must now be SCOSC.
+        // Park cursor, save via `CSI s`, move, restore — should land back.
+        t.feed("\x1b[1;5H\x1b[s\x1b[1;1H\x1b8");
+        assert_eq!(t.cursor().col, 4, "after RIS, bare CSI s should be SCOSC");
+    }
+
+    #[test]
+    fn resize_clears_lrmm_state() {
+        // Resize must drop LRMM — the old margins are tied to the old
+        // column count and would be nonsensical (or out of bounds) after
+        // a resize. The renderer assumes scroll_right < cols.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b[?69h\x1b[1;5s"); // narrow LRM on the 10-col grid
+        t.resize(20, 3); // grow to 20 cols
+        // Fill row 0 across the new width then SU — if LRMM survived, the
+        // old narrow margin would leak through and cols 5..19 wouldn't
+        // clear. We expect them to clear (LRMM disabled, full width).
+        t.feed("\x1b[1;1H");
+        for c in 0..20 {
+            t.feed(&format!("{}", (b'a' + (c % 26) as u8) as char));
+        }
+        t.feed("\x1b[1S");
+        let s: String = t.row(0).iter().map(|c| c.ch).collect();
+        assert_eq!(s, "                    ", "resize must clear LRMM state");
+    }
+
+    #[test]
+    fn cup_and_print_column_of_chars() {
+        // Reproduce the way tmux paints a vertical pane border: for each row,
+        // CUP to (row, divider_col) then Print('│'). Whole column must be
+        // filled, including rows where nothing else was written.
+        let mut t = Terminal::new(7, 5, 100);
+        for r in 1..=5 {
+            t.feed(&format!("\x1b[{};4H│", r));
+        }
+        for r in 0..5 {
+            assert_eq!(t.row(r)[3].ch, '│', "row {r}: divider missing");
+        }
+    }
+
+    #[test]
+    fn alt_screen_cup_column_paint_survives() {
+        // Same as above but inside alt-screen (where tmux actually runs).
+        let mut t = Terminal::new(7, 5, 100);
+        t.feed("\x1b[?1049h");
+        for r in 1..=5 {
+            t.feed(&format!("\x1b[{};4H│", r));
+        }
+        for r in 0..5 {
+            assert_eq!(t.row(r)[3].ch, '│', "alt-screen row {r}: divider missing");
+        }
     }
 
     #[test]

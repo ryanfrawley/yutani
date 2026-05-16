@@ -72,11 +72,26 @@ impl Pty {
         let mut input: [u8; 1500] = [0; 1500];
         let mut pending: Vec<u8> = Vec::with_capacity(4);
 
+        // Optional raw-byte dump for debugging app behavior (e.g. tmux pane
+        // borders). Set `TERMINAL_PTY_LOG=/path/to/file` before launching.
+        let mut log = std::env::var_os("TERMINAL_PTY_LOG").and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+
         unsafe {
             loop {
                 let n = read(self.master, input.as_mut_ptr() as *mut c_void, input.len());
                 if n <= 0 {
                     break;
+                }
+                if let Some(f) = log.as_mut() {
+                    use std::io::Write;
+                    let _ = f.write_all(&input[..n as usize]);
+                    let _ = f.flush();
                 }
                 pending.extend_from_slice(&input[..n as usize]);
                 emit_utf8(&mut pending, &on_output);
