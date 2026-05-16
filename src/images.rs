@@ -127,6 +127,13 @@ struct StoredImage {
     /// id renders blank (one or two frames, typically) until the worker
     /// finishes and `poll` fills the slot.
     image: Option<GpuImage>,
+    /// CPU-side downsampled RGBA preview, generated at decode time. Used by
+    /// the half-block fallback path when the GPU draw is suppressed (config
+    /// `images_enabled = false`). Held alongside `image` because re-reading
+    /// pixels back from the GPU each frame would be ruinous and the preview
+    /// is tiny (≤ MAX_PREVIEW_PIXELS * 4 bytes). `None` while the decode is
+    /// in flight, mirroring `image`.
+    preview: Option<Preview>,
     /// Bytes-on-GPU estimate (`width * height * 4`). 0 while `image` is
     /// `None` so a reservation doesn't consume the byte budget before
     /// upload.
@@ -135,6 +142,168 @@ struct StoredImage {
     /// not currently used for eviction.
     last_used: Instant,
 }
+
+/// Small CPU-side RGBA8 thumbnail of a decoded image. Used to drive the
+/// half-block fallback path (one glyph per two vertical pixels). Sized at
+/// decode time to fit inside `MAX_PREVIEW_COLS × MAX_PREVIEW_ROWS` so the
+/// memory cost is bounded and the per-cell sampling is a single index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    pub width: u32,
+    pub height: u32,
+    /// Straight-alpha RGBA8, top-row-first. Same orientation as the
+    /// source decode, so cell (0, 0) lands at pixel (0, 0).
+    pub rgba: Vec<u8>,
+}
+
+/// Upper bound on the preview's horizontal pixel count. Picked so the
+/// preview can supply two pixels per glyph cell for a full-width 160-column
+/// half-block render without wasting memory. Each output cell is one
+/// horizontal pixel (we don't try to render quarter-blocks in the X axis).
+pub const MAX_PREVIEW_COLS: u32 = 160;
+/// Upper bound on the preview's vertical pixel count. Each cell renders
+/// U+2580 (▀) — fg = top half pixel, bg = bottom half pixel — so a 192px
+/// preview covers a 96-row placement. 160 × 192 * 4 = 122 KiB worst case;
+/// realistic placements stay well under that.
+pub const MAX_PREVIEW_ROWS: u32 = 192;
+
+/// Box-filter downsample `rgba` (straight-alpha RGBA8, `w × h`) to a
+/// preview sized to fit inside the half-block budget while preserving
+/// aspect ratio. The destination is always at least 1×1 so any non-empty
+/// source produces a sampleable buffer.
+///
+/// Cheap on purpose: a simple area average per destination pixel. Decode
+/// already cost ~tens of ms on a real image, and the preview is generated
+/// once per image — a more expensive Lanczos resample would buy nothing
+/// the half-block path can show.
+pub fn build_preview(rgba: &[u8], w: u32, h: u32) -> Option<Preview> {
+    if w == 0 || h == 0 || rgba.len() < (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    // Pick the largest destination size that fits inside the budget and
+    // matches the source aspect. Scale by the more-constrained axis so the
+    // other axis stays bounded too.
+    let sx = (MAX_PREVIEW_COLS as f32) / (w as f32);
+    let sy = (MAX_PREVIEW_ROWS as f32) / (h as f32);
+    let s = sx.min(sy).min(1.0); // Don't upscale — wastes memory.
+    let dst_w = ((w as f32) * s).round().clamp(1.0, MAX_PREVIEW_COLS as f32) as u32;
+    let dst_h = ((h as f32) * s).round().clamp(1.0, MAX_PREVIEW_ROWS as f32) as u32;
+
+    let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
+    for dy in 0..dst_h {
+        // Source row span for this destination row. Inclusive lower bound,
+        // exclusive upper. `.max(y0 + 1)` guarantees at least one source
+        // row per destination row even when scaling 1:1 lands on an
+        // integer boundary that the float math rounds the same way.
+        let y0 = ((dy as u64) * (h as u64) / (dst_h as u64)) as u32;
+        let y1 = (((dy + 1) as u64) * (h as u64) / (dst_h as u64)).max((y0 + 1) as u64) as u32;
+        let y1 = y1.min(h);
+        for dx in 0..dst_w {
+            let x0 = ((dx as u64) * (w as u64) / (dst_w as u64)) as u32;
+            let x1 = (((dx + 1) as u64) * (w as u64) / (dst_w as u64)).max((x0 + 1) as u64) as u32;
+            let x1 = x1.min(w);
+            // Sum into u32s — a 160x192 source covering the whole 4x4-byte
+            // budget stays well under u32::MAX even at 255 per sample.
+            let (mut r, mut g, mut b, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for sy_i in y0..y1 {
+                let row_base = (sy_i as usize) * (w as usize) * 4;
+                for sx_i in x0..x1 {
+                    let i = row_base + (sx_i as usize) * 4;
+                    r += rgba[i] as u32;
+                    g += rgba[i + 1] as u32;
+                    b += rgba[i + 2] as u32;
+                    a += rgba[i + 3] as u32;
+                    n += 1;
+                }
+            }
+            // n is guaranteed ≥ 1 by the `.max(+1)` clamps above.
+            let o = (dy as usize) * (dst_w as usize) * 4 + (dx as usize) * 4;
+            out[o] = (r / n) as u8;
+            out[o + 1] = (g / n) as u8;
+            out[o + 2] = (b / n) as u8;
+            out[o + 3] = (a / n) as u8;
+        }
+    }
+    Some(Preview { width: dst_w, height: dst_h, rgba: out })
+}
+
+/// One half-block glyph cell. The renderer turns this into `Cell { ch: '▀',
+/// style: Style { color_fg: Some(fg), color_bg: Some(bg), .. } }` — U+2580
+/// fills the top half of the cell with fg and leaves the bottom half showing
+/// bg, so two vertical pixels of the preview render per cell.
+///
+/// Coordinates are *cell offsets* relative to the placement's anchor —
+/// caller adds `placement.top_row` / `placement.left_col` to get viewport
+/// coords. Keeping them relative makes the unit test for the math trivial.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HalfblockCell {
+    pub row_offset: u16,
+    pub col_offset: u16,
+    /// Linear-space [r, g, b, a] in the same convention as `style::Cell`'s
+    /// color slots. sRGB conversion happens here so the renderer just
+    /// stuffs the values into `Style::color_fg` / `color_bg`.
+    pub fg: [f32; 4],
+    pub bg: [f32; 4],
+}
+
+/// Rasterize `preview` into a grid of `rows × cols` half-block cells.
+/// Each output cell consumes two vertical and one horizontal preview pixel:
+/// fg = the top pixel, bg = the bottom pixel. When `rows`/`cols` ask for
+/// more cells than the preview has pixels, sampling is nearest-neighbour
+/// against the preview — the placement was already sized to the image's
+/// native cell extent, so the common case is exact-match.
+///
+/// Returns one entry per cell (no skipping). Callers can iterate and emit
+/// glyph cells directly.
+pub fn halfblock_cells(preview: &Preview, rows: u16, cols: u16) -> Vec<HalfblockCell> {
+    use crate::palette::srgb_to_linear;
+    let mut out = Vec::with_capacity((rows as usize) * (cols as usize));
+    if preview.width == 0 || preview.height == 0 || rows == 0 || cols == 0 {
+        return out;
+    }
+    for rr in 0..rows {
+        for cc in 0..cols {
+            // Nearest-neighbour sample in cell space → preview space.
+            // The +0.5 centers each cell on its pixel cluster so the
+            // first and last cells don't both sample the same edge pixel
+            // when `rows`/`cols` exceed the preview.
+            let px = ((cc as u32 * preview.width) / (cols as u32)).min(preview.width - 1);
+            // Top and bottom half-pixel rows. `2 * rr` and `2 * rr + 1`
+            // span the conceptual "two pixels per cell" — but the
+            // preview's vertical extent isn't necessarily exactly 2*rows
+            // (it was clamped to MAX_PREVIEW_ROWS), so scale through to
+            // preview height.
+            let top_p = (((2 * rr as u32) * preview.height) / (2 * rows as u32)).min(preview.height - 1);
+            let bot_p =
+                ((((2 * rr as u32) + 1) * preview.height) / (2 * rows as u32)).min(preview.height - 1);
+            let top_i = ((top_p as usize) * (preview.width as usize) + (px as usize)) * 4;
+            let bot_i = ((bot_p as usize) * (preview.width as usize) + (px as usize)) * 4;
+            let p = &preview.rgba;
+            // Preview is straight-alpha sRGB8 (image crate convention).
+            // The renderer's color slots expect linear-space floats —
+            // same path `style::rgb()` takes for SGR truecolor.
+            let fg = [
+                srgb_to_linear(p[top_i]),
+                srgb_to_linear(p[top_i + 1]),
+                srgb_to_linear(p[top_i + 2]),
+                (p[top_i + 3] as f32) / 255.0,
+            ];
+            let bg = [
+                srgb_to_linear(p[bot_i]),
+                srgb_to_linear(p[bot_i + 1]),
+                srgb_to_linear(p[bot_i + 2]),
+                (p[bot_i + 3] as f32) / 255.0,
+            ];
+            out.push(HalfblockCell { row_offset: rr, col_offset: cc, fg, bg });
+        }
+    }
+    out
+}
+
+/// Half-block glyph used by [`halfblock_cells`] callers. U+2580 (▀) —
+/// upper half block. Public so the renderer's substitution path can match
+/// against it without re-defining the codepoint.
+pub const HALFBLOCK_CHAR: char = '▀';
 
 struct DecodeJob {
     pending_id: u32,
@@ -235,7 +404,12 @@ impl Store {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.images.insert(
             image_id,
-            StoredImage { image: None, bytes: 0, last_used: Instant::now() },
+            StoredImage {
+                image: None,
+                preview: None,
+                bytes: 0,
+                last_used: Instant::now(),
+            },
         );
 
         let pending_id = self.next_pending;
@@ -333,6 +507,13 @@ impl Store {
                             nearest_filter,
                             result.label.as_deref(),
                         );
+                        // Build the half-block preview from the same RGBA
+                        // buffer before it gets dropped. Cheap (one box
+                        // filter), tiny memory (≤ MAX_PREVIEW_* * 4 bytes).
+                        // Held even when `images_enabled = true` so a
+                        // runtime config flip can switch over instantly
+                        // without waiting for the next decode.
+                        let preview = build_preview(&decoded.rgba, decoded.width, decoded.height);
                         // Fill the reservation in place — DON'T allocate
                         // a new id, otherwise placements would reference
                         // the stale id and render blank forever.
@@ -341,6 +522,7 @@ impl Store {
                             .get_mut(&req.image_id)
                             .expect("reservation present until decode resolves");
                         entry.image = Some(image);
+                        entry.preview = preview;
                         entry.bytes = bytes_used;
                         entry.last_used = Instant::now();
                         self.total_bytes += bytes_used;
@@ -375,6 +557,15 @@ impl Store {
     /// Returns `None` in the same cases as `get`.
     pub fn peek(&self, id: ImageId) -> Option<&GpuImage> {
         self.images.get(&id.0).and_then(|e| e.image.as_ref())
+    }
+
+    /// Read-only access to the half-block preview. Returns `None` for
+    /// unknown ids AND for reservations whose decode is still in flight —
+    /// callers should treat both as "no preview, skip the half-block draw".
+    /// The preview lifetime tracks the GPU image: `retain` drops both
+    /// together when the placement is gone.
+    pub fn preview(&self, id: ImageId) -> Option<&Preview> {
+        self.images.get(&id.0).and_then(|e| e.preview.as_ref())
     }
 
     /// True when the id is reserved but its decode hasn't completed yet.
@@ -429,6 +620,7 @@ impl Store {
             id,
             StoredImage {
                 image: Some(gpu_image),
+                preview: None,
                 bytes,
                 last_used: Instant::now(),
             },
@@ -826,6 +1018,209 @@ mod tests {
         let decode = DecodeError::Decode(inner);
         let s = format!("{decode}");
         assert!(s.contains("decode"), "got: {s}");
+    }
+
+    //
+    // Half-block preview / fallback path tests.
+    //
+    // (b)-strategy lives or dies on these: the preview is small, must be
+    // deterministic for the same input, and the cell math must land each
+    // half-block on exactly the right two preview pixels.
+    //
+
+    #[test]
+    fn build_preview_passes_through_when_image_fits_in_budget() {
+        // A 4×4 source fits comfortably under MAX_PREVIEW_* — output stays
+        // 4×4 (no upscale) and the pixel data round-trips byte-for-byte
+        // through the single-pixel box-filter cell.
+        let mut src = Vec::with_capacity(4 * 4 * 4);
+        for i in 0..16 {
+            // Distinct per-pixel colors so any swap or off-by-one in the
+            // sampler is immediately visible.
+            src.extend_from_slice(&[i as u8 * 17, 0, 0, 255]);
+        }
+        let p = build_preview(&src, 4, 4).expect("preview built");
+        assert_eq!((p.width, p.height), (4, 4));
+        assert_eq!(p.rgba, src);
+    }
+
+    #[test]
+    fn build_preview_downsamples_oversized_image_within_budget() {
+        // 1000-wide source forces a downscale; verify the result fits the
+        // budget and preserves aspect to within rounding.
+        let w = 1000u32;
+        let h = 500u32;
+        let src = vec![128u8; (w as usize) * (h as usize) * 4];
+        let p = build_preview(&src, w, h).expect("preview built");
+        assert!(p.width <= MAX_PREVIEW_COLS);
+        assert!(p.height <= MAX_PREVIEW_ROWS);
+        assert!(p.width >= 1 && p.height >= 1);
+        // 2:1 aspect ratio in, ≈2:1 ratio out. Allow ±1 for rounding.
+        let ratio = (p.width as f32) / (p.height as f32);
+        assert!((ratio - 2.0).abs() < 0.25, "aspect drifted: {ratio}");
+        // All source pixels were 128 → every output pixel is 128 too.
+        assert!(p.rgba.iter().all(|&b| b == 128));
+    }
+
+    #[test]
+    fn build_preview_is_deterministic_for_same_input() {
+        // The half-block path samples the preview each frame; a
+        // non-deterministic downsample would flicker. Pin determinism.
+        let mut src = vec![0u8; 32 * 24 * 4];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = ((i * 7) % 256) as u8;
+        }
+        let a = build_preview(&src, 32, 24).unwrap();
+        let b = build_preview(&src, 32, 24).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn build_preview_rejects_zero_dimensions() {
+        let src = vec![0u8; 4];
+        assert!(build_preview(&src, 0, 1).is_none());
+        assert!(build_preview(&src, 1, 0).is_none());
+    }
+
+    #[test]
+    fn build_preview_rejects_undersized_buffer() {
+        // Caller mismatch — buffer length doesn't cover the claimed
+        // dimensions. Reject cleanly rather than indexing past the end.
+        let src = vec![0u8; 4 * 4 * 4 - 1];
+        assert!(build_preview(&src, 4, 4).is_none());
+    }
+
+    #[test]
+    fn halfblock_cells_emits_one_per_cell_with_correct_offsets() {
+        // 4×2 preview = enough pixels for two cells in a column, or one
+        // 2-wide × 1-tall cell row. We ask for 2 rows × 2 cols → 4 cells.
+        let mut rgba = Vec::with_capacity(4 * 2 * 4);
+        for i in 0..8 {
+            rgba.extend_from_slice(&[i as u8 * 20, 0, 0, 255]);
+        }
+        let p = Preview { width: 2, height: 4, rgba };
+        let cells = halfblock_cells(&p, 2, 2);
+        assert_eq!(cells.len(), 4);
+        // Offsets cover (0,0), (0,1), (1,0), (1,1) in row-major order.
+        let offsets: Vec<(u16, u16)> =
+            cells.iter().map(|c| (c.row_offset, c.col_offset)).collect();
+        assert_eq!(offsets, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn halfblock_cells_top_pixel_drives_fg_bottom_drives_bg() {
+        // 1×2 preview: pixel 0 (top) = pure red, pixel 1 (bottom) = pure
+        // blue. One cell. fg must come from row 0, bg from row 1.
+        let rgba = vec![
+            255, 0, 0, 255,  // (0,0) red
+            0, 0, 255, 255,  // (0,1) blue
+        ];
+        let p = Preview { width: 1, height: 2, rgba };
+        let cells = halfblock_cells(&p, 1, 1);
+        assert_eq!(cells.len(), 1);
+        let c = &cells[0];
+        // Top pixel is fg. srgb_to_linear(255) = 1.0 exactly.
+        assert!((c.fg[0] - 1.0).abs() < 1e-4, "fg r: {}", c.fg[0]);
+        assert!(c.fg[2] < 0.01, "fg b should be near zero, got {}", c.fg[2]);
+        // Bottom pixel is bg.
+        assert!(c.bg[0] < 0.01, "bg r should be near zero, got {}", c.bg[0]);
+        assert!((c.bg[2] - 1.0).abs() < 1e-4, "bg b: {}", c.bg[2]);
+        // Alpha passes through as straight-alpha float.
+        assert!((c.fg[3] - 1.0).abs() < 1e-4);
+        assert!((c.bg[3] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn halfblock_cells_handles_empty_request() {
+        let p = Preview { width: 4, height: 4, rgba: vec![255u8; 64] };
+        assert!(halfblock_cells(&p, 0, 4).is_empty());
+        assert!(halfblock_cells(&p, 4, 0).is_empty());
+    }
+
+    #[test]
+    fn halfblock_cells_handles_oversized_request_without_panicking() {
+        // Ask for more cells than the preview has pixels — nearest-
+        // neighbour clamping must keep every sample inside bounds.
+        let p = Preview { width: 2, height: 2, rgba: vec![255u8; 16] };
+        let cells = halfblock_cells(&p, 10, 10);
+        assert_eq!(cells.len(), 100, "every cell still emitted");
+    }
+
+    #[test]
+    fn store_preview_is_some_after_decode() {
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut s = Store::new(DEFAULT_CAP_BYTES);
+        let png = make_png(4, 4);
+        let (_pending, image_id) =
+            s.request_insert(png, 100, Duration::from_secs(5), None);
+        // Pre-decode: preview unavailable (mirrors `peek`).
+        assert!(s.preview(image_id).is_none());
+        let results = poll_until_result(&mut s, &p, &d, &q, Duration::from_secs(2));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        // Post-decode: preview is populated and at least 1×1.
+        let preview = s.preview(image_id).expect("preview should land");
+        assert!(preview.width >= 1 && preview.height >= 1);
+    }
+
+    #[test]
+    fn store_preview_is_none_for_unknown_id() {
+        let s = Store::new(DEFAULT_CAP_BYTES);
+        assert!(s.preview(ImageId(1)).is_none());
+        assert!(s.preview(ImageId(99_999)).is_none());
+    }
+
+    #[test]
+    fn store_preview_dropped_when_retain_evicts() {
+        // Preview lifetime must track the GPU image: a placement that
+        // has been fully cleaned up loses its preview at the next
+        // retain, otherwise a stale preview could be rendered against a
+        // freshly-allocated id that happens to recycle the same slot.
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut s = Store::new(DEFAULT_CAP_BYTES);
+        let (_pid, image_id) =
+            s.request_insert(make_png(2, 2), 100, Duration::from_secs(5), None);
+        let results = poll_until_result(&mut s, &p, &d, &q, Duration::from_secs(2));
+        assert_eq!(results.len(), 1);
+        assert!(s.preview(image_id).is_some());
+        s.retain(&HashSet::new());
+        assert!(s.preview(image_id).is_none());
+    }
+
+    #[test]
+    fn halfblock_cells_end_to_end_against_store_preview() {
+        // Real decode → preview → halfblock_cells round-trip. Pins that
+        // the consumer path (sampling preview pixels for half-block fg/bg)
+        // works against an image that flowed through the worker, not just
+        // a hand-built Preview.
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut s = Store::new(DEFAULT_CAP_BYTES);
+        let png = make_png(8, 8);
+        let (_pid, image_id) =
+            s.request_insert(png, 100, Duration::from_secs(5), None);
+        let results = poll_until_result(&mut s, &p, &d, &q, Duration::from_secs(2));
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_ok());
+        let preview = s.preview(image_id).expect("preview built");
+        let cells = halfblock_cells(preview, 3, 4);
+        assert_eq!(cells.len(), 12);
+        // make_png paints the whole image red — fg AND bg should both
+        // be near-red (linear ≈ 1.0 on R, ≈ 0 on G/B).
+        for c in cells {
+            assert!(c.fg[0] > 0.9, "fg r: {}", c.fg[0]);
+            assert!(c.bg[0] > 0.9, "bg r: {}", c.bg[0]);
+            assert!(c.fg[1] < 0.1 && c.fg[2] < 0.1);
+            assert!(c.bg[1] < 0.1 && c.bg[2] < 0.1);
+        }
     }
 
     #[test]
