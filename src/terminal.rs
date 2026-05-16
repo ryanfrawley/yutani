@@ -1708,18 +1708,34 @@ impl Terminal {
             return;
         };
 
-        // Capability handshake. `kitty +kitten icat` (and most other
-        // Kitty-graphics-aware apps) send `a=q` on startup to probe
-        // support; we reply `OK` so they proceed to send real images.
-        // The reply mirrors the request's image_id when present so the
-        // app can correlate. `q=` suppresses replies — q=1 hides only
-        // success responses (we have no errors to report in K1), q=2
-        // hides all.
+        // Capability handshake. Apps query each (format, transmission)
+        // combo on startup; we must answer truthfully or they'll pick a
+        // path we can't serve and silently drop their image. Kitty's
+        // icat in particular queries `f=24` (raw RGB) variants first and
+        // will use raw + shared memory if we say OK to them — we don't
+        // implement those, so reply ENOTSUPPORTED and force the fallback
+        // to f=100/t=f which we do support.
+        //
+        // Quiet modes per spec: q=0 (default) reply always, q=1 suppress
+        // success, q=2 suppress all.
         if matches!(ctrl.action, KittyAction::Query) {
-            if ctrl.quiet == 0 {
+            let supported = self.kitty_query_supported(ctrl.format, ctrl.transmission);
+            let suppress = match ctrl.quiet {
+                0 => false,
+                1 => supported, // suppress OK, but still send errors
+                _ => true,      // q>=2: silence everything
+            };
+            if !suppress {
+                let body = if supported {
+                    "OK".to_string()
+                } else {
+                    // Spec format is `ENOTSUPPORTED:<message>`; the
+                    // message text is informational.
+                    "ENOTSUPPORTED:format or transmission not supported".to_string()
+                };
                 let reply = match ctrl.image_id {
-                    Some(id) => format!("\x1b_Gi={};OK\x1b\\", id),
-                    None => "\x1b_G;OK\x1b\\".to_string(),
+                    Some(id) => format!("\x1b_Gi={};{}\x1b\\", id, body),
+                    None => format!("\x1b_G;{}\x1b\\", body),
                 };
                 self.pending_response.extend_from_slice(reply.as_bytes());
             }
@@ -1743,6 +1759,22 @@ impl Terminal {
             KittyTransmission::File => self.handle_apc_file(payload, &ctrl),
             KittyTransmission::Other => {} // unsupported medium → drop
         }
+    }
+
+    /// Single source of truth for which (format, transmission) tuples we
+    /// can actually serve. Used both by the capability-query reply and
+    /// by the transmission branch — keeps the two paths in lockstep so
+    /// we never say OK to something the dispatcher would then drop.
+    fn kitty_query_supported(
+        &self,
+        format: KittyFormat,
+        transmission: KittyTransmission,
+    ) -> bool {
+        matches!(format, KittyFormat::Png)
+            && matches!(
+                transmission,
+                KittyTransmission::Direct | KittyTransmission::File
+            )
     }
 
     /// Direct base64 transmission: payload is the image bytes (possibly
@@ -4611,9 +4643,8 @@ mod tests {
     #[test]
     fn kitty_apc_query_replies_ok_with_request_id() {
         // kitty +kitten icat probes support with `a=q,i=N` on startup.
-        // We must reply `\e_Gi=N;OK\e\\` so the app proceeds to send
-        // real images. Reply id mirrors the request id so the app can
-        // correlate multiple in-flight probes.
+        // For supported (format, transmission) tuples we reply
+        // `\e_Gi=N;OK\e\\`. Defaults are f=100 / t=d (both supported).
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&kitty_apc_control_only("a=q,i=42,s=1,v=1"));
         assert!(t.take_pending_image_uploads().is_empty());
@@ -4630,14 +4661,57 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_query_quiet_suppresses_reply() {
-        // q=1 hides success responses (we never emit errors in K1, so
-        // it effectively hides all). q=2 hides everything.
-        for q in [1, 2] {
-            let mut t = Terminal::new(80, 24, 100);
-            t.feed(&kitty_apc_control_only(&format!("a=q,i=1,q={}", q)));
-            assert!(t.take_response().is_empty(), "q={} should silence", q);
-        }
+    fn kitty_apc_query_replies_enotsupported_for_raw_format() {
+        // f=24 (raw RGB) isn't implemented — say so. Otherwise icat
+        // picks raw + shared memory for large images and our dispatcher
+        // silently drops the transmission.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=5,f=24,s=1,v=1"));
+        let reply = t.take_response();
+        let s = std::str::from_utf8(&reply).unwrap();
+        assert!(s.starts_with("\x1b_Gi=5;ENOTSUPPORTED"), "got: {s}");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_enotsupported_for_shared_memory() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=6,f=100,t=s,s=1,v=1"));
+        let reply = t.take_response();
+        let s = std::str::from_utf8(&reply).unwrap();
+        assert!(s.starts_with("\x1b_Gi=6;ENOTSUPPORTED"), "got: {s}");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_ok_for_t_f_file() {
+        // t=f is the path icat picks for local PNGs — it MUST be in
+        // the "supported" set or the kitten won't use it.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=7,f=100,t=f,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=7;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_quiet_modes() {
+        // q=0 default → reply always. q=1 → suppress OK but still send
+        // errors. q=2 → silence everything.
+        let mut t = Terminal::new(80, 24, 100);
+
+        t.feed(&kitty_apc_control_only("a=q,i=1,q=0")); // supported + q=0
+        assert_eq!(t.take_response(), b"\x1b_Gi=1;OK\x1b\\");
+
+        t.feed(&kitty_apc_control_only("a=q,i=1,q=1")); // supported + q=1
+        assert!(t.take_response().is_empty(), "q=1 should suppress OK");
+
+        t.feed(&kitty_apc_control_only("a=q,i=2,f=24,q=1")); // error + q=1
+        let reply = t.take_response();
+        assert!(
+            std::str::from_utf8(&reply).unwrap().contains("ENOTSUPPORTED"),
+            "q=1 must NOT suppress errors; got: {:?}",
+            reply,
+        );
+
+        t.feed(&kitty_apc_control_only("a=q,i=3,f=24,q=2")); // error + q=2
+        assert!(t.take_response().is_empty(), "q=2 must silence everything");
     }
 
     #[test]
