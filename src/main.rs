@@ -4490,7 +4490,7 @@ async fn run() {
 
     let transparent = false; // needed because of a shadow bug
     let window = WindowBuilder::new()
-        .with_title("Terminal")
+        .with_title("Yutani")
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
@@ -4535,7 +4535,7 @@ async fn run() {
     }
     // Match the NSAppearance to the palette so the title-bar text the OS
     // draws over our transparent chrome reads against the actual bg —
-    // otherwise dark schemes render black "Terminal" text on a dark fill.
+    // otherwise dark schemes render black "Yutani" text on a dark fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
@@ -4802,7 +4802,7 @@ fn format_hex_rgb(c: [f32; 4]) -> String {
 
 /// Pick a window NSAppearance to match a background color. Title-bar text is
 /// drawn by the OS using that appearance, so a dark scheme must report Dark
-/// or "Terminal" comes out black on near-black.
+/// or "Yutani" comes out black on near-black.
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray
     // (sRGB 0.5). Below that, dark chrome reads better.
