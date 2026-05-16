@@ -514,12 +514,17 @@ fn is_word_char(ch: char) -> bool {
 
 /// A clickable URL the mouse is currently hovering over. Tracked while the
 /// Cmd modifier is held so the renderer can underline the span and the
-/// click handler can open it.
+/// click handler can open it. URLs that wrap at the right edge span
+/// multiple rows; the start/end pair is inclusive on both ends.
 #[derive(Clone, Debug, PartialEq)]
 struct HoverUrl {
-    /// Absolute (scroll-stable) line index.
-    abs_line: isize,
-    /// Inclusive cell column range of the URL on that line.
+    /// Absolute (scroll-stable) line indices. `start_abs_line == end_abs_line`
+    /// for the common single-row case.
+    start_abs_line: isize,
+    end_abs_line: isize,
+    /// Inclusive cell columns. For wrapped URLs, the underline strip on each
+    /// intermediate row spans the full row width — only the first and last
+    /// rows use these column positions.
     start_col: usize,
     end_col: usize,
     /// The URL text itself, ready to hand to `open(1)`.
@@ -583,6 +588,96 @@ fn find_url_in_cells(cells: &[style::Cell], col: usize) -> Option<(usize, usize,
         .map(|c| c.ch)
         .collect();
     Some((url_start_col, url_end_col, url))
+}
+
+/// Cap on how far we'll walk in either direction looking for a wrapped URL
+/// continuation. URLs that span more than this many rows are exotic enough
+/// that the heuristic isn't worth burning scrollback walks on.
+const URL_WRAP_MAX_ROWS: usize = 32;
+
+/// Build the wrapped logical line containing `abs_line`: walk back and
+/// forward across rows whose adjacent edges are both non-whitespace (the
+/// terminal's autowrap left no separator between them) and concatenate the
+/// cells. Returns `(start_abs_line, cols, flat_cells)` so callers can map
+/// flat indices back to (row, col). Bounded by `URL_WRAP_MAX_ROWS` either
+/// side.
+fn build_wrapped_line(
+    terminal: &terminal::Terminal,
+    abs_line: isize,
+) -> Option<(isize, usize, Vec<style::Cell>)> {
+    let row = terminal.line_at(abs_line)?;
+    let cols = row.len();
+    if cols == 0 {
+        return Some((abs_line, 0, Vec::new()));
+    }
+
+    // Walk back as long as the previous row's last col is non-whitespace
+    // *and* the current row's first col is non-whitespace — the only
+    // signature autowrap leaves on the cell grid (no soft-wrap flag).
+    let mut start = abs_line;
+    let mut steps = 0;
+    while steps < URL_WRAP_MAX_ROWS {
+        let prev = match terminal.line_at(start - 1) {
+            Some(p) if p.len() == cols => p,
+            _ => break,
+        };
+        let cur = terminal.line_at(start).expect("walked from a valid row");
+        if prev.last().map(|c| c.ch.is_whitespace()).unwrap_or(true)
+            || cur.first().map(|c| c.ch.is_whitespace()).unwrap_or(true)
+        {
+            break;
+        }
+        start -= 1;
+        steps += 1;
+    }
+
+    let mut end = abs_line;
+    let mut steps = 0;
+    while steps < URL_WRAP_MAX_ROWS {
+        let next = match terminal.line_at(end + 1) {
+            Some(n) if n.len() == cols => n,
+            _ => break,
+        };
+        let cur = terminal.line_at(end).expect("walked from a valid row");
+        if cur.last().map(|c| c.ch.is_whitespace()).unwrap_or(true)
+            || next.first().map(|c| c.ch.is_whitespace()).unwrap_or(true)
+        {
+            break;
+        }
+        end += 1;
+        steps += 1;
+    }
+
+    let mut buf = Vec::with_capacity(((end - start + 1) as usize) * cols);
+    for line in start..=end {
+        let r = terminal.line_at(line)?;
+        buf.extend_from_slice(r);
+    }
+    Some((start, cols, buf))
+}
+
+/// Locate the URL under `(abs_line, col)`, joining wrap-continued rows so a
+/// link that spilled past the right edge still resolves as a single span.
+/// Falls back to a same-row search when no wrap continuation is in play.
+fn find_url_at(
+    terminal: &terminal::Terminal,
+    abs_line: isize,
+    col: usize,
+) -> Option<HoverUrl> {
+    let (start_abs, cols, flat) = build_wrapped_line(terminal, abs_line)?;
+    if cols == 0 || col >= cols {
+        return None;
+    }
+    let row_offset = (abs_line - start_abs) as usize;
+    let virtual_col = row_offset * cols + col;
+    let (s, e, url) = find_url_in_cells(&flat, virtual_col)?;
+    Some(HoverUrl {
+        start_abs_line: start_abs + (s / cols) as isize,
+        start_col: s % cols,
+        end_abs_line: start_abs + (e / cols) as isize,
+        end_col: e % cols,
+        url,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1563,15 +1658,24 @@ impl State {
         // text through smooth scroll.
         if let Some(hu) = &self.hover_url {
             for r in r_lo..r_hi {
-                if self.terminal.visual_to_abs_line(r) != hu.abs_line {
+                let abs_line = self.terminal.visual_to_abs_line(r);
+                if abs_line < hu.start_abs_line || abs_line > hu.end_abs_line {
                     continue;
                 }
-                if hu.start_col >= cols {
-                    break;
+                // Span on this row: first row honors start_col, last row
+                // honors end_col, every middle row covers the full width
+                // (the URL ran edge-to-edge to wrap).
+                let from = if abs_line == hu.start_abs_line { hu.start_col } else { 0 };
+                let to = if abs_line == hu.end_abs_line { hu.end_col } else { cols - 1 };
+                if from >= cols {
+                    continue;
                 }
-                let last = hu.end_col.min(cols - 1);
-                let ux = col_x(hu.start_col);
-                let uw = (last - hu.start_col + 1) as f32 * cell_w;
+                let last = to.min(cols - 1);
+                if last < from {
+                    continue;
+                }
+                let ux = col_x(from);
+                let uw = (last - from + 1) as f32 * cell_w;
                 // Honor the font's own underline_position / underline_thickness
                 // so the line lands where the type designer intended and scales
                 // with point size. `underline_pos_px` is the (signed) offset of
@@ -1584,7 +1688,7 @@ impl State {
                 // theme overrides; fall back to the default fg.
                 let fg = self
                     .terminal
-                    .extended_cell(r, hu.start_col)
+                    .extended_cell(r, from)
                     .map(|cell| {
                         if cell.style.reverse {
                             cell.style.color_bg.unwrap_or(default_bg_solid)
@@ -1605,7 +1709,6 @@ impl State {
                     fg,
                     [0.0; 4],
                 );
-                break;
             }
         }
 
@@ -2400,14 +2503,7 @@ impl State {
         let new = if self.modifiers.super_key() {
             let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
             let abs_line = self.terminal.visual_to_abs_line(vrow);
-            self.terminal.line_at(abs_line).and_then(|cells| {
-                find_url_in_cells(cells, col).map(|(s, e, url)| HoverUrl {
-                    abs_line,
-                    start_col: s,
-                    end_col: e,
-                    url,
-                })
-            })
+            find_url_at(&self.terminal, abs_line, col)
         } else {
             None
         };
@@ -3783,5 +3879,136 @@ mod tests {
         let row = cells_from_str("a\thttps://example.com");
         // Cursor on the tab itself.
         assert!(find_url_in_cells(&row, 1).is_none());
+    }
+
+    // ---- wrap-aware URL detection (find_url_at / build_wrapped_line) ----
+    //
+    // The autowrap heuristic looks at the cell grid: a row joins its
+    // predecessor only when *both* the prev row's last col and the cur row's
+    // first col are non-whitespace. A real `terminal::Terminal` is required
+    // here so we exercise the actual grid layout autowrap produces.
+
+    /// 20-col x rows terminal with a generous scrollback budget. Default
+    /// autowrap on, no DECLRMM margins — matches the conditions a hovered
+    /// shell URL sees.
+    fn make_terminal(rows: usize, cols: usize) -> terminal::Terminal {
+        terminal::Terminal::new(cols, rows, 1024)
+    }
+
+    #[test]
+    fn find_url_at_wrapped_url_resolves_from_first_row() {
+        // 39-char URL on a 20-col grid: row 0 gets cols 0..19
+        // ("https://example.com/"), row 1 gets cols 0..18
+        // ("very-long-path/here"). The join condition holds because
+        // row 0's last cell ('/') and row 1's first cell ('v') are both
+        // non-whitespace.
+        let mut t = make_terminal(5, 20);
+        let url = "https://example.com/very-long-path/here";
+        assert_eq!(url.len(), 39);
+        t.feed(url);
+
+        let hover = find_url_at(&t, 0, 5).expect("URL should be found from first row");
+        assert_eq!(hover.start_abs_line, 0);
+        assert_eq!(hover.end_abs_line, 1);
+        assert_eq!(hover.start_col, 0);
+        assert_eq!(hover.end_col, 18, "39 chars over 20 cols ends at col 18 of row 1");
+        assert_eq!(hover.url, url);
+    }
+
+    #[test]
+    fn find_url_at_wrapped_url_resolves_from_continuation_row() {
+        // Same wrapped URL — cursor on the continuation row must resolve to
+        // the same span. This is the regression: previously hovering the
+        // tail row found nothing because the row in isolation has no scheme.
+        let mut t = make_terminal(5, 20);
+        let url = "https://example.com/very-long-path/here";
+        t.feed(url);
+
+        let from_first = find_url_at(&t, 0, 5).expect("first-row hover");
+        let from_tail = find_url_at(&t, 1, 5).expect("tail-row hover should also resolve");
+        assert_eq!(from_first, from_tail);
+    }
+
+    #[test]
+    fn find_url_at_does_not_join_when_boundary_is_whitespace() {
+        // Row 0: "https://example.com " (19 + 1 space = 20 cols exactly).
+        // Row 1: "extra-text" starting at col 0. Row 0's last cell is a
+        // space, so the join is suppressed and the URL stays on row 0
+        // without sucking up "extra-text".
+        let mut t = make_terminal(5, 20);
+        t.feed("https://example.com extra-text");
+
+        let hover = find_url_at(&t, 0, 5).expect("URL on row 0");
+        assert_eq!(hover.start_abs_line, 0);
+        assert_eq!(hover.end_abs_line, 0);
+        assert_eq!(hover.start_col, 0);
+        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.url, "https://example.com");
+        assert!(
+            !hover.url.contains("extra-text"),
+            "whitespace at boundary must break the wrap-join"
+        );
+    }
+
+    #[test]
+    fn find_url_at_caps_continuation_walk() {
+        // Feed many rows of solid non-whitespace text with a URL at the
+        // top. Without the URL_WRAP_MAX_ROWS cap, build_wrapped_line would
+        // walk every continuous row in scrollback. With the cap, the walk
+        // is bounded; the test must complete quickly and return *some*
+        // URL — we don't pin the exact length because that's the heuristic's
+        // discretion.
+        let mut t = make_terminal(5, 20);
+        // 50 rows worth of solid non-whitespace, starting with the scheme.
+        let mut s = String::from("https://example.com/");
+        // 49 more rows of 20 'x' each — all non-whitespace, so every
+        // boundary qualifies for the join (until the cap kicks in).
+        for _ in 0..49 {
+            s.push_str(&"x".repeat(20));
+        }
+        t.feed(&s);
+
+        // The first row of the URL is now somewhere in scrollback. Find it
+        // by scanning abs_line 0..scrollback_len + rows for the row that
+        // starts with 'h'.
+        let total_lines = t.scrollback_len() as isize + t.rows as isize;
+        let mut start_abs = None;
+        for abs in 0..total_lines {
+            if let Some(row) = t.line_at(abs) {
+                if row.first().map(|c| c.ch) == Some('h') {
+                    start_abs = Some(abs);
+                    break;
+                }
+            }
+        }
+        let start_abs = start_abs.expect("URL start row should exist");
+
+        let hover = find_url_at(&t, start_abs, 0).expect("should resolve to some URL");
+        assert_eq!(hover.start_abs_line, start_abs);
+        assert!(hover.url.starts_with("https://example.com/"));
+        // Cap is URL_WRAP_MAX_ROWS rows past the start; bound length
+        // generously to confirm we didn't walk all 50 rows.
+        let max_len = (URL_WRAP_MAX_ROWS + 1) * 20;
+        assert!(
+            hover.url.len() <= max_len,
+            "URL length {} exceeded wrap cap (max {})",
+            hover.url.len(),
+            max_len
+        );
+    }
+
+    #[test]
+    fn find_url_at_single_row_url_still_works() {
+        // Regression: the wrap-aware path must not break the common
+        // single-row case. 60 cols is wide enough that nothing wraps.
+        let mut t = make_terminal(5, 60);
+        t.feed("https://example.com more text here");
+
+        let hover = find_url_at(&t, 0, 10).expect("single-row URL");
+        assert_eq!(hover.start_abs_line, 0);
+        assert_eq!(hover.end_abs_line, 0);
+        assert_eq!(hover.start_col, 0);
+        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.url, "https://example.com");
     }
 }
