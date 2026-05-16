@@ -1134,6 +1134,7 @@ impl Terminal {
             Event::Osc(s) => self.handle_osc(&s),
             Event::Dcs(s) => self.handle_dcs(&s),
             Event::Apc(s) => self.handle_apc(&s),
+            Event::XtwinopsQuery(ps) => self.handle_xtwinops_query(ps),
             Event::Sgr(params) => self.cursor.style.apply_sgr(&params),
             Event::PrivateModeSet(n) => self.private_mode(n, true),
             Event::PrivateModeReset(n) => self.private_mode(n, false),
@@ -1642,6 +1643,40 @@ impl Terminal {
             cell_anchor,
             cell_extent,
         });
+    }
+
+    /// Reply to an XTWINOPS size query. Apps (Kitty's icat kitten in
+    /// particular) probe these before sending image protocols so they
+    /// know how many pixels a cell is — without a reply the kitten
+    /// errors out with "terminal does not support reporting screen
+    /// sizes in pixels."
+    ///
+    /// Only the report subset (14 / 16 / 18) is honored; the
+    /// resize/move/raise/lower actions on the same final byte are
+    /// silently ignored upstream in the parser.
+    fn handle_xtwinops_query(&mut self, ps: u16) {
+        let cell_w = self.cell_w_px.max(1) as usize;
+        let line_h = self.line_h_px.max(1) as usize;
+        match ps {
+            // 14 → text area in pixels: `\e[4;<height>;<width>t`.
+            14 => {
+                let w = self.cols * cell_w;
+                let h = self.rows * line_h;
+                let s = format!("\x1b[4;{};{}t", h, w);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            // 16 → single cell in pixels: `\e[6;<height>;<width>t`.
+            16 => {
+                let s = format!("\x1b[6;{};{}t", line_h, cell_w);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            // 18 → text area in characters: `\e[8;<rows>;<cols>t`.
+            18 => {
+                let s = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            _ => {} // parser only emits the three above; defensive.
+        }
     }
 
     /// Handle a captured APC payload. The Kitty graphics protocol
@@ -4140,6 +4175,60 @@ mod tests {
         // Unsupported units fall through to None — caller substitutes Auto.
         assert_eq!(parse_iterm_size("5em"), None);
         assert_eq!(parse_iterm_size("-1"), None);
+    }
+
+    //
+    // XTWINOPS — what the kitty kitten queries on startup to learn cell
+    // pixel size. Without these the kitten refuses to send images at all.
+    //
+
+    #[test]
+    fn xtwinops_14_replies_with_text_area_pixel_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b[14t");
+        // height = rows * line_h = 24 * 16 = 384
+        // width  = cols * cell_w = 80 * 8 = 640
+        assert_eq!(t.take_response(), b"\x1b[4;384;640t");
+    }
+
+    #[test]
+    fn xtwinops_16_replies_with_cell_pixel_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(9, 20);
+        t.feed("\x1b[16t");
+        // height = line_h = 20, width = cell_w = 9
+        assert_eq!(t.take_response(), b"\x1b[6;20;9t");
+    }
+
+    #[test]
+    fn xtwinops_18_replies_with_text_area_character_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[18t");
+        // rows=24, cols=80
+        assert_eq!(t.take_response(), b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn xtwinops_unrelated_action_codes_are_ignored() {
+        // 1 = de-iconify, 3 = move, 4 = resize, 5 = raise. Honoring
+        // these would let any program move our window without consent.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        for ps in [1, 3, 4, 5, 22, 23] {
+            t.feed(&format!("\x1b[{}t", ps));
+            assert!(t.take_response().is_empty(), "ps={} should be silent", ps);
+        }
+    }
+
+    #[test]
+    fn xtwinops_uses_clamped_one_for_unset_cell_size() {
+        // If State hasn't called set_cell_size_px yet, default is 1×1.
+        // The kitten will still get a reply (no error), just a degenerate
+        // one — better than nothing.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[14t");
+        assert_eq!(t.take_response(), b"\x1b[4;24;80t");
     }
 
     //

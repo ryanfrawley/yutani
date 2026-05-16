@@ -54,6 +54,16 @@ pub enum Event {
     // CSI > c — Secondary Device Attributes (terminal type / version).
     SecondaryDeviceAttributes,
 
+    // CSI Ps t — XTWINOPS window-manipulation query. Apps use this to
+    // ask the terminal for its size in pixels or cells:
+    //   14 → text area in pixels       → \e[4;<height>;<width>t
+    //   16 → cell size in pixels       → \e[6;<height>;<width>t
+    //   18 → text area in characters   → \e[8;<rows>;<cols>t
+    // Only the query subset is parsed; the action subset (resize, move,
+    // raise, etc.) is ignored. Kitty's icat depends on 14/16 for its
+    // pixel-precise placement math.
+    XtwinopsQuery(u16),
+
     // CSI <n> SP q — DECSCUSR. 0/1=blink block, 2=block, 3=blink underline,
     // 4=underline, 5=blink bar, 6=bar.
     SetCursorStyle(u16),
@@ -483,6 +493,16 @@ impl Parser {
                 p1.filter(|&v| v != 0),
             )),
             'm' => emit(Event::Sgr(std::mem::take(&mut self.params))),
+            // XTWINOPS — only the report-size subset; resize/move/etc.
+            // are silently ignored to avoid letting apps move the
+            // window without user consent.
+            't' => {
+                if let Some(ps) = p0 {
+                    if matches!(ps, 14 | 16 | 18) {
+                        emit(Event::XtwinopsQuery(ps));
+                    }
+                }
+            }
             _ => {} // unsupported final byte — silently drop
         }
     }
