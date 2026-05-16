@@ -1726,13 +1726,8 @@ impl Terminal {
             return;
         }
 
-        // Format and transmission gating. Only direct-base64 PNG is
-        // wired up in K1; anything else is silently dropped per the
-        // Kitty contract.
+        // Format gating. Only PNG is wired up in K1.
         if !matches!(ctrl.format, KittyFormat::Png) {
-            return;
-        }
-        if !matches!(ctrl.transmission, KittyTransmission::Direct) {
             return;
         }
 
@@ -1743,6 +1738,16 @@ impl Terminal {
             return;
         }
 
+        match ctrl.transmission {
+            KittyTransmission::Direct => self.handle_apc_direct(payload, &ctrl),
+            KittyTransmission::File => self.handle_apc_file(payload, &ctrl),
+            KittyTransmission::Other => {} // unsupported medium → drop
+        }
+    }
+
+    /// Direct base64 transmission: payload is the image bytes (possibly
+    /// chunked across multiple APCs and reassembled by `kitty_chunks`).
+    fn handle_apc_direct(&mut self, payload: &str, ctrl: &KittyControl) {
         // Strip APC-internal whitespace from the payload (some apps wrap
         // base64 lines for readability). The base64 alphabet doesn't
         // include whitespace, so this is unambiguous.
@@ -1756,7 +1761,6 @@ impl Terminal {
         // finalize; with no in-flight buffer it's a single-chunk image.
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
-                // Start or continue accumulation.
                 let entry = self.kitty_chunks.entry(id).or_insert(KittyChunks {
                     b64: String::new(),
                     cells_cols: ctrl.cells_cols,
@@ -1766,9 +1770,6 @@ impl Terminal {
                 entry.b64.push_str(&chunk);
             }
             (Some(id), false) if self.kitty_chunks.contains_key(&id) => {
-                // Final chunk for an in-flight transmission. Take the
-                // accumulator (drops the HashMap entry), append this
-                // chunk's bytes, and dispatch.
                 let mut acc = self.kitty_chunks.remove(&id).expect("contains_key");
                 acc.b64.push_str(&chunk);
                 self.finalize_kitty_image(
@@ -1778,11 +1779,6 @@ impl Terminal {
                     acc.do_not_move_cursor,
                 );
             }
-            // (None, _) — no image_id, treat as single-chunk regardless
-            // of m=. Chunked transmission without an id is ambiguous and
-            // most apps don't emit it.
-            // (Some(_), false) with no buffer — single-chunk image with
-            // an id (icat's small-image case).
             _ => {
                 self.finalize_kitty_image(
                     &chunk,
@@ -1794,9 +1790,47 @@ impl Terminal {
         }
     }
 
-    /// Decode `b64` and queue a `PendingImageUpload` with the requested
-    /// cell extent. Mirrors `handle_osc_1337`'s post-decode plumbing —
-    /// header peek, cursor advance with scroll compensation, queue push.
+    /// File transmission (`t=f`): payload is a base64-encoded UTF-8
+    /// filesystem path. We read the file ourselves rather than the
+    /// app shipping its bytes over the PTY. Cheaper for large images
+    /// (no base64 round-trip, no chunked reassembly), which is why
+    /// `kitty +kitten icat` picks this path by default for local files.
+    fn handle_apc_file(&mut self, payload: &str, ctrl: &KittyControl) {
+        use base64::Engine;
+        // Path may have internal whitespace from base64 line wrapping —
+        // strip before decode.
+        let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let Ok(path_bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())
+        else {
+            return;
+        };
+        let Ok(path) = std::str::from_utf8(&path_bytes) else { return };
+
+        // Bound the read so a malformed app pointing at /dev/zero or a
+        // multi-GB log file can't OOM us. 256 MiB is huge for any real
+        // image; oversized files are silently dropped.
+        const MAX_FILE_READ_BYTES: u64 = 256 * 1024 * 1024;
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        if meta.len() > MAX_FILE_READ_BYTES {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(path) else { return };
+
+        // File transmission bypasses base64 entirely — the bytes are
+        // ready to peek and queue. Reuse the post-decode shared path.
+        let pixel_size = crate::images::peek_dimensions(&bytes);
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            ctrl.cells_cols,
+            ctrl.cells_rows,
+            ctrl.do_not_move_cursor,
+        );
+    }
+
+    /// Base64-decode `b64` and hand the bytes to `finalize_kitty_image_bytes`.
+    /// The direct-transmission path uses this; file transmission skips
+    /// the base64 step since the bytes are read straight from disk.
     fn finalize_kitty_image(
         &mut self,
         b64: &str,
@@ -1809,7 +1843,27 @@ impl Terminal {
             return;
         };
         let pixel_size = crate::images::peek_dimensions(&bytes);
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            cells_cols,
+            cells_rows,
+            do_not_move_cursor,
+        );
+    }
 
+    /// Shared finalize for both direct-base64 and file transmissions —
+    /// computes cell extent, advances the cursor with scroll
+    /// compensation, queues the upload. Mirrors `handle_osc_1337`'s
+    /// post-decode plumbing.
+    fn finalize_kitty_image_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+        pixel_size: Option<(u32, u32)>,
+        cells_cols: Option<u32>,
+        cells_rows: Option<u32>,
+        do_not_move_cursor: bool,
+    ) {
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
         // falling back to Auto (image's native cell extent) when not.
         // u16 clamping matches what the renderer can address.
@@ -2125,13 +2179,19 @@ pub enum KittyFormat {
     Other,
 }
 
-/// Transmission medium from `t=`. Only direct base64 (in the same APC) is
-/// supported in slice 1 — file/shared-memory paths would let an app touch
-/// arbitrary filesystem locations through the terminal, which needs more
-/// thought about security.
+/// Transmission medium from `t=`. `Direct` is the base64-in-APC default;
+/// `File` reads the image from a path the app supplies (the path itself
+/// is base64'd in the payload). `Temp` and `Shared` (shared memory) are
+/// not yet implemented.
+///
+/// File read is safe from a privilege standpoint — the app is already
+/// running as the user; it could read the file directly. We just shift
+/// the read across the PTY so chunked base64 of a multi-MB image
+/// doesn't have to traverse the byte stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KittyTransmission {
     Direct,
+    File,
     Other,
 }
 
@@ -2232,6 +2292,7 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
             },
             "t" => ctrl.transmission = match v {
                 "d" => KittyTransmission::Direct,
+                "f" => KittyTransmission::File,
                 _ => KittyTransmission::Other,
             },
             "i" => ctrl.image_id = v.parse().ok(),
@@ -4278,8 +4339,9 @@ mod tests {
         assert_eq!(parse_kitty_control("f=32").unwrap().format, KittyFormat::Other);
         assert_eq!(parse_kitty_control("f=24").unwrap().format, KittyFormat::Other);
         assert_eq!(parse_kitty_control("t=d").unwrap().transmission, KittyTransmission::Direct);
-        assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::Other);
+        assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::File);
         assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::Other);
+        assert_eq!(parse_kitty_control("t=t").unwrap().transmission, KittyTransmission::Other);
     }
 
     #[test]
@@ -4461,13 +4523,78 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_non_direct_transmission_silently_dropped() {
+    fn kitty_apc_unsupported_transmission_silently_dropped() {
+        // t=s (shared memory) and t=t (temp file) are out of scope.
+        // t=f (file) IS now implemented — see kitty_apc_t_f_reads_file.
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
         let png = kitty_png(4, 4);
-        // t=f (file path) is out of scope for K1.
-        t.feed(&kitty_apc("a=T,f=100,t=f,c=2,r=1", &png));
+        for medium in ["s", "t"] {
+            t.feed(&kitty_apc(&format!("a=T,f=100,t={},c=2,r=1", medium), &png));
+            assert!(
+                t.take_pending_image_uploads().is_empty(),
+                "t={} should drop",
+                medium
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_apc_t_f_reads_file_from_disk() {
+        // Real kitty +kitten icat picks `t=f` (file) by default for
+        // local PNG inputs — the payload is a base64-encoded UTF-8
+        // path. Write a PNG to a temp file, point an APC at it, and
+        // assert the queue receives the file's bytes intact.
+        use base64::Engine;
+        let png = kitty_png(4, 4);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("yutani-kitty-test-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write temp png");
+        let path_b64 = base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap());
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f,c=2,r=1;{}\x1b\\", path_b64));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "file-transmission upload should land");
+        assert_eq!(uploads[0].bytes, png);
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn kitty_apc_t_f_missing_file_drops_silently() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode("/definitely/does/not/exist.png");
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
         assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_t_f_non_utf8_path_drops_silently() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        // Invalid UTF-8 in the path → reject before touching the
+        // filesystem. (A real path with non-UTF-8 bytes on macOS would
+        // also be rejected — kitty's spec implies UTF-8 paths.)
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn parse_kitty_control_t_f_is_file() {
+        assert_eq!(
+            parse_kitty_control("t=f").unwrap().transmission,
+            KittyTransmission::File
+        );
     }
 
     #[test]
