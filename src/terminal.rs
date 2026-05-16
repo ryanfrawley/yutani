@@ -152,6 +152,60 @@ pub struct PendingImageUpload {
     /// Kitty `x=` / `y=` / `w=` / `h=` source crop in image pixels.
     /// `None` samples the whole image (the common case).
     pub src_rect: Option<(u32, u32, u32, u32)>,
+    /// Per-frame metadata for `a=f` transmissions. When `Some`,
+    /// `bytes` holds the new frame's pixel data and `kitty_image_id`
+    /// names the parent image whose frames vec the result will be
+    /// appended to. main.rs routes these through
+    /// `Store::request_insert_frame` rather than `request_insert`.
+    pub animation_frame: Option<KittyAnimationFrameSpec>,
+    /// Animation-control message from `a=a`. When `Some`, `bytes` is
+    /// empty and there's nothing to decode — main.rs applies the
+    /// control op directly to the store for `kitty_image_id`.
+    pub animation_control: Option<KittyAnimationControl>,
+}
+
+/// `a=f` per-frame metadata. Carried alongside the raw frame payload
+/// from terminal.rs to main.rs to Store. Pulled into its own struct
+/// so the existing fields of `PendingImageUpload` stay focused on the
+/// base-image case.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyAnimationFrameSpec {
+    /// `r=` target slot. `None` (or 0) = append a new frame. `Some(n)`
+    /// (1-based) replaces frame slot `n` if it exists; otherwise
+    /// silently appends.
+    pub target_slot: Option<u32>,
+    /// `c=` 1-based source frame to use as the composition base.
+    /// `None` defaults to frame 1 (the original base image).
+    pub compose_base: Option<u32>,
+    /// `z=` gap in milliseconds before this frame advances. `0` is
+    /// the spec's "as fast as possible" sentinel.
+    pub gap_ms: u32,
+    /// `X=` top-left x of the new frame's pixel data inside the
+    /// parent image, in pixels.
+    pub dst_x: u32,
+    /// `Y=` top-left y of the new frame's pixel data inside the
+    /// parent image, in pixels.
+    pub dst_y: u32,
+}
+
+/// `a=a` control message. Some combination of these fields is set
+/// based on which sub-operation the app requested.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyAnimationControl {
+    /// `s=` playback control: `Some(1)` stop, `Some(2)` run while
+    /// frames are still being loaded, `Some(3)` run with finite loops
+    /// (count from `loop_count`).
+    pub control: Option<u32>,
+    /// `v=` loop count for `s=3`. `Some(0)` means infinite.
+    pub loop_count: Option<u32>,
+    /// `c=` 1-based frame to make the current static frame. Mutually
+    /// exclusive with `control` (the spec doesn't combine the two in
+    /// a single message).
+    pub make_current: Option<u32>,
+    /// `r=` 1-based frame to edit. Paired with `edit_gap_ms`.
+    pub edit_frame: Option<u32>,
+    /// `z=` new gap for `edit_frame`, in milliseconds.
+    pub edit_gap_ms: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -497,6 +551,14 @@ pub struct Terminal {
     // mark-and-sweep doesn't drop a transmitted-but-not-yet-placed
     // image between a=t and a=p.
     kitty_image_ids: std::collections::HashMap<u32, ImageId>,
+    // Format the base image was transmitted with, keyed by the same
+    // client id used in `kitty_image_ids`. Animation frames (`a=f`)
+    // commonly omit `f=` and expect the base's format to apply (icat
+    // sends e.g. `f=24` on the base, then a=f frames with no `f=` at
+    // all — the spec says raw frame data inherits the base format).
+    // Populated whenever a Kitty transmission with a client id
+    // finalizes; cleared on `a=d` selectors that drop the image.
+    kitty_image_formats: std::collections::HashMap<u32, KittyFormat>,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -557,6 +619,7 @@ impl Terminal {
             kitty_chunks: std::collections::HashMap::new(),
             kitty_chunks_anon: None,
             kitty_image_ids: std::collections::HashMap::new(),
+            kitty_image_formats: std::collections::HashMap::new(),
             cell_w_px: 1,
             line_h_px: 1,
         }
@@ -1832,6 +1895,8 @@ impl Terminal {
             pixel_offset: (0, 0),
             z_index: 0,
             src_rect: None,
+            animation_frame: None,
+            animation_control: None,
         });
     }
 
@@ -1932,10 +1997,14 @@ impl Terminal {
             return;
         }
 
-        // Place / Delete don't carry image data — handle and return.
+        // Place / Delete / animation-control don't carry an image
+        // payload (or the control branch consumes it specially) —
+        // handle and return.
         match ctrl.action {
             KittyAction::Place => return self.handle_apc_place(&ctrl),
             KittyAction::Delete => return self.handle_apc_delete(&ctrl),
+            KittyAction::AnimationControl => return self.handle_apc_animation_control(&ctrl),
+            KittyAction::AnimationFrame => return self.handle_apc_animation_frame(payload, &ctrl),
             KittyAction::Other => return,
             // Fall through for Transmit / TransmitAndDisplay; both
             // accept an image payload.
@@ -1999,6 +2068,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
+            ctrl.format,
         );
     }
 
@@ -2051,6 +2121,279 @@ impl Terminal {
         );
     }
 
+    /// `a=f` — transmit a new frame for an existing animated image.
+    /// Queues the frame's raw payload (PNG / raw RGB / raw RGBA) plus
+    /// the per-frame metadata (target slot, compose base, gap_ms, x/y
+    /// position) into `pending_image_uploads` so main.rs can drive the
+    /// async decode + composite + GPU upload through the existing
+    /// store-poll loop. Drops silently when the parent image id is
+    /// missing or when the transmission medium isn't one we support.
+    fn handle_apc_animation_frame(&mut self, payload: &str, ctrl: &KittyControl) {
+        let Some(client_id) = ctrl.image_id else { return };
+        if !matches!(ctrl.format, KittyFormat::Other)
+            && !self.kitty_query_supported(ctrl.format, ctrl.transmission)
+        {
+            return;
+        }
+
+        // Direct-transmission chunking: `m=1` on `a=f` accumulates
+        // into `kitty_chunks` under the same image id, same as `a=t`.
+        // Only finalize when the last chunk (`m=0` / missing) arrives.
+        // File / shared-memory paths are inherently single-message so
+        // their chunking branch is moot.
+        if matches!(ctrl.transmission, KittyTransmission::Direct) {
+            if ctrl.more_chunks {
+                let entry =
+                    self.kitty_chunks.entry(client_id).or_insert_with(|| KittyChunks {
+                        b64: String::new(),
+                        // Carry through the parser's view — even if
+                        // Png (the "no f= seen" sentinel) — so the
+                        // final-chunk path can run the same format
+                        // inference the single-chunk path uses.
+                        format: ctrl.format,
+                        source_w: ctrl.source_w,
+                        source_h: ctrl.source_h,
+                        cells_cols: ctrl.cells_cols,
+                        cells_rows: ctrl.cells_rows,
+                        do_not_move_cursor: true,
+                        kitty_image_id: Some(client_id),
+                        kitty_placement_id: None,
+                        display_immediately: false,
+                        compressed_zlib: ctrl.compressed_zlib,
+                    });
+                append_b64_filtered(&mut entry.b64, payload);
+                return;
+            }
+            // Last chunk of a multi-chunk transmission: pull the
+            // accumulator out, append the final piece, decode the
+            // assembled base64, and continue through the normal
+            // finalize path with the parent's params.
+            if let Some(mut acc) = self.kitty_chunks.remove(&client_id) {
+                use base64::Engine;
+                append_b64_filtered(&mut acc.b64, payload);
+                let Ok(mut raw) = base64::engine::general_purpose::STANDARD
+                    .decode(acc.b64.as_bytes())
+                else {
+                    return;
+                };
+                if acc.compressed_zlib {
+                    let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+                    raw = inflated;
+                }
+                let effective_format = self.resolve_frame_format(
+                    client_id,
+                    acc.format,
+                    &raw,
+                    acc.source_w,
+                    acc.source_h,
+                );
+                let Some((bytes, _pixel_size)) =
+                    normalize_kitty_payload(effective_format, &raw, acc.source_w, acc.source_h)
+                else {
+                    return;
+                };
+                self.queue_animation_frame_upload(client_id, bytes, ctrl);
+                return;
+            }
+        }
+
+        // Single-chunk decode path. Pull the bytes through the
+        // medium-specific reader, decompress if needed, and normalize
+        // raw RGB/RGBA into PNG so the decode worker sees one shape.
+        let raw_bytes: Option<Vec<u8>> = match ctrl.transmission {
+            KittyTransmission::Direct => {
+                use base64::Engine;
+                let mut b64 = String::with_capacity(payload.len());
+                append_b64_filtered(&mut b64, payload);
+                base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok()
+            }
+            KittyTransmission::File => {
+                decode_kitty_file_path(payload).and_then(|p| read_kitty_file(&p))
+            }
+            KittyTransmission::TempFile => {
+                decode_kitty_file_path(payload).and_then(|p| {
+                    let bytes = read_kitty_file(&p);
+                    if path_is_under_temp_dir(&p) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                    bytes
+                })
+            }
+            #[cfg(unix)]
+            KittyTransmission::SharedMemory => {
+                decode_kitty_shm_name(payload).and_then(|n| {
+                    let bytes = read_kitty_shm(&n);
+                    unlink_kitty_shm(&n);
+                    bytes
+                })
+            }
+            #[cfg(not(unix))]
+            KittyTransmission::SharedMemory => None,
+            KittyTransmission::Other => None,
+        };
+        let Some(mut raw) = raw_bytes else { return };
+        if ctrl.compressed_zlib {
+            let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
+            raw = inflated;
+        }
+        let effective_format = self.resolve_frame_format(
+            client_id,
+            ctrl.format,
+            &raw,
+            ctrl.source_w,
+            ctrl.source_h,
+        );
+        let Some((bytes, _pixel_size)) =
+            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
+        else {
+            return;
+        };
+        self.queue_animation_frame_upload(client_id, bytes, ctrl);
+    }
+
+    /// Pick the right pixel format for an `a=f` raw payload.
+    ///
+    /// Kitty's `kitten icat` is loose about the `f=` key on frame
+    /// transmissions: it sends `f=24` (RGB) on some frames, `f=32`
+    /// (RGBA) on others, and omits `f=` entirely on a meaningful
+    /// fraction. The parser turns omitted-`f` into the PNG default
+    /// (the sentinel value for "not specified"), which is wrong for
+    /// every actual GIF frame.
+    ///
+    /// Resolution order:
+    ///   1. PNG signature in the raw bytes → really PNG. Trust it.
+    ///   2. Source dims + raw byte count match RGB or RGBA within
+    ///      one page (16 KB on macOS SHM padding) → use that format.
+    ///   3. Recorded base format for this id → use it.
+    ///   4. Hand back whatever the parser saw — `normalize_kitty_payload`
+    ///      will reject if it can't make sense of it.
+    fn resolve_frame_format(
+        &self,
+        client_id: u32,
+        parsed_format: KittyFormat,
+        raw: &[u8],
+        source_w: Option<u32>,
+        source_h: Option<u32>,
+    ) -> KittyFormat {
+        // Explicit non-PNG always wins — the app told us.
+        if !matches!(parsed_format, KittyFormat::Png) {
+            return parsed_format;
+        }
+        // Real PNG always starts with the 8-byte signature. If we see
+        // it, treat as PNG regardless of any size hints.
+        const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        if raw.starts_with(PNG_SIG) {
+            return KittyFormat::Png;
+        }
+        // Size inference. SHM segments on macOS are 16 KB-page
+        // aligned, so the actual byte count exceeds w*h*c by less
+        // than one page. The two candidate ranges don't overlap for
+        // anything but trivially small frames (where the page padding
+        // dwarfs the per-pixel diff).
+        if let (Some(w), Some(h)) = (source_w, source_h) {
+            const PAGE: usize = 16 * 1024;
+            let pixels = (w as usize).saturating_mul(h as usize);
+            let rgb_bytes = pixels.saturating_mul(3);
+            let rgba_bytes = pixels.saturating_mul(4);
+            if raw.len() >= rgba_bytes && raw.len() < rgba_bytes + PAGE {
+                return KittyFormat::Rgba;
+            }
+            if raw.len() >= rgb_bytes && raw.len() < rgb_bytes + PAGE {
+                return KittyFormat::Rgb;
+            }
+            // Neither range matches. Prefer RGBA when over-large
+            // (modern default); the normalizer truncates to fit.
+            if raw.len() >= rgba_bytes {
+                return KittyFormat::Rgba;
+            }
+        }
+        // Last resort: whatever the base was. Better than PNG, which
+        // we already know doesn't match (no signature above).
+        self.kitty_image_formats
+            .get(&client_id)
+            .copied()
+            .unwrap_or(parsed_format)
+    }
+
+    /// Shared tail of the `a=f` path. Builds the `PendingImageUpload`
+    /// that main.rs's drain routes into `Store::request_insert_frame`.
+    /// `cell_extent: (0, 0)` plus `display_immediately: false` keep
+    /// the upload off the placement-creation path entirely — frames
+    /// are not displayable on their own; they're metadata for the
+    /// parent image.
+    fn queue_animation_frame_upload(
+        &mut self,
+        client_id: u32,
+        bytes: Vec<u8>,
+        ctrl: &KittyControl,
+    ) {
+        self.pending_image_uploads.push(PendingImageUpload {
+            bytes,
+            pixel_size: None,
+            width: ImageSizeSpec::Auto,
+            height: ImageSizeSpec::Auto,
+            preserve_aspect: true,
+            do_not_move_cursor: true,
+            label: Some("kitty animation frame".into()),
+            cell_anchor: (0, 0),
+            cell_extent: (0, 0),
+            kitty_image_id: Some(client_id),
+            kitty_placement_id: None,
+            display_immediately: false,
+            pixel_offset: (0, 0),
+            z_index: 0,
+            src_rect: None,
+            animation_frame: Some(KittyAnimationFrameSpec {
+                target_slot: ctrl.anim_frame_num,
+                compose_base: ctrl.anim_compose_base.filter(|&n| n > 0),
+                gap_ms: ctrl.anim_gap_ms.unwrap_or(0),
+                // For `a=f`, the Kitty spec overloads lowercase `x=`
+                // and `y=` (normally source-crop on `a=T`) as the
+                // destination top-left within the parent frame. The
+                // parser populated them into `crop_x` / `crop_y`;
+                // capital `X=`/`Y=` aren't defined for `a=f`. Fall
+                // back to `pixel_offset_x/y` only if the lowercase
+                // pair is absent, for forward-compat with apps that
+                // pick the opposite convention.
+                dst_x: ctrl.crop_x.or(ctrl.pixel_offset_x).unwrap_or(0),
+                dst_y: ctrl.crop_y.or(ctrl.pixel_offset_y).unwrap_or(0),
+            }),
+            animation_control: None,
+        });
+    }
+
+    /// `a=a` — animation playback / per-frame editing. Mutates the
+    /// store's `AnimationState` for the target image. No payload is
+    /// consumed.
+    fn handle_apc_animation_control(&mut self, ctrl: &KittyControl) {
+        let Some(client_id) = ctrl.image_id else { return };
+        self.pending_image_uploads.push(PendingImageUpload {
+            bytes: Vec::new(),
+            pixel_size: None,
+            width: ImageSizeSpec::Auto,
+            height: ImageSizeSpec::Auto,
+            preserve_aspect: true,
+            do_not_move_cursor: true,
+            label: None,
+            cell_anchor: (0, 0),
+            cell_extent: (0, 0),
+            kitty_image_id: Some(client_id),
+            kitty_placement_id: None,
+            display_immediately: false,
+            pixel_offset: (0, 0),
+            z_index: 0,
+            src_rect: None,
+            animation_frame: None,
+            animation_control: Some(KittyAnimationControl {
+                control: ctrl.anim_control,
+                loop_count: ctrl.anim_loop_count,
+                make_current: ctrl.anim_make_current.filter(|&n| n > 0),
+                edit_frame: ctrl.anim_frame_num.filter(|&n| n > 0),
+                edit_gap_ms: ctrl.anim_gap_ms,
+            }),
+        });
+    }
+
     /// `a=d` — delete placements (and optionally drop the underlying
     /// store entries via mark-and-sweep). Selector + relevant ids
     /// come from `d=` / `i=` / `p=`.
@@ -2070,12 +2413,14 @@ impl Terminal {
                 self.scrollback_placements
                     .retain(|sp| sp.placement.kitty_image_id.is_none());
                 self.kitty_image_ids.clear();
+                self.kitty_image_formats.clear();
             }
             KittyDeleteSelector::Image => {
                 let Some(client_id) = ctrl.image_id else { return };
                 let Some(image_id) = self.kitty_image_id_lookup(client_id) else { return };
                 self.remove_placements_with_image(image_id);
                 self.kitty_image_ids.remove(&client_id);
+                self.kitty_image_formats.remove(&client_id);
             }
             KittyDeleteSelector::Placement => {
                 let Some(pid) = ctrl.placement_id else { return };
@@ -2240,6 +2585,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
+            ctrl.format,
         );
     }
 
@@ -2275,6 +2621,7 @@ impl Terminal {
             (0, 0),
             0,
             None,
+            acc.format,
         );
     }
 
@@ -2322,6 +2669,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
+            ctrl.format,
         );
     }
 
@@ -2343,7 +2691,16 @@ impl Terminal {
         pixel_offset: (i32, i32),
         z_index: i32,
         src_rect: Option<(u32, u32, u32, u32)>,
+        source_format: KittyFormat,
     ) {
+        // Record the base's format so subsequent `a=f` frames that
+        // omit `f=` can inherit it. Per Kitty spec the frame data
+        // format defaults to the base image's format — typically
+        // f=24 (RGB) or f=32 (RGBA) for animations sourced from
+        // GIFs, since the app already decoded once.
+        if let Some(id) = kitty_image_id {
+            self.kitty_image_formats.insert(id, source_format);
+        }
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
         // falling back to Auto (image's native cell extent) when not.
         // u16 clamping matches what the renderer can address.
@@ -2402,6 +2759,8 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
+            animation_frame: None,
+            animation_control: None,
         });
     }
 
@@ -2666,8 +3025,20 @@ pub enum KittyAction {
     /// `a=d` — delete placement(s) or image(s). The actual selector
     /// comes from `d=` (and the relevant `i=` / `p=` keys).
     Delete,
-    /// `a=a` (animation) / unknown — accepted into the parser but
-    /// produces no observable behavior in K1.
+    /// `a=f` — transmit a new frame for an existing animated image.
+    /// Uses `i=` to identify the parent, `r=` to pick a target frame
+    /// slot (0 / missing = append), `c=` for the base frame to compose
+    /// against (1-based, default 1), `z=` for the per-frame gap in ms,
+    /// and `X=`/`Y=`/`s=`/`v=` for the per-frame placement + raw
+    /// payload dimensions.
+    AnimationFrame,
+    /// `a=a` — animation control / per-frame editing. `s=` picks the
+    /// playback state (1=stop, 2=run while frames loading, 3=run with
+    /// loops), `v=` is the loop count, `c=` makes a frame the current
+    /// one, and `r=`/`z=` together edit a frame's gap.
+    AnimationControl,
+    /// Unknown action — accepted into the parser but produces no
+    /// observable behavior.
     Other,
 }
 
@@ -2818,6 +3189,32 @@ pub struct KittyControl {
     /// read), the bytes need to be inflated before being treated as
     /// image data.
     pub compressed_zlib: bool,
+    /// Animation `r=` alias — frame number to operate on (1-based).
+    /// `a=f`: which existing frame slot to replace (0 / missing =
+    /// append). `a=a`: which frame to edit (for gap / compose changes).
+    /// Parsed from the same raw value as `cells_rows`; the dispatcher
+    /// picks one based on the action.
+    pub anim_frame_num: Option<u32>,
+    /// `a=f c=N` — 1-based index of the source frame to use as the
+    /// composition base for a new frame. Default (when missing / 0) is
+    /// frame 1, i.e., the original image. Parsed from the same raw
+    /// value as `cells_cols`.
+    pub anim_compose_base: Option<u32>,
+    /// `a=a c=N` — 1-based frame number to make current (display
+    /// statically without playing). Same raw value as `cells_cols`.
+    pub anim_make_current: Option<u32>,
+    /// `a=a s=N` — playback control: 1 = stop, 2 = run while frames
+    /// are still being added, 3 = run with `v=` loops. Parsed from
+    /// the same raw value as `source_w`.
+    pub anim_control: Option<u32>,
+    /// `a=a v=N` — total loop count when `anim_control == Some(3)`.
+    /// 0 means infinite. Same raw value as `source_h`.
+    pub anim_loop_count: Option<u32>,
+    /// `a=f z=N` / `a=a z=N` — gap in milliseconds before this frame
+    /// advances to the next. Parsed from the same raw value as
+    /// `z_index`; the dispatcher uses one or the other based on
+    /// action.
+    pub anim_gap_ms: Option<u32>,
 }
 
 impl Default for KittyControl {
@@ -2848,6 +3245,12 @@ impl Default for KittyControl {
             crop_w: None,
             crop_h: None,
             compressed_zlib: false,
+            anim_frame_num: None,
+            anim_compose_base: None,
+            anim_make_current: None,
+            anim_control: None,
+            anim_loop_count: None,
+            anim_gap_ms: None,
         }
     }
 }
@@ -3174,6 +3577,8 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
                 "q" => KittyAction::Query,
                 "p" => KittyAction::Place,
                 "d" => KittyAction::Delete,
+                "f" => KittyAction::AnimationFrame,
+                "a" => KittyAction::AnimationControl,
                 _ => KittyAction::Other,
             },
             "d" => ctrl.delete_selector = Some(match v {
@@ -3188,8 +3593,20 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
                 "32" => KittyFormat::Rgba,
                 _ => KittyFormat::Other,
             },
-            "s" => ctrl.source_w = v.parse().ok(),
-            "v" => ctrl.source_h = v.parse().ok(),
+            "s" => {
+                // `s=` is overloaded: source pixel width for image /
+                // frame transmission, OR the playback-state code for
+                // `a=a`. Parse into both — the dispatcher picks based
+                // on the action.
+                ctrl.source_w = v.parse().ok();
+                ctrl.anim_control = v.parse().ok();
+            }
+            "v" => {
+                // `v=` is overloaded: source pixel height for image /
+                // frame transmission, OR the loop count for `a=a s=3`.
+                ctrl.source_h = v.parse().ok();
+                ctrl.anim_loop_count = v.parse().ok();
+            }
             "t" => ctrl.transmission = match v {
                 "d" => KittyTransmission::Direct,
                 "f" => KittyTransmission::File,
@@ -3198,16 +3615,51 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
                 _ => KittyTransmission::Other,
             },
             "i" => ctrl.image_id = v.parse().ok(),
+            "I" => {
+                // `I=` is the Kitty "image number" — clients use it
+                // when they want the terminal to assign the real
+                // image id and reply. icat sends I= for the base and
+                // for every a=f frame, never using lowercase i= for
+                // transmission. We don't currently implement the
+                // number→id reply protocol; instead we treat the
+                // number as the identifier directly. That makes
+                // `a=p,I=N` / `a=f,I=N` / `a=d,I=N` resolve through
+                // the same `kitty_image_ids` map as `i=N` would.
+                // If both keys are present, `i=` wins (it's the
+                // explicit client-managed id).
+                if ctrl.image_id.is_none() {
+                    ctrl.image_id = v.parse().ok();
+                }
+            }
             "p" => ctrl.placement_id = v.parse().ok(),
-            "c" => ctrl.cells_cols = v.parse().ok(),
-            "r" => ctrl.cells_rows = v.parse().ok(),
+            "c" => {
+                // Overloaded: target column count for placement; OR
+                // the compose-base frame number for `a=f`; OR the
+                // make-current frame number for `a=a`.
+                ctrl.cells_cols = v.parse().ok();
+                ctrl.anim_compose_base = v.parse().ok();
+                ctrl.anim_make_current = v.parse().ok();
+            }
+            "r" => {
+                // Overloaded: target row count for placement; OR the
+                // frame slot to operate on for `a=f` / `a=a`.
+                ctrl.cells_rows = v.parse().ok();
+                ctrl.anim_frame_num = v.parse().ok();
+            }
             "m" => ctrl.more_chunks = v == "1",
             "C" => ctrl.do_not_move_cursor = v == "1",
             "q" => ctrl.quiet = v.parse().unwrap_or(0),
             "U" => ctrl.virtual_placement = v == "1",
             "X" => ctrl.pixel_offset_x = v.parse().ok(),
             "Y" => ctrl.pixel_offset_y = v.parse().ok(),
-            "z" => ctrl.z_index = v.parse().ok(),
+            "z" => {
+                // Overloaded: signed z-index for placement; OR the
+                // unsigned per-frame gap in milliseconds for `a=f` /
+                // `a=a`. Negative `z=` makes no sense as a gap so the
+                // animation path silently drops those.
+                ctrl.z_index = v.parse().ok();
+                ctrl.anim_gap_ms = v.parse().ok();
+            }
             "x" => ctrl.crop_x = v.parse().ok(),
             "y" => ctrl.crop_y = v.parse().ok(),
             "w" => ctrl.crop_w = v.parse().ok(),
@@ -5239,11 +5691,10 @@ mod tests {
         assert_eq!(parse_kitty_control("a=q").unwrap().action, KittyAction::Query);
         assert_eq!(parse_kitty_control("a=p").unwrap().action, KittyAction::Place);
         assert_eq!(parse_kitty_control("a=d").unwrap().action, KittyAction::Delete);
-        // Unknown / not-yet-implemented actions land on Other — the
-        // Kitty contract says "unknown action = no-op", which we encode
-        // as Other + dispatcher drop. `a=a` (animation) is still
-        // unimplemented and falls here.
-        assert_eq!(parse_kitty_control("a=a").unwrap().action, KittyAction::Other);
+        assert_eq!(parse_kitty_control("a=f").unwrap().action, KittyAction::AnimationFrame);
+        assert_eq!(parse_kitty_control("a=a").unwrap().action, KittyAction::AnimationControl);
+        // Unknown actions land on Other — the Kitty contract says
+        // "unknown action = no-op", encoded as Other + dispatcher drop.
         assert_eq!(parse_kitty_control("a=Z").unwrap().action, KittyAction::Other);
     }
 
@@ -5292,6 +5743,283 @@ mod tests {
         let c = parse_kitty_control("i=notanumber,a=T").unwrap();
         assert_eq!(c.image_id, None);
         assert_eq!(c.action, KittyAction::TransmitAndDisplay);
+    }
+
+    #[test]
+    fn parse_kitty_control_animation_keys_populate_overlapping_fields() {
+        // `s=`, `v=`, `c=`, `r=`, `z=` are all overloaded between
+        // transmission semantics and animation semantics. The parser
+        // populates both alias fields; the dispatcher picks based on
+        // action so a single raw value reaches the right place.
+        let c = parse_kitty_control("a=f,i=7,r=3,c=2,z=50,X=4,Y=6,s=128,v=64").unwrap();
+        assert_eq!(c.action, KittyAction::AnimationFrame);
+        assert_eq!(c.image_id, Some(7));
+        // r= is both cells_rows and anim_frame_num.
+        assert_eq!(c.cells_rows, Some(3));
+        assert_eq!(c.anim_frame_num, Some(3));
+        // c= is both cells_cols and anim_compose_base / anim_make_current.
+        assert_eq!(c.cells_cols, Some(2));
+        assert_eq!(c.anim_compose_base, Some(2));
+        assert_eq!(c.anim_make_current, Some(2));
+        // z= is both z_index and anim_gap_ms.
+        assert_eq!(c.z_index, Some(50));
+        assert_eq!(c.anim_gap_ms, Some(50));
+        // s= / v= remain source dimensions for `a=f` (raw pixel data).
+        assert_eq!(c.source_w, Some(128));
+        assert_eq!(c.source_h, Some(64));
+        // ...and the animation aliases also get populated; the dispatcher
+        // ignores them for `a=f`.
+        assert_eq!(c.anim_control, Some(128));
+        assert_eq!(c.anim_loop_count, Some(64));
+    }
+
+    #[test]
+    fn parse_kitty_control_animation_control_keys() {
+        // `a=a,i=1,s=3,v=0` → run with infinite loops.
+        let c = parse_kitty_control("a=a,i=1,s=3,v=0").unwrap();
+        assert_eq!(c.action, KittyAction::AnimationControl);
+        assert_eq!(c.image_id, Some(1));
+        assert_eq!(c.anim_control, Some(3));
+        assert_eq!(c.anim_loop_count, Some(0));
+        // `a=a,i=1,c=4` → make frame 4 current.
+        let c = parse_kitty_control("a=a,i=1,c=4").unwrap();
+        assert_eq!(c.anim_make_current, Some(4));
+        // `a=a,i=1,r=2,z=200` → edit frame 2 gap to 200ms.
+        let c = parse_kitty_control("a=a,i=1,r=2,z=200").unwrap();
+        assert_eq!(c.anim_frame_num, Some(2));
+        assert_eq!(c.anim_gap_ms, Some(200));
+    }
+
+    #[test]
+    fn a_f_does_not_create_a_placement() {
+        // Frame transmissions are metadata for the parent image, not
+        // their own visible objects. The dispatcher must queue them
+        // with `display_immediately: false` and `cell_extent: (0, 0)`
+        // so main.rs's drain skips placement creation.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let apc = format!("\x1b_Ga=f,f=100,i=7,z=20;{}\x1b\\", b64);
+        t.feed(&apc);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = &uploads[0];
+        assert!(!up.display_immediately, "a=f must not display");
+        assert_eq!(up.cell_extent, (0, 0), "a=f has no cell extent of its own");
+        assert!(
+            up.animation_frame.is_some(),
+            "a=f must flag the animation_frame spec so the drain routes correctly",
+        );
+        assert_eq!(t.cursor().row, 0, "a=f must not advance the cursor");
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn a_f_chunked_assembles_into_one_upload() {
+        // The chunking path on `a=f` mirrors `a=t`'s — split the
+        // payload across multiple APCs with `m=1`, then a final `m=0`
+        // chunk to flush. Only one PendingImageUpload should fall out
+        // of the queue, carrying the assembled bytes.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = {
+            let buf = image::RgbaImage::from_pixel(3, 3, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+        let (head, tail) = b64.split_at(mid);
+        let apc1 = format!("\x1b_Ga=f,f=100,i=9,m=1;{}\x1b\\", head);
+        let apc2 = format!("\x1b_Ga=f,f=100,i=9,m=0;{}\x1b\\", tail);
+        t.feed(&apc1);
+        // First chunk must not produce an upload — it's still in the
+        // accumulator.
+        assert!(
+            t.take_pending_image_uploads().is_empty(),
+            "intermediate m=1 chunk must not queue an upload",
+        );
+        t.feed(&apc2);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "final chunk must finalize");
+        let up = &uploads[0];
+        assert!(up.animation_frame.is_some());
+        assert!(up.bytes.starts_with(b"\x89PNG"), "assembled bytes look like PNG");
+    }
+
+    #[test]
+    fn parse_kitty_control_capital_i_is_alias_for_image_id() {
+        // icat uses I= (image number) for transmissions, not i=. The
+        // protocol distinguishes them — number is meant to be a
+        // client-side counter that the terminal maps to a real id —
+        // but for our renderer's purposes the number works as the
+        // identifier directly.
+        let c = parse_kitty_control("I=60091135").unwrap();
+        assert_eq!(c.image_id, Some(60091135));
+        // If both keys are present, the lowercase `i=` wins.
+        let c = parse_kitty_control("i=5,I=99").unwrap();
+        assert_eq!(c.image_id, Some(5));
+    }
+
+    #[test]
+    fn a_f_size_inference_picks_rgba_when_byte_count_matches_w_h_4() {
+        // icat sends some a=f frames with no `f=` and raw RGBA
+        // payload (w*h*4 bytes). The dispatcher must infer RGBA from
+        // the byte count — *not* default to the base's f=24 or to
+        // PNG. Mis-inference causes shifted rows that look like
+        // tiled/repeating artifacts and the corruption compounds
+        // across delta frames since each composes onto the previous.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Base: f=24 RGB, so kitty_image_formats[42] = Rgb.
+        use base64::Engine;
+        let raw_rgb_base: Vec<u8> = (0..4 * 4 * 3).map(|_| 0xAAu8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_base);
+        t.feed(&format!("\x1b_Ga=T,f=24,s=4,v=4,I=42;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+
+        // a=f frame, NO `f=`, payload is exactly w*h*4 bytes (RGBA).
+        // Base-format inheritance would PNG-encode 3-byte-stride
+        // garbage and shift colors. Size inference correctly picks
+        // RGBA.
+        let raw_rgba_frame: Vec<u8> = (0..2 * 2 * 4).map(|_| 0x44u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba_frame);
+        t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=42,z=100;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "frame queues despite omitted f=");
+        let up = &uploads[0];
+        assert!(up.animation_frame.is_some());
+        // PNG re-encoded from raw RGBA. Decode it back and verify
+        // dimensions match w*h (proving the format was RGBA, not RGB
+        // — which would have decoded as different dimensions or
+        // failed entirely).
+        assert!(up.bytes.starts_with(b"\x89PNG"));
+        let img = image::load_from_memory(&up.bytes).expect("re-decode");
+        assert_eq!(img.width(), 2);
+        assert_eq!(img.height(), 2);
+    }
+
+    #[test]
+    fn a_f_size_inference_picks_rgb_when_byte_count_matches_w_h_3() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Base is f=32 RGBA — so base-format inheritance would say
+        // "RGBA" but the actual frame payload is RGB. Inference
+        // must use the byte count to pick RGB instead.
+        use base64::Engine;
+        let raw_rgba_base: Vec<u8> = (0..4 * 4 * 4).map(|_| 0xAAu8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba_base);
+        t.feed(&format!("\x1b_Ga=T,f=32,s=4,v=4,I=42;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+
+        // a=f with no f=, payload is exactly w*h*3 → must infer RGB.
+        let raw_rgb_frame: Vec<u8> = (0..2 * 2 * 3).map(|_| 0x44u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_frame);
+        t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=42,z=100;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = &uploads[0];
+        assert!(up.animation_frame.is_some());
+        let img = image::load_from_memory(&up.bytes).expect("re-decode");
+        assert_eq!(img.width(), 2);
+        assert_eq!(img.height(), 2);
+    }
+
+    #[test]
+    fn a_f_uses_lowercase_xy_as_destination_position() {
+        // icat's a=f messages carry the frame's parent-coords via
+        // lowercase `x=` / `y=` (not capital X/Y). On a=T those keys
+        // mean source-crop; on a=f they mean "where in the parent
+        // does this frame go". A regression that reads from
+        // pixel_offset_x/y instead would stamp every frame at (0, 0)
+        // and the animation would visibly distort.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        let raw_rgba = vec![0u8; 4 * 4 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba);
+        // Base.
+        t.feed(&format!("\x1b_Ga=T,f=32,s=4,v=4,I=77;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+        // Frame with lowercase x=10, y=20 (and capital X/Y absent).
+        let frame_rgba = vec![1u8; 2 * 2 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_rgba);
+        t.feed(&format!(
+            "\x1b_Ga=f,f=32,s=2,v=2,x=10,y=20,I=77,z=50;{}\x1b\\",
+            b64,
+        ));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let spec = uploads[0]
+            .animation_frame
+            .as_ref()
+            .expect("animation_frame populated");
+        assert_eq!(spec.dst_x, 10, "lowercase x= must reach dst_x");
+        assert_eq!(spec.dst_y, 20, "lowercase y= must reach dst_y");
+    }
+
+    #[test]
+    fn a_f_size_inference_keeps_png_when_payload_has_png_signature() {
+        // App that genuinely sends PNG with no `f=100`. The 89 50 4E
+        // 47 ... signature trumps everything else.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Build a real PNG.
+        let png = {
+            let buf = image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        // Base also PNG so kitty_image_formats[42] = Png.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        t.feed(&format!("\x1b_Ga=T,I=42;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+
+        // a=f with no f= and PNG signature → keep as PNG even though
+        // a 4x4 image's byte count happens to land in some range.
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_png);
+        t.feed(&format!("\x1b_Ga=f,I=42,z=100;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = &uploads[0];
+        assert!(up.animation_frame.is_some());
+        // The bytes are still PNG (not re-encoded by the raw normalizer).
+        assert!(up.bytes.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn parse_kitty_control_negative_z_doesnt_populate_gap_ms() {
+        // `z=-1` parses as i32 z_index but fails u32 anim_gap_ms.
+        // Important: dispatcher uses anim_gap_ms for animation paths,
+        // so a negative z must not silently set a wrap-around gap.
+        let c = parse_kitty_control("z=-1").unwrap();
+        assert_eq!(c.z_index, Some(-1));
+        assert_eq!(c.anim_gap_ms, None);
     }
 
     //
