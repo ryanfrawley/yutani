@@ -80,6 +80,11 @@ pub enum Event {
 enum State {
     Ground,
     Escape,
+    // ESC followed by a 0x20-0x2F intermediate (SCS designators like
+    // `ESC ( B`, `ESC ) 0`, plus `ESC SP F/G/L/M/N` for ANSI conformance).
+    // We don't implement charset switching, but we must still consume the
+    // final byte or it leaks into Ground and gets printed.
+    EscIntermediate,
     CsiEntry,
     CsiParam,
     CsiIntermediate,
@@ -131,6 +136,7 @@ impl Parser {
         match self.state {
             State::Ground => self.ground(ch, &mut emit),
             State::Escape => self.escape(ch, &mut emit),
+            State::EscIntermediate => self.esc_intermediate(ch),
             State::CsiEntry => self.csi_entry(ch, &mut emit),
             State::CsiParam => self.csi_param(ch, &mut emit),
             State::CsiIntermediate => self.csi_intermediate(ch, &mut emit),
@@ -182,7 +188,29 @@ impl Parser {
                 emit(Event::FullReset);
                 self.state = State::Ground;
             }
+            // Intermediate byte (SCS designators `( ) * +`, `SP` for ANSI
+            // conformance, etc.). Wait for the final byte so it doesn't
+            // leak into Ground — e.g. `ESC ( B` would print a stray "B".
+            ' '..='/' => self.state = State::EscIntermediate,
             _ => self.state = State::Ground,
+        }
+    }
+
+    fn esc_intermediate(&mut self, ch: char) {
+        // Stay in this state as long as additional intermediates arrive;
+        // any final byte (0x30-0x7E) terminates the sequence. We don't
+        // implement charset switching, so the dispatch is a no-op.
+        //
+        // TODO: if we ever need to support legacy ncurses apps that draw
+        // boxes via DEC Special Graphics (`ESC ( 0` then ASCII letters
+        // remapped to line-drawing — `q`→─, `x`→│, `l`→┌, etc.), wire it
+        // up here. Sketch: track `g0`/`g1` charset on the Parser, dispatch
+        // on `(intermediate, ch)` to set them, handle SI (0x0F) / SO (0x0E)
+        // in `ground()` to toggle the active slot, and remap chars in
+        // `Event::Print` before emission. Modern apps (tmux, vim, anything
+        // UTF-8) use Unicode box-drawing directly and don't need this.
+        if !(' '..='/').contains(&ch) {
+            self.state = State::Ground;
         }
     }
 
@@ -681,6 +709,34 @@ mod tests {
                 Event::DeviceStatusReport(5),
                 Event::DeviceStatusReport(0),
             ],
+        );
+    }
+
+    #[test]
+    fn esc_scs_designators_are_consumed() {
+        // SCS sequences `ESC ( B`, `ESC ) 0`, `ESC * A`, `ESC + B`. We don't
+        // implement charset switching but must not print the final byte.
+        // Regression: tmux/starship-style prompts terminate styled segments
+        // with `ESC ( B`, which previously leaked a stray "B" into output.
+        assert_eq!(
+            collect("a\x1b(Bb\x1b)0c\x1b*Ad\x1b+Be"),
+            vec![
+                Event::Print('a'),
+                Event::Print('b'),
+                Event::Print('c'),
+                Event::Print('d'),
+                Event::Print('e'),
+            ],
+        );
+    }
+
+    #[test]
+    fn esc_space_intermediate_is_consumed() {
+        // `ESC SP F/G/L/M/N` — ANSI conformance / 7-vs-8-bit controls. Same
+        // shape as SCS: intermediate byte then a final. Must not print.
+        assert_eq!(
+            collect("a\x1b Fb\x1b Gc"),
+            vec![Event::Print('a'), Event::Print('b'), Event::Print('c')],
         );
     }
 
