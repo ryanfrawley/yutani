@@ -93,57 +93,20 @@ impl Cell {
 }
 
 fn ansi_color(n: u8, bright: bool) -> [f32; 4] {
-    const DIM: [[f32; 3]; 8] = [
-        [0.0, 0.0, 0.0],
-        [0.67, 0.0, 0.0],
-        [0.0, 0.67, 0.0],
-        [0.67, 0.67, 0.0],
-        [0.0, 0.0, 0.67],
-        [0.67, 0.0, 0.67],
-        [0.0, 0.67, 0.67],
-        [0.75, 0.75, 0.75],
-    ];
-    const BRIGHT: [[f32; 3]; 8] = [
-        [0.5, 0.5, 0.5],
-        [1.0, 0.33, 0.33],
-        [0.33, 1.0, 0.33],
-        [1.0, 1.0, 0.33],
-        [0.33, 0.33, 1.0],
-        [1.0, 0.33, 1.0],
-        [0.33, 1.0, 1.0],
-        [1.0, 1.0, 1.0],
-    ];
-    let p = if bright { BRIGHT[n as usize] } else { DIM[n as usize] };
-    [p[0], p[1], p[2], 1.0]
+    crate::palette::get().ansi(n, bright)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+    // SGR truecolor params are sRGB bytes (`\e[38;2;R;G;Bm` matches what web
+    // hex codes mean). Linearize them so the GPU's sRGB-encoded write lands
+    // on the user's intended pixel value — same reason `palette::rgba_from`
+    // does this for scheme files.
+    use crate::palette::srgb_to_linear;
+    [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]
 }
 
 fn xterm_256(n: u8) -> [f32; 4] {
-    match n {
-        0..=7 => ansi_color(n, false),
-        8..=15 => ansi_color(n - 8, true),
-        16..=231 => {
-            let n = n - 16;
-            let r = n / 36;
-            let g = (n % 36) / 6;
-            let b = n % 6;
-            let conv = |v: u8| {
-                if v == 0 {
-                    0.0
-                } else {
-                    (55.0 + v as f32 * 40.0) / 255.0
-                }
-            };
-            [conv(r), conv(g), conv(b), 1.0]
-        }
-        232..=255 => {
-            let v = (8 + (n as u16 - 232) * 10) as f32 / 255.0;
-            [v, v, v, 1.0]
-        }
-    }
+    crate::palette::get().xterm_256(n)
 }
 
 #[cfg(test)]
@@ -202,6 +165,8 @@ mod tests {
     fn bright_fg() {
         let mut s = Style::new();
         s.apply_sgr(&[91]);
+        // SGR 91 hits the default bright-red entry in Palette::defaults(),
+        // which is still defined in linear space (hand-picked).
         assert_eq!(s.color_fg, Some([1.0, 0.33, 0.33, 1.0]));
     }
 
@@ -209,17 +174,22 @@ mod tests {
     fn truecolor_fg() {
         let mut s = Style::new();
         s.apply_sgr(&[38, 2, 255, 128, 0]);
-        assert_eq!(s.color_fg, Some([1.0, 128.0 / 255.0, 0.0, 1.0]));
+        let c = s.color_fg.expect("fg set");
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[0]), 255);
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[1]), 128);
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[2]), 0);
+        assert_eq!(c[3], 1.0);
     }
 
     #[test]
     fn truecolor_bg() {
         let mut s = Style::new();
         s.apply_sgr(&[48, 2, 10, 20, 30]);
-        assert_eq!(
-            s.color_bg,
-            Some([10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0, 1.0])
-        );
+        let c = s.color_bg.expect("bg set");
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[0]), 10);
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[1]), 20);
+        assert_eq!(crate::palette::linear_to_srgb_u8(c[2]), 30);
+        assert_eq!(c[3], 1.0);
     }
 
     #[test]
