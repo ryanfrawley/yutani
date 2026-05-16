@@ -54,6 +54,16 @@ pub enum Event {
     // CSI > c — Secondary Device Attributes (terminal type / version).
     SecondaryDeviceAttributes,
 
+    // CSI Ps t — XTWINOPS window-manipulation query. Apps use this to
+    // ask the terminal for its size in pixels or cells:
+    //   14 → text area in pixels       → \e[4;<height>;<width>t
+    //   16 → cell size in pixels       → \e[6;<height>;<width>t
+    //   18 → text area in characters   → \e[8;<rows>;<cols>t
+    // Only the query subset is parsed; the action subset (resize, move,
+    // raise, etc.) is ignored. Kitty's icat depends on 14/16 for its
+    // pixel-precise placement math.
+    XtwinopsQuery(u16),
+
     // CSI <n> SP q — DECSCUSR. 0/1=blink block, 2=block, 3=blink underline,
     // 4=underline, 5=blink bar, 6=bar.
     SetCursorStyle(u16),
@@ -64,8 +74,14 @@ pub enum Event {
 
     // DCS payload (everything between ESC P and ST). Used by xterm's
     // XTGETTCAP termcap query — apps like vim probe terminal capabilities
-    // here on startup. SOS/PM/APC are still swallowed silently.
+    // here on startup. SOS/PM are still swallowed silently.
     Dcs(String),
+
+    // APC payload (everything between ESC _ and ST). Used by Kitty's
+    // graphics protocol — `\e_G<ctrl>;<base64>\e\\` for inline images.
+    // The terminal-level dispatcher (`handle_apc`) is what decides
+    // whether the payload is interesting; this layer just captures.
+    Apc(String),
 
     Sgr(Vec<u16>),
 
@@ -98,7 +114,10 @@ enum State {
     // DCS payload, captured for the host (XTGETTCAP queries land here).
     DcsString,
     DcsEsc,
-    // SOS / PM / APC payload — same framing (BEL or ESC \) but no consumer,
+    // APC payload, captured for the Kitty graphics protocol dispatcher.
+    ApcString,
+    ApcEsc,
+    // SOS / PM payload — same framing (BEL or ESC \) but no consumer,
     // so we discard the bytes rather than buffer them.
     StringSwallow,
     StringEsc,
@@ -120,6 +139,8 @@ pub struct Parser {
     osc_buf: String,
     // DCS payload accumulator. Same lifecycle as `osc_buf`.
     dcs_buf: String,
+    // APC payload accumulator. Kitty graphics chunks land here.
+    apc_buf: String,
 }
 
 impl Parser {
@@ -133,6 +154,7 @@ impl Parser {
             intermediate: None,
             osc_buf: String::new(),
             dcs_buf: String::new(),
+            apc_buf: String::new(),
         }
     }
 
@@ -149,6 +171,8 @@ impl Parser {
             State::OscEsc => self.osc_esc(ch, &mut emit),
             State::DcsString => self.dcs(ch, &mut emit),
             State::DcsEsc => self.dcs_esc(ch, &mut emit),
+            State::ApcString => self.apc(ch, &mut emit),
+            State::ApcEsc => self.apc_esc(ch, &mut emit),
             State::StringSwallow => self.string_swallow(ch),
             State::StringEsc => self.string_esc(),
         }
@@ -176,10 +200,12 @@ impl Parser {
             ']' => self.state = State::OscString,
             // DCS — captured for XTGETTCAP and similar.
             'P' => self.state = State::DcsString,
-            // SOS / PM / APC — string-form sequences we don't implement.
-            // Must be consumed up to ST so their payload doesn't leak into
-            // ground state and get printed verbatim.
-            'X' | '^' | '_' => self.state = State::StringSwallow,
+            // APC payload — captured for the Kitty graphics dispatcher.
+            // SOS ('X') / PM ('^') are still swallowed — must be consumed
+            // up to ST so their payload doesn't leak into ground state and
+            // get printed verbatim.
+            '_' => self.state = State::ApcString,
+            'X' | '^' => self.state = State::StringSwallow,
             '7' => {
                 emit(Event::SaveCursor);
                 self.state = State::Ground;
@@ -341,6 +367,35 @@ impl Parser {
         }
     }
 
+    fn apc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
+        match ch {
+            '\x07' => {
+                self.flush_apc(emit);
+                self.state = State::Ground;
+            }
+            '\x1b' => self.state = State::ApcEsc,
+            _ => self.apc_buf.push(ch),
+        }
+    }
+
+    fn apc_esc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
+        // ESC \ is the proper ST terminator; anything else aborts the APC
+        // string without emitting (matching the OSC/DCS contract).
+        if ch == '\\' {
+            self.flush_apc(emit);
+        } else {
+            self.apc_buf.clear();
+        }
+        self.state = State::Ground;
+    }
+
+    fn flush_apc(&mut self, emit: &mut impl FnMut(Event)) {
+        let s = std::mem::take(&mut self.apc_buf);
+        if !s.is_empty() {
+            emit(Event::Apc(s));
+        }
+    }
+
     fn string_swallow(&mut self, ch: char) {
         match ch {
             '\x07' => self.state = State::Ground,
@@ -438,6 +493,16 @@ impl Parser {
                 p1.filter(|&v| v != 0),
             )),
             'm' => emit(Event::Sgr(std::mem::take(&mut self.params))),
+            // XTWINOPS — only the report-size subset; resize/move/etc.
+            // are silently ignored to avoid letting apps move the
+            // window without user consent.
+            't' => {
+                if let Some(ps) = p0 {
+                    if matches!(ps, 14 | 16 | 18) {
+                        emit(Event::XtwinopsQuery(ps));
+                    }
+                }
+            }
             _ => {} // unsupported final byte — silently drop
         }
     }
@@ -614,8 +679,10 @@ mod tests {
     }
 
     #[test]
-    fn sos_pm_apc_are_swallowed() {
-        for intro in ['X', '^', '_'] {
+    fn sos_pm_are_swallowed() {
+        // APC moved to its own Event variant for the Kitty graphics
+        // dispatcher; SOS/PM are still consumed-but-not-emitted.
+        for intro in ['X', '^'] {
             let s = format!("a\x1b{}payload\x1b\\b", intro);
             assert_eq!(
                 collect(&s),
@@ -623,6 +690,30 @@ mod tests {
                 "introducer {intro:?}",
             );
         }
+    }
+
+    #[test]
+    fn apc_payload_emits_event_with_st_terminator() {
+        assert_eq!(
+            collect("a\x1b_GfooBar\x1b\\b"),
+            vec![Event::Print('a'), Event::Apc("GfooBar".into()), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn apc_payload_emits_event_with_bel_terminator() {
+        assert_eq!(
+            collect("a\x1b_GfooBar\x07b"),
+            vec![Event::Print('a'), Event::Apc("GfooBar".into()), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn apc_payload_aborted_by_non_st_esc_does_not_emit() {
+        assert_eq!(
+            collect("a\x1b_Gfoo\x1bZb"),
+            vec![Event::Print('a'), Event::Print('b')],
+        );
     }
 
     #[test]
@@ -755,5 +846,33 @@ mod tests {
         // 65536 wraps to 0 in u16 if we use wrapping — assert we saturate.
         let ev = collect("\x1b[99999A");
         assert!(matches!(ev.as_slice(), &[Event::CursorUp(u16::MAX)]));
+    }
+
+    #[test]
+    fn apc_aborted_then_valid_apc_does_not_carry_over_buffer() {
+        // Regression guard: an aborted APC must clear `apc_buf` so a
+        // subsequent valid APC doesn't emit the discarded payload
+        // concatenated with the new one.
+        let mut p = Parser::new();
+        let mut out = Vec::new();
+        for ch in "\x1b_Gdiscarded\x1bZ".chars() {
+            p.feed(ch, |e| out.push(e));
+        }
+        // Aborted — no Apc event yet.
+        assert!(out.is_empty(), "aborted APC must not emit");
+        for ch in "\x1b_Gkept\x1b\\".chars() {
+            p.feed(ch, |e| out.push(e));
+        }
+        // Only the second APC should be emitted, and its payload must
+        // not contain bytes from the discarded sequence.
+        assert_eq!(out, vec![Event::Apc("Gkept".into())]);
+    }
+
+    #[test]
+    fn apc_empty_payload_emits_nothing() {
+        // `flush_apc` short-circuits on empty — pin the contract so an
+        // empty APC doesn't surface as an `Apc("")` event the dispatcher
+        // would have to filter.
+        assert_eq!(collect("\x1b_\x1b\\"), vec![]);
     }
 }

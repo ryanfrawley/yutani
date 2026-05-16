@@ -439,6 +439,20 @@ pub struct Terminal {
     // multiple OSC 1337 sequences and we want them all visible in one
     // drain.
     pending_image_uploads: Vec<PendingImageUpload>,
+    // Kitty graphics chunked transmissions in flight. Keyed by `i=`
+    // image id; chunks with `m=1` append, chunk with `m=0` (or omitted)
+    // completes the upload. Only the FIRST chunk's sizing / cursor
+    // params are kept — that's what the Kitty spec says wins.
+    kitty_chunks: std::collections::HashMap<u32, KittyChunks>,
+    // Chunked transmission without an image_id. The Kitty spec says
+    // chunked transmissions MUST use `i=`, but `kitty +kitten icat`
+    // doesn't in practice — when sending raw RGB/JPG it omits the id
+    // and expects the terminal to thread the chunks together as a
+    // singular anonymous in-flight image. Only one can be in flight at
+    // a time; a new `m=1` without an id while one's open silently
+    // overwrites (matching the implicit "only one anonymous stream"
+    // contract).
+    kitty_chunks_anon: Option<KittyChunks>,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -496,6 +510,8 @@ impl Terminal {
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
+            kitty_chunks: std::collections::HashMap::new(),
+            kitty_chunks_anon: None,
             cell_w_px: 1,
             line_h_px: 1,
         }
@@ -1127,6 +1143,8 @@ impl Terminal {
             Event::SetCursorStyle(n) => self.cursor_style_dec = n,
             Event::Osc(s) => self.handle_osc(&s),
             Event::Dcs(s) => self.handle_dcs(&s),
+            Event::Apc(s) => self.handle_apc(&s),
+            Event::XtwinopsQuery(ps) => self.handle_xtwinops_query(ps),
             Event::Sgr(params) => self.cursor.style.apply_sgr(&params),
             Event::PrivateModeSet(n) => self.private_mode(n, true),
             Event::PrivateModeReset(n) => self.private_mode(n, false),
@@ -1637,6 +1655,369 @@ impl Terminal {
         });
     }
 
+    /// Reply to an XTWINOPS size query. Apps (Kitty's icat kitten in
+    /// particular) probe these before sending image protocols so they
+    /// know how many pixels a cell is — without a reply the kitten
+    /// errors out with "terminal does not support reporting screen
+    /// sizes in pixels."
+    ///
+    /// Only the report subset (14 / 16 / 18) is honored; the
+    /// resize/move/raise/lower actions on the same final byte are
+    /// silently ignored upstream in the parser.
+    fn handle_xtwinops_query(&mut self, ps: u16) {
+        let cell_w = self.cell_w_px.max(1) as usize;
+        let line_h = self.line_h_px.max(1) as usize;
+        match ps {
+            // 14 → text area in pixels: `\e[4;<height>;<width>t`.
+            14 => {
+                let w = self.cols * cell_w;
+                let h = self.rows * line_h;
+                let s = format!("\x1b[4;{};{}t", h, w);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            // 16 → single cell in pixels: `\e[6;<height>;<width>t`.
+            16 => {
+                let s = format!("\x1b[6;{};{}t", line_h, cell_w);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            // 18 → text area in characters: `\e[8;<rows>;<cols>t`.
+            18 => {
+                let s = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                self.pending_response.extend_from_slice(s.as_bytes());
+            }
+            _ => {} // parser only emits the three above; defensive.
+        }
+    }
+
+    /// Handle a captured APC payload. The Kitty graphics protocol
+    /// (`_G<ctrl>;<base64>`) is the only consumer today; other APC
+    /// strings drop silently.
+    fn handle_apc(&mut self, s: &str) {
+        // Set `YUTANI_LOG_APC=1` to see the control-data portion of
+        // every Kitty APC the terminal receives — useful for figuring
+        // out which protocol subset a tool (icat, ueberzug, etc.) is
+        // actually using when an image doesn't render. The payload
+        // body is elided since it's typically a multi-KB base64 blob.
+        if std::env::var_os("YUTANI_LOG_APC").is_some() {
+            let head: String = s.chars().take(120).collect();
+            let elided = if s.len() > 120 { "…" } else { "" };
+            eprintln!("[apc] {}{}", head, elided);
+        }
+
+        // Strip the `G` verb. The `;` separator between control data and
+        // payload is optional — a control-only message (e.g. `a=q,...`
+        // for capability query) may omit it.
+        let Some(rest) = s.strip_prefix('G') else {
+            return;
+        };
+        let (ctrl_str, payload) = match rest.split_once(';') {
+            Some((c, p)) => (c, p),
+            None => (rest, ""),
+        };
+        let Some(ctrl) = parse_kitty_control(ctrl_str) else {
+            return;
+        };
+
+        // Capability handshake. Apps query each (format, transmission)
+        // combo on startup; we must answer truthfully or they'll pick a
+        // path we can't serve and silently drop their image. Kitty's
+        // icat in particular queries `f=24` (raw RGB) variants first and
+        // will use raw + shared memory if we say OK to them — we don't
+        // implement those, so reply ENOTSUPPORTED and force the fallback
+        // to f=100/t=f which we do support.
+        //
+        // Quiet modes per spec: q=0 (default) reply always, q=1 suppress
+        // success, q=2 suppress all.
+        if matches!(ctrl.action, KittyAction::Query) {
+            let supported = self.kitty_query_supported(ctrl.format, ctrl.transmission);
+            let suppress = match ctrl.quiet {
+                0 => false,
+                1 => supported, // suppress OK, but still send errors
+                _ => true,      // q>=2: silence everything
+            };
+            if !suppress {
+                let body = if supported {
+                    "OK".to_string()
+                } else {
+                    // Spec format is `ENOTSUPPORTED:<message>`; the
+                    // message text is informational.
+                    "ENOTSUPPORTED:format or transmission not supported".to_string()
+                };
+                let reply = match ctrl.image_id {
+                    Some(id) => format!("\x1b_Gi={};{}\x1b\\", id, body),
+                    None => format!("\x1b_G;{}\x1b\\", body),
+                };
+                self.pending_response.extend_from_slice(reply.as_bytes());
+            }
+            return;
+        }
+
+        // `a=t` (transmit-only, no display) requires deferred placement,
+        // which means tracking image_id → ImageId mapping for a later
+        // `a=p`. Not in K1; drop.
+        if !matches!(ctrl.action, KittyAction::TransmitAndDisplay) {
+            return;
+        }
+
+        // Format/transmission pair must be in our supported set.
+        // `kitty_query_supported` is the source of truth — the query
+        // branch above tells the app exactly which combos work, and
+        // here we enforce the same set on the actual transmission.
+        // Anything outside (raw over file, shared memory, etc.) drops
+        // silently.
+        if !self.kitty_query_supported(ctrl.format, ctrl.transmission) {
+            return;
+        }
+
+        match ctrl.transmission {
+            KittyTransmission::Direct => self.handle_apc_direct(payload, &ctrl),
+            KittyTransmission::File => self.handle_apc_file(payload, &ctrl),
+            KittyTransmission::Other => {} // unsupported medium → drop
+        }
+    }
+
+    /// Single source of truth for which (format, transmission) tuples we
+    /// can actually serve. Used both by the capability-query reply and
+    /// by the transmission branch — keeps the two paths in lockstep so
+    /// we never say OK to something the dispatcher would then drop.
+    ///
+    /// Supported:
+    /// - PNG over direct base64 OR file path. PNG is the default for
+    ///   most apps and is what `t=f` ships as.
+    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64. icat
+    ///   uses these for non-PNG sources (JPG, GIF) — it decodes locally
+    ///   then ships raw bytes to skip a PNG re-encode round-trip.
+    ///
+    /// Unsupported (silently dropped both in query and transmission):
+    /// - Shared memory (`t=s`) and temp-file (`t=t`) transmissions.
+    /// - Raw formats from a file path (`f=24/32, t=f`) — rare in practice.
+    fn kitty_query_supported(
+        &self,
+        format: KittyFormat,
+        transmission: KittyTransmission,
+    ) -> bool {
+        match (format, transmission) {
+            (KittyFormat::Png, KittyTransmission::Direct | KittyTransmission::File) => true,
+            (KittyFormat::Rgb | KittyFormat::Rgba, KittyTransmission::Direct) => true,
+            _ => false,
+        }
+    }
+
+    /// Direct base64 transmission: payload is the image bytes (possibly
+    /// chunked across multiple APCs and reassembled by `kitty_chunks`).
+    fn handle_apc_direct(&mut self, payload: &str, ctrl: &KittyControl) {
+        // Branch on chunking. Four states: (id present, more chunks),
+        // (id present, last chunk), (no id, more chunks), (no id, last
+        // chunk). The two id-less branches use `kitty_chunks_anon`
+        // because `kitty +kitten icat` omits `i=` for raw / JPG
+        // streams but still expects accumulation.
+        //
+        // Hot path: a typical 1MB image arrives in ~250 chunks, so the
+        // per-chunk work has to stay minimal. Stream the whitespace
+        // filter directly into the accumulator's existing String instead
+        // of allocating a per-chunk staging buffer.
+        match (ctrl.image_id, ctrl.more_chunks) {
+            (Some(id), true) => {
+                let entry = self.kitty_chunks.entry(id).or_insert_with(|| KittyChunks {
+                    b64: String::new(),
+                    format: ctrl.format,
+                    source_w: ctrl.source_w,
+                    source_h: ctrl.source_h,
+                    cells_cols: ctrl.cells_cols,
+                    cells_rows: ctrl.cells_rows,
+                    do_not_move_cursor: ctrl.do_not_move_cursor,
+                });
+                append_b64_filtered(&mut entry.b64, payload);
+            }
+            (Some(id), false) if self.kitty_chunks.contains_key(&id) => {
+                let mut acc = self.kitty_chunks.remove(&id).expect("contains_key");
+                append_b64_filtered(&mut acc.b64, payload);
+                self.finalize_kitty_image(
+                    &acc.b64,
+                    acc.format,
+                    acc.source_w,
+                    acc.source_h,
+                    acc.cells_cols,
+                    acc.cells_rows,
+                    acc.do_not_move_cursor,
+                );
+            }
+            (None, true) => {
+                // Anonymous chunk. The first one establishes the
+                // sizing/format; later ones just append base64. A new
+                // first-chunk while one's open overwrites — there's no
+                // way to distinguish them otherwise.
+                let entry = self.kitty_chunks_anon.get_or_insert_with(|| KittyChunks {
+                    b64: String::new(),
+                    format: ctrl.format,
+                    source_w: ctrl.source_w,
+                    source_h: ctrl.source_h,
+                    cells_cols: ctrl.cells_cols,
+                    cells_rows: ctrl.cells_rows,
+                    do_not_move_cursor: ctrl.do_not_move_cursor,
+                });
+                append_b64_filtered(&mut entry.b64, payload);
+            }
+            (None, false) if self.kitty_chunks_anon.is_some() => {
+                let mut acc = self.kitty_chunks_anon.take().expect("is_some");
+                append_b64_filtered(&mut acc.b64, payload);
+                self.finalize_kitty_image(
+                    &acc.b64,
+                    acc.format,
+                    acc.source_w,
+                    acc.source_h,
+                    acc.cells_cols,
+                    acc.cells_rows,
+                    acc.do_not_move_cursor,
+                );
+            }
+            _ => {
+                // Single-chunk: id present (or not) with m=0 and no
+                // in-flight buffer. Build a one-off filtered string
+                // since the accumulator path isn't involved.
+                let mut buf = String::with_capacity(payload.len());
+                append_b64_filtered(&mut buf, payload);
+                self.finalize_kitty_image(
+                    &buf,
+                    ctrl.format,
+                    ctrl.source_w,
+                    ctrl.source_h,
+                    ctrl.cells_cols,
+                    ctrl.cells_rows,
+                    ctrl.do_not_move_cursor,
+                );
+            }
+        }
+    }
+
+    /// File transmission (`t=f`): payload is a base64-encoded UTF-8
+    /// filesystem path. We read the file ourselves rather than the
+    /// app shipping its bytes over the PTY. Cheaper for large images
+    /// (no base64 round-trip, no chunked reassembly), which is why
+    /// `kitty +kitten icat` picks this path by default for local files.
+    fn handle_apc_file(&mut self, payload: &str, ctrl: &KittyControl) {
+        use base64::Engine;
+        // Path may have internal whitespace from base64 line wrapping —
+        // strip before decode.
+        let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let Ok(path_bytes) = base64::engine::general_purpose::STANDARD.decode(cleaned.as_bytes())
+        else {
+            return;
+        };
+        let Ok(path) = std::str::from_utf8(&path_bytes) else { return };
+
+        // Bound the read so a malformed app pointing at /dev/zero or a
+        // multi-GB log file can't OOM us. 256 MiB is huge for any real
+        // image; oversized files are silently dropped.
+        const MAX_FILE_READ_BYTES: u64 = 256 * 1024 * 1024;
+        let Ok(meta) = std::fs::metadata(path) else { return };
+        if meta.len() > MAX_FILE_READ_BYTES {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(path) else { return };
+
+        // File transmission bypasses base64 entirely — the bytes are
+        // ready to peek and queue. Reuse the post-decode shared path.
+        let pixel_size = crate::images::peek_dimensions(&bytes);
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            ctrl.cells_cols,
+            ctrl.cells_rows,
+            ctrl.do_not_move_cursor,
+        );
+    }
+
+    /// Base64-decode `b64`, transform per `format` (PNG bytes pass
+    /// through; raw RGB/RGBA bytes get PNG-encoded so they flow
+    /// through the same `image::load_from_memory` worker path), then
+    /// hand off to `finalize_kitty_image_bytes`.
+    fn finalize_kitty_image(
+        &mut self,
+        b64: &str,
+        format: KittyFormat,
+        source_w: Option<u32>,
+        source_h: Option<u32>,
+        cells_cols: Option<u32>,
+        cells_rows: Option<u32>,
+        do_not_move_cursor: bool,
+    ) {
+        use base64::Engine;
+        let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+            return;
+        };
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(format, &raw, source_w, source_h)
+        else {
+            return;
+        };
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            cells_cols,
+            cells_rows,
+            do_not_move_cursor,
+        );
+    }
+
+    /// Shared finalize for both direct-base64 and file transmissions —
+    /// computes cell extent, advances the cursor with scroll
+    /// compensation, queues the upload. Mirrors `handle_osc_1337`'s
+    /// post-decode plumbing.
+    fn finalize_kitty_image_bytes(
+        &mut self,
+        bytes: Vec<u8>,
+        pixel_size: Option<(u32, u32)>,
+        cells_cols: Option<u32>,
+        cells_rows: Option<u32>,
+        do_not_move_cursor: bool,
+    ) {
+        // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
+        // falling back to Auto (image's native cell extent) when not.
+        // u16 clamping matches what the renderer can address.
+        let width = cells_cols
+            .map(|n| ImageSizeSpec::Cells(n.min(u16::MAX as u32) as u16))
+            .unwrap_or(ImageSizeSpec::Auto);
+        let height = cells_rows
+            .map(|n| ImageSizeSpec::Cells(n.min(u16::MAX as u32) as u16))
+            .unwrap_or(ImageSizeSpec::Auto);
+
+        let cell_extent = compute_cell_extent(
+            width,
+            height,
+            pixel_size,
+            self.cell_w_px,
+            self.line_h_px,
+            self.cols as u16,
+            self.rows as u16,
+            true, // Kitty's default is to preserve aspect when one axis is omitted.
+        );
+
+        let original_row = self.cursor.row as isize;
+        let original_col = self.cursor.col as isize;
+        let rows = cell_extent.0 as isize;
+        if !do_not_move_cursor {
+            for _ in 0..rows {
+                self.line_feed();
+            }
+        }
+        let cursor_advance = self.cursor.row as isize - original_row;
+        let scrolls = if do_not_move_cursor { 0 } else { rows - cursor_advance };
+        let cell_anchor = (original_row - scrolls, original_col);
+
+        self.pending_image_uploads.push(PendingImageUpload {
+            bytes,
+            pixel_size,
+            width,
+            height,
+            preserve_aspect: true,
+            do_not_move_cursor,
+            label: Some("kitty graphics".into()),
+            cell_anchor,
+            cell_extent,
+        });
+    }
+
     /// Handle a captured DCS payload. Currently we only implement xterm's
     /// XTGETTCAP query (`+q<hex>;<hex>;...`); other DCS strings are dropped.
     fn handle_dcs(&mut self, s: &str) {
@@ -1874,6 +2255,275 @@ fn compute_cell_extent(
 ///
 /// Returns `None` for anything else (negative numbers, unsupported units,
 /// empty string). Callers default to `Auto` on `None`.
+/// Kitty graphics-protocol action verb. We only handle the small subset
+/// that `kitty +kitten icat` needs in slice 1; everything else routes to
+/// `Other` and gets silently dropped (the Kitty contract — unknown action
+/// is a no-op).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KittyAction {
+    /// `a=t` — transmit only, don't display. Image is held by id for a
+    /// later `a=p`. Phase 1 of slice 1 doesn't yet support deferred
+    /// placement; treat as a no-op.
+    Transmit,
+    /// `a=T` — transmit and display immediately. The default action when
+    /// `a=` is absent. This is what icat sends.
+    TransmitAndDisplay,
+    /// `a=q` — query capability. Reply with `OK` so the app proceeds to
+    /// send real images (K1.5).
+    Query,
+    /// `a=p` / `a=d` / `a=a` / unknown — accepted into the parser but
+    /// produces no observable behavior in K1.
+    Other,
+}
+
+/// Pixel-format identifier from `f=`.
+///
+/// PNG (`f=100`) is the universal format. Raw RGB (`f=24`) and RGBA
+/// (`f=32`) are what `kitty +kitten icat` uses for non-PNG sources
+/// (JPG, GIF, etc.) — it decodes to raw and ships those bytes rather
+/// than re-encoding to PNG. Raw formats require source dimensions
+/// (`s=` / `v=`); we PNG-encode them on the receiving side so they
+/// flow through the same decoder path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KittyFormat {
+    Png,
+    /// `f=24` — bytes are `s * v * 3` straight RGB.
+    Rgb,
+    /// `f=32` — bytes are `s * v * 4` straight RGBA.
+    Rgba,
+    /// Unknown / unsupported `f=` value. Parser captures it but
+    /// `handle_apc` drops the payload silently.
+    Other,
+}
+
+/// Transmission medium from `t=`. `Direct` is the base64-in-APC default;
+/// `File` reads the image from a path the app supplies (the path itself
+/// is base64'd in the payload). `Temp` and `Shared` (shared memory) are
+/// not yet implemented.
+///
+/// File read is safe from a privilege standpoint — the app is already
+/// running as the user; it could read the file directly. We just shift
+/// the read across the PTY so chunked base64 of a multi-MB image
+/// doesn't have to traverse the byte stream.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KittyTransmission {
+    Direct,
+    File,
+    Other,
+}
+
+/// Parsed Kitty graphics-protocol control data — the `key=value,...` part
+/// between `_G` and the first `;`. Fields are public so the dispatcher
+/// (`handle_apc`) can pattern-match without going through accessors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KittyControl {
+    pub action: KittyAction,
+    pub format: KittyFormat,
+    pub transmission: KittyTransmission,
+    /// `i=` image id. Client-assigned u32. When present and `m=1`, the
+    /// payload chunk appends to a per-id buffer; when present and `m=0`
+    /// (or omitted), it completes the buffer.
+    pub image_id: Option<u32>,
+    /// `p=` placement id. Lets a client refer to a specific placement
+    /// later (e.g. for delete). Not yet acted on in K1.
+    pub placement_id: Option<u32>,
+    /// `c=` target column count for the placement. Treated as
+    /// `ImageSizeSpec::Cells`.
+    pub cells_cols: Option<u32>,
+    /// `r=` target row count for the placement.
+    pub cells_rows: Option<u32>,
+    /// `m=1` means more chunks coming; `m=0` (or omitted) means this is
+    /// the last chunk. The accumulator keys on `image_id` to thread
+    /// chunks of the same image together.
+    pub more_chunks: bool,
+    /// `C=1` suppresses the post-placement cursor advance — Kitty's
+    /// equivalent of iTerm's `doNotMoveCursor=1`.
+    pub do_not_move_cursor: bool,
+    /// `q=` quiet mode. `q=0` (default) — always reply, `q=1` —
+    /// suppress success responses, `q=2` — suppress all. K1.5 honors this.
+    pub quiet: u8,
+    /// `s=` source pixel width. Required for raw RGB/RGBA formats so we
+    /// know how to reshape the byte stream; ignored for PNG (the header
+    /// supplies the dimensions).
+    pub source_w: Option<u32>,
+    /// `v=` source pixel height. Same story as `source_w`.
+    pub source_h: Option<u32>,
+}
+
+impl Default for KittyControl {
+    fn default() -> Self {
+        Self {
+            // Spec default when `a=` is absent.
+            action: KittyAction::TransmitAndDisplay,
+            // PNG when `f=` is absent.
+            format: KittyFormat::Png,
+            // Direct when `t=` is absent.
+            transmission: KittyTransmission::Direct,
+            image_id: None,
+            placement_id: None,
+            cells_cols: None,
+            cells_rows: None,
+            more_chunks: false,
+            do_not_move_cursor: false,
+            quiet: 0,
+            source_w: None,
+            source_h: None,
+        }
+    }
+}
+
+/// In-flight Kitty chunked transmission. The accumulator on `Terminal`
+/// holds one of these per `i=` image id between the first `m=1` chunk
+/// and the eventual `m=0` (or omitted-`m`) chunk that completes it.
+///
+/// We accumulate the still-base64 strings rather than decoded bytes
+/// because a chunk's base64 may not be a multiple of 4 — partial decodes
+/// can't be combined trivially.
+#[derive(Clone, Debug)]
+struct KittyChunks {
+    /// Concatenated base64 payload across all chunks so far. Decoded
+    /// once at the terminal chunk.
+    b64: String,
+    /// Format and source dimensions from the *first* chunk — the Kitty
+    /// spec says only the first chunk's attributes matter, so chunked
+    /// raw RGB/RGBA payloads still know how to reshape their bytes.
+    format: KittyFormat,
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+    /// Sizing / cursor params from the first chunk.
+    cells_cols: Option<u32>,
+    cells_rows: Option<u32>,
+    do_not_move_cursor: bool,
+}
+
+/// Append `payload`'s base64 chars to `dest`, skipping ASCII whitespace.
+/// Some apps wrap base64 inside an APC at 76 chars per line for
+/// readability; the base64 alphabet doesn't include whitespace, so the
+/// skip is unambiguous.
+///
+/// Pulled out of `handle_apc_direct` because it runs on the hot path —
+/// a typical 1MB image arrives in ~250 chunks and the old `chunk:
+/// String = ... .collect()` path allocated a fresh String per chunk
+/// then copied it into the accumulator. Streaming directly into the
+/// destination is one pass, no allocation.
+fn append_b64_filtered(dest: &mut String, payload: &str) {
+    // Base64 is pure ASCII so we can byte-iterate without UTF-8 decoding.
+    // Reserving up-front amortizes the growth cost across many chunks.
+    dest.reserve(payload.len());
+    for &b in payload.as_bytes() {
+        if !b.is_ascii_whitespace() {
+            // SAFETY-equivalent: pushing an ASCII byte into a String is
+            // always valid UTF-8.
+            dest.push(b as char);
+        }
+    }
+}
+
+/// Normalize a Kitty graphics payload into the PNG-bytes format the
+/// `image::load_from_memory` decoder accepts.
+///
+/// - PNG payloads pass through unchanged, with `pixel_size` from the
+///   PNG header peek.
+/// - Raw RGB (`f=24`) and RGBA (`f=32`) payloads get PNG-encoded here.
+///   The encode runs on the PTY thread (a few ms for typical images);
+///   the alternative would be plumbing a "skip decode, here are raw
+///   pixels" code path through the worker, which doubles the API
+///   surface for one rare case.
+///
+/// Returns `None` when raw formats are missing required `s=` / `v=`
+/// dimensions, when raw byte counts don't match the declared geometry,
+/// or when PNG re-encoding fails.
+fn normalize_kitty_payload(
+    format: KittyFormat,
+    raw: &[u8],
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+) -> Option<(Vec<u8>, Option<(u32, u32)>)> {
+    match format {
+        KittyFormat::Png => {
+            let pixel_size = crate::images::peek_dimensions(raw);
+            Some((raw.to_vec(), pixel_size))
+        }
+        KittyFormat::Rgb | KittyFormat::Rgba => {
+            let w = source_w?;
+            let h = source_h?;
+            let bytes_per_px = if matches!(format, KittyFormat::Rgba) { 4 } else { 3 };
+            let expected = (w as usize)
+                .checked_mul(h as usize)?
+                .checked_mul(bytes_per_px)?;
+            if raw.len() != expected {
+                return None;
+            }
+            let dyn_img = match format {
+                KittyFormat::Rgba => image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(w, h, raw.to_vec())?,
+                ),
+                KittyFormat::Rgb => image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(w, h, raw.to_vec())?,
+                ),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::new();
+            dyn_img
+                .write_to(
+                    &mut std::io::Cursor::new(&mut out),
+                    image::ImageOutputFormat::Png,
+                )
+                .ok()?;
+            Some((out, Some((w, h))))
+        }
+        KittyFormat::Other => None,
+    }
+}
+
+/// Parse the comma-separated `key=value` portion of a Kitty graphics
+/// control sequence. Unknown keys are accepted-but-ignored per the Kitty
+/// contract; malformed value parses fall back to the field's default.
+/// Returns `None` only when the input doesn't look like a control list
+/// at all (which can't happen via `handle_apc`'s split, but the guard
+/// keeps the helper testable in isolation).
+pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
+    let mut ctrl = KittyControl::default();
+    if s.is_empty() {
+        return Some(ctrl);
+    }
+    for kv in s.split(',') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k {
+            "a" => ctrl.action = match v {
+                "t" => KittyAction::Transmit,
+                "T" => KittyAction::TransmitAndDisplay,
+                "q" => KittyAction::Query,
+                _ => KittyAction::Other,
+            },
+            "f" => ctrl.format = match v {
+                "100" => KittyFormat::Png,
+                "24" => KittyFormat::Rgb,
+                "32" => KittyFormat::Rgba,
+                _ => KittyFormat::Other,
+            },
+            "s" => ctrl.source_w = v.parse().ok(),
+            "v" => ctrl.source_h = v.parse().ok(),
+            "t" => ctrl.transmission = match v {
+                "d" => KittyTransmission::Direct,
+                "f" => KittyTransmission::File,
+                _ => KittyTransmission::Other,
+            },
+            "i" => ctrl.image_id = v.parse().ok(),
+            "p" => ctrl.placement_id = v.parse().ok(),
+            "c" => ctrl.cells_cols = v.parse().ok(),
+            "r" => ctrl.cells_rows = v.parse().ok(),
+            "m" => ctrl.more_chunks = v == "1",
+            "C" => ctrl.do_not_move_cursor = v == "1",
+            "q" => ctrl.quiet = v.parse().unwrap_or(0),
+            // s, v, x, y, w, h, X, Y, z, I, o, etc. — accepted but unused
+            // in K1. Future slices wire them up.
+            _ => {}
+        }
+    }
+    Some(ctrl)
+}
+
 fn parse_iterm_size(s: &str) -> Option<ImageSizeSpec> {
     if s.eq_ignore_ascii_case("auto") || s.is_empty() {
         return Some(ImageSizeSpec::Auto);
@@ -3811,6 +4461,859 @@ mod tests {
         // Unsupported units fall through to None — caller substitutes Auto.
         assert_eq!(parse_iterm_size("5em"), None);
         assert_eq!(parse_iterm_size("-1"), None);
+    }
+
+    //
+    // XTWINOPS — what the kitty kitten queries on startup to learn cell
+    // pixel size. Without these the kitten refuses to send images at all.
+    //
+
+    #[test]
+    fn xtwinops_14_replies_with_text_area_pixel_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b[14t");
+        // height = rows * line_h = 24 * 16 = 384
+        // width  = cols * cell_w = 80 * 8 = 640
+        assert_eq!(t.take_response(), b"\x1b[4;384;640t");
+    }
+
+    #[test]
+    fn xtwinops_16_replies_with_cell_pixel_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(9, 20);
+        t.feed("\x1b[16t");
+        // height = line_h = 20, width = cell_w = 9
+        assert_eq!(t.take_response(), b"\x1b[6;20;9t");
+    }
+
+    #[test]
+    fn xtwinops_18_replies_with_text_area_character_size() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[18t");
+        // rows=24, cols=80
+        assert_eq!(t.take_response(), b"\x1b[8;24;80t");
+    }
+
+    #[test]
+    fn xtwinops_unrelated_action_codes_are_ignored() {
+        // 1 = de-iconify, 3 = move, 4 = resize, 5 = raise. Honoring
+        // these would let any program move our window without consent.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        for ps in [1, 3, 4, 5, 22, 23] {
+            t.feed(&format!("\x1b[{}t", ps));
+            assert!(t.take_response().is_empty(), "ps={} should be silent", ps);
+        }
+    }
+
+    #[test]
+    fn xtwinops_uses_clamped_one_for_unset_cell_size() {
+        // If State hasn't called set_cell_size_px yet, default is 1×1.
+        // The kitten will still get a reply (no error), just a degenerate
+        // one — better than nothing.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[14t");
+        assert_eq!(t.take_response(), b"\x1b[4;24;80t");
+    }
+
+    //
+    // K1.2: Kitty graphics-protocol control-data parser. Tests pin the
+    // defaults (which apply when keys are omitted, common in real Kitty
+    // payloads) and the action / format / transmission discriminants.
+    //
+
+    #[test]
+    fn parse_kitty_control_empty_returns_defaults() {
+        // Spec default when the control list is empty: a=T, f=100, t=d.
+        let c = parse_kitty_control("").unwrap();
+        assert_eq!(c.action, KittyAction::TransmitAndDisplay);
+        assert_eq!(c.format, KittyFormat::Png);
+        assert_eq!(c.transmission, KittyTransmission::Direct);
+        assert!(!c.more_chunks);
+        assert!(!c.do_not_move_cursor);
+        assert_eq!(c.quiet, 0);
+    }
+
+    #[test]
+    fn parse_kitty_control_action_variants() {
+        assert_eq!(parse_kitty_control("a=t").unwrap().action, KittyAction::Transmit);
+        assert_eq!(parse_kitty_control("a=T").unwrap().action, KittyAction::TransmitAndDisplay);
+        assert_eq!(parse_kitty_control("a=q").unwrap().action, KittyAction::Query);
+        // Unknown actions land on Other — the Kitty contract says
+        // "unknown action = no-op", which we encode as Other + dispatcher drop.
+        assert_eq!(parse_kitty_control("a=p").unwrap().action, KittyAction::Other);
+        assert_eq!(parse_kitty_control("a=d").unwrap().action, KittyAction::Other);
+        assert_eq!(parse_kitty_control("a=Z").unwrap().action, KittyAction::Other);
+    }
+
+    #[test]
+    fn parse_kitty_control_format_and_transmission() {
+        assert_eq!(parse_kitty_control("f=100").unwrap().format, KittyFormat::Png);
+        assert_eq!(parse_kitty_control("f=32").unwrap().format, KittyFormat::Rgba);
+        assert_eq!(parse_kitty_control("f=24").unwrap().format, KittyFormat::Rgb);
+        assert_eq!(parse_kitty_control("f=99").unwrap().format, KittyFormat::Other);
+        assert_eq!(parse_kitty_control("t=d").unwrap().transmission, KittyTransmission::Direct);
+        assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::File);
+        assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::Other);
+        assert_eq!(parse_kitty_control("t=t").unwrap().transmission, KittyTransmission::Other);
+    }
+
+    #[test]
+    fn parse_kitty_control_ids_and_sizing() {
+        let c = parse_kitty_control("i=42,p=7,c=10,r=5").unwrap();
+        assert_eq!(c.image_id, Some(42));
+        assert_eq!(c.placement_id, Some(7));
+        assert_eq!(c.cells_cols, Some(10));
+        assert_eq!(c.cells_rows, Some(5));
+    }
+
+    #[test]
+    fn parse_kitty_control_chunking_and_cursor_and_quiet() {
+        let c = parse_kitty_control("m=1,C=1,q=2").unwrap();
+        assert!(c.more_chunks);
+        assert!(c.do_not_move_cursor);
+        assert_eq!(c.quiet, 2);
+    }
+
+    #[test]
+    fn parse_kitty_control_unknown_keys_accepted() {
+        // Forward-compat: unknown keys must not abort the parse.
+        let c = parse_kitty_control("a=T,futureKey=99,o=z,i=1").unwrap();
+        assert_eq!(c.action, KittyAction::TransmitAndDisplay);
+        assert_eq!(c.image_id, Some(1));
+    }
+
+    #[test]
+    fn parse_kitty_control_malformed_value_falls_back_to_default() {
+        // i= with garbage → None (not Some(0)) so the dispatcher can
+        // distinguish "no id given" from "id 0".
+        let c = parse_kitty_control("i=notanumber,a=T").unwrap();
+        assert_eq!(c.image_id, None);
+        assert_eq!(c.action, KittyAction::TransmitAndDisplay);
+    }
+
+    //
+    // K1.3 / K1.4: Kitty graphics dispatch end-to-end. Builds a small
+    // PNG, wraps it in an APC, feeds it through `Terminal::feed`, and
+    // verifies the upload queue + cursor state. Same shape as the
+    // `osc_1337_*` tests but for the Kitty wire format.
+    //
+
+    /// Build a Kitty graphics APC wrapping `png_bytes`. `args` is the
+    /// pre-`;` control string (e.g. `"a=T,f=100,c=5,r=2"`).
+    fn kitty_apc(args: &str, png_bytes: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+        format!("\x1b_G{};{}\x1b\\", args, b64)
+    }
+
+    /// Same as `kitty_apc` but with a control-only payload (no `;`).
+    /// Used for `a=q` queries that carry no image data.
+    fn kitty_apc_control_only(args: &str) -> String {
+        format!("\x1b_G{}\x1b\\", args)
+    }
+
+    /// Re-encode the same fixture PNG that the iTerm tests use, so we
+    /// know `peek_dimensions` will return Some((w, h)).
+    fn kitty_png(w: u32, h: u32) -> Vec<u8> {
+        let buf = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 128, 255, 255]));
+        let mut bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn kitty_apc_single_chunk_queues_one_upload() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,f=100,c=2,r=1", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+        // Cursor advanced by 1 row (cell_extent.0).
+        assert_eq!(t.cursor().row, 1);
+    }
+
+    #[test]
+    fn kitty_apc_default_action_is_transmit_and_display() {
+        // `a=` omitted → default T per spec → image displays.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(2, 2);
+        t.feed(&kitty_apc("f=100,c=3,r=2", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (2, 3));
+    }
+
+    #[test]
+    fn kitty_apc_no_sizing_falls_back_to_image_native_extent() {
+        // c/r omitted → Auto → cell extent = ceil(pixels / cell_size).
+        // 16x16 image, 8x16 cell → 1 row × 2 cols.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(16, 16);
+        t.feed(&kitty_apc("a=T,f=100", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+    }
+
+    #[test]
+    fn kitty_apc_do_not_move_cursor() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b[10;1H"); // CUP row 10 col 1 → cursor.row = 9
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,f=100,c=2,r=1,C=1", &png));
+        // C=1 must keep the cursor at row 9, NOT advance.
+        assert_eq!(t.cursor().row, 9);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads[0].cell_anchor, (9, 0));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_transmission_assembles_full_payload() {
+        // Split the same payload across three APCs (m=1, m=1, m=0) with
+        // the same i=. The accumulator must concatenate them in order
+        // and only emit the upload on the terminator.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let chunk_size = (b64.len() / 3 + 1).max(4);
+        let c1 = &b64[..chunk_size];
+        let c2 = &b64[chunk_size..2 * chunk_size];
+        let c3 = &b64[2 * chunk_size..];
+
+        // First chunk carries the sizing.
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=42,m=1;{}\x1b\\", c1));
+        assert!(t.take_pending_image_uploads().is_empty());
+        // Middle chunk continues — only `i=` and `m=1` matter, sizing
+        // here would be ignored (and we leave it absent to verify that).
+        t.feed(&format!("\x1b_Gi=42,m=1;{}\x1b\\", c2));
+        assert!(t.take_pending_image_uploads().is_empty());
+        // Terminal chunk — m=0 (or omitted; this test uses omitted to
+        // pin the "absent m means last" path).
+        t.feed(&format!("\x1b_Gi=42;{}\x1b\\", c3));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+        // Round-trip the payload: peek_dimensions on the assembled
+        // bytes should still see 4×4.
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_uses_first_chunks_sizing_not_last() {
+        // First chunk: c=10. Last chunk: c=3 (would be ignored). Pin
+        // the contract: first-chunk sizing wins.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+        t.feed(&format!("\x1b_Ga=T,f=100,c=10,r=2,i=7,m=1;{}\x1b\\", &b64[..mid]));
+        t.feed(&format!("\x1b_Ga=T,c=3,r=99,i=7;{}\x1b\\", &b64[mid..]));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (2, 10));
+    }
+
+    #[test]
+    fn kitty_apc_non_png_format_silently_dropped() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        // f=32 (RGBA raw) requires `s=`/`v=` and isn't wired in K1.
+        t.feed(&kitty_apc("a=T,f=32,s=4,v=4,c=2,r=1", &png));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_unsupported_transmission_silently_dropped() {
+        // t=s (shared memory) and t=t (temp file) are out of scope.
+        // t=f (file) IS now implemented — see kitty_apc_t_f_reads_file.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        for medium in ["s", "t"] {
+            t.feed(&kitty_apc(&format!("a=T,f=100,t={},c=2,r=1", medium), &png));
+            assert!(
+                t.take_pending_image_uploads().is_empty(),
+                "t={} should drop",
+                medium
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_apc_t_f_reads_file_from_disk() {
+        // Real kitty +kitten icat picks `t=f` (file) by default for
+        // local PNG inputs — the payload is a base64-encoded UTF-8
+        // path. Write a PNG to a temp file, point an APC at it, and
+        // assert the queue receives the file's bytes intact.
+        use base64::Engine;
+        let png = kitty_png(4, 4);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("yutani-kitty-test-{}.png", std::process::id()));
+        std::fs::write(&path, &png).expect("write temp png");
+        let path_b64 = base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap());
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f,c=2,r=1;{}\x1b\\", path_b64));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "file-transmission upload should land");
+        assert_eq!(uploads[0].bytes, png);
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn kitty_apc_t_f_missing_file_drops_silently() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode("/definitely/does/not/exist.png");
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_t_f_non_utf8_path_drops_silently() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        // Invalid UTF-8 in the path → reject before touching the
+        // filesystem. (A real path with non-UTF-8 bytes on macOS would
+        // also be rejected — kitty's spec implies UTF-8 paths.)
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_anonymous_chunked_transmission_assembles() {
+        // kitty +kitten icat omits `i=` on its chunked transmissions —
+        // the spec says chunked MUST have an id, but reality differs.
+        // Use the `kitty_chunks_anon` slot to thread chunks together.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+        let (c1, c2) = b64.split_at(mid);
+
+        // First chunk: m=1, no `i=`. Carries the sizing.
+        t.feed(&format!("\x1b_Ga=T,q=2,f=100,m=1,c=2,r=1;{}\x1b\\", c1));
+        assert!(t.take_pending_image_uploads().is_empty(),
+            "first anon chunk must not flush");
+        // Terminal chunk: m=0 (or omitted), no `i=`.
+        t.feed(&format!("\x1b_Ga=T,m=0;{}\x1b\\", c2));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "anonymous chunks should coalesce");
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_anonymous_chunked_does_not_collide_with_id_keyed() {
+        // Anonymous and id-keyed chunked transmissions use separate
+        // slots so they can be in-flight at the same time. Pin that
+        // by interleaving and verifying both land independently.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png_anon = kitty_png(2, 2);
+        let png_keyed = kitty_png(3, 3);
+        use base64::Engine;
+        let b_anon = base64::engine::general_purpose::STANDARD.encode(&png_anon);
+        let b_keyed = base64::engine::general_purpose::STANDARD.encode(&png_keyed);
+
+        let (a1, a2) = b_anon.split_at(b_anon.len() / 2);
+        let (k1, k2) = b_keyed.split_at(b_keyed.len() / 2);
+
+        t.feed(&format!("\x1b_Ga=T,f=100,m=1,c=1,r=1;{}\x1b\\", a1));
+        t.feed(&format!("\x1b_Ga=T,f=100,m=1,i=99,c=2,r=2;{}\x1b\\", k1));
+        t.feed(&format!("\x1b_Ga=T,i=99,m=0;{}\x1b\\", k2));
+        t.feed(&format!("\x1b_Ga=T,m=0;{}\x1b\\", a2));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 2);
+        // Both should have valid pixel data — proves the buffers didn't
+        // cross-contaminate.
+        for up in &uploads {
+            assert!(up.pixel_size.is_some(), "decoded cleanly: {:?}", up.cell_extent);
+        }
+    }
+
+    #[test]
+    fn kitty_apc_raw_rgb_direct_decodes_via_png_round_trip() {
+        // What `kitty +kitten icat` does for a JPG: decode locally to
+        // raw RGB, ship over t=d, count on the terminal to handle f=24.
+        // We PNG-encode on the receiving side; downstream this looks
+        // like any other PNG upload.
+        use base64::Engine;
+        let w = 4u32;
+        let h = 4u32;
+        let rgb: Vec<u8> = (0..(w * h * 3) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgb);
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=24,s={},v={},c=2,r=1;{}\x1b\\",
+            w, h, b64
+        ));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        // PNG round-trip should preserve the declared dimensions.
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        // First two bytes of a real PNG are 0x89 0x50 (PNG signature) —
+        // proves the payload was re-encoded, not passed raw.
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn kitty_apc_raw_rgba_direct_decodes_via_png_round_trip() {
+        use base64::Engine;
+        let w = 2u32;
+        let h = 2u32;
+        let rgba: Vec<u8> = (0..(w * h * 4) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba);
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=32,s={},v={};{}\x1b\\",
+            w, h, b64
+        ));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn kitty_apc_raw_format_with_mismatched_byte_count_drops() {
+        // s*v*3 mismatch — declared 4x4 RGB (48 bytes) but payload is
+        // only 12. Reject so a buggy app can't crash the decoder.
+        use base64::Engine;
+        let too_few = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 12]);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=24,s=4,v=4;{}\x1b\\", too_few));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_raw_format_without_source_dims_drops() {
+        // s= / v= are required for raw — there's no header to fall back on.
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 48]);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=24;{}\x1b\\", bytes));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn parse_kitty_control_t_f_is_file() {
+        assert_eq!(
+            parse_kitty_control("t=f").unwrap().transmission,
+            KittyTransmission::File
+        );
+    }
+
+    #[test]
+    fn kitty_apc_transmit_only_action_does_not_display() {
+        // `a=t` (lowercase) is "transmit only, hold for later a=p" —
+        // deferred placement isn't implemented in K1. Drop silently.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=t,f=100,c=2,r=1,i=1", &png));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_ok_with_request_id() {
+        // kitty +kitten icat probes support with `a=q,i=N` on startup.
+        // For supported (format, transmission) tuples we reply
+        // `\e_Gi=N;OK\e\\`. Defaults are f=100 / t=d (both supported).
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=42,s=1,v=1"));
+        assert!(t.take_pending_image_uploads().is_empty());
+        let reply = t.take_response();
+        assert_eq!(reply, b"\x1b_Gi=42;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_without_id_replies_ok_idless() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,s=1,v=1"));
+        let reply = t.take_response();
+        assert_eq!(reply, b"\x1b_G;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_ok_for_raw_rgb_direct() {
+        // f=24 (raw RGB) over direct base64 IS supported — we PNG-encode
+        // the raw bytes on the way in. icat uses this for JPG and other
+        // non-PNG sources.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=5,f=24,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_enotsupported_for_raw_over_file() {
+        // f=24 + t=f is a weird combo (file containing raw RGB bytes
+        // with no header to know dimensions) and we don't handle it.
+        // Pin the negative response.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=5,f=24,t=f,s=1,v=1"));
+        let reply = t.take_response();
+        let s = std::str::from_utf8(&reply).unwrap();
+        assert!(s.starts_with("\x1b_Gi=5;ENOTSUPPORTED"), "got: {s}");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_enotsupported_for_shared_memory() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=6,f=100,t=s,s=1,v=1"));
+        let reply = t.take_response();
+        let s = std::str::from_utf8(&reply).unwrap();
+        assert!(s.starts_with("\x1b_Gi=6;ENOTSUPPORTED"), "got: {s}");
+    }
+
+    #[test]
+    fn kitty_apc_query_replies_ok_for_t_f_file() {
+        // t=f is the path icat picks for local PNGs — it MUST be in
+        // the "supported" set or the kitten won't use it.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=7,f=100,t=f,s=1,v=1"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=7;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_quiet_modes() {
+        // q=0 default → reply always. q=1 → suppress OK but still send
+        // errors. q=2 → silence everything.
+        let mut t = Terminal::new(80, 24, 100);
+
+        t.feed(&kitty_apc_control_only("a=q,i=1,q=0")); // supported + q=0
+        assert_eq!(t.take_response(), b"\x1b_Gi=1;OK\x1b\\");
+
+        t.feed(&kitty_apc_control_only("a=q,i=1,q=1")); // supported + q=1
+        assert!(t.take_response().is_empty(), "q=1 should suppress OK");
+
+        // Trigger an actual error via t=s (shared memory not supported).
+        t.feed(&kitty_apc_control_only("a=q,i=2,f=100,t=s,q=1")); // error + q=1
+        let reply = t.take_response();
+        assert!(
+            std::str::from_utf8(&reply).unwrap().contains("ENOTSUPPORTED"),
+            "q=1 must NOT suppress errors; got: {:?}",
+            reply,
+        );
+
+        t.feed(&kitty_apc_control_only("a=q,i=3,f=100,t=s,q=2")); // error + q=2
+        assert!(t.take_response().is_empty(), "q=2 must silence everything");
+    }
+
+    #[test]
+    fn kitty_apc_bad_base64_silently_dropped() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Invalid base64 — decode fails, nothing queued.
+        t.feed("\x1b_Ga=T,f=100,c=2,r=1;not!base64!\x1b\\");
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_chunked_with_internal_whitespace_assembles() {
+        // Real kitty payloads sometimes wrap base64 lines for
+        // readability inside the APC. The handler strips whitespace.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(2, 2);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let with_ws: String = b64
+            .as_bytes()
+            .chunks(8)
+            .map(|s| std::str::from_utf8(s).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.feed(&format!("\x1b_Ga=T,f=100,c=1,r=1;{}\x1b\\", with_ws));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((2, 2)));
+    }
+
+    //
+    // K1 gap-fill: edge cases around handle_apc, chunk lifecycle, query
+    // formatting, and interactions with the iTerm path.
+    //
+
+    #[test]
+    fn kitty_apc_only_g_verb_no_semicolon_does_not_panic() {
+        // APC payload that's literally just "G" — no control string, no
+        // payload, no `;`. Splits to ("", ""), parses to defaults (a=T),
+        // f=100 PNG, t=d direct. Bare empty payload base64-decodes to
+        // zero bytes; the upload is still queued (pin current behavior).
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b_G\x1b\\");
+        // Defaults are a=T,f=100,t=d → finalize fires. Empty base64 → zero
+        // bytes → peek_dimensions returns None → cell_extent falls back to
+        // (1, 1). Pin so a future tightening of the validator is intentional.
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].bytes.is_empty());
+        assert_eq!(uploads[0].pixel_size, None);
+    }
+
+    #[test]
+    fn kitty_apc_payload_without_g_prefix_is_silently_dropped() {
+        // APC payloads not starting with `G` aren't Kitty — drop without
+        // touching the upload queue or response buffer.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b_other,a=T,f=100;ZGF0YQ==\x1b\\");
+        t.feed("\x1b_X-custom\x1b\\");
+        assert!(t.take_pending_image_uploads().is_empty());
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_empty_payload_after_semicolon_still_queues_upload() {
+        // `G<ctrl>;` with empty body — base64 of "" succeeds and gives
+        // zero bytes. handle_apc still pushes a pending upload; the
+        // downstream Store decode is what ultimately fails. Pin the
+        // current "queue first, validate later" behavior.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b_Ga=T,f=100,c=2,r=1;\x1b\\");
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].bytes.is_empty(), "empty base64 → zero bytes");
+        // Explicit c/r honored even when bytes are empty.
+        assert_eq!(uploads[0].cell_extent, (1, 2));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_survives_interleaved_unrelated_apc() {
+        // A non-Kitty APC arriving between chunks must not perturb the
+        // accumulator keyed by image_id. Real terminals see all kinds of
+        // APC payloads from misbehaving apps — this guards against a
+        // future refactor that accidentally clears `kitty_chunks` on any
+        // APC.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=11,m=1;{}\x1b\\", &b64[..mid]));
+        // Unrelated APC payload — no G prefix.
+        t.feed("\x1b_other-vendor-payload\x1b\\");
+        // OSC sneaks in too.
+        t.feed("\x1b]0;ignore me\x07");
+        // Resume the same image — accumulator must still have the first half.
+        t.feed(&format!("\x1b_Gi=11;{}\x1b\\", &b64[mid..]));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "interleaving must not lose the chunk buffer");
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_terminator_with_no_buffer_falls_to_single_chunk() {
+        // m=0 with an `i=` that has no in-flight buffer — falls through
+        // to the single-chunk path. Pin: this should produce one upload
+        // from the terminator's own payload (not zero, not two).
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(2, 2);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        t.feed(&format!("\x1b_Ga=T,f=100,c=1,r=1,i=77,m=0;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((2, 2)));
+    }
+
+    #[test]
+    fn kitty_apc_chunks_cleared_after_flush_so_id_reuse_works() {
+        // After a flush, the HashMap entry for that id is removed — so
+        // a second transmission reusing the same id starts fresh and
+        // gets its own first-chunk sizing (rather than inheriting the
+        // prior one). Demonstrates the lifecycle without a private accessor.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+
+        // First transmission with id=5, sized 2×1.
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=5,m=1;{}\x1b\\", &b64[..mid]));
+        t.feed(&format!("\x1b_Gi=5;{}\x1b\\", &b64[mid..]));
+        let first = t.take_pending_image_uploads();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].cell_extent, (1, 2));
+
+        // Reuse the same id with different sizing — must NOT inherit
+        // the prior accumulator or its (2,1) sizing.
+        t.feed(&format!("\x1b_Ga=T,f=100,c=4,r=2,i=5,m=1;{}\x1b\\", &b64[..mid]));
+        t.feed(&format!("\x1b_Gi=5;{}\x1b\\", &b64[mid..]));
+        let second = t.take_pending_image_uploads();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].cell_extent, (2, 4), "second transmission's sizing wins");
+    }
+
+    #[test]
+    fn kitty_apc_many_concurrent_image_ids_all_flush_independently() {
+        // Interleave 5 chunked transmissions with distinct image_ids;
+        // every one should flush cleanly when its terminator arrives.
+        // Guards the HashMap-keyed-by-id design from a regression that
+        // serializes uploads or cross-contaminates buffers.
+        let mut t = Terminal::new(160, 60, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+
+        let ids = [101u32, 202, 303, 404, 505];
+        // First-half chunks for all ids — interleaved.
+        for &id in &ids {
+            t.feed(&format!(
+                "\x1b_Ga=T,f=100,c=2,r=1,i={},m=1;{}\x1b\\",
+                id,
+                &b64[..mid],
+            ));
+        }
+        // No uploads yet — all in flight.
+        assert!(t.take_pending_image_uploads().is_empty());
+        // Send terminators in a different order — independence test.
+        for &id in &[303, 101, 505, 202, 404] {
+            t.feed(&format!("\x1b_Gi={};{}\x1b\\", id, &b64[mid..]));
+        }
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 5);
+        // All decoded to the original 4×4 — i.e. no buffer mixing.
+        for up in &uploads {
+            assert_eq!(up.pixel_size, Some((4, 4)));
+        }
+    }
+
+    #[test]
+    fn kitty_apc_query_explicit_q_zero_still_replies() {
+        // Spec: q=0 == default == reply. Pin so a future shortcut
+        // ("if q is set, suppress") doesn't silently break icat.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=9,q=0"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=9;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_query_malformed_quiet_falls_back_to_zero_and_replies() {
+        // `q=banana` doesn't parse — falls back to default 0, so the
+        // reply fires. Pin the lenient parse contract.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&kitty_apc_control_only("a=q,i=3,q=banana"));
+        assert_eq!(t.take_response(), b"\x1b_Gi=3;OK\x1b\\");
+    }
+
+    #[test]
+    fn kitty_apc_malformed_format_value_is_dropped() {
+        // f=abc and f= (empty value) both fall to KittyFormat::Other,
+        // which the dispatcher drops. Pin.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(2, 2);
+        t.feed(&kitty_apc("a=T,f=abc,c=1,r=1", &png));
+        t.feed(&kitty_apc("a=T,f=,c=1,r=1", &png));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[test]
+    fn kitty_apc_explicit_c_and_r_fit_exactly_no_aspect_munging() {
+        // K1's compute_cell_extent is called with preserve_aspect=true,
+        // but when BOTH axes are explicit Cells the aspect branch is a
+        // no-op — Kitty's c/r are exact cell extents. Pin so changing
+        // the iTerm-shared default doesn't accidentally squish Kitty.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Use a wildly non-square source (32×4 px) with c=10,r=10. If
+        // aspect were applied, one axis would be overridden; with both
+        // explicit, we should get exactly (10, 10).
+        let png = kitty_png(32, 4);
+        t.feed(&kitty_apc("a=T,f=100,c=10,r=10", &png));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].cell_extent, (10, 10));
+    }
+
+    #[test]
+    fn kitty_apc_in_decstbm_scroll_region_anchor_follows_scrolls() {
+        // Kitty mirror of osc_1337_in_decstbm_scroll_region_anchor_follows_scrolls.
+        // Cursor pinned at scroll_bottom; an image taller than the
+        // remaining region rows scrolls in-region. Anchor compensation
+        // (original_row - scrolls) must still resolve to a visible row.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed("\x1b[10;20r"); // scroll region rows 10..20 (1-based)
+        t.feed("\x1b[20;1H"); // cursor at row 20 (bottom of region)
+        // Drain any uploads / responses from preamble (defensive).
+        let _ = t.take_pending_image_uploads();
+        let _ = t.take_response();
+        let png = kitty_png(4, 4);
+        // c=4, r=3 → 3 line-feeds at scroll_bottom → 3 in-region scrolls.
+        t.feed(&kitty_apc("a=T,f=100,c=4,r=3", &png));
+        assert_eq!(t.cursor().row, 19, "cursor pinned at scroll_bottom");
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        // 3 line-feeds, 0 cursor advance → scrolls = 3 - 0 = 3.
+        // anchor row = 19 - 3 = 16.
+        assert_eq!(uploads[0].cell_anchor, (16, 0));
+        assert_eq!(uploads[0].cell_extent, (3, 4));
+    }
+
+    #[test]
+    fn mixed_iterm_osc_and_kitty_apc_share_queue_in_arrival_order() {
+        // Both paths push onto the same `pending_image_uploads` queue.
+        // A feed containing one of each must surface both in arrival
+        // order so the caller's hand-off to Store sees them as the
+        // host sent them.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // iTerm first (label = None per minimal OSC), then Kitty.
+        let png = kitty_png(2, 2);
+        let combo = format!("{}{}", iterm_osc(""), kitty_apc("a=T,f=100,c=1,r=1", &png));
+        t.feed(&combo);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 2);
+        // Order: iTerm OSC was first → comes first.
+        assert_eq!(uploads[0].label.as_deref(), None);
+        assert_eq!(uploads[1].label.as_deref(), Some("kitty graphics"));
     }
 
     //

@@ -1646,4 +1646,224 @@ mod tests {
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].label.as_deref(), Some(filename));
     }
+
+    //
+    // K1.6 — Kitty graphics end-to-end. Mirrors the iTerm e2e suite:
+    // feed Terminal an APC, hand the queued upload to Store, poll
+    // until decode completes, verify the placement is visible.
+    //
+
+    fn make_kitty_apc(args: &str, png_bytes: &[u8]) -> String {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+        format!("\x1b_G{};{}\x1b\\", args, b64)
+    }
+
+    #[test]
+    fn e2e_kitty_apc_lands_visible_placement_after_decode() {
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        let png = make_png(4, 4);
+        term.feed(&make_kitty_apc("a=T,f=100,c=2,r=1", &png));
+
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = uploads.into_iter().next().unwrap();
+
+        let (pending, image_id) = store.request_insert(
+            up.bytes,
+            100,
+            Duration::from_secs(5),
+            up.label,
+        );
+        let (rows, cols) = up.cell_extent;
+        let (row, col) = up.cell_anchor;
+        term.insert_placement(image_id, row, col, rows, cols, 0);
+
+        // Pre-decode: placement created, no pixels yet.
+        assert_eq!(term.live_placements().len(), 1);
+        assert!(store.is_pending(image_id));
+
+        let results = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, pending);
+        let returned = results[0].1.as_ref().expect("decode succeeded");
+        assert_eq!(*returned, image_id);
+        assert!(store.peek(image_id).is_some());
+    }
+
+    #[test]
+    fn e2e_kitty_apc_chunked_assembles_into_one_decode() {
+        // Three-chunk transmission with one image_id. The terminal
+        // accumulator concatenates them; only one upload reaches Store.
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        let png = make_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let third = (b64.len() / 3 + 1).max(4);
+        let (c1, rest) = b64.split_at(third.min(b64.len()));
+        let split2 = third.min(rest.len());
+        let (c2, c3) = rest.split_at(split2);
+
+        term.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=99,m=1;{}\x1b\\", c1));
+        term.feed(&format!("\x1b_Gi=99,m=1;{}\x1b\\", c2));
+        term.feed(&format!("\x1b_Gi=99,m=0;{}\x1b\\", c3));
+
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "chunks must coalesce into one upload");
+
+        let up = uploads.into_iter().next().unwrap();
+        let (pending, image_id) = store.request_insert(
+            up.bytes,
+            100,
+            Duration::from_secs(5),
+            up.label,
+        );
+        term.insert_placement(image_id, up.cell_anchor.0, up.cell_anchor.1, up.cell_extent.0, up.cell_extent.1, 0);
+
+        let results = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, pending);
+        assert!(results[0].1.is_ok(), "reassembled chunks decoded cleanly");
+        assert!(store.peek(image_id).is_some());
+    }
+
+    #[test]
+    fn e2e_kitty_query_then_image_does_full_handshake() {
+        // Simulate icat's startup: send query, expect OK, then send the
+        // real image. Verify both branches land their respective side
+        // effects (response bytes for the query, upload for the image).
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        term.feed("\x1b_Ga=q,i=7,s=1,v=1\x1b\\");
+        let reply = term.take_response();
+        assert!(reply.starts_with(b"\x1b_Gi=7;OK"), "got: {:?}", reply);
+
+        let png = make_png(3, 3);
+        term.feed(&make_kitty_apc("a=T,f=100,i=8,c=2,r=2", &png));
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let up = uploads.into_iter().next().unwrap();
+        let (_pid, image_id) = store.request_insert(up.bytes, 100, Duration::from_secs(5), None);
+        term.insert_placement(image_id, up.cell_anchor.0, up.cell_anchor.1, up.cell_extent.0, up.cell_extent.1, 0);
+
+        let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        assert!(store.peek(image_id).is_some());
+    }
+
+    #[test]
+    fn e2e_kitty_concurrent_chunked_ids_each_land_independent_textures() {
+        // Two interleaved chunked transmissions with distinct ids must
+        // each surface as its own upload, decode independently, and
+        // produce distinct ImageIds inside Store.
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        let png_a = make_png(4, 4);
+        let png_b = make_png(2, 2);
+        use base64::Engine;
+        let b64_a = base64::engine::general_purpose::STANDARD.encode(&png_a);
+        let b64_b = base64::engine::general_purpose::STANDARD.encode(&png_b);
+        let mid_a = b64_a.len() / 2;
+        let mid_b = b64_b.len() / 2;
+
+        // Interleave starts: A first half, B first half, A finish, B finish.
+        term.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=1001,m=1;{}\x1b\\", &b64_a[..mid_a]));
+        term.feed(&format!("\x1b_Ga=T,f=100,c=1,r=1,i=1002,m=1;{}\x1b\\", &b64_b[..mid_b]));
+        assert!(term.take_pending_image_uploads().is_empty(), "no flush mid-stream");
+        term.feed(&format!("\x1b_Gi=1001;{}\x1b\\", &b64_a[mid_a..]));
+        term.feed(&format!("\x1b_Gi=1002;{}\x1b\\", &b64_b[mid_b..]));
+
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 2);
+
+        // Hand both off in order. ImageIds must be distinct (Store mints
+        // a fresh one per request_insert).
+        let mut image_ids = Vec::new();
+        for up in uploads {
+            let (_pending, id) =
+                store.request_insert(up.bytes, 100, Duration::from_secs(5), up.label);
+            image_ids.push(id);
+        }
+        assert_ne!(image_ids[0], image_ids[1]);
+
+        let results = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
+        // Both should arrive — though possibly across multiple polls; the
+        // helper returns on the first non-empty. Keep polling until both land.
+        let mut decoded = results.len();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while decoded < 2 && Instant::now() < deadline {
+            decoded += store.poll(&p, &d, &q, false).len();
+        }
+        assert_eq!(decoded, 2, "both chunked images must decode");
+        assert!(store.peek(image_ids[0]).is_some());
+        assert!(store.peek(image_ids[1]).is_some());
+    }
+
+    #[test]
+    fn e2e_mixed_iterm_and_kitty_uploads_both_decode_through_store() {
+        // Both wire formats funnel into the same upload queue. Feed one
+        // iTerm OSC and one Kitty APC in a single feed; both should
+        // decode independently inside Store and produce distinct
+        // GpuImages.
+        let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let mut term = crate::terminal::Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+
+        let png = make_png(2, 2);
+        let combo = format!(
+            "{}{}",
+            make_iterm_osc("inline=1", &png),
+            make_kitty_apc("a=T,f=100,c=1,r=1", &png),
+        );
+        term.feed(&combo);
+
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 2);
+        // Arrival order: iTerm OSC came first.
+        assert_ne!(uploads[1].label.as_deref(), uploads[0].label.as_deref());
+
+        let mut image_ids = Vec::new();
+        for up in uploads {
+            let (_pending, id) =
+                store.request_insert(up.bytes, 100, Duration::from_secs(5), up.label);
+            image_ids.push(id);
+        }
+        let mut decoded = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while decoded < 2 && Instant::now() < deadline {
+            decoded += store.poll(&p, &d, &q, false).len();
+        }
+        assert_eq!(decoded, 2, "both wire formats must decode through Store");
+        assert!(store.peek(image_ids[0]).is_some());
+        assert!(store.peek(image_ids[1]).is_some());
+    }
 }
