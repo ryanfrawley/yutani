@@ -29,6 +29,18 @@ pub struct Placement {
     /// top). Phase 1 doesn't expose this to apps — kept at 0 — but the
     /// field is here so the eventual Kitty `z=` parameter has a home.
     pub z: i32,
+    /// Sub-cell pixel offset from the anchor cell's top-left, in
+    /// framebuffer pixels. `(0, 0)` snaps to the cell grid (phase 1
+    /// behavior); positive values shift the draw right/down. Plumbed so
+    /// phase 2's Kitty `X=` / `Y=` params land here without further
+    /// renderer changes. Doesn't affect eviction / scroll math — those
+    /// still work in whole cells using `rows`/`cols`.
+    pub pixel_offset: (i32, i32),
+    /// Source crop in image pixel coords, `(x, y, w, h)`. `None` samples
+    /// the whole image (phase 1 behavior); `Some(...)` selects a sub-rect.
+    /// Renderer converts to UVs against the GpuImage's known width/height.
+    /// Future home for Kitty's source-rectangle / animated-frame slicing.
+    pub src_rect: Option<(u32, u32, u32, u32)>,
 }
 
 impl Placement {
@@ -527,9 +539,35 @@ impl Terminal {
         cols: u16,
         z: i32,
     ) -> PlacementId {
+        self.insert_placement_with_crop(
+            image, top_row, left_col, rows, cols, z, (0, 0), None,
+        )
+    }
+
+    /// Like `insert_placement` but with sub-cell pixel offsets and an
+    /// optional source-crop rectangle. Kept as a separate entry point so
+    /// phase 1 callers (iTerm2 OSC 1337 parser, debug keybinds) stay on
+    /// the cell-grid-snapped signature; phase 2's Kitty graphics protocol
+    /// — which supports `X=` / `Y=` pixel offsets and an explicit source
+    /// rect — will reach for this one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_placement_with_crop(
+        &mut self,
+        image: ImageId,
+        top_row: isize,
+        left_col: isize,
+        rows: u16,
+        cols: u16,
+        z: i32,
+        pixel_offset: (i32, i32),
+        src_rect: Option<(u32, u32, u32, u32)>,
+    ) -> PlacementId {
         let id = self.next_placement_id;
         self.next_placement_id = self.next_placement_id.wrapping_add(1).max(1);
-        let placement = Placement { id, image, top_row, left_col, rows, cols, z };
+        let placement = Placement {
+            id, image, top_row, left_col, rows, cols, z,
+            pixel_offset, src_rect,
+        };
         self.active_grid_mut().placements.push(placement);
         id
     }
@@ -1799,13 +1837,18 @@ fn compute_cell_extent(
         }
     }
 
-    // Ceiling divide pixels → cells. Fallback to 1 if the spec is
-    // unresolvable (e.g. Auto with no header peek).
+    // Ceiling divide pixels → cells. `saturating_add` because a malformed
+    // protocol payload (Kitty `s=`/`v=`, eventually) could pass a width
+    // close to u32::MAX; a plain `+ cell_w_px - 1` panics in debug and
+    // wraps in release. Saturating clips the result to u16::MAX cells via
+    // the final `.min(...)`, which is the worst case the renderer can
+    // handle. Fallback to 1 if the spec is unresolvable (e.g. Auto with
+    // no header peek).
     let cols = w_px
-        .map(|px| ((px + cell_w_px - 1) / cell_w_px).max(1))
+        .map(|px| (px.saturating_add(cell_w_px - 1) / cell_w_px).max(1))
         .unwrap_or(1);
     let rows = h_px
-        .map(|px| ((px + line_h_px - 1) / line_h_px).max(1))
+        .map(|px| (px.saturating_add(line_h_px - 1) / line_h_px).max(1))
         .unwrap_or(1);
     (
         rows.min(u16::MAX as u32) as u16,
@@ -4010,6 +4053,8 @@ mod tests {
             rows,
             cols,
             z: 0,
+            pixel_offset: (0, 0),
+            src_rect: None,
         };
         let grid_r = 10usize;
         let grid_c = 8usize;
@@ -4047,6 +4092,7 @@ mod tests {
         // placements during a single-row scroll.
         let mk = |top: isize, rows: u16| Placement {
             id: 1, image: ImageId(1), top_row: top, left_col: 0, rows, cols: 1, z: 0,
+            pixel_offset: (0, 0), src_rect: None,
         };
         // Region [5..=9].
         // Placement at rows 3..=4 → bottom_row=5 == top → no overlap.
@@ -4059,6 +4105,60 @@ mod tests {
         assert!(mk(9, 3).rows_intersect(5, 9));
         // Placement just past the bottom — top_row=10 > 9 → no.
         assert!(!mk(10, 1).rows_intersect(5, 9));
+    }
+
+    #[test]
+    fn insert_placement_defaults_pixel_offset_and_src_rect_to_phase1_values() {
+        // The original 7-arg `insert_placement` must keep producing the
+        // exact same `Placement` data as before — pixel_offset zeroed and
+        // src_rect None. Phase 1 callers (OSC 1337 parser, debug keybind)
+        // rely on this; anything else would silently shift their draws.
+        let mut t = Terminal::new(10, 10, 100);
+        let id = t.insert_placement(ImageId(1), 2, 3, 4, 5, 0);
+        let p = t.live_placements().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(p.pixel_offset, (0, 0));
+        assert_eq!(p.src_rect, None);
+    }
+
+    #[test]
+    fn insert_placement_with_crop_round_trips_offsets_and_rect() {
+        // `insert_placement_with_crop` is the phase-2 entry point; the values
+        // it accepts must survive into `live_placements()` unchanged so the
+        // renderer sees what the parser produced. Single field-by-field
+        // round trip pins the wiring.
+        let mut t = Terminal::new(10, 10, 100);
+        let id = t.insert_placement_with_crop(
+            ImageId(7), 1, 2, 3, 4, 0, (5, -6), Some((10, 20, 30, 40)),
+        );
+        let p = t.live_placements().iter().find(|p| p.id == id).unwrap();
+        assert_eq!(p.image, ImageId(7));
+        assert_eq!(p.top_row, 1);
+        assert_eq!(p.left_col, 2);
+        assert_eq!(p.rows, 3);
+        assert_eq!(p.cols, 4);
+        assert_eq!(p.pixel_offset, (5, -6));
+        assert_eq!(p.src_rect, Some((10, 20, 30, 40)));
+    }
+
+    #[test]
+    fn pixel_offset_does_not_change_fully_off_grid() {
+        // pixel_offset is a sub-cell visual nudge; it must NOT alter which
+        // cells the placement covers for eviction math. If it did, a
+        // placement with a +50px offset would falsely escape eviction.
+        let p_zero = Placement {
+            id: 1, image: ImageId(1), top_row: 5, left_col: 0,
+            rows: 1, cols: 1, z: 0, pixel_offset: (0, 0), src_rect: None,
+        };
+        let p_offset = Placement {
+            pixel_offset: (999, -999), ..p_zero.clone()
+        };
+        assert_eq!(
+            p_zero.fully_off_grid(10, 10),
+            p_offset.fully_off_grid(10, 10),
+        );
+        // And neither should be off-grid at row 5 of a 10-row grid.
+        assert!(!p_zero.fully_off_grid(10, 10));
+        assert!(!p_offset.fully_off_grid(10, 10));
     }
 
     #[test]
@@ -4314,18 +4414,15 @@ mod tests {
         assert_eq!(cols, u16::MAX);
     }
 
-    // BUG: `(px + cell_w_px - 1) / cell_w_px` in compute_cell_extent
-    // overflows in debug builds (and silently wraps in release) when px is
-    // within (cell - 1) of u32::MAX. A `saturating_add` or pre-clamp before
-    // the ceil-div would fix it. Pinned here as #[should_panic] so the
-    // existence of the bug is visible to whoever fixes it — flip this to
-    // a positive assertion (u16::MAX clamp) once the saturating fix lands.
+    /// A `Pixels(u32::MAX - 1)` spec used to overflow the `+ cell_w_px - 1`
+    /// in the ceil-div (debug panic, release wrap). `saturating_add` makes
+    /// the worst case clip cleanly to `u16::MAX` cells, which is the
+    /// largest extent the renderer can represent.
     #[test]
-    #[should_panic(expected = "attempt to add with overflow")]
-    fn compute_cell_extent_pixels_near_u32_max_overflows_today() {
-        let _ = compute_cell_extent(
+    fn compute_cell_extent_pixels_near_u32_max_clamps_instead_of_overflowing() {
+        let (rows, cols) = compute_cell_extent(
             ImageSizeSpec::Pixels(u32::MAX - 1),
-            ImageSizeSpec::Auto,
+            ImageSizeSpec::Pixels(u32::MAX - 1),
             None,
             8,
             16,
@@ -4333,6 +4430,8 @@ mod tests {
             24,
             false,
         );
+        assert_eq!(rows, u16::MAX);
+        assert_eq!(cols, u16::MAX);
     }
 
     #[test]

@@ -196,6 +196,14 @@ struct Config {
     /// sampler their bind group was built with — a flip applies to
     /// subsequent decodes only.
     images_filter: String,
+    /// When the GPU image draw is unavailable for a placement — either
+    /// `images_enabled = false` or the placement's decode failed in a
+    /// case main.rs hasn't yet cleaned up — render the placement as
+    /// Unicode half-block (▀) glyphs against the cell grid using the
+    /// preview cached in `images::Store`. Off by default: the in-flight
+    /// decode case (which would flicker) is *never* covered; only the
+    /// fully-disabled / fully-failed cases are.
+    images_halfblock_for_missing: bool,
 }
 
 impl Config {
@@ -235,6 +243,7 @@ impl Config {
             images_decode_timeout_ms: 2000,
             images_in_scrollback: true,
             images_filter: "linear".to_string(),
+            images_halfblock_for_missing: false,
         }
     }
 
@@ -334,6 +343,9 @@ impl Config {
                     // Silently keep the default on unknown values — same
                     // contract as the `color_scheme` slot above.
                 },
+                "images_halfblock_for_missing" => if let Ok(x) = v.parse() {
+                    c.images_halfblock_for_missing = x;
+                },
                 _ => (),
             }
         }
@@ -416,13 +428,15 @@ impl Config {
              images_max_pixels = {}\n\
              images_decode_timeout_ms = {}\n\
              images_in_scrollback = {}\n\
-             images_filter = {}\n",
+             images_filter = {}\n\
+             images_halfblock_for_missing = {}\n",
             self.images_enabled,
             self.images_memory_cap_mb,
             self.images_max_pixels,
             self.images_decode_timeout_ms,
             self.images_in_scrollback,
             self.images_filter,
+            self.images_halfblock_for_missing,
         ));
         s
     }
@@ -1671,8 +1685,42 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Rebuild the vertex/index buffers if they're stale, recording the cost
-    /// in `perf`. Called from the redraw handler before `render`.
+    /// Per-frame setup. Runs in the redraw handler between `update` (input
+    /// processing) and `render` (GPU encode). Resolves the image store's
+    /// async state, then rebuilds vertices if stale.
+    ///
+    /// The ordering matters: poll → retain → vertex build → render. Both
+    /// the vertex builder (half-block fallback path) and `render` (GPU
+    /// image_draws) consult `Store::peek` for the same set of placements.
+    /// If they disagreed on `peek`'s return value within a frame, a decode
+    /// that resolved between the two would either double-draw (half-block
+    /// behind GPU pixels) or vanish for a frame (vertex builder saw Some,
+    /// then mark-and-sweep dropped the slot before render). Doing both
+    /// store mutations before either consumer reads guarantees one snapshot
+    /// per frame.
+    ///
+    /// **Invariant:** no caller may mutate `terminal.placements` between
+    /// `prepare_frame` and `render` — `retain` has already been computed
+    /// against the snapshot we hand to `render`, and any new placement
+    /// would slip past it.
+    fn prepare_frame(&mut self) {
+        // Resolve worker decodes that completed since the last frame. May
+        // call `insert_placement` (deferred path success) or
+        // `remove_placements_with_image` (pre-placed path failure), both of
+        // which mark vertices dirty internally.
+        self.poll_pending_images();
+        // Mark-and-sweep AFTER poll so a freshly-landed image referenced
+        // by a placement created in this same `poll_pending_images` call
+        // is kept alive.
+        let referenced = self.terminal.referenced_image_ids();
+        self.image_store.retain(&referenced);
+        self.flush_vertices();
+    }
+
+    /// Rebuild the vertex/index buffers if they're stale, recording the
+    /// cost in `perf`. Called from `prepare_frame`; production code should
+    /// not call this directly — the image-store snapshot has to be set up
+    /// first.
     fn flush_vertices(&mut self) {
         if !self.vertices_dirty {
             return;
@@ -2154,6 +2202,15 @@ impl State {
         ];
         let selection = self.selection;
 
+        // 0b. Half-block fallback overrides for image placements that
+        // the GPU image pipeline can't draw this frame (config-disabled
+        // or decode-failed). One entry per affected cell holds the
+        // top/bottom half-pixel colors for a U+2580 ▀ glyph. Built only
+        // when `images_halfblock_for_missing` is on; empty otherwise so
+        // the lookup below is a single hash miss in the default case.
+        let halfblock_overrides: std::collections::HashMap<(isize, usize), images::HalfblockCell> =
+            self.halfblock_overrides();
+
         // 1. Terminal grid + phantom rows on each side (`r_lo..r_hi` defined
         // above where the shaping pass lives — same range so ligature
         // covers and emits stay in sync).
@@ -2173,6 +2230,23 @@ impl State {
         for r in r_lo..r_hi {
             let over = row_overrides.get(&r);
             for c in 0..cols {
+                // Half-block fallback: substitute the underlying cell
+                // (typically a blank reserved by the placement) with a
+                // ▀ glyph whose fg/bg pull from the preview's two
+                // half-pixels. Wins over any other cell content because
+                // the image placement *owns* these cells — there's no
+                // real text the user expects to see here.
+                if let Some(hb) = halfblock_overrides.get(&(r, c)) {
+                    emit_bg_for_cell(&mut vertices, &mut indices, r, c, hb.bg);
+                    resolved.push(ResolvedCell {
+                        fg_source: GlyphSource::Char(images::HALFBLOCK_CHAR),
+                        variant: font::FaceVariant::Regular,
+                        r,
+                        c,
+                        fg: hb.fg,
+                    });
+                    continue;
+                }
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
                 // SGR 7 (reverse) swaps fg/bg. Resolve unset colors to concrete
                 // theme defaults before swapping — `default_bg` is transparent
@@ -3397,11 +3471,115 @@ impl State {
             }
         }
         if any_placed {
+            // Mark vertices dirty: a new placement may need half-block
+            // override cells, and a removed placement may need its
+            // override cells cleared. The redraw request also fires so
+            // the new vertex buffer reaches the screen this frame.
+            self.vertices_dirty = true;
             self.window.request_redraw();
         }
         // (The "keep ticking while pending" redraw was issued up-front,
         // before the early-return for empty `results` — see the comment
         // there. Avoid double-requesting the same frame.)
+    }
+
+    /// Decision oracle for "should we render this placement as half-block
+    /// glyphs?". Split from `halfblock_overrides` so the matrix of
+    /// (config × store-state) outcomes can be tested in isolation without
+    /// the surrounding Store / Terminal scaffolding.
+    fn should_halfblock(
+        images_enabled: bool,
+        opted_in: bool,
+        is_pending: bool,
+        gpu_image_available: bool,
+    ) -> bool {
+        // Decode-in-flight always wins: even if the user opted in,
+        // flipping briefly to a thumbnail and then snapping to GPU
+        // pixels would flicker badly.
+        if is_pending {
+            return false;
+        }
+        if !images_enabled {
+            // GPU path disabled — half-block is the only thing the user
+            // can see. (Default value of `opted_in` doesn't gate this
+            // case; disabling images entirely already implies wanting
+            // *some* representation.)
+            return true;
+        }
+        // Images enabled and the GPU has the texture: GPU path draws.
+        if gpu_image_available {
+            return false;
+        }
+        // Images enabled, GPU image missing, decode not in flight ⇒
+        // a failed decode where main.rs's cleanup hasn't fired yet (one
+        // frame, typically). Honor the opt-in.
+        opted_in
+    }
+
+    /// Build the per-cell half-block override map for the upcoming vertex
+    /// rebuild. Empty in the common case (images enabled and decoded), so
+    /// the lookup in the cell loop is a single hash miss per cell.
+    ///
+    /// Three cases produce overrides:
+    ///   1. `images_enabled = false` AND a preview is cached (decoded
+    ///      before the toggle, or some other process populated it).
+    ///   2. `images_enabled = true` AND `peek` returns None AND the
+    ///      placement is *not* in-flight (decode failed, but cleanup
+    ///      hasn't fired yet — typically one frame) AND the user opted
+    ///      in via `images_halfblock_for_missing`.
+    ///   3. *Never* when `is_pending` is true: the decode is in flight
+    ///      and pixels are arriving within a frame or two. Showing a
+    ///      half-block thumbnail and then snapping to GPU pixels would
+    ///      flicker badly.
+    ///
+    /// Returns a row-major hash keyed on viewport-coord `(row, col)` so
+    /// the cell loop can probe with the same coords it already iterates.
+    fn halfblock_overrides(
+        &self,
+    ) -> std::collections::HashMap<(isize, usize), images::HalfblockCell> {
+        let mut out = std::collections::HashMap::new();
+        let images_enabled = self.config.images_enabled;
+        let opted_in = self.config.images_halfblock_for_missing;
+        // Early-out: no possible override when images are on and the user
+        // hasn't opted in to the failure-cleanup window.
+        if images_enabled && !opted_in {
+            return out;
+        }
+        let cols = self.terminal.cols;
+        for p in self.terminal.live_placements() {
+            let is_pending = self.image_store.is_pending(p.image);
+            let gpu_ok = self.image_store.peek(p.image).is_some();
+            if !Self::should_halfblock(images_enabled, opted_in, is_pending, gpu_ok) {
+                continue;
+            }
+            let Some(preview) = self.image_store.preview(p.image) else {
+                // Disabled-but-no-preview: nothing to draw with. The
+                // empty space is the right behaviour here; users who
+                // want a placeholder would have to wait for a future
+                // sub-slice that synthesizes a generic frame.
+                continue;
+            };
+            let cells = images::halfblock_cells(preview, p.rows, p.cols);
+            for hb in cells {
+                let r = p.top_row + hb.row_offset as isize;
+                let c = p.left_col + hb.col_offset as isize;
+                // Clip to viewport — phantom rows above/below are still
+                // valid (`extended_cell` reads them), but a placement
+                // extending past the grid horizontally would land off
+                // any drawn cell.
+                if c < 0 || c >= cols as isize {
+                    continue;
+                }
+                // Vertical clipping happens implicitly in the cell
+                // emission loop (it iterates r_lo..r_hi); an entry whose
+                // row falls outside that range is silently ignored
+                // there. Keeping the entry in the map costs one HashMap
+                // slot per scrolled-off row and avoids duplicating the
+                // r_lo / r_hi math here.
+                out.insert((r, c as usize), hb);
+            }
+        }
+        out
     }
 
     /// Wrap `Terminal::feed` so any OSC-1337 payloads parsed in this PTY
@@ -3840,18 +4018,11 @@ impl State {
         let bg_index_range = 0..self.num_bg_indices;
         let fg_index_range = self.num_bg_indices..self.num_indices;
 
-        // Finalize any image decodes that completed since the last frame —
-        // this calls `insert_placement` for successes and frees the
-        // pending slot in either outcome. Runs before mark-and-sweep so
-        // the new image isn't immediately reclaimed.
-        self.poll_pending_images();
-
-        // Mark-and-sweep on the image store: drop any image whose last
-        // placement has gone away (scrolled past scrollback, full reset,
-        // alt-screen wipe, etc.). One-frame-deferred — invisible at frame
-        // rates we care about.
-        let referenced = self.terminal.referenced_image_ids();
-        self.image_store.retain(&referenced);
+        // `prepare_frame` (called by the redraw handler before `render`)
+        // already polled the image store and ran mark-and-sweep, so the
+        // store's state here matches what `update_vertices` saw. This
+        // matters for the half-block fallback: vertex emission and image
+        // draw selection now agree on `peek`'s return value.
 
         // Build per-frame image draw list from `live_placements()`. Cell
         // anchor → pixel rect uses the same font metrics + decorator_offset
@@ -3877,43 +4048,70 @@ impl State {
         // Resolve store entries up front so the borrow can live alongside
         // the upcoming `&mut encoder` calls. Placements whose image was
         // already evicted (shouldn't happen with mark-and-sweep, but
-        // defensible) are silently skipped.
+        // defensible) are silently skipped. When `images_enabled = false`
+        // we never call the GPU image pipeline — the half-block fallback
+        // (computed in `update_vertices` via `halfblock_overrides`) is
+        // the only visible representation in that case.
         //
-        // Two walks share the same pixel math: live placements (always)
-        // plus, when the user has scrolled history into view on the
-        // primary screen, scrollback placements rebased into viewport-row
-        // coords by `scrollback_placements_in_view`. Because that accessor
-        // returns `top_row` in viewport coords, the formula below
-        // (`top_row * line_height + decorator_offset + scroll_y`) makes
-        // images slide in lockstep with text during smooth-scroll.
-        let scrollback_draws = self
-            .terminal
-            .scrollback_placements_in_view(self.terminal.rows);
-        let mut image_draws: Vec<renderer::images::ImageDraw<'_>> =
-            Vec::with_capacity(
+        // When images are on, two walks share the same pixel math: live
+        // placements (always) plus, when the user has scrolled history
+        // into view on the primary screen, scrollback placements rebased
+        // into viewport-row coords by `scrollback_placements_in_view`.
+        // Because that accessor returns `top_row` in viewport coords, the
+        // formula below (`top_row * line_height + decorator_offset +
+        // scroll_y`) makes images slide in lockstep with text during
+        // smooth-scroll.
+        let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
+        if self.config.images_enabled {
+            let scrollback_draws = self
+                .terminal
+                .scrollback_placements_in_view(self.terminal.rows);
+            image_draws.reserve(
                 self.terminal.live_placements().len() + scrollback_draws.len(),
             );
-        let placement_iter = self
-            .terminal
-            .live_placements()
-            .iter()
-            .chain(scrollback_draws.iter());
-        for p in placement_iter {
-            let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
-            let x_px = WINDOW_PADDING + (p.left_col as f32) * cell_w;
-            let y_px = WINDOW_PADDING
-                + decorator_offset
-                + (p.top_row as f32) * line_height
-                + scroll_y;
-            let w_px = (p.cols as f32) * cell_w;
-            let h_px = (p.rows as f32) * line_height;
-            image_draws.push(renderer::images::ImageDraw {
-                image: gpu_img,
-                x_px,
-                y_px,
-                w_px,
-                h_px,
-            });
+            let placement_iter = self
+                .terminal
+                .live_placements()
+                .iter()
+                .chain(scrollback_draws.iter());
+            for p in placement_iter {
+                let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
+                // pixel_offset shifts the draw inside the anchor cell — phase 2
+                // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
+                // identical so eviction / scroll-region shifting is unaffected.
+                let x_px = WINDOW_PADDING
+                    + (p.left_col as f32) * cell_w
+                    + p.pixel_offset.0 as f32;
+                let y_px = WINDOW_PADDING
+                    + decorator_offset
+                    + (p.top_row as f32) * line_height
+                    + scroll_y
+                    + p.pixel_offset.1 as f32;
+                let w_px = (p.cols as f32) * cell_w;
+                let h_px = (p.rows as f32) * line_height;
+                // src_rect (pixels) → UVs (0..1) against this image's known size.
+                // Guard against zero w/h on the GpuImage to avoid div-by-zero —
+                // shouldn't happen for a successfully uploaded texture, but cheap.
+                let uv_rect = p.src_rect.and_then(|(sx, sy, sw, sh)| {
+                    let iw = gpu_img.width_px as f32;
+                    let ih = gpu_img.height_px as f32;
+                    if iw <= 0.0 || ih <= 0.0 { return None; }
+                    Some((
+                        sx as f32 / iw,
+                        sy as f32 / ih,
+                        (sx + sw) as f32 / iw,
+                        (sy + sh) as f32 / ih,
+                    ))
+                });
+                image_draws.push(renderer::images::ImageDraw {
+                    image: gpu_img,
+                    x_px,
+                    y_px,
+                    w_px,
+                    h_px,
+                    uv_rect,
+                });
+            }
         }
         let has_images = !image_draws.is_empty();
 
@@ -4457,7 +4655,7 @@ async fn run() {
                         }
                         WindowEvent::RedrawRequested => {
                             state.update();
-                            state.flush_vertices();
+                            state.prepare_frame();
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
@@ -4941,6 +5139,78 @@ mod tests {
     fn config_image_invalid_bool_keeps_default() {
         let parsed = Config::parse_str("images_enabled = banana\n");
         assert!(parsed.images_enabled);
+    }
+
+    #[test]
+    fn config_image_halfblock_for_missing_default_off() {
+        // Default off: the opt-in only matters for the failure-cleanup
+        // window, where most users either don't notice the one-frame
+        // blank or wouldn't appreciate a colored-cell flash on a
+        // decode error. Keeping it off is the conservative choice.
+        let c = Config::defaults();
+        assert!(!c.images_halfblock_for_missing);
+    }
+
+    #[test]
+    fn config_image_halfblock_for_missing_round_trips() {
+        let mut c = Config::defaults();
+        c.images_halfblock_for_missing = true;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.images_halfblock_for_missing);
+    }
+
+    //
+    // Half-block fallback decision matrix. Pure function — no Store,
+    // Terminal, or window required. Each row pins one cell of the
+    // (images_enabled × opted_in × is_pending × gpu_image_available)
+    // truth table so a future refactor that changes priorities (e.g.
+    // accidentally letting an in-flight decode flicker) fails loud.
+    //
+
+    #[test]
+    fn halfblock_decision_pending_decode_never_renders() {
+        // Pending wins over every other flag — the flicker case.
+        for &en in &[true, false] {
+            for &oi in &[true, false] {
+                for &gpu in &[true, false] {
+                    assert!(
+                        !State::should_halfblock(en, oi, /*pending*/ true, gpu),
+                        "pending should suppress halfblock (en={en} oi={oi} gpu={gpu})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn halfblock_decision_disabled_always_renders_when_not_pending() {
+        // images_enabled=false ⇒ GPU draw is forbidden. Half-block is
+        // the only visible representation; opt-in doesn't gate this
+        // because the user already turned the GPU path off.
+        for &oi in &[true, false] {
+            for &gpu in &[true, false] {
+                assert!(
+                    State::should_halfblock(/*en*/ false, oi, false, gpu),
+                    "disabled should always halfblock (oi={oi} gpu={gpu})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn halfblock_decision_enabled_with_gpu_image_never_renders() {
+        // GPU has the texture, GPU path draws → don't double-emit a
+        // half-block on top.
+        assert!(!State::should_halfblock(true, false, false, true));
+        assert!(!State::should_halfblock(true, true, false, true));
+    }
+
+    #[test]
+    fn halfblock_decision_enabled_missing_image_needs_opt_in() {
+        // images_enabled=true, peek=None, !pending → decode failed and
+        // cleanup hasn't fired. Only honored when the user opts in.
+        assert!(!State::should_halfblock(true, false, false, false));
+        assert!(State::should_halfblock(true, true, false, false));
     }
 
     #[test]
