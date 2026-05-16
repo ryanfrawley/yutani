@@ -1943,8 +1943,46 @@ impl Terminal {
             KittyTransmission::Direct => self.handle_apc_direct(payload, &ctrl),
             KittyTransmission::File => self.handle_apc_file(payload, &ctrl, /*delete=*/ false),
             KittyTransmission::TempFile => self.handle_apc_file(payload, &ctrl, /*delete=*/ true),
+            KittyTransmission::SharedMemory => self.handle_apc_shm(payload, &ctrl),
             KittyTransmission::Other => {} // unsupported medium → drop
         }
+    }
+
+    /// `t=s` — POSIX shared-memory transmission. Payload is the
+    /// (base64'd) SHM object name. Unix-only; on other targets this
+    /// silently drops (we shouldn't get here at all since
+    /// `kitty_query_supported` returns false off-Unix).
+    #[cfg(unix)]
+    fn handle_apc_shm(&mut self, payload: &str, ctrl: &KittyControl) {
+        let Some(name) = decode_kitty_shm_name(payload) else { return };
+        let bytes_opt = read_kitty_shm(&name);
+        // Per spec the terminal owns the unlink — even on read
+        // failure, attempt cleanup so a malformed sender doesn't
+        // leak SHM objects.
+        unlink_kitty_shm(&name);
+        let Some(raw) = bytes_opt else { return };
+        let Some((bytes, pixel_size)) =
+            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
+        else {
+            return;
+        };
+        let display = matches!(ctrl.action, KittyAction::TransmitAndDisplay)
+            && !ctrl.virtual_placement;
+        self.finalize_kitty_image_bytes(
+            bytes,
+            pixel_size,
+            ctrl.cells_cols,
+            ctrl.cells_rows,
+            ctrl.do_not_move_cursor,
+            ctrl.image_id,
+            ctrl.placement_id,
+            display,
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn handle_apc_shm(&mut self, _payload: &str, _ctrl: &KittyControl) {
+        // Shared-memory transmission isn't implemented off-Unix.
     }
 
     /// `a=p` — place a previously-transmitted image at the cursor.
@@ -2036,30 +2074,38 @@ impl Terminal {
     /// by the transmission branch — keeps the two paths in lockstep so
     /// we never say OK to something the dispatcher would then drop.
     ///
-    /// Supported:
-    /// - PNG over direct base64, file path, OR temp file.
-    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64 OR temp
-    ///   file. icat uses these for non-PNG sources (JPG, GIF) — temp
-    ///   file skips the ~250-chunk base64 stream for large images.
+    /// Supported (Unix):
+    /// - PNG over direct base64, file path, temp file, OR shared memory.
+    /// - Raw RGB (`f=24`) and RGBA (`f=32`) over direct base64, temp
+    ///   file, OR shared memory. Shared memory is the fastest path
+    ///   for big raw payloads — zero copies through the PTY.
     ///
-    /// Unsupported (silently dropped both in query and transmission):
-    /// - Shared memory (`t=s`) — needs `shm_open` plumbing; future slice.
-    /// - Raw formats from a regular file path (`f=24/32, t=f`) — rare in
-    ///   practice and would need out-of-protocol dimension hints.
+    /// On non-Unix targets `t=s` is unsupported (shm_open isn't
+    /// available); the query reflects this so apps fall back.
+    ///
+    /// Unsupported everywhere:
+    /// - Raw formats from a regular file path (`f=24/32, t=f`) — rare
+    ///   and would need out-of-protocol dimension hints.
     fn kitty_query_supported(
         &self,
         format: KittyFormat,
         transmission: KittyTransmission,
     ) -> bool {
+        // Shared memory is gated on `cfg(unix)` — Windows would need
+        // a different API and the kitten won't pick `t=s` on Windows
+        // anyway, but be explicit.
+        let shm_ok = cfg!(unix);
         match (format, transmission) {
             (
                 KittyFormat::Png,
                 KittyTransmission::Direct | KittyTransmission::File | KittyTransmission::TempFile,
             ) => true,
+            (KittyFormat::Png, KittyTransmission::SharedMemory) => shm_ok,
             (
                 KittyFormat::Rgb | KittyFormat::Rgba,
                 KittyTransmission::Direct | KittyTransmission::TempFile,
             ) => true,
+            (KittyFormat::Rgb | KittyFormat::Rgba, KittyTransmission::SharedMemory) => shm_ok,
             _ => false,
         }
     }
@@ -2637,6 +2683,12 @@ pub enum KittyTransmission {
     /// defense-in-depth against a malformed app pointing us at
     /// arbitrary paths.
     TempFile,
+    /// `t=s` — POSIX shared memory. Payload is the SHM object name
+    /// (typically `/something`); we `shm_open` + `mmap` to read,
+    /// then `shm_unlink` per spec. Zero copies through the PTY for
+    /// arbitrarily large images; what icat picks for big payloads
+    /// when we advertise it. Unix-only.
+    SharedMemory,
     Other,
 }
 
@@ -2799,6 +2851,77 @@ fn read_kitty_file(path: &std::path::Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+/// Decode the base64-encoded UTF-8 POSIX SHM object name from a `t=s`
+/// payload. Names are short (typically `/icat-<random>`), so we apply
+/// the same base64-with-whitespace tolerance the file-path decoder uses.
+fn decode_kitty_shm_name(payload: &str) -> Option<String> {
+    use base64::Engine;
+    let cleaned: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(cleaned.as_bytes())
+        .ok()?;
+    String::from_utf8(raw).ok()
+}
+
+/// Open a POSIX shared-memory object by name, mmap it, copy out the
+/// contents, and tear down. Same 256 MiB cap the file paths use guards
+/// against malicious senders. Returns `None` on any syscall failure —
+/// the caller still attempts `shm_unlink` so a partially-set-up object
+/// doesn't leak.
+#[cfg(unix)]
+fn read_kitty_shm(name: &str) -> Option<Vec<u8>> {
+    use std::ffi::CString;
+    use std::ptr;
+    const MAX_BYTES: usize = 256 * 1024 * 1024;
+    let c_name = CString::new(name).ok()?;
+    unsafe {
+        let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
+        if fd < 0 {
+            return None;
+        }
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut st) < 0 {
+            libc::close(fd);
+            return None;
+        }
+        let size = st.st_size as usize;
+        if size == 0 || size > MAX_BYTES {
+            libc::close(fd);
+            return None;
+        }
+        let p = libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            libc::close(fd);
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(p as *const u8, size).to_vec();
+        libc::munmap(p, size);
+        libc::close(fd);
+        Some(bytes)
+    }
+}
+
+/// Best-effort `shm_unlink`. Kitty spec says the terminal owns the
+/// unlink, so we always try — silently swallow failures because a
+/// double-unlink (or unlink of a name we never opened because read
+/// failed) isn't worth surfacing.
+#[cfg(unix)]
+fn unlink_kitty_shm(name: &str) {
+    use std::ffi::CString;
+    if let Ok(c_name) = CString::new(name) {
+        unsafe {
+            libc::shm_unlink(c_name.as_ptr());
+        }
+    }
+}
+
 /// True when `path` resolves under `std::env::temp_dir()`. Used by `t=t`
 /// to gate file deletion — we'll read any path the app gives us (it
 /// could read the file itself anyway), but only delete inside the temp
@@ -2866,15 +2989,21 @@ fn normalize_kitty_payload(
             let expected = (w as usize)
                 .checked_mul(h as usize)?
                 .checked_mul(bytes_per_px)?;
-            if raw.len() != expected {
+            // Accept oversized buffers and truncate — POSIX SHM
+            // segments on macOS round up to page size, so a 109-byte
+            // payload arrives as 4096 bytes with zero padding. The
+            // declared `s=`/`v=` is the truth; trust them. Reject
+            // only when we got LESS than declared.
+            if raw.len() < expected {
                 return None;
             }
+            let trimmed: Vec<u8> = raw[..expected].to_vec();
             let dyn_img = match format {
                 KittyFormat::Rgba => image::DynamicImage::ImageRgba8(
-                    image::RgbaImage::from_raw(w, h, raw.to_vec())?,
+                    image::RgbaImage::from_raw(w, h, trimmed)?,
                 ),
                 KittyFormat::Rgb => image::DynamicImage::ImageRgb8(
-                    image::RgbImage::from_raw(w, h, raw.to_vec())?,
+                    image::RgbImage::from_raw(w, h, trimmed)?,
                 ),
                 _ => unreachable!(),
             };
@@ -2931,6 +3060,7 @@ pub fn parse_kitty_control(s: &str) -> Option<KittyControl> {
                 "d" => KittyTransmission::Direct,
                 "f" => KittyTransmission::File,
                 "t" => KittyTransmission::TempFile,
+                "s" => KittyTransmission::SharedMemory,
                 _ => KittyTransmission::Other,
             },
             "i" => ctrl.image_id = v.parse().ok(),
@@ -4983,7 +5113,8 @@ mod tests {
         assert_eq!(parse_kitty_control("f=99").unwrap().format, KittyFormat::Other);
         assert_eq!(parse_kitty_control("t=d").unwrap().transmission, KittyTransmission::Direct);
         assert_eq!(parse_kitty_control("t=f").unwrap().transmission, KittyTransmission::File);
-        assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::Other);
+        assert_eq!(parse_kitty_control("t=s").unwrap().transmission, KittyTransmission::SharedMemory);
+        assert_eq!(parse_kitty_control("t=x").unwrap().transmission, KittyTransmission::Other);
         assert_eq!(parse_kitty_control("t=t").unwrap().transmission, KittyTransmission::TempFile);
     }
 
@@ -5156,23 +5287,26 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_non_png_format_silently_dropped() {
+    fn kitty_apc_unknown_format_silently_dropped() {
+        // Unknown `f=` value (`f=99`) lands on KittyFormat::Other and
+        // is silently dropped. f=24/32/100 are all wired up now —
+        // see their focused tests.
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
         let png = kitty_png(4, 4);
-        // f=32 (RGBA raw) requires `s=`/`v=` and isn't wired in K1.
-        t.feed(&kitty_apc("a=T,f=32,s=4,v=4,c=2,r=1", &png));
+        t.feed(&kitty_apc("a=T,f=99,c=2,r=1", &png));
         assert!(t.take_pending_image_uploads().is_empty());
     }
 
     #[test]
     fn kitty_apc_unsupported_transmission_silently_dropped() {
-        // t=s (shared memory) and t=t (temp file) are out of scope.
-        // t=f (file) IS now implemented — see kitty_apc_t_f_reads_file.
+        // Unknown t= value falls into KittyTransmission::Other and
+        // drops cleanly. (t=f / t=t / t=s are all implemented now —
+        // see their own focused tests.)
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
         let png = kitty_png(4, 4);
-        for medium in ["s", "t"] {
+        for medium in ["x", "Q"] {
             t.feed(&kitty_apc(&format!("a=T,f=100,t={},c=2,r=1", medium), &png));
             assert!(
                 t.take_pending_image_uploads().is_empty(),
@@ -5230,6 +5364,127 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode([0xFF, 0xFE, 0xFD]);
         t.feed(&format!("\x1b_Ga=T,f=100,t=f;{}\x1b\\", b64));
         assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    //
+    // K3: POSIX shared-memory transmission (`t=s`). Unix-only — the
+    // tests create a real SHM segment via libc, populate it, send the
+    // APC, assert the upload landed AND the segment was unlinked.
+    //
+
+    #[cfg(unix)]
+    fn write_shm(name: &str, bytes: &[u8]) {
+        use std::ffi::CString;
+        let c_name = CString::new(name).unwrap();
+        unsafe {
+            // O_CREAT | O_RDWR | 0o600 — caller is responsible for an
+            // earlier unlink if reusing a name.
+            let fd = libc::shm_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR,
+                0o600,
+            );
+            assert!(fd >= 0, "shm_open failed");
+            let r = libc::ftruncate(fd, bytes.len() as libc::off_t);
+            assert_eq!(r, 0);
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                bytes.len(),
+                libc::PROT_WRITE | libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            );
+            assert!(p != libc::MAP_FAILED);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+            libc::munmap(p, bytes.len());
+            libc::close(fd);
+        }
+    }
+
+    #[cfg(unix)]
+    fn shm_object_exists(name: &str) -> bool {
+        use std::ffi::CString;
+        let c_name = CString::new(name).unwrap();
+        unsafe {
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0);
+            if fd >= 0 {
+                libc::close(fd);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_apc_t_s_reads_and_unlinks_shared_memory() {
+        use base64::Engine;
+        let png = kitty_png(4, 4);
+        // POSIX SHM names start with `/`. Use the test PID for
+        // uniqueness across parallel test runs.
+        let name = format!("/yutani-shm-test-{}", std::process::id());
+        // Pre-clean in case a previous failed run left it behind.
+        unlink_kitty_shm(&name);
+        write_shm(&name, &png);
+        assert!(shm_object_exists(&name), "fixture should exist pre-test");
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode(&name);
+
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=s,c=2,r=1;{}\x1b\\", name_b64));
+
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "SHM upload should land");
+        // On macOS the SHM segment rounds up to a page; the upload
+        // bytes include zero padding past the PNG body. Compare the
+        // prefix and let `peek_dimensions` confirm the PNG decoded.
+        assert_eq!(&uploads[0].bytes[..png.len()], png.as_slice());
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+        assert!(!shm_object_exists(&name), "t=s must shm_unlink after read");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_apc_t_s_unlinks_even_on_read_failure() {
+        use base64::Engine;
+        // Reference a nonexistent SHM name. The read fails (shm_open
+        // returns ENOENT) but we still call shm_unlink — testing
+        // that this doesn't panic or leave anything weird behind.
+        let name = format!("/yutani-shm-missing-{}", std::process::id());
+        unlink_kitty_shm(&name); // belt-and-braces
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode(&name);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!("\x1b_Ga=T,f=100,t=s,c=1,r=1;{}\x1b\\", name_b64));
+        assert!(t.take_pending_image_uploads().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kitty_apc_t_s_with_raw_rgb_pngencodes_on_read() {
+        // icat's preferred path for huge JPGs: raw RGB via SHM. The
+        // SHM segment contains raw bytes; we read, PNG-encode, queue.
+        use base64::Engine;
+        let w = 4u32;
+        let h = 4u32;
+        let raw: Vec<u8> = (0..(w * h * 3) as u8).collect();
+        let name = format!("/yutani-shm-raw-{}", std::process::id());
+        unlink_kitty_shm(&name);
+        write_shm(&name, &raw);
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode(&name);
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        t.feed(&format!(
+            "\x1b_Ga=T,f=24,t=s,s={},v={},c=2,r=1;{}\x1b\\",
+            w, h, name_b64
+        ));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].pixel_size, Some((w, h)));
+        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        assert!(!shm_object_exists(&name));
     }
 
     //
@@ -5826,13 +6081,14 @@ mod tests {
         assert!(s.starts_with("\x1b_Gi=5;ENOTSUPPORTED"), "got: {s}");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn kitty_apc_query_replies_enotsupported_for_shared_memory() {
+    fn kitty_apc_query_replies_ok_for_shared_memory_on_unix() {
+        // t=s is wired up on Unix (POSIX shm_open). On other targets
+        // we'd reply ENOTSUPPORTED; gate the test on unix.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&kitty_apc_control_only("a=q,i=6,f=100,t=s,s=1,v=1"));
-        let reply = t.take_response();
-        let s = std::str::from_utf8(&reply).unwrap();
-        assert!(s.starts_with("\x1b_Gi=6;ENOTSUPPORTED"), "got: {s}");
+        assert_eq!(t.take_response(), b"\x1b_Gi=6;OK\x1b\\");
     }
 
     #[test]
@@ -5856,8 +6112,10 @@ mod tests {
         t.feed(&kitty_apc_control_only("a=q,i=1,q=1")); // supported + q=1
         assert!(t.take_response().is_empty(), "q=1 should suppress OK");
 
-        // Trigger an actual error via t=s (shared memory not supported).
-        t.feed(&kitty_apc_control_only("a=q,i=2,f=100,t=s,q=1")); // error + q=1
+        // Trigger an actual error via an unknown transmission (t=x);
+        // shared memory IS supported on Unix now so it's no longer
+        // a reliable error trigger.
+        t.feed(&kitty_apc_control_only("a=q,i=2,f=100,t=x,q=1")); // error + q=1
         let reply = t.take_response();
         assert!(
             std::str::from_utf8(&reply).unwrap().contains("ENOTSUPPORTED"),
@@ -5865,7 +6123,7 @@ mod tests {
             reply,
         );
 
-        t.feed(&kitty_apc_control_only("a=q,i=3,f=100,t=s,q=2")); // error + q=2
+        t.feed(&kitty_apc_control_only("a=q,i=3,f=100,t=x,q=2")); // error + q=2
         assert!(t.take_response().is_empty(), "q=2 must silence everything");
     }
 
