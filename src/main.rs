@@ -988,15 +988,17 @@ impl CursorAnim {
     }
 
     /// Smoothstep `t*t*(3 - 2t)` — symmetric ease-in-out, no overshoot.
-    fn current(&self, duration: f32) -> (f32, f32) {
-        if duration <= 0.0 {
+    /// Snaps `from = to` once elapsed crosses `duration` so the next
+    /// `animating()` call returns false — without that snap the event loop
+    /// could stop ticking with the last drawn frame at `t < duration`
+    /// (cursor a few pixels short of target) because the previous
+    /// `WaitUntil` landed after the animation ended.
+    fn current(&mut self, duration: f32) -> (f32, f32) {
+        if duration <= 0.0 || self.started_at.elapsed().as_secs_f32() >= duration {
+            self.from = self.to;
             return self.to;
         }
-        let elapsed = self.started_at.elapsed().as_secs_f32();
-        if elapsed >= duration {
-            return self.to;
-        }
-        let t = elapsed / duration;
+        let t = self.started_at.elapsed().as_secs_f32() / duration;
         let e = t * t * (3.0 - 2.0 * t);
         (
             self.from.0 + (self.to.0 - self.from.0) * e,
@@ -1004,10 +1006,13 @@ impl CursorAnim {
         )
     }
 
-    fn animating(&self, duration: f32) -> bool {
-        let moving = (self.from.0 - self.to.0).abs() > f32::EPSILON
-            || (self.from.1 - self.to.1).abs() > f32::EPSILON;
-        moving && self.started_at.elapsed().as_secs_f32() < duration
+    /// "Still chasing": `from != to`. Stays true even past `duration`
+    /// until a render calls `current()` and snaps `from = to`, so the
+    /// event loop is guaranteed to render at least one frame past the
+    /// end of the ease (where `current()` returns `to`) before parking.
+    fn animating(&self, _duration: f32) -> bool {
+        (self.from.0 - self.to.0).abs() > f32::EPSILON
+            || (self.from.1 - self.to.1).abs() > f32::EPSILON
     }
 
     /// Point the ease at a new target, rebasing `from` to whatever is
@@ -4094,7 +4099,7 @@ mod tests {
 
     #[test]
     fn snapped_has_from_equal_to_target() {
-        let a = CursorAnim::snapped((3.0, 4.0));
+        let mut a = CursorAnim::snapped((3.0, 4.0));
         assert_eq!(a.from, (3.0, 4.0));
         assert_eq!(a.to, (3.0, 4.0));
         // current() should immediately return the target regardless of duration.
@@ -4103,26 +4108,29 @@ mod tests {
 
     #[test]
     fn current_returns_to_when_duration_zero_or_negative() {
-        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
         assert!(approx_pair(a.current(0.0), (10.0, 4.0)));
-        assert!(approx_pair(a.current(-1.0), (10.0, 4.0)));
+        let mut b = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        assert!(approx_pair(b.current(-1.0), (10.0, 4.0)));
     }
 
     #[test]
     fn current_returns_to_after_duration_elapses() {
         // Back-date 10s to guarantee elapsed >= duration for any reasonable duration.
-        let a = CursorAnim {
+        let mut a = CursorAnim {
             from: (0.0, 0.0),
             to: (10.0, 4.0),
             started_at: Instant::now() - Duration::from_secs(10),
         };
         assert!(approx_pair(a.current(0.2), (10.0, 4.0)));
+        // And the snap means it no longer reports as animating.
+        assert!(!a.animating(0.2));
     }
 
     #[test]
     fn smoothstep_midpoint_is_half() {
         // smoothstep(0.5) = 0.25 * (3 - 1) = 0.5
-        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
+        let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
         let p = a.current(0.2);
         assert!(approx_pair(p, (5.0, 2.0)), "got {:?}", p);
     }
@@ -4130,7 +4138,7 @@ mod tests {
     #[test]
     fn smoothstep_quarter_point() {
         // smoothstep(0.25) = 0.0625 * (3 - 0.5) = 0.15625
-        let a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.25);
+        let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.25);
         let p = a.current(0.2);
         assert!(approx_pair(p, (1.5625, 0.625)), "got {:?}", p);
     }
@@ -4142,15 +4150,21 @@ mod tests {
     }
 
     #[test]
-    fn animating_true_in_flight_false_after_duration() {
+    fn animating_true_until_current_snaps_past_duration() {
+        // Mid-flight: from != to, so animating.
         let mid = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
         assert!(mid.animating(0.2));
 
-        let done = CursorAnim {
+        // Past duration but no current() call yet: from still != to,
+        // so still reports animating. This is the safety net that keeps
+        // the event loop ticking until a render actually snaps the value.
+        let mut done = CursorAnim {
             from: (0.0, 0.0),
             to: (10.0, 4.0),
             started_at: Instant::now() - Duration::from_secs(10),
         };
+        assert!(done.animating(0.2));
+        let _ = done.current(0.2);
         assert!(!done.animating(0.2));
     }
 
