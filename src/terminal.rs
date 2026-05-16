@@ -492,13 +492,83 @@ impl Terminal {
             return;
         }
         let blank = Cell::new(' ', self.cursor.style);
-        self.primary = resize_grid(&self.primary, rows, cols, blank);
+        let old_rows = self.rows;
+
+        // Vertical reflow on the primary screen so the bottom of the grid
+        // (where the prompt almost always lives) survives shrink/grow
+        // cycles. Shrink spills the top rows into scrollback; grow pulls
+        // them back so previously-hidden content re-uncovers. Both anchor
+        // the cursor to the rows it moved with. Alt screen has no
+        // scrollback — fall through to the old clamp-only behavior.
+        let (spill, refill) = if self.use_alternate {
+            (0, 0)
+        } else if rows < old_rows {
+            (old_rows - rows, 0)
+        } else if rows > old_rows {
+            let extra = rows - old_rows;
+            (0, extra.min(self.scrollback.len()))
+        } else {
+            (0, 0)
+        };
+
+        if spill > 0 && self.scrollback_limit > 0 {
+            for r in 0..spill {
+                let line = self.primary.row(r).to_vec();
+                if self.scrollback.len() == self.scrollback_limit {
+                    self.scrollback.pop_front();
+                }
+                self.scrollback.push_back(line);
+            }
+            // Match scroll_region_up_by: keep the user's view of historical
+            // content stable while new lines stream into scrollback.
+            if self.view_offset > 0 {
+                self.view_offset = (self.view_offset + spill).min(self.scrollback.len());
+            }
+        }
+
+        let mut new_primary = Grid::new(rows, cols, blank);
+        let mut dst_row = 0usize;
+        if refill > 0 {
+            let take_from = self.scrollback.len() - refill;
+            let pulled: Vec<Vec<Cell>> = self.scrollback.drain(take_from..).collect();
+            for src in pulled {
+                let width = cols.min(src.len());
+                for c in 0..width {
+                    new_primary.set(dst_row, c, src[c]);
+                }
+                dst_row += 1;
+            }
+            // We just removed `refill` rows from the tail of scrollback. Any
+            // view_offset pointing into that tail is now stale; clamp it.
+            self.view_offset = self.view_offset.min(self.scrollback.len());
+        }
+        let src_start = spill;
+        for old_r in src_start..old_rows {
+            if dst_row >= rows {
+                break;
+            }
+            let width = cols.min(self.cols);
+            for c in 0..width {
+                new_primary.set(dst_row, c, self.primary.get(old_r, c));
+            }
+            dst_row += 1;
+        }
+        self.primary = new_primary;
         self.alternate = Grid::new(rows, cols, blank);
-        self.cols = cols;
-        self.rows = rows;
-        self.cursor.row = self.cursor.row.min(rows - 1);
+
+        // Cursor follows the rows it sat with: spill moves the top down
+        // into the grid (cursor steps up by `spill`); refill puts new rows
+        // above (cursor steps down by `refill`). Clamp to grid bounds.
+        if self.use_alternate {
+            self.cursor.row = self.cursor.row.min(rows - 1);
+        } else {
+            let r = self.cursor.row as isize - spill as isize + refill as isize;
+            self.cursor.row = r.clamp(0, rows as isize - 1) as usize;
+        }
         self.cursor.col = self.cursor.col.min(cols - 1);
         self.cursor.wrap_pending = false;
+        self.cols = cols;
+        self.rows = rows;
         self.scroll_top = 0;
         self.scroll_bottom = rows - 1;
         self.scroll_left = 0;
@@ -1125,18 +1195,6 @@ fn termcap_value(name: &str) -> Option<&'static str> {
         "%i" | "kRIT" => "\x1b[1;2C",
         _ => return None,
     })
-}
-
-fn resize_grid(old: &Grid, new_rows: usize, new_cols: usize, blank: Cell) -> Grid {
-    let mut g = Grid::new(new_rows, new_cols, blank);
-    let rows = old.rows.min(new_rows);
-    let cols = old.cols.min(new_cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            g.set(r, c, old.get(r, c));
-        }
-    }
-    g
 }
 
 #[cfg(test)]
@@ -2043,6 +2101,151 @@ mod tests {
         t.resize(3, 3);
         assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "HEL");
         assert_eq!(t.cols, 3);
+    }
+
+    /// Helper: read a row of cells back as a trimmed string, for legibility
+    /// in the resize-reflow assertions below.
+    fn row_string(cells: &[Cell]) -> String {
+        cells.iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn resize_vertical_shrink_spills_top_rows_into_scrollback() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        // Pre-conditions: top row holds L1, cursor sits on the last grid row.
+        assert_eq!(row_string(t.row(0)), "L1");
+        assert_eq!(t.cursor().row, 4);
+        assert_eq!(t.scrollback_len(), 0);
+
+        t.resize(10, 3);
+
+        // Two top rows spill into scrollback in chronological order.
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(row_string(t.line_at(0).unwrap()), "L1");
+        assert_eq!(row_string(t.line_at(1).unwrap()), "L2");
+        // Grid now holds the bottom three lines.
+        assert_eq!(row_string(t.row(0)), "L3");
+        assert_eq!(row_string(t.row(1)), "L4");
+        assert_eq!(row_string(t.row(2)), "L5");
+        // Cursor was at row 4; spill of 2 brings it down to row 2 (still on L5).
+        assert_eq!(t.cursor().row, 2);
+    }
+
+    #[test]
+    fn resize_vertical_grow_pulls_from_scrollback() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        // Pre-conditions: 2 rows already in scrollback, cursor on L5 (row 2).
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(t.cursor().row, 2);
+
+        t.resize(10, 5);
+
+        // Scrollback fully drained back into the grid.
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(row_string(t.row(0)), "L1");
+        assert_eq!(row_string(t.row(1)), "L2");
+        assert_eq!(row_string(t.row(2)), "L3");
+        assert_eq!(row_string(t.row(3)), "L4");
+        assert_eq!(row_string(t.row(4)), "L5");
+        // Cursor steps down by the pull count (2) to stay on L5.
+        assert_eq!(t.cursor().row, 4);
+    }
+
+    #[test]
+    fn resize_shrink_then_grow_round_trip_preserves_content() {
+        // The user-reported regression: shrinking and growing back used to
+        // leave blank rows where the prompt had been.
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        let before = render(&t);
+        assert_eq!(t.cursor().row, 4);
+
+        t.resize(10, 3);
+        t.resize(10, 5);
+
+        assert_eq!(render(&t), before);
+        assert_eq!(t.cursor().row, 4);
+        assert_eq!(t.scrollback_len(), 0);
+    }
+
+    #[test]
+    fn resize_vertical_shrink_evicts_oldest_when_scrollback_full() {
+        // scrollback_limit = 1 means a 2-row spill must drop the older line.
+        let mut t = Terminal::new(10, 5, 1);
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        assert_eq!(t.scrollback_len(), 0);
+
+        t.resize(10, 3);
+
+        // Spill of 2 with capacity 1: L1 evicted via pop_front, L2 kept.
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(row_string(t.line_at(0).unwrap()), "L2");
+        // Grid still holds the bottom three lines.
+        assert_eq!(row_string(t.row(0)), "L3");
+        assert_eq!(row_string(t.row(1)), "L4");
+        assert_eq!(row_string(t.row(2)), "L5");
+    }
+
+    #[test]
+    fn resize_vertical_grow_with_no_scrollback_adds_blank_rows_at_top() {
+        let mut t = Terminal::new(10, 3, 100);
+        // No input — empty grid, empty scrollback, cursor at origin.
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(t.cursor().row, 0);
+
+        t.resize(10, 5);
+
+        assert_eq!(t.scrollback_len(), 0);
+        // Nothing was pulled — cursor untouched, all rows blank.
+        assert_eq!(t.cursor().row, 0);
+        for r in 0..5 {
+            assert_eq!(row_string(t.row(r)), "");
+        }
+    }
+
+    #[test]
+    fn resize_on_alt_screen_does_not_touch_scrollback() {
+        let mut t = Terminal::new(10, 5, 100);
+        // Push two lines into primary scrollback before switching screens.
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7");
+        let scrollback_before = t.scrollback_len();
+        assert_eq!(scrollback_before, 2);
+
+        // Enter alt screen and write something there.
+        t.feed("\x1b[?1049h");
+        t.feed("alt-text");
+        assert_eq!(row_string(t.row(0)), "alt-text");
+
+        // Shrink + grow on the alt screen must not touch primary scrollback.
+        t.resize(10, 3);
+        assert_eq!(t.scrollback_len(), scrollback_before);
+        t.resize(10, 5);
+        assert_eq!(t.scrollback_len(), scrollback_before);
+
+        // Alt grid is rebuilt blank on resize (existing alt-screen behavior).
+        for r in 0..5 {
+            assert_eq!(row_string(t.row(r)), "");
+        }
+    }
+
+    #[test]
+    fn resize_no_op_when_dimensions_match() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+        let before_render = render(&t);
+        let before_scrollback = t.scrollback_len();
+        let before_cursor = t.cursor();
+        let before_view = t.view_offset();
+
+        t.resize(10, 5);
+
+        assert_eq!(render(&t), before_render);
+        assert_eq!(t.scrollback_len(), before_scrollback);
+        assert_eq!(t.cursor().row, before_cursor.row);
+        assert_eq!(t.cursor().col, before_cursor.col);
+        assert_eq!(t.view_offset(), before_view);
     }
 
     #[test]
