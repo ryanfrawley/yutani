@@ -260,6 +260,10 @@ struct State {
     // be within the threshold window).
     last_click: Option<(std::time::Instant, (isize, usize))>,
     click_count: u32,
+    /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
+    /// the pointer isn't over a URL. Drives the underline overlay and the
+    /// Cmd-click open behavior.
+    hover_url: Option<HoverUrl>,
     master: i32,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
@@ -506,6 +510,86 @@ enum HorizSide {
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '~' | '+' | ':' | '@' | '%')
 }
+
+/// A clickable URL the mouse is currently hovering over. Tracked while the
+/// Cmd modifier is held so the renderer can underline the span and the
+/// click handler can open it.
+#[derive(Clone, Debug, PartialEq)]
+struct HoverUrl {
+    /// Absolute (scroll-stable) line index.
+    abs_line: isize,
+    /// Inclusive cell column range of the URL on that line.
+    start_col: usize,
+    end_col: usize,
+    /// The URL text itself, ready to hand to `open(1)`.
+    url: String,
+}
+
+/// Locate an http/https URL within a row of cells that covers `col`. The
+/// run is bounded by surrounding whitespace; trailing sentence punctuation
+/// (`.,;:!?)]}>'"`) is stripped so a URL at the end of a sentence still
+/// opens cleanly.
+fn find_url_in_cells(cells: &[style::Cell], col: usize) -> Option<(usize, usize, String)> {
+    let n = cells.len();
+    if col >= n || cells[col].ch.is_whitespace() {
+        return None;
+    }
+    let mut start = col;
+    while start > 0 && !cells[start - 1].ch.is_whitespace() {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < n && !cells[end + 1].ch.is_whitespace() {
+        end += 1;
+    }
+    let mut hit: Option<(usize, usize)> = None;
+    'outer: for s in start..=end {
+        for prefix in ["https://", "http://"] {
+            let plen = prefix.len();
+            if s + plen > end + 1 {
+                continue;
+            }
+            if cells[s..s + plen]
+                .iter()
+                .zip(prefix.chars())
+                .all(|(c, p)| c.ch == p)
+            {
+                hit = Some((s, plen));
+                break 'outer;
+            }
+        }
+    }
+    let (url_start_col, prefix_len) = hit?;
+    let mut url_end_col = end;
+    while url_end_col > url_start_col
+        && matches!(
+            cells[url_end_col].ch,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '\'' | '"'
+        )
+    {
+        url_end_col -= 1;
+    }
+    // Reject scheme-only matches like "https://" or "https://." — a URL is
+    // only useful if there's at least one host char past the separator.
+    if url_end_col + 1 <= url_start_col + prefix_len {
+        return None;
+    }
+    if col < url_start_col || col > url_end_col {
+        return None;
+    }
+    let url: String = cells[url_start_col..=url_end_col]
+        .iter()
+        .map(|c| c.ch)
+        .collect();
+    Some((url_start_col, url_end_col, url))
+}
+
+#[cfg(target_os = "macos")]
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
+#[cfg(not(target_os = "macos"))]
+fn open_url(_url: &str) {}
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
@@ -964,6 +1048,7 @@ impl State {
             press_pixel: None,
             last_click: None,
             click_count: 0,
+            hover_url: None,
             master,
             perf: PerfLog::new(),
             vertices_dirty: true,
@@ -1063,11 +1148,37 @@ impl State {
         let mut indices: Vec<u16> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let metrics = self.font.face().size_metrics().unwrap();
+        let face = self.font.face();
+        let metrics = face.size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let cell_w = self.font.cell_width() as f32;
         let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let descender = (metrics.descender >> 6) as f32;
+        // Underline metrics from the font's `post` table. The face values are
+        // in font design units; `y_scale` (16.16 fixed) converts to 26.6 px
+        // for this size, matching how `ascender` / `descender` above land in
+        // 26.6 — divide by 64 once for actual pixels.
+        //   - `underline_position`: vertical center of the stem, in font
+        //     units. Negative ⇒ below the baseline (the usual case).
+        //   - `underline_thickness`: stem height in font units.
+        // Kept as floats; the rasterizer can render a sub-pixel quad
+        // across two rows of fragments which reads as a softer-than-1px
+        // line and lets the stripe grow smoothly with point size.
+        // Fallbacks cover fonts whose `post` table is empty (some
+        // bitmap-style monospace TTFs report 0).
+        let y_scale = metrics.y_scale as f32 / 65536.0;
+        let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
+        let underline_thickness_px = if raw_thick_px > 0.0 {
+            raw_thick_px
+        } else {
+            line_height * 0.06
+        };
+        let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
+        let underline_pos_px = if face.underline_position() != 0 {
+            raw_pos_px
+        } else {
+            descender * 0.5
+        };
 
         let default_fg = [0.0, 0.0, 0.0, 1.0];
         let default_bg = [0.0, 0.0, 0.0, 0.0];
@@ -1441,6 +1552,59 @@ impl State {
                     None => GlyphSource::Char(cell.ch),
                 };
                 emit_cell(&mut vertices, &mut indices, fg_source, variant, r, c, fg, bg);
+            }
+        }
+
+        // 1a. Cmd-hover URL underline. Drawn on top of the glyph row so the
+        // line is visible regardless of cell bg, and below the selection
+        // overlay (1b) so a selected URL still reads as selected. Walks the
+        // phantom-row range like the cell loop so the underline follows the
+        // text through smooth scroll.
+        if let Some(hu) = &self.hover_url {
+            for r in r_lo..r_hi {
+                if self.terminal.visual_to_abs_line(r) != hu.abs_line {
+                    continue;
+                }
+                if hu.start_col >= cols {
+                    break;
+                }
+                let last = hu.end_col.min(cols - 1);
+                let ux = col_x(hu.start_col);
+                let uw = (last - hu.start_col + 1) as f32 * cell_w;
+                // Honor the font's own underline_position / underline_thickness
+                // so the line lands where the type designer intended and scales
+                // with point size. `underline_pos_px` is the (signed) offset of
+                // the stem center from the baseline — negative means below, so
+                // adding `-pos` walks downward in screen coords. Subtracting
+                // half the thickness then gives the top edge of the stripe.
+                let uh = underline_thickness_px;
+                let uy = row_y(r) - underline_pos_px - uh * 0.5 + scroll_y;
+                // Match the cell's foreground color so the underline tracks
+                // theme overrides; fall back to the default fg.
+                let fg = self
+                    .terminal
+                    .extended_cell(r, hu.start_col)
+                    .map(|cell| {
+                        if cell.style.reverse {
+                            cell.style.color_bg.unwrap_or(default_bg_solid)
+                        } else {
+                            cell.style.color_fg.unwrap_or(default_fg)
+                        }
+                    })
+                    .unwrap_or(default_fg);
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    ux,
+                    uy,
+                    uw,
+                    uh,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    fg,
+                    [0.0; 4],
+                );
+                break;
             }
         }
 
@@ -2226,6 +2390,39 @@ impl State {
         (self.terminal.visual_to_abs_line(vrow), col)
     }
 
+    /// Recompute the URL under the mouse pointer. Tracks Cmd state so the
+    /// underline overlay and pointer cursor only appear while the user is
+    /// actually holding the modifier; releasing Cmd clears the hover. Any
+    /// state change here flips the system cursor icon and invalidates the
+    /// frame so the underline can repaint.
+    fn update_hover_url(&mut self) {
+        let new = if self.modifiers.super_key() {
+            let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
+            let abs_line = self.terminal.visual_to_abs_line(vrow);
+            self.terminal.line_at(abs_line).and_then(|cells| {
+                find_url_in_cells(cells, col).map(|(s, e, url)| HoverUrl {
+                    abs_line,
+                    start_col: s,
+                    end_col: e,
+                    url,
+                })
+            })
+        } else {
+            None
+        };
+        if new == self.hover_url {
+            return;
+        }
+        let icon = if new.is_some() {
+            winit::window::CursorIcon::Pointer
+        } else {
+            winit::window::CursorIcon::Text
+        };
+        self.window.set_cursor_icon(icon);
+        self.hover_url = new;
+        self.invalidate();
+    }
+
     /// Anchor a new selection at the mouse position. Click count cycles
     /// 1 → 2 → 3 → 1 for click sequences within the threshold on the same
     /// cell, picking Cell / Word / Line granularity respectively.
@@ -2406,6 +2603,7 @@ impl State {
                     self.handle_mouse_drag();
                     self.invalidate();
                 }
+                self.update_hover_url();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let code = match button {
@@ -2420,6 +2618,19 @@ impl State {
                         self.held_button = Some(code);
                     } else {
                         self.held_button = None;
+                    }
+                    // Cmd-click on a hovered URL opens it. Done before the
+                    // mouse-mode check so the gesture works even when an app
+                    // (vim, less) has grabbed mouse tracking, matching the
+                    // behavior every other macOS terminal ships.
+                    if press
+                        && code == input::MOUSE_LEFT
+                        && self.modifiers.super_key()
+                    {
+                        if let Some(hu) = self.hover_url.clone() {
+                            open_url(&hu.url);
+                            return true;
+                        }
                     }
                     let mouse_mode_active = self.terminal.mouse_protocol().enabled()
                         && !self.modifiers.shift_key();
@@ -2536,10 +2747,16 @@ impl State {
                     }
                 }
                 self.invalidate();
+                // Content slid under the pointer — the URL (if any) might be
+                // different now.
+                self.update_hover_url();
                 return true;
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+                // Pressing/releasing Cmd flips URL-hover affordances on or
+                // off, even though the mouse hasn't moved.
+                self.update_hover_url();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
@@ -2909,6 +3126,9 @@ async fn run() {
                     }
                     state.perf.note_pty(bytes, t0.elapsed());
                     state.invalidate();
+                    // New / removed cells may have changed which URL (if any)
+                    // sits under the pointer.
+                    state.update_hover_url();
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
@@ -3246,5 +3466,306 @@ mod tests {
         let parsed = Config::parse_str("cursor_blink = banana\nfont_size = 12.5\n");
         assert!(!parsed.cursor_blink);
         assert!(approx_eq(parsed.font_size, 12.5));
+    }
+
+    /// Build a row of cells from a string for URL-detection tests. Each
+    /// char becomes one cell with default style.
+    fn cells_from_str(s: &str) -> Vec<style::Cell> {
+        s.chars()
+            .map(|ch| style::Cell::new(ch, style::Style::new()))
+            .collect()
+    }
+
+    #[test]
+    fn url_detected_when_cursor_inside() {
+        let row = cells_from_str("see https://example.com today");
+        // Cursor on the 'e' inside "example".
+        let (s, e, url) = find_url_in_cells(&row, 12).expect("should find url");
+        assert_eq!(s, 4);
+        assert_eq!(e, 22);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_detected_at_start_of_prefix() {
+        let row = cells_from_str("see https://example.com today");
+        // Cursor on the leading 'h' of "https".
+        let (s, e, url) = find_url_in_cells(&row, 4).expect("should find url");
+        assert_eq!(s, 4);
+        assert_eq!(e, 22);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_detected_at_end_of_url() {
+        let row = cells_from_str("see https://example.com today");
+        // Cursor on the trailing 'm' of ".com".
+        let (s, e, _) = find_url_in_cells(&row, 22).expect("should find url");
+        assert_eq!(s, 4);
+        assert_eq!(e, 22);
+    }
+
+    #[test]
+    fn http_scheme_also_detected() {
+        let row = cells_from_str("http://foo.bar/baz");
+        let (s, e, url) = find_url_in_cells(&row, 0).expect("should find url");
+        assert_eq!(s, 0);
+        assert_eq!(e, row.len() - 1);
+        assert_eq!(url, "http://foo.bar/baz");
+    }
+
+    #[test]
+    fn returns_none_when_cursor_on_whitespace() {
+        let row = cells_from_str("see https://example.com today");
+        // Cursor on the space at index 3 (between "see" and "https").
+        assert!(find_url_in_cells(&row, 3).is_none());
+    }
+
+    #[test]
+    fn returns_none_when_cursor_outside_url() {
+        let row = cells_from_str("see https://example.com today");
+        // Cursor on 's' in "see" — outside the URL run.
+        assert!(find_url_in_cells(&row, 0).is_none());
+        // Cursor on 't' in "today" — past the URL.
+        assert!(find_url_in_cells(&row, 24).is_none());
+    }
+
+    #[test]
+    fn returns_none_for_plain_text() {
+        let row = cells_from_str("no url anywhere here");
+        for c in 0..row.len() {
+            assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+        }
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_stripped() {
+        let row = cells_from_str("visit https://example.com.");
+        let (_, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+        // Trailing '.' should not be part of the URL.
+        assert_eq!(url, "https://example.com");
+        assert_eq!(row[e].ch, 'm');
+    }
+
+    #[test]
+    fn trailing_paren_is_stripped() {
+        let row = cells_from_str("(see https://example.com)");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_only_in_punctuation_run_rejected() {
+        // A `).` after the prefix would leave an empty host. Make sure we
+        // don't return a URL that's just the scheme.
+        let row = cells_from_str("https://.");
+        assert!(find_url_in_cells(&row, 0).is_none());
+    }
+
+    #[test]
+    fn empty_row_returns_none() {
+        let row: Vec<style::Cell> = Vec::new();
+        assert!(find_url_in_cells(&row, 0).is_none());
+    }
+
+    #[test]
+    fn out_of_bounds_col_returns_none() {
+        let row = cells_from_str("https://example.com");
+        assert!(find_url_in_cells(&row, row.len()).is_none());
+        assert!(find_url_in_cells(&row, row.len() + 5).is_none());
+    }
+
+    #[test]
+    fn url_with_path_and_query() {
+        let row = cells_from_str("https://example.com/a/b?q=1&x=2");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com/a/b?q=1&x=2");
+    }
+
+    #[test]
+    fn returns_first_url_when_multiple_share_a_run() {
+        // A run with no whitespace can theoretically have two prefixes
+        // concatenated — make sure we return the earlier (and longer https)
+        // start, not the embedded http.
+        let row = cells_from_str("https://foo");
+        let (s, _, url) = find_url_in_cells(&row, 0).expect("should find url");
+        assert_eq!(s, 0);
+        assert_eq!(url, "https://foo");
+    }
+
+    // ---- additional edge-case tests --------------------------------------
+
+    #[test]
+    fn url_at_very_first_column_with_cursor_on_last_char() {
+        // URL fills the entire row; cursor sits on the final cell.
+        let row = cells_from_str("https://example.com");
+        let last = row.len() - 1;
+        let (s, e, url) = find_url_in_cells(&row, last).expect("should find url");
+        assert_eq!(s, 0);
+        assert_eq!(e, last);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn url_at_very_last_column_of_row() {
+        // No trailing whitespace — URL ends exactly at the right edge.
+        let row = cells_from_str("see https://example.com");
+        let last = row.len() - 1;
+        let (s, e, url) = find_url_in_cells(&row, last).expect("should find url");
+        assert_eq!(s, 4);
+        assert_eq!(e, last);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn tab_delimits_url_run() {
+        // Tabs are whitespace; the URL between two tabs is detected.
+        let row = cells_from_str("a\thttps://example.com\tb");
+        // Cursor on the 'x' of "example".
+        let (s, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(s, 2);
+        assert_eq!(e, 20);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn very_short_url_with_single_char_host() {
+        // "http://a" is the shortest legal http URL we accept (scheme + one
+        // host char). Make sure the scheme-only guard does not over-reject.
+        let row = cells_from_str("http://a");
+        let (s, e, url) = find_url_in_cells(&row, 7).expect("should find url");
+        assert_eq!(s, 0);
+        assert_eq!(e, 7);
+        assert_eq!(url, "http://a");
+    }
+
+    #[test]
+    fn url_with_fragment_is_preserved() {
+        let row = cells_from_str("https://example.com/page#section-2");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com/page#section-2");
+    }
+
+    #[test]
+    fn url_with_percent_encoded_chars_is_preserved() {
+        let row = cells_from_str("https://example.com/a%20b%2Fc");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com/a%20b%2Fc");
+    }
+
+    #[test]
+    fn single_slash_scheme_is_not_a_url() {
+        // "http:/foo" — missing the second slash. Must not match.
+        let row = cells_from_str("http:/foo.bar");
+        for c in 0..row.len() {
+            assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+        }
+    }
+
+    #[test]
+    fn single_slash_https_scheme_is_not_a_url() {
+        let row = cells_from_str("https:/example.com");
+        for c in 0..row.len() {
+            assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+        }
+    }
+
+    #[test]
+    fn unicode_letter_adjacent_to_url_is_part_of_run() {
+        // Non-whitespace unicode glues onto the run, but the prefix scan
+        // still locates "https://" further in and produces a clean URL.
+        // (Whether we strip the leading unicode is a behavior choice — the
+        // function happens to skip it because url_start_col jumps to where
+        // the prefix actually matched.)
+        let row = cells_from_str("→https://example.com");
+        // Cursor on the 'x' of "example".
+        let (s, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        // The leading arrow is NOT part of the URL — the prefix scan starts
+        // at column 1.
+        assert_eq!(s, 1);
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn unicode_letter_after_url_is_part_of_url() {
+        // Trailing non-ASCII letters are not whitespace and are not in the
+        // sentence-punctuation strip list, so they ride along as part of
+        // the URL. We document the behavior here so it changes deliberately.
+        let row = cells_from_str("https://例え.jp");
+        let (_, _, url) = find_url_in_cells(&row, 0).expect("should find url");
+        assert_eq!(url, "https://例え.jp");
+    }
+
+    #[test]
+    fn two_concatenated_urls_in_one_run_return_combined_span() {
+        // Pathological input: two URLs glued with no whitespace. The function
+        // is whitespace-delimited, so it returns the whole run starting at
+        // the first prefix. Cursor on the first URL gets the combined span.
+        // (Documenting current behavior — splitting on a second "http(s)://"
+        // would require extra logic we don't ship.)
+        let row = cells_from_str("https://a.comhttps://b.com");
+        let (s, e, url) = find_url_in_cells(&row, 2).expect("should find url");
+        assert_eq!(s, 0);
+        assert_eq!(e, row.len() - 1);
+        assert_eq!(url, "https://a.comhttps://b.com");
+    }
+
+    #[test]
+    fn cursor_on_stripped_trailing_punctuation_returns_none() {
+        // "https://example.com." with cursor on the '.' — the dot is
+        // stripped from the URL, so the cursor is "past" url_end_col and
+        // we report no hit. Hovering exactly on the trailing dot is not a
+        // URL hover.
+        let row = cells_from_str("https://example.com.");
+        let dot_col = row.len() - 1;
+        assert_eq!(row[dot_col].ch, '.');
+        assert!(find_url_in_cells(&row, dot_col).is_none());
+    }
+
+    #[test]
+    fn quoted_url_strips_trailing_quote() {
+        let row = cells_from_str("\"https://example.com\"");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn bracketed_url_strips_trailing_bracket() {
+        let row = cells_from_str("[https://example.com]");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn multiple_trailing_punctuation_all_stripped() {
+        // "...)!" should all peel off, leaving the bare URL.
+        let row = cells_from_str("https://example.com.)!");
+        let (_, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "https://example.com");
+        assert_eq!(row[e].ch, 'm');
+    }
+
+    #[test]
+    fn uppercase_scheme_is_not_matched() {
+        // Prefix match is case-sensitive — "HTTPS://" is not recognized.
+        // Documenting current behavior (browsers accept it, we don't).
+        let row = cells_from_str("HTTPS://example.com");
+        for c in 0..row.len() {
+            assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+        }
+    }
+
+    #[test]
+    fn url_with_port_number() {
+        let row = cells_from_str("http://localhost:8080/path");
+        let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
+        assert_eq!(url, "http://localhost:8080/path");
+    }
+
+    #[test]
+    fn cursor_on_whitespace_tab_returns_none() {
+        let row = cells_from_str("a\thttps://example.com");
+        // Cursor on the tab itself.
+        assert!(find_url_in_cells(&row, 1).is_none());
     }
 }
