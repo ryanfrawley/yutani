@@ -3639,12 +3639,72 @@ impl State {
             return;
         }
         for up in uploads {
-            let (pending, image_id) = self.image_store.request_insert(
-                up.bytes,
-                self.config.images_max_pixels,
-                std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
-                up.label,
-            );
+            // `a=a` control message — no pixel data, no decode. Route
+            // straight into the store's playback-state mutation.
+            if let Some(ctrl) = up.animation_control.clone() {
+                let Some(client_id) = up.kitty_image_id else { continue };
+                let Some(image_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+                    continue;
+                };
+                self.image_store.apply_animation_control(
+                    image_id,
+                    ctrl.control,
+                    ctrl.loop_count,
+                    ctrl.make_current,
+                    ctrl.edit_frame,
+                    ctrl.edit_gap_ms,
+                    std::time::Instant::now(),
+                );
+                // Animation state change may need a redraw to land on
+                // the new current frame and / or kick off the
+                // wall-clock advance.
+                self.window.request_redraw();
+                continue;
+            }
+            // `a=f` frame transmission — append to the parent image's
+            // frames vec via the dedicated request path.
+            if let Some(frame_spec) = up.animation_frame.clone() {
+                let Some(client_id) = up.kitty_image_id else { continue };
+                let Some(parent) = self.terminal.kitty_image_id_lookup(client_id) else {
+                    continue;
+                };
+                let _ = self.image_store.request_insert_frame(
+                    parent,
+                    up.bytes,
+                    self.config.images_max_pixels,
+                    std::time::Duration::from_millis(
+                        self.config.images_decode_timeout_ms,
+                    ),
+                    up.label,
+                    frame_spec.target_slot,
+                    frame_spec.compose_base,
+                    frame_spec.gap_ms,
+                    frame_spec.dst_x,
+                    frame_spec.dst_y,
+                );
+                self.window.request_redraw();
+                continue;
+            }
+            // Kitty uploads (`a=t` / `a=T`) opt into the animatable
+            // variant so the store keeps a CPU RGBA copy of the base
+            // — needed if a later `a=f` arrives and has to composite
+            // against it. iTerm OSC 1337 / debug-keybind paths skip
+            // this since they can never receive frames.
+            let (pending, image_id) = if up.kitty_image_id.is_some() {
+                self.image_store.request_insert_animatable(
+                    up.bytes,
+                    self.config.images_max_pixels,
+                    std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
+                    up.label,
+                )
+            } else {
+                self.image_store.request_insert(
+                    up.bytes,
+                    self.config.images_max_pixels,
+                    std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
+                    up.label,
+                )
+            };
             // Kitty `a=t` / `a=T` may carry an `i=` id the client uses
             // to refer back to this image via `a=p` (place) or `a=d`
             // (delete). Register the mapping immediately so those ops
@@ -4146,8 +4206,12 @@ impl State {
                 )
             });
             let scrollback_iter = scrollback_draws.iter().map(|p| (p.top_row, p));
+            let now = std::time::Instant::now();
             for (viewport_row, p) in live_iter.chain(scrollback_iter) {
-                let Some(gpu_img) = self.image_store.peek(p.image) else { continue };
+                // peek_at picks the current animation frame for animated
+                // images; for static images it returns the same texture
+                // as peek().
+                let Some(gpu_img) = self.image_store.peek_at(p.image, now) else { continue };
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
@@ -4196,7 +4260,7 @@ impl State {
                 let Some(store_id) = self.terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
-                let Some(gpu_img) = self.image_store.peek(store_id) else { continue };
+                let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
                 let viewport_row =
                     Self::live_placement_viewport_row(top, view_offset, rows);
                 let x_px = WINDOW_PADDING + (left as f32) * cell_w;
@@ -4792,9 +4856,20 @@ async fn run() {
                 } else {
                     None
                 };
+                // Image-animation deadline (Kitty `a=a` playback). The
+                // store returns `None` if no animated image is
+                // currently advancing; otherwise it returns the
+                // earliest moment a frame swap is due.
+                let next_image_anim = state
+                    .image_store
+                    .next_frame_deadline(std::time::Instant::now());
+                if next_image_anim.is_some() {
+                    state.invalidate();
+                }
                 let next_wake = [
                     state.next_blink_wake(),
                     next_anim,
+                    next_image_anim,
                     state.perf.next_wake(),
                 ]
                 .into_iter()

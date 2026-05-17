@@ -51,6 +51,12 @@ pub enum DecodeError {
     /// total bytes past the configured cap. Refuse rather than evict
     /// in-use images (mark-and-sweep already prunes unused).
     BudgetExceeded { needed: usize, available: usize },
+    /// `a=f` arrived before its parent image's base decode finished
+    /// (so `base_dims` / `base_rgba` aren't populated yet) — we can't
+    /// composite without dimensions. Distinct from `BudgetExceeded`
+    /// so a caller doesn't confuse the two when reasoning about
+    /// cleanup.
+    ParentNotReady,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -66,6 +72,10 @@ impl std::fmt::Display for DecodeError {
             DecodeError::BudgetExceeded { needed, available } => {
                 write!(f, "image needs {needed} bytes, only {available} free in cache")
             }
+            DecodeError::ParentNotReady => write!(
+                f,
+                "animation frame arrived before parent image finished decoding",
+            ),
         }
     }
 }
@@ -141,6 +151,93 @@ struct StoredImage {
     /// Wall-clock of the most recent `get`. Available for future LRU work;
     /// not currently used for eviction.
     last_used: Instant,
+    /// Full-size CPU RGBA mirror of the base (frame 1 in Kitty's 1-based
+    /// terms). Populated at decode time so the Kitty `a=f` path can
+    /// composite incoming frame deltas against the base without
+    /// reading back from the GPU. Same `width * height * 4` byte
+    /// count as `image` — included in `bytes` accounting.
+    base_rgba: Option<Vec<u8>>,
+    /// Width/height of the base image in pixels. Mirrors
+    /// `image.width_px` / `image.height_px` once `image` is `Some`;
+    /// kept separately so the `a=f` validator can refuse a frame whose
+    /// declared dimensions don't match the parent before going through
+    /// the decode worker.
+    base_dims: Option<(u32, u32)>,
+    /// Additional frames after the base. `frames[i]` is Kitty frame
+    /// `i + 2` (1-based, with the base being frame 1). Empty for
+    /// non-animated images. Each frame holds its own GPU texture and
+    /// CPU RGBA mirror so later frames can compose against any earlier
+    /// one without GPU readback.
+    frames: Vec<Frame>,
+    /// Playback state. Defaults to `Stopped` on frame 1; mutated by
+    /// `a=a c=` (make-current) and `a=a s=` (play / loop). Even
+    /// stopped, `current_frame > 0` shows that specific frame instead
+    /// of the base.
+    animation: AnimationState,
+    /// Per-frame gap (in ms) for the base image — Kitty frame 1.
+    /// Set via `a=a r=1 z=N`. The base has no slot in `frames`, so
+    /// without this field it would have to borrow some other frame's
+    /// delay when wrapping back around. Default 0 means "advance
+    /// immediately" (effectively a 1-tick minimum so the loop
+    /// doesn't busy-spin).
+    base_delay_ms: u32,
+}
+
+/// One frame past the base in an animated image. Stored alongside the
+/// base in `StoredImage::frames`. Each frame is a fully-composed
+/// snapshot at the parent image's full dimensions; the `a=f` ingest
+/// path runs the composition CPU-side at decode-completion time so the
+/// renderer's per-frame draw is a plain texture sample with no extra
+/// blend math.
+pub struct Frame {
+    pub image: GpuImage,
+    pub rgba: Vec<u8>,
+    pub delay_ms: u32,
+    pub bytes: usize,
+}
+
+/// Kitty animation play state. `peek_at` consults this together with
+/// the wall clock to decide which frame's GPU image to hand back this
+/// render tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnimationState {
+    pub play_mode: PlayMode,
+    /// 0-based index into the (base + frames) sequence: 0 = the base
+    /// (Kitty frame 1), `n` = `frames[n - 1]` (Kitty frame `n + 1`).
+    /// Held even while stopped — `a=a c=N` sets this to display frame
+    /// N statically.
+    pub current_frame: u32,
+    /// When `current_frame`'s display window opened. `peek_at` adds
+    /// the frame's `delay_ms` and decides whether to advance.
+    pub current_frame_started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayMode {
+    /// Hold on `current_frame` forever. The default until `a=a s=2/3`
+    /// is received.
+    Stopped,
+    /// `a=a s=2` — keep advancing frames as long as new ones may
+    /// still arrive. We treat this as the same wall-clock advance as
+    /// `LoopForever` since the store has no way to know whether the
+    /// app is done sending frames.
+    RunWhileLoading,
+    /// `a=a s=3 v=0` — loop indefinitely.
+    LoopForever,
+    /// `a=a s=3 v=N` (N > 0) — play through the whole sequence N
+    /// times, then stop on the last frame. `remaining` decrements
+    /// each time we wrap back to frame 0.
+    LoopFinite { remaining: u32 },
+}
+
+impl Default for AnimationState {
+    fn default() -> Self {
+        Self {
+            play_mode: PlayMode::Stopped,
+            current_frame: 0,
+            current_frame_started: Instant::now(),
+        }
+    }
 }
 
 /// Small CPU-side RGBA8 thumbnail of a decoded image. Used to drive the
@@ -305,6 +402,156 @@ pub fn halfblock_cells(preview: &Preview, rows: u16, cols: u16) -> Vec<Halfblock
 /// against it without re-defining the codepoint.
 pub const HALFBLOCK_CHAR: char = '▀';
 
+/// Alpha-blend `src` (sized `src_w * src_h`, RGBA8) onto a copy of
+/// `dst` (sized `dst_w * dst_h`, RGBA8) at top-left `(dx, dy)`. Returns
+/// the composed buffer at `dst`'s dimensions.
+///
+/// Used by the Kitty `a=f` ingest path so each new frame turns into a
+/// fully-realized full-frame RGBA snapshot the renderer can sample
+/// directly. Out-of-bounds src pixels are clipped at the dst's edges
+/// — the spec says new frames may overhang but the visible portion
+/// is what gets composed.
+///
+/// Composition is "source-over" with straight alpha: fully-opaque src
+/// pixels overwrite, fully-transparent src pixels leave dst unchanged,
+/// partial-alpha src pixels are integer-blended onto dst. The integer
+/// math (≤ 6 ops per channel, no float, no LUT) is cheap enough to
+/// run on the main thread inside Store::poll without noticeable
+/// frame-loop impact.
+pub(crate) fn composite_rgba(
+    dst: &[u8],
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dx: u32,
+    dy: u32,
+) -> Vec<u8> {
+    let dst_w_us = dst_w as usize;
+    let dst_h_us = dst_h as usize;
+    let src_w_us = src_w as usize;
+    let src_h_us = src_h as usize;
+    let dx_us = dx as usize;
+    let dy_us = dy as usize;
+    let mut out = dst.to_vec();
+    if src.len() < src_w_us.saturating_mul(src_h_us).saturating_mul(4) {
+        // Defensive: a malformed payload that's shorter than declared
+        // would index out-of-bounds. Return the dst unchanged.
+        return out;
+    }
+    for sy in 0..src_h_us {
+        let dy_i = match dy_us.checked_add(sy) {
+            Some(v) if v < dst_h_us => v,
+            _ => continue,
+        };
+        for sx in 0..src_w_us {
+            let dx_i = match dx_us.checked_add(sx) {
+                Some(v) if v < dst_w_us => v,
+                _ => continue,
+            };
+            let s = (sy * src_w_us + sx) * 4;
+            let d = (dy_i * dst_w_us + dx_i) * 4;
+            let sa = src[s + 3] as u32;
+            if sa == 0 {
+                continue;
+            }
+            if sa == 255 {
+                out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                continue;
+            }
+            let inv = 255 - sa;
+            let sr = src[s] as u32;
+            let sg = src[s + 1] as u32;
+            let sb = src[s + 2] as u32;
+            let dr = out[d] as u32;
+            let dg = out[d + 1] as u32;
+            let db = out[d + 2] as u32;
+            let da = out[d + 3] as u32;
+            // Source-over with straight-alpha: out = src*α + dst*(1-α).
+            // Round-half-up via `+ 127` keeps a single pass of blends
+            // from drifting toward zero.
+            out[d] = (((sr * sa) + (dr * inv) + 127) / 255) as u8;
+            out[d + 1] = (((sg * sa) + (dg * inv) + 127) / 255) as u8;
+            out[d + 2] = (((sb * sa) + (db * inv) + 127) / 255) as u8;
+            // Alpha output: standard "over" yields α_out = α_src +
+            // α_dst*(1-α_src). Same precision as the color channels.
+            out[d + 3] = ((sa * 255 + da * inv + 127) / 255).min(255) as u8;
+        }
+    }
+    out
+}
+
+/// True for play modes that should advance frames over time.
+fn is_advancing(mode: PlayMode) -> bool {
+    matches!(
+        mode,
+        PlayMode::RunWhileLoading
+            | PlayMode::LoopForever
+            | PlayMode::LoopFinite { .. },
+    )
+}
+
+/// Decide which frame index (0 = base, 1..=N = frames[0..N-1]) should
+/// be displayed for `entry` at wall-clock `now`. Pure function so the
+/// `peek_at` path can be tested without GPU mocking.
+fn resolve_current_frame(entry: &StoredImage, now: Instant) -> u32 {
+    let total_frames = (entry.frames.len() as u32) + 1; // base + frames
+    if entry.frames.is_empty() || !is_advancing(entry.animation.play_mode) {
+        return entry.animation.current_frame.min(total_frames - 1);
+    }
+    // Walk the timeline forward from `current_frame_started` consuming
+    // each frame's delay_ms until we hit one whose end is past `now`.
+    // The base's delay borrows from the first frame (spec has no
+    // per-base gap field; the loop wraps base → frames[0] → frames[1] →
+    // … → base).
+    let mut idx = entry.animation.current_frame.min(total_frames - 1);
+    let mut anchor = entry.animation.current_frame_started;
+    let max_steps = total_frames.saturating_mul(8) as u64 + 1024; // safety cap
+    let mut steps: u64 = 0;
+    loop {
+        let delay_ms = if idx == 0 {
+            entry.base_delay_ms
+        } else {
+            entry
+                .frames
+                .get((idx as usize).saturating_sub(1))
+                .map(|f| f.delay_ms)
+                .unwrap_or(0)
+        };
+        // delay_ms == 0 means "advance immediately"; treat as 1ms to
+        // bound the loop. Otherwise we'd spin forever for now > anchor.
+        let delay = Duration::from_millis(delay_ms.max(1) as u64);
+        let end = anchor + delay;
+        if now < end {
+            return idx;
+        }
+        anchor = end;
+        // Advance to next frame, wrapping per play mode.
+        let next = idx + 1;
+        if next >= total_frames {
+            match entry.animation.play_mode {
+                PlayMode::LoopForever | PlayMode::RunWhileLoading => {
+                    idx = 0;
+                }
+                PlayMode::LoopFinite { remaining } => {
+                    if remaining <= 1 {
+                        return total_frames - 1; // stop on last
+                    }
+                    idx = 0;
+                }
+                PlayMode::Stopped => return idx, // can't get here (is_advancing)
+            }
+        } else {
+            idx = next;
+        }
+        steps += 1;
+        if steps > max_steps {
+            return idx;
+        }
+    }
+}
+
 struct DecodeJob {
     pending_id: u32,
     bytes: Vec<u8>,
@@ -329,8 +576,40 @@ struct PendingRequest {
     /// time. The slot in `images` is reserved with `image: None` and gets
     /// filled (or removed) when `poll` processes the worker's result.
     image_id: u32,
+    /// Whether this pending decode is filling the base image or
+    /// appending a frame. The `poll` path branches on this so a frame
+    /// decode doesn't accidentally overwrite the base, and a base
+    /// decode doesn't accidentally compose against a partially-loaded
+    /// frame sequence.
+    kind: PendingKind,
     issued_at: Instant,
     timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingKind {
+    /// First-pass decode for an `a=t` / `a=T` payload. Result fills
+    /// `StoredImage::image` (+ preview, plus `base_rgba` when
+    /// `keep_rgba` is set so future `a=f` frames can composite).
+    Base { keep_rgba: bool },
+    /// `a=f` frame transmission. Result is composed against the
+    /// indicated base frame and pushed onto `StoredImage::frames`.
+    Frame {
+        /// Pixel position in the parent image where the new frame's
+        /// data lands.
+        dst_x: u32,
+        dst_y: u32,
+        /// 0-based index into (base + frames) of the source to use as
+        /// the composition base. `0` = the base RGBA, `n` = frame
+        /// `n - 1`. `None` (or a stale index) falls back to the base.
+        compose_base: Option<u32>,
+        /// Gap before this frame advances, in milliseconds.
+        delay_ms: u32,
+        /// `Some(n)` (1-based, n >= 1) replaces the frame at that slot
+        /// in `frames` (index `n - 2` since slot 1 is the base).
+        /// `None` or `Some(0)` appends.
+        target_slot: Option<u32>,
+    },
 }
 
 /// Decode + GPU residency cache for images.
@@ -400,6 +679,37 @@ impl Store {
         timeout: Duration,
         label: Option<String>,
     ) -> (PendingId, ImageId) {
+        self.request_insert_inner(bytes, max_pixels, timeout, label, false)
+    }
+
+    /// Variant of [`Store::request_insert`] that keeps a CPU RGBA
+    /// mirror of the decoded image alongside the GPU texture. The
+    /// mirror is required for `a=f` frame compositing — without it
+    /// the store would have to read back from the GPU each time a
+    /// frame arrives, which is sync + slow.
+    ///
+    /// Only the Kitty `a=T` / `a=t` ingest path opts in. Other inserts
+    /// (iTerm OSC 1337, the debug keybind) skip the mirror because
+    /// they can never receive frames and the doubled memory budget
+    /// would just be waste.
+    pub fn request_insert_animatable(
+        &mut self,
+        bytes: Vec<u8>,
+        max_pixels: u64,
+        timeout: Duration,
+        label: Option<String>,
+    ) -> (PendingId, ImageId) {
+        self.request_insert_inner(bytes, max_pixels, timeout, label, true)
+    }
+
+    fn request_insert_inner(
+        &mut self,
+        bytes: Vec<u8>,
+        max_pixels: u64,
+        timeout: Duration,
+        label: Option<String>,
+        keep_rgba: bool,
+    ) -> (PendingId, ImageId) {
         let image_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.images.insert(
@@ -409,6 +719,11 @@ impl Store {
                 preview: None,
                 bytes: 0,
                 last_used: Instant::now(),
+                base_rgba: None,
+                base_dims: None,
+                frames: Vec::new(),
+                animation: AnimationState::default(),
+                base_delay_ms: 0,
             },
         );
 
@@ -416,7 +731,12 @@ impl Store {
         self.next_pending = self.next_pending.wrapping_add(1).max(1);
         self.pending.insert(
             pending_id,
-            PendingRequest { image_id, issued_at: Instant::now(), timeout },
+            PendingRequest {
+                image_id,
+                kind: PendingKind::Base { keep_rgba },
+                issued_at: Instant::now(),
+                timeout,
+            },
         );
 
         // Channel send only fails if the worker has died, which only
@@ -431,6 +751,306 @@ impl Store {
             label,
         });
         (PendingId(pending_id), ImageId(image_id))
+    }
+
+    /// Queue a Kitty `a=f` frame decode + composite. The decode runs on
+    /// the worker as a normal image decode; `poll` then composites the
+    /// result onto the chosen source frame's CPU RGBA and uploads the
+    /// composed full-frame buffer as a fresh GPU texture.
+    ///
+    /// Returns `None` if the parent image doesn't exist (e.g. an
+    /// `a=f,i=N` arrived before `a=t,i=N`). The frame is silently
+    /// dropped in that case; surfacing the error wouldn't help any
+    /// caller currently.
+    pub fn request_insert_frame(
+        &mut self,
+        parent: ImageId,
+        bytes: Vec<u8>,
+        max_pixels: u64,
+        timeout: Duration,
+        label: Option<String>,
+        target_slot: Option<u32>,
+        compose_base: Option<u32>,
+        delay_ms: u32,
+        dst_x: u32,
+        dst_y: u32,
+    ) -> Option<PendingId> {
+        // Parent must exist (even if its decode is still in flight).
+        // `a=f` against an unknown id is undefined per the spec — we
+        // drop silently rather than allocating a stranded pending
+        // entry that no `image_id` ever resolves to.
+        self.images.get(&parent.0)?;
+
+        // Map a Kitty 1-based compose-base hint to our 0-based
+        // (base + frames) index. `None` / `Some(0)` / `Some(1)` all
+        // resolve to the base (0); `Some(n)` (n >= 2) resolves to
+        // `n - 1` so that Kitty frame 2 = index 1 = frames[0], etc.
+        let compose_base_idx = compose_base.and_then(|n| {
+            if n <= 1 {
+                Some(0u32)
+            } else {
+                Some(n - 1)
+            }
+        });
+
+        let pending_id = self.next_pending;
+        self.next_pending = self.next_pending.wrapping_add(1).max(1);
+        self.pending.insert(
+            pending_id,
+            PendingRequest {
+                image_id: parent.0,
+                kind: PendingKind::Frame {
+                    dst_x,
+                    dst_y,
+                    compose_base: compose_base_idx,
+                    delay_ms,
+                    target_slot,
+                },
+                issued_at: Instant::now(),
+                timeout,
+            },
+        );
+
+        let _ = self.job_tx.send(DecodeJob {
+            pending_id,
+            bytes,
+            max_pixels,
+            label,
+        });
+        Some(PendingId(pending_id))
+    }
+
+    /// `a=a` per-image mutation hook. Mutates the play state and / or
+    /// individual frame fields based on which sub-op the parser
+    /// detected. Bare `now` reset keeps `peek_at` aligned with the
+    /// caller's wall clock without forcing every call site to thread
+    /// an Instant explicitly.
+    pub fn apply_animation_control(
+        &mut self,
+        id: ImageId,
+        control: Option<u32>,
+        loop_count: Option<u32>,
+        make_current: Option<u32>,
+        edit_frame: Option<u32>,
+        edit_gap_ms: Option<u32>,
+        now: Instant,
+    ) {
+        let Some(img) = self.images.get_mut(&id.0) else { return };
+        // `r=N z=M` per-frame edit applies independently of the other
+        // ops (the Kitty spec lets a single `a=a` both edit a gap and
+        // change play state).
+        if let (Some(n), Some(gap)) = (edit_frame, edit_gap_ms) {
+            // 1-based; n == 1 is the base, which has its own
+            // `base_delay_ms` slot. Frames vec is 0-indexed starting
+            // at Kitty frame 2.
+            if n == 1 {
+                img.base_delay_ms = gap;
+            } else if n >= 2 {
+                let idx = (n - 2) as usize;
+                if let Some(frame) = img.frames.get_mut(idx) {
+                    frame.delay_ms = gap;
+                }
+            }
+        }
+        // `c=N` make-current and `s=N` play-mode control are mutually
+        // exclusive — the Kitty spec doesn't define a single message
+        // that both pins a frame and starts playback. When the parser
+        // sees both keys (e.g. an app that sends an ambiguous payload)
+        // we prefer `make_current` since it has fewer side effects
+        // (no clock reset on top of the play-mode change).
+        if let Some(n) = make_current {
+            let frame_count = (img.frames.len() as u32) + 1; // base + frames
+            // Clamp to [0, frame_count-1]; `n` is 1-based.
+            let target = n.saturating_sub(1).min(frame_count - 1);
+            img.animation.current_frame = target;
+            img.animation.play_mode = PlayMode::Stopped;
+            img.animation.current_frame_started = now;
+        } else if let Some(c) = control {
+            img.animation.play_mode = match c {
+                1 => PlayMode::Stopped,
+                2 => PlayMode::RunWhileLoading,
+                3 => match loop_count {
+                    Some(0) | None => PlayMode::LoopForever,
+                    Some(n) => PlayMode::LoopFinite { remaining: n },
+                },
+                _ => img.animation.play_mode, // unknown control op = no-op
+            };
+            // Reset the per-frame clock so playback starts from now;
+            // the previous current_frame stays as the starting frame.
+            img.animation.current_frame_started = now;
+        }
+    }
+
+    /// Build the GpuImage + bookkeeping for a base-image decode. Split
+    /// out of `poll` so the per-result switch reads as a flat
+    /// `kind → finish_*` dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_base_decode(
+        &mut self,
+        image_id: u32,
+        decoded: DecodedPixels,
+        keep_rgba: bool,
+        label: Option<&str>,
+        pipeline: &ImagePipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nearest_filter: bool,
+    ) -> Result<ImageId, DecodeError> {
+        let gpu_bytes = (decoded.width as usize) * (decoded.height as usize) * 4;
+        // We charge the GPU texture against the cap, plus the CPU
+        // RGBA mirror when the Kitty animation path requested one
+        // (see `request_insert_animatable`). Non-animatable inserts
+        // (iTerm OSC, the debug keybind) pay GPU-only.
+        let total_bytes = if keep_rgba { gpu_bytes.saturating_mul(2) } else { gpu_bytes };
+        if self.total_bytes.saturating_add(total_bytes) > self.cap_bytes {
+            self.images.remove(&image_id);
+            let available = self.cap_bytes.saturating_sub(self.total_bytes);
+            return Err(DecodeError::BudgetExceeded { needed: total_bytes, available });
+        }
+        let image = pipeline.upload_rgba(
+            device,
+            queue,
+            &decoded.rgba,
+            decoded.width,
+            decoded.height,
+            nearest_filter,
+            label,
+        );
+        let preview = build_preview(&decoded.rgba, decoded.width, decoded.height);
+        let entry = self
+            .images
+            .get_mut(&image_id)
+            .expect("reservation present until decode resolves");
+        entry.image = Some(image);
+        entry.preview = preview;
+        entry.bytes = total_bytes;
+        entry.last_used = Instant::now();
+        entry.base_dims = Some((decoded.width, decoded.height));
+        if keep_rgba {
+            entry.base_rgba = Some(decoded.rgba);
+        }
+        self.total_bytes += total_bytes;
+        Ok(ImageId(image_id))
+    }
+
+    /// Build a composed frame from a decoded `a=f` payload. The new
+    /// frame's pixel data is alpha-blended onto a copy of the source
+    /// frame (per `compose_base`) at `(dst_x, dst_y)`, then uploaded
+    /// as a full-parent-dimension GPU texture.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_frame_decode(
+        &mut self,
+        parent_id: u32,
+        decoded: DecodedPixels,
+        dst_x: u32,
+        dst_y: u32,
+        compose_base: Option<u32>,
+        delay_ms: u32,
+        target_slot: Option<u32>,
+        label: Option<&str>,
+        pipeline: &ImagePipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        nearest_filter: bool,
+    ) -> Result<ImageId, DecodeError> {
+        let parent = self
+            .images
+            .get(&parent_id)
+            .ok_or(DecodeError::ParentNotReady)?;
+        let Some((base_w, base_h)) = parent.base_dims else {
+            // Parent's base decode hasn't landed yet — we can't
+            // composite without dimensions. Surface as
+            // `ParentNotReady` so callers can distinguish from a real
+            // OOM / cap-exceeded event.
+            return Err(DecodeError::ParentNotReady);
+        };
+
+        let parent_bytes = (base_w as usize) * (base_h as usize) * 4;
+        // Frame adds CPU + GPU mirror just like the base.
+        let total_bytes = parent_bytes.saturating_mul(2);
+        if self.total_bytes.saturating_add(total_bytes) > self.cap_bytes {
+            let available = self.cap_bytes.saturating_sub(self.total_bytes);
+            return Err(DecodeError::BudgetExceeded { needed: total_bytes, available });
+        }
+
+        // Pick the source-frame RGBA. `0` = base, `n` = frames[n - 1].
+        // Stale or out-of-range indices fall back to the base — the
+        // spec is silent on this edge but composing onto blank would
+        // hide the rest of the image.
+        let src_rgba: Vec<u8> = match compose_base.unwrap_or(0) {
+            0 => parent
+                .base_rgba
+                .clone()
+                .unwrap_or_else(|| vec![0u8; parent_bytes]),
+            n => parent
+                .frames
+                .get((n as usize).saturating_sub(1))
+                .map(|f| f.rgba.clone())
+                .or_else(|| parent.base_rgba.clone())
+                .unwrap_or_else(|| vec![0u8; parent_bytes]),
+        };
+        let composed = composite_rgba(
+            &src_rgba,
+            base_w,
+            base_h,
+            &decoded.rgba,
+            decoded.width,
+            decoded.height,
+            dst_x,
+            dst_y,
+        );
+
+        let image = pipeline.upload_rgba(
+            device,
+            queue,
+            &composed,
+            base_w,
+            base_h,
+            nearest_filter,
+            label,
+        );
+        let frame = Frame {
+            image,
+            rgba: composed,
+            delay_ms,
+            bytes: total_bytes,
+        };
+
+        let parent = self
+            .images
+            .get_mut(&parent_id)
+            .expect("checked above and not removed since");
+        // Target slot: 1-based, where 1 = base (we don't allow
+        // replacing the base via `a=f` — apps re-transmit with `a=t`
+        // for that). `Some(0)` / `None` append; `Some(n)` (n >= 2)
+        // replaces frames[n - 2] if it exists, else appends.
+        let replaced_bytes = match target_slot {
+            Some(n) if n >= 2 && ((n - 2) as usize) < parent.frames.len() => {
+                let idx = (n - 2) as usize;
+                let old = std::mem::replace(&mut parent.frames[idx], frame);
+                old.bytes
+            }
+            _ => {
+                parent.frames.push(frame);
+                0
+            }
+        };
+        // Per-image bytes mirror the global cap so `retain` can
+        // recompute the global from the surviving images. Replacement
+        // has to subtract the displaced frame's bytes here, not just
+        // at the global level — otherwise repeated edits make
+        // `parent.bytes` drift upward and the next `retain` carries
+        // the drift into `total_bytes`.
+        parent.bytes = parent
+            .bytes
+            .saturating_add(total_bytes)
+            .saturating_sub(replaced_bytes);
+        parent.last_used = Instant::now();
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(total_bytes)
+            .saturating_sub(replaced_bytes);
+        Ok(ImageId(parent_id))
     }
 
     /// Drain finished decode jobs, upload them to the GPU, and surface
@@ -485,50 +1105,47 @@ impl Store {
             let Some(req) = self.pending.remove(&pid) else { continue };
             let outcome = match result.outcome {
                 Err(e) => {
-                    // Decode failure: evict the reservation.
-                    self.images.remove(&req.image_id);
+                    // Decode failure: only evict the base reservation.
+                    // A failed frame decode leaves the parent intact —
+                    // dropping the whole image just because one frame
+                    // is malformed is too aggressive.
+                    if matches!(req.kind, PendingKind::Base { .. }) {
+                        self.images.remove(&req.image_id);
+                    }
                     Err(e)
                 }
-                Ok(decoded) => {
-                    let bytes_used = (decoded.width as usize) * (decoded.height as usize) * 4;
-                    if self.total_bytes.saturating_add(bytes_used) > self.cap_bytes {
-                        // Over budget: evict the reservation rather than
-                        // hold an empty slot indefinitely.
-                        self.images.remove(&req.image_id);
-                        let available = self.cap_bytes.saturating_sub(self.total_bytes);
-                        Err(DecodeError::BudgetExceeded { needed: bytes_used, available })
-                    } else {
-                        let image = pipeline.upload_rgba(
-                            device,
-                            queue,
-                            &decoded.rgba,
-                            decoded.width,
-                            decoded.height,
-                            nearest_filter,
-                            result.label.as_deref(),
-                        );
-                        // Build the half-block preview from the same RGBA
-                        // buffer before it gets dropped. Cheap (one box
-                        // filter), tiny memory (≤ MAX_PREVIEW_* * 4 bytes).
-                        // Held even when `images_enabled = true` so a
-                        // runtime config flip can switch over instantly
-                        // without waiting for the next decode.
-                        let preview = build_preview(&decoded.rgba, decoded.width, decoded.height);
-                        // Fill the reservation in place — DON'T allocate
-                        // a new id, otherwise placements would reference
-                        // the stale id and render blank forever.
-                        let entry = self
-                            .images
-                            .get_mut(&req.image_id)
-                            .expect("reservation present until decode resolves");
-                        entry.image = Some(image);
-                        entry.preview = preview;
-                        entry.bytes = bytes_used;
-                        entry.last_used = Instant::now();
-                        self.total_bytes += bytes_used;
-                        Ok(ImageId(req.image_id))
-                    }
-                }
+                Ok(decoded) => match req.kind {
+                    PendingKind::Base { keep_rgba } => self.finish_base_decode(
+                        req.image_id,
+                        decoded,
+                        keep_rgba,
+                        result.label.as_deref(),
+                        pipeline,
+                        device,
+                        queue,
+                        nearest_filter,
+                    ),
+                    PendingKind::Frame {
+                        dst_x,
+                        dst_y,
+                        compose_base,
+                        delay_ms,
+                        target_slot,
+                    } => self.finish_frame_decode(
+                        req.image_id,
+                        decoded,
+                        dst_x,
+                        dst_y,
+                        compose_base,
+                        delay_ms,
+                        target_slot,
+                        result.label.as_deref(),
+                        pipeline,
+                        device,
+                        queue,
+                        nearest_filter,
+                    ),
+                },
             };
             out.push((PendingId(pid), outcome));
         }
@@ -555,8 +1172,99 @@ impl Store {
     /// Read-only lookup; doesn't bump LRU. The renderer uses this so
     /// rendering doesn't unnecessarily reshuffle the `last_used` ordering.
     /// Returns `None` in the same cases as `get`.
+    ///
+    /// For animated images this returns the base frame (frame 1).
+    /// Animation-aware callers should use [`Store::peek_at`] instead so
+    /// the wall-clock advance lands on the right frame.
     pub fn peek(&self, id: ImageId) -> Option<&GpuImage> {
         self.images.get(&id.0).and_then(|e| e.image.as_ref())
+    }
+
+    /// Read-only lookup that selects the correct frame for an animated
+    /// image given the current wall clock. For a static image (no
+    /// frames added past the base) this is identical to [`Store::peek`].
+    ///
+    /// `now` is the caller's monotonic clock; passing a stale value
+    /// just freezes the animation at whatever frame that timestamp
+    /// resolves to, which is the right behavior for tests that need
+    /// determinism.
+    pub fn peek_at(&self, id: ImageId, now: Instant) -> Option<&GpuImage> {
+        let entry = self.images.get(&id.0)?;
+        let target = resolve_current_frame(entry, now);
+        match target {
+            0 => entry.image.as_ref(),
+            n => entry
+                .frames
+                .get((n as usize).saturating_sub(1))
+                .map(|f| &f.image)
+                .or(entry.image.as_ref()),
+        }
+    }
+
+    /// Number of frames past the base for `id` — `0` for a non-animated
+    /// image, `n` for one with `n` `a=f` deliveries on top of the base.
+    /// Test-only accessor; the renderer doesn't need this.
+    #[cfg(test)]
+    pub fn frame_count(&self, id: ImageId) -> usize {
+        self.images.get(&id.0).map(|e| e.frames.len()).unwrap_or(0)
+    }
+
+    /// Test hook to inspect the playback state for an image. Returns
+    /// `None` for unknown ids.
+    #[cfg(test)]
+    pub fn animation_state(&self, id: ImageId) -> Option<AnimationState> {
+        self.images.get(&id.0).map(|e| e.animation)
+    }
+
+    /// Force playback state to the given values — used by the test
+    /// suite so a test doesn't need to thread `Instant::now()` through
+    /// the dispatcher just to set up a scenario. Production code goes
+    /// through [`Store::apply_animation_control`].
+    #[cfg(test)]
+    pub fn force_animation_state_for_test(
+        &mut self,
+        id: ImageId,
+        state: AnimationState,
+    ) {
+        if let Some(e) = self.images.get_mut(&id.0) {
+            e.animation = state;
+        }
+    }
+
+    /// Earliest wall-clock at which any animated image needs a render
+    /// tick to advance to its next frame. The main loop threads this
+    /// into its `WaitUntil` so playback doesn't stall between events.
+    /// Returns `None` when no image is currently animating.
+    pub fn next_frame_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut earliest: Option<Instant> = None;
+        for entry in self.images.values() {
+            if entry.frames.is_empty() {
+                continue;
+            }
+            if !is_advancing(entry.animation.play_mode) {
+                continue;
+            }
+            let cur = entry.animation.current_frame as usize;
+            let total_frames = entry.frames.len() + 1; // base + frames
+            // 0-based current_frame → delay sits on the *frame being
+            // displayed*. Base uses its own `base_delay_ms` (set via
+            // `a=a r=1 z=N`).
+            let delay_ms = if cur == 0 {
+                entry.base_delay_ms
+            } else if cur < total_frames {
+                entry.frames.get(cur - 1).map(|f| f.delay_ms).unwrap_or(0)
+            } else {
+                0
+            };
+            // delay_ms == 0 means "advance immediately" — schedule a
+            // wakeup on the next tick so we don't busy-spin but the
+            // frame still advances promptly.
+            let delay = Duration::from_millis(delay_ms.max(1) as u64);
+            let deadline = entry.animation.current_frame_started + delay;
+            let deadline = deadline.max(now);
+            earliest = Some(earliest.map(|e| e.min(deadline)).unwrap_or(deadline));
+        }
+        earliest
     }
 
     /// Read-only access to the half-block preview. Returns `None` for
@@ -616,6 +1324,7 @@ impl Store {
     pub(crate) fn insert_synthetic_for_test(&mut self, gpu_image: GpuImage, bytes: usize) -> ImageId {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        let dims = (gpu_image.width_px, gpu_image.height_px);
         self.images.insert(
             id,
             StoredImage {
@@ -623,6 +1332,11 @@ impl Store {
                 preview: None,
                 bytes,
                 last_used: Instant::now(),
+                base_rgba: None,
+                base_dims: Some(dims),
+                frames: Vec::new(),
+                animation: AnimationState::default(),
+                base_delay_ms: 0,
             },
         );
         self.total_bytes += bytes;
@@ -2006,5 +2720,987 @@ mod tests {
         term.register_kitty_image_id(client_id, image_id_2);
         let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
         assert!(store.peek(image_id_2).is_some(), "re-transmission decodes cleanly");
+    }
+
+    //
+    // Animation (a=f / a=a) coverage. These exercise the pure helpers
+    // (composite_rgba, resolve_current_frame) plus the Store-level
+    // request_insert_frame + apply_animation_control plumbing.
+    //
+
+    #[test]
+    fn composite_rgba_opaque_src_overwrites_dst() {
+        // 2×2 red dst; 1×1 green src at (1, 0). After: top-right pixel
+        // green; everything else still red.
+        let dst: Vec<u8> = (0..4)
+            .flat_map(|_| [255u8, 0, 0, 255])
+            .collect();
+        let src = vec![0u8, 255, 0, 255];
+        let out = composite_rgba(&dst, 2, 2, &src, 1, 1, 1, 0);
+        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&out[4..8], &[0, 255, 0, 255]); // top-right
+        assert_eq!(&out[8..12], &[255, 0, 0, 255]);
+        assert_eq!(&out[12..16], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn composite_rgba_transparent_src_leaves_dst_unchanged() {
+        let dst = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let src = vec![200u8, 200, 200, 0]; // fully-transparent
+        let out = composite_rgba(&dst, 2, 1, &src, 1, 1, 0, 0);
+        assert_eq!(out, dst);
+    }
+
+    #[test]
+    fn composite_rgba_half_alpha_blends_to_midpoint() {
+        // dst black, src white at 50% alpha → blended to ~128.
+        let dst = vec![0u8, 0, 0, 255];
+        let src = vec![255u8, 255, 255, 128];
+        let out = composite_rgba(&dst, 1, 1, &src, 1, 1, 0, 0);
+        // 128*255 + 0*127 = 32640; /255 = 128. Round-half-up keeps it
+        // at 128 rather than drifting to 127.
+        for &c in &out[..3] {
+            assert!((127..=129).contains(&c), "channel {c} not near midpoint");
+        }
+    }
+
+    #[test]
+    fn composite_rgba_src_overhangs_dst_clips_silently() {
+        // 2×2 dst, 4×4 src at (1, 1): only the top-left pixel of src
+        // lands on the bottom-right of dst. No panic, no overflow.
+        // Use opaque src so the result is a straight overwrite.
+        let dst = vec![0u8; 16];
+        let mut src = vec![123u8; 64];
+        // Force alpha = 255 in every pixel.
+        for px in src.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let out = composite_rgba(&dst, 2, 2, &src, 4, 4, 1, 1);
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[0..12], &[0u8; 12]);
+        assert_eq!(&out[12..16], &[123, 123, 123, 255]);
+    }
+
+    #[test]
+    fn composite_rgba_malformed_src_returns_dst_copy() {
+        // src claims 4×4 but only carries 8 bytes (2 pixels). Should
+        // return dst unchanged rather than panic.
+        let dst = vec![5u8; 16];
+        let src = vec![99u8; 8];
+        let out = composite_rgba(&dst, 2, 2, &src, 4, 4, 0, 0);
+        assert_eq!(out, dst);
+    }
+
+    fn make_frame_test_image(
+        store: &mut Store,
+        dims: (u32, u32),
+    ) -> Option<(wgpu::Device, wgpu::Queue, ImagePipeline, ImageId)> {
+        let (d, q, p, _img) = try_make_pipeline_and_image()?;
+        let (w, h) = dims;
+        let rgba = vec![0x55u8; (w as usize) * (h as usize) * 4];
+        let gpu = p.upload_rgba(&d, &q, &rgba, w, h, false, Some("base"));
+        let id = store.insert_synthetic_for_test(gpu, (w as usize) * (h as usize) * 4);
+        // The synthetic-insert helper doesn't populate base_rgba, so
+        // do it manually — request_insert_frame requires it to know
+        // what to composite against.
+        let entry = store.images.get_mut(&id.0).expect("just inserted");
+        entry.base_rgba = Some(rgba);
+        Some((d, q, p, id))
+    }
+
+    #[test]
+    fn request_insert_frame_appends_decoded_frame_to_parent() {
+        let Some((d, q, p, parent)) = make_frame_test_image(
+            &mut Store::new(DEFAULT_CAP_BYTES),
+            (4, 4),
+        ) else {
+            return;
+        };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        // We need parent in *this* store, so redo with the store we
+        // own. (try_make_pipeline_and_image hands back a fresh device
+        // per call — that's fine; we just need any device for upload.)
+        let _ = (d, q, p, parent); // ignore the throwaway store result
+        let Some((d, q, p, parent)) = make_frame_test_image(&mut store, (4, 4)) else {
+            return;
+        };
+        assert_eq!(store.frame_count(parent), 0);
+
+        // 2×2 fully-opaque red square encoded as PNG, intended for
+        // (1, 1) inside the 4×4 parent.
+        let frame_png: Vec<u8> = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 30, 30, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                frame_png,
+                100,
+                Duration::from_secs(5),
+                Some("test frame".into()),
+                None, // append
+                None, // compose against base
+                50,   // 50ms gap
+                1, 1, // top-left at (1, 1)
+            )
+            .expect("parent exists");
+        // Drive the decode through the poll loop until it lands.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&p, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("frame decode never completed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(store.frame_count(parent), 1);
+
+        // Sanity-check the composited pixels: corners stay 0x55
+        // (parent fill), the (1,1)..(3,3) box turned red.
+        let entry = store.images.get(&parent.0).expect("parent still present");
+        let f0 = &entry.frames[0];
+        // (0,0) — outside the frame's dst rect.
+        assert_eq!(&f0.rgba[0..4], &[0x55, 0x55, 0x55, 0x55]);
+        // (1,1) — inside, should be solid red.
+        let idx = ((1 * 4) + 1) * 4;
+        assert_eq!(&f0.rgba[idx..idx + 4], &[200, 30, 30, 255]);
+    }
+
+    #[test]
+    fn request_insert_frame_drops_silently_for_unknown_parent() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let r = store.request_insert_frame(
+            ImageId(999),
+            vec![0u8; 8],
+            100,
+            Duration::from_secs(5),
+            None,
+            None,
+            None,
+            0,
+            0, 0,
+        );
+        assert!(r.is_none());
+        assert_eq!(store.pending_count(), 0);
+    }
+
+    #[test]
+    fn apply_animation_control_make_current_clamps_and_stops() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Pretend we have 3 frames in addition to the base.
+        for _ in 0..3 {
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            // Cheap fake: stick a clone of the base GpuImage via
+            // upload-on-the-side. We only need *count* for the math.
+            // Cheat: re-use insert_synthetic_for_test to mint a GpuImage.
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let fake = Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 100,
+                bytes: 0,
+            };
+            entry.frames.push(fake);
+        }
+        // c=10 (out of range) clamps to last frame index (3 in our
+        // 0-based scheme: base + 3 frames = 4 slots).
+        store.apply_animation_control(
+            parent,
+            None,
+            None,
+            Some(10),
+            None,
+            None,
+            Instant::now(),
+        );
+        let state = store.animation_state(parent).expect("present");
+        assert_eq!(state.current_frame, 3);
+        assert_eq!(state.play_mode, PlayMode::Stopped);
+    }
+
+    #[test]
+    fn apply_animation_control_s3_v0_sets_loop_forever() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        store.apply_animation_control(
+            parent,
+            Some(3),
+            Some(0),
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        let state = store.animation_state(parent).expect("present");
+        assert_eq!(state.play_mode, PlayMode::LoopForever);
+    }
+
+    #[test]
+    fn apply_animation_control_s3_vN_sets_finite_loops() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        store.apply_animation_control(
+            parent,
+            Some(3),
+            Some(5),
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        let state = store.animation_state(parent).expect("present");
+        assert_eq!(state.play_mode, PlayMode::LoopFinite { remaining: 5 });
+    }
+
+    #[test]
+    fn resolve_current_frame_static_image_returns_zero() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // No frames added; resolve always returns 0 (the base).
+        let now = Instant::now();
+        let entry = store.images.get(&parent.0).expect("parent");
+        assert_eq!(resolve_current_frame(entry, now), 0);
+        assert_eq!(resolve_current_frame(entry, now + Duration::from_secs(60)), 0);
+    }
+
+    #[test]
+    fn resolve_current_frame_advances_through_timeline_with_loop_forever() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Push 2 frames with 100ms delays each.
+        for _ in 0..2 {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 100,
+                bytes: 0,
+            });
+        }
+        // Base also gets a 100ms gap so the timeline math is uniform
+        // across all three slots.
+        store.images.get_mut(&parent.0).expect("parent").base_delay_ms = 100;
+        let t0 = Instant::now();
+        store.force_animation_state_for_test(
+            parent,
+            AnimationState {
+                play_mode: PlayMode::LoopForever,
+                current_frame: 0,
+                current_frame_started: t0,
+            },
+        );
+        let entry = store.images.get(&parent.0).expect("parent");
+        // t = 50ms → still base (frame 0)
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(50)), 0);
+        // t = 150ms → frame 1 (index 1)
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(150)), 1);
+        // t = 250ms → frame 2 (index 2)
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(250)), 2);
+        // t = 350ms → wraps to base (frame 0)
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(350)), 0);
+        // t = 700ms → wrapped twice more, lands at frame 1.
+        // Timeline: 0→100 base, 100→200 f1, 200→300 f2, 300→400 base,
+        // 400→500 f1, 500→600 f2, 600→700 base, 700+ → f1.
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(700)), 1);
+    }
+
+    #[test]
+    fn resolve_current_frame_loop_finite_stops_on_last_after_exhausting() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        for _ in 0..2 {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 100,
+                bytes: 0,
+            });
+        }
+        store.images.get_mut(&parent.0).expect("parent").base_delay_ms = 100;
+        let t0 = Instant::now();
+        // 1 loop only.
+        store.force_animation_state_for_test(
+            parent,
+            AnimationState {
+                play_mode: PlayMode::LoopFinite { remaining: 1 },
+                current_frame: 0,
+                current_frame_started: t0,
+            },
+        );
+        let entry = store.images.get(&parent.0).expect("parent");
+        // Play through base → f1 → f2 → would wrap but remaining=1 →
+        // freeze on f2 (index 2).
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_millis(500)), 2);
+        assert_eq!(resolve_current_frame(entry, t0 + Duration::from_secs(5)), 2);
+    }
+
+    #[test]
+    fn next_frame_deadline_none_for_stopped_image() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, _parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        assert!(store.next_frame_deadline(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn next_frame_deadline_reflects_running_image() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let entry = store.images.get_mut(&parent.0).expect("parent");
+        entry.frames.push(Frame {
+            image,
+            rgba: vec![0u8; 16],
+            delay_ms: 80,
+            bytes: 0,
+        });
+        // Match the test's expectation: base gap = 80ms so first
+        // frame swap deadline is t0 + 80ms.
+        entry.base_delay_ms = 80;
+        let t0 = Instant::now();
+        store.force_animation_state_for_test(
+            parent,
+            AnimationState {
+                play_mode: PlayMode::LoopForever,
+                current_frame: 0,
+                current_frame_started: t0,
+            },
+        );
+        let dl = store.next_frame_deadline(t0).expect("animating");
+        assert!(dl >= t0 + Duration::from_millis(70));
+        assert!(dl <= t0 + Duration::from_millis(90));
+    }
+
+    #[test]
+    fn peek_at_returns_base_for_static_image() {
+        let Some((_d, _q, _p, _img)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let a = store.peek_at(parent, Instant::now()).map(|g| g.width_px);
+        let b = store.peek(parent).map(|g| g.width_px);
+        assert_eq!(a, b);
+        assert_eq!(a, Some(2));
+    }
+
+    //
+    // Kitty graphics dispatch E2E for animation. Feeds the same APC
+    // bytes through Terminal::feed that an `icat --transfer-mode=memory
+    // --no-stop-on-error` (with frames) would send, then exercises the
+    // ingest path all the way to Store::frame_count.
+    //
+
+    #[test]
+    fn e2e_kitty_a_f_appends_frame_to_parent_image() {
+        use crate::terminal::Terminal;
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut term = Terminal::new(80, 24, 100);
+        term.set_cell_size_px(8, 16);
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+
+        // Base image: 4×4 PNG.
+        let base_png = make_png(4, 4);
+        let apc_base = make_kitty_apc("a=T,f=100,i=42,c=2,r=1", &base_png);
+        term.feed(&apc_base);
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "base transmission queues one upload");
+        let up = uploads.into_iter().next().unwrap();
+        assert_eq!(up.kitty_image_id, Some(42));
+        let (_, base_id) = store.request_insert_animatable(
+            up.bytes,
+            100,
+            Duration::from_secs(5),
+            up.label,
+        );
+        term.register_kitty_image_id(42, base_id);
+        let _ = poll_until_result(&mut store, &pipeline, &d, &q, Duration::from_secs(2));
+        assert!(store.peek(base_id).is_some(), "base decoded");
+        assert!(
+            store.images.get(&base_id.0).and_then(|e| e.base_rgba.as_ref()).is_some(),
+            "base_rgba populated for animatable image"
+        );
+
+        // a=f frame: a 2×2 green PNG, gap 30ms, append.
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let apc_frame = make_kitty_apc("a=f,f=100,i=42,z=30", &frame_png);
+        term.feed(&apc_frame);
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "frame transmission queues one upload");
+        let up = uploads.into_iter().next().unwrap();
+        let spec = up.animation_frame.expect("a=f flags animation_frame");
+        assert_eq!(spec.gap_ms, 30);
+        assert_eq!(spec.target_slot, None);
+        // Route through the store.
+        let pid = store
+            .request_insert_frame(
+                base_id,
+                up.bytes,
+                100,
+                Duration::from_secs(5),
+                up.label,
+                spec.target_slot,
+                spec.compose_base,
+                spec.gap_ms,
+                spec.dst_x,
+                spec.dst_y,
+            )
+            .expect("parent exists");
+        // Drive the decode through poll.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("frame decode never completed");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(store.frame_count(base_id), 1);
+        let entry = store.images.get(&base_id.0).expect("base present");
+        assert_eq!(entry.frames[0].delay_ms, 30);
+    }
+
+    #[test]
+    fn request_insert_frame_returns_parent_not_ready_for_in_flight_base() {
+        // Reserve an ImageId (pending base) but never drive the
+        // decode to completion. A frame upload arriving in that
+        // window must return ParentNotReady, not BudgetExceeded.
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let png = make_png(2, 2);
+        let (_pid, parent) = store.request_insert_animatable(
+            png,
+            100,
+            Duration::from_secs(60), // long timeout
+            None,
+        );
+        // Frame arrives before base decode completes.
+        let pid = store
+            .request_insert_frame(
+                parent,
+                make_png(1, 1),
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None,
+                10,
+                0, 0,
+            )
+            .expect("parent reservation exists");
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut frame_outcome = None;
+        loop {
+            let results = store.poll(&pipeline, &d, &q, false);
+            for (id, r) in results {
+                if id == pid {
+                    frame_outcome = Some(r);
+                }
+            }
+            if frame_outcome.is_some() {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("frame decode never resolved");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Note: there's a race here — if the base decode happens to
+        // beat the frame to the poll-loop, the frame would succeed.
+        // Make the assertion tolerant: it's either ParentNotReady
+        // (the typical case) OR Ok (the race-loser case). What we
+        // explicitly forbid is BudgetExceeded for this scenario.
+        match frame_outcome.unwrap() {
+            Err(DecodeError::ParentNotReady) => {}
+            Ok(_) => {}
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_frame_decode_replacing_existing_frame_keeps_byte_accounting_consistent() {
+        // Bug fix verification: per-image `parent.bytes` and
+        // store-wide `total_bytes` must move in lockstep across
+        // replacements. Before the fix, repeated edits drifted
+        // `parent.bytes` upward and the next `retain` carried the
+        // drift into the global.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d2, _q2, _p2, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Add one frame.
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                frame_png.clone(),
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None,
+                0,
+                0, 0,
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let bytes_after_first = store.bytes();
+        let parent_bytes_after_first =
+            store.images.get(&parent.0).expect("parent").bytes;
+
+        // Replace the same frame (target_slot = 2 → frames[0]) twice.
+        for _ in 0..2 {
+            let pid = store
+                .request_insert_frame(
+                    parent,
+                    frame_png.clone(),
+                    100,
+                    Duration::from_secs(5),
+                    None,
+                    Some(2),
+                    None,
+                    0,
+                    0, 0,
+                )
+                .expect("parent exists");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let r = store.poll(&pipeline, &d, &q, false);
+                if r.iter().any(|(id, _)| *id == pid) { break; }
+                if Instant::now() > deadline { panic!("decode timeout"); }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(store.frame_count(parent), 1, "still exactly one frame");
+        assert_eq!(
+            store.bytes(),
+            bytes_after_first,
+            "store-wide bytes unchanged across replacements",
+        );
+        assert_eq!(
+            store.images.get(&parent.0).expect("parent").bytes,
+            parent_bytes_after_first,
+            "per-image bytes unchanged across replacements",
+        );
+        // retain() of the live set must not drift the global.
+        let mut keep = HashSet::new();
+        keep.insert(parent);
+        store.retain(&keep);
+        assert_eq!(store.bytes(), bytes_after_first);
+    }
+
+    #[test]
+    fn apply_animation_control_unknown_id_is_silent_noop() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        // No image with id 9999 — call must not panic and must not
+        // create a state entry.
+        store.apply_animation_control(
+            ImageId(9999),
+            Some(3),
+            Some(0),
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn apply_animation_control_s2_sets_run_while_loading() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        store.apply_animation_control(
+            parent,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(
+            store.animation_state(parent).unwrap().play_mode,
+            PlayMode::RunWhileLoading,
+        );
+    }
+
+    #[test]
+    fn apply_animation_control_unknown_s_value_leaves_play_mode_unchanged() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Start running.
+        store.apply_animation_control(
+            parent,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        // Now send an unknown s= value.
+        store.apply_animation_control(
+            parent,
+            Some(99),
+            None,
+            None,
+            None,
+            None,
+            Instant::now(),
+        );
+        assert_eq!(
+            store.animation_state(parent).unwrap().play_mode,
+            PlayMode::RunWhileLoading,
+            "unknown control op leaves play_mode unchanged",
+        );
+    }
+
+    #[test]
+    fn apply_animation_control_edits_frame_gap() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Push two frames each with gap 100.
+        for _ in 0..2 {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 100,
+                bytes: 0,
+            });
+        }
+        // Edit frame 2's gap to 250ms.
+        store.apply_animation_control(
+            parent,
+            None,
+            None,
+            None,
+            Some(2),
+            Some(250),
+            Instant::now(),
+        );
+        assert_eq!(
+            store.images.get(&parent.0).expect("parent").frames[0].delay_ms,
+            250,
+        );
+        // frame 3's gap (frames[1]) untouched.
+        assert_eq!(
+            store.images.get(&parent.0).expect("parent").frames[1].delay_ms,
+            100,
+        );
+    }
+
+    #[test]
+    fn apply_animation_control_r1_sets_base_delay_without_touching_frames() {
+        // r=1 targets the base, which has its own `base_delay_ms`
+        // slot — separate from any entry in `frames`. Verify the
+        // write lands on the base and that frame[0] (Kitty frame 2)
+        // is untouched.
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let entry = store.images.get_mut(&parent.0).expect("parent");
+        entry.frames.push(Frame {
+            image,
+            rgba: vec![0u8; 16],
+            delay_ms: 77,
+            bytes: 0,
+        });
+        store.apply_animation_control(
+            parent,
+            None,
+            None,
+            None,
+            Some(1),
+            Some(250),
+            Instant::now(),
+        );
+        let entry = store.images.get(&parent.0).expect("parent");
+        assert_eq!(entry.base_delay_ms, 250, "r=1 writes the base's delay");
+        assert_eq!(entry.frames[0].delay_ms, 77, "r=1 leaves frames[0] alone");
+    }
+
+    #[test]
+    fn apply_animation_control_make_current_n1_pins_base() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        for _ in 0..2 {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 100,
+                bytes: 0,
+            });
+        }
+        store.apply_animation_control(
+            parent,
+            None,
+            None,
+            Some(1),
+            None,
+            None,
+            Instant::now(),
+        );
+        let s = store.animation_state(parent).unwrap();
+        assert_eq!(s.current_frame, 0);
+        assert_eq!(s.play_mode, PlayMode::Stopped);
+    }
+
+    #[test]
+    fn apply_animation_control_make_current_takes_priority_over_control() {
+        // Spec contract: `c=` and `s=` aren't combined in one message.
+        // When the parser sees both, `make_current` wins.
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        store.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: vec![0u8; 16],
+            delay_ms: 100,
+            bytes: 0,
+        });
+        store.apply_animation_control(
+            parent,
+            Some(3), // would normally set LoopForever
+            Some(0),
+            Some(2), // make-current frame 2 → index 1
+            None,
+            None,
+            Instant::now(),
+        );
+        let s = store.animation_state(parent).unwrap();
+        assert_eq!(s.play_mode, PlayMode::Stopped, "make_current wins over control");
+        assert_eq!(s.current_frame, 1);
+    }
+
+    #[test]
+    fn peek_at_returns_frame_image_when_advanced_past_base() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let frame_w = image.width_px;
+        store.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: vec![0u8; 16],
+            delay_ms: 100,
+            bytes: 0,
+        });
+        // Make frame 2 (index 1) the static current.
+        store.apply_animation_control(
+            parent,
+            None,
+            None,
+            Some(2),
+            None,
+            None,
+            Instant::now(),
+        );
+        let got = store.peek_at(parent, Instant::now()).map(|g| g.width_px);
+        assert_eq!(got, Some(frame_w));
+    }
+
+    #[test]
+    fn next_frame_deadline_returns_earliest_across_multiple_animating_images() {
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, slow)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let Some((_d, _q, _p, fast)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        for (parent, delay) in [(slow, 200u32), (fast, 50u32)] {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: delay,
+                bytes: 0,
+            });
+            // Each image's base gap matches its frame gap so the
+            // earliest-deadline calculation lines up with the test's
+            // intuition about which image fires first.
+            entry.base_delay_ms = delay;
+        }
+        let t0 = Instant::now();
+        for parent in [slow, fast] {
+            store.force_animation_state_for_test(
+                parent,
+                AnimationState {
+                    play_mode: PlayMode::LoopForever,
+                    current_frame: 0,
+                    current_frame_started: t0,
+                },
+            );
+        }
+        let dl = store.next_frame_deadline(t0).expect("animating");
+        // Must be near the `fast` image's 50ms, not the `slow` 200ms.
+        assert!(dl >= t0 + Duration::from_millis(40));
+        assert!(dl <= t0 + Duration::from_millis(60));
+    }
+
+    #[test]
+    fn request_insert_frame_compose_base_n_uses_prior_frame_rgba() {
+        // Verify the 1-based → 0-based mapping in compose_base:
+        // None / Some(0) / Some(1) → base, Some(2) → frames[0], etc.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Set up frame 2 manually with a known RGBA (all 7s).
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let frame2_rgba = vec![7u8; 2 * 2 * 4];
+        store.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: frame2_rgba.clone(),
+            delay_ms: 100,
+            bytes: 0,
+        });
+
+        // Send a 1×1 fully-transparent PNG (will not overwrite any
+        // pixel, so the composite output equals the source). Tells us
+        // which source the composite read from.
+        let transparent_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                transparent_png,
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                Some(2), // compose against frame 2 (i.e., frames[0])
+                0,
+                0, 0,
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // frames[1] should equal frame2_rgba — the source we composed
+        // against.
+        let entry = store.images.get(&parent.0).expect("parent");
+        assert_eq!(entry.frames[1].rgba, frame2_rgba);
+    }
+
+    #[test]
+    fn e2e_kitty_a_a_c1_stops_playback_and_pins_frame() {
+        use crate::terminal::Terminal;
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Pretend we have two frames + base.
+        for _ in 0..2 {
+            let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+            let entry = store.images.get_mut(&parent.0).expect("parent");
+            entry.frames.push(Frame {
+                image,
+                rgba: vec![0u8; 16],
+                delay_ms: 50,
+                bytes: 0,
+            });
+        }
+        let mut term = Terminal::new(80, 24, 100);
+        term.register_kitty_image_id(7, parent);
+        term.feed("\x1b_Ga=a,i=7,s=1\x1b\\");
+        let uploads = term.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "a=a queues a control message");
+        let ctrl = uploads.into_iter().next().unwrap().animation_control.expect("flag");
+        assert_eq!(ctrl.control, Some(1));
+        store.apply_animation_control(
+            parent,
+            ctrl.control,
+            ctrl.loop_count,
+            ctrl.make_current,
+            ctrl.edit_frame,
+            ctrl.edit_gap_ms,
+            Instant::now(),
+        );
+        assert_eq!(
+            store.animation_state(parent).unwrap().play_mode,
+            PlayMode::Stopped,
+        );
     }
 }
