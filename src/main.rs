@@ -3141,6 +3141,17 @@ impl State {
             g.write_glow_params(&self.gpu.queue);
         }
 
+        // Already-painted cells carry pre-resolved RGBA from when their
+        // SGR sequences ran under the old palette. Sweep them to pick
+        // up the new scheme so the visible viewport actually changes
+        // color, not just any new output printed after this point.
+        // Truecolor cells (absolute RGB from the app) are left alone.
+        self.terminal.reresolve_palette();
+        // Cell vertex buffer caches bg colors and glyph fg colors per
+        // cell; the sweep above just changed those values, so the
+        // cached vertices are stale.
+        self.vertices_dirty = true;
+
         // OSC 10/11/12 reports and the title-bar appearance both need to
         // reflect the new bg / fg.
         self.sync_theme_colors();

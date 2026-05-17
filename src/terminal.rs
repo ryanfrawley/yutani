@@ -996,6 +996,30 @@ impl Terminal {
         self.default_cursor_rgb = cursor;
     }
 
+    /// Walk every cell on every grid (primary, alternate, scrollback)
+    /// and re-resolve any `ColorSource::Indexed` foreground/background
+    /// against the currently-installed palette. Truecolor and Default
+    /// cells are untouched.
+    ///
+    /// Called after `palette::install` runs from the Cmd-Shift-R
+    /// reload path. Without this sweep, already-painted cells keep
+    /// the RGB values they were resolved to under the OLD palette;
+    /// only cells that get re-printed afterward pick up the new
+    /// scheme.
+    pub fn reresolve_palette(&mut self) {
+        for cell in self.primary.cells.iter_mut() {
+            cell.style.reresolve_palette();
+        }
+        for cell in self.alternate.cells.iter_mut() {
+            cell.style.reresolve_palette();
+        }
+        for row in self.scrollback.iter_mut() {
+            for cell in row.iter_mut() {
+                cell.style.reresolve_palette();
+            }
+        }
+    }
+
     /// Drain any bytes the emulator wants written back to the host. Returns
     /// an empty vec when there's nothing pending.
     pub fn take_response(&mut self) -> Vec<u8> {
@@ -3939,6 +3963,102 @@ mod tests {
             .iter()
             .map(|p| (p.image.0, p.top_row, p.left_col, p.rows, p.cols))
             .collect()
+    }
+
+    #[test]
+    fn sgr_then_print_persists_color_source_on_cell() {
+        // Pins the writer-path invariant `reresolve_palette_updates_*`
+        // depends on: the printed cell must carry the cursor's style,
+        // including its `ColorSource`. A regression here would let the
+        // reresolve path appear to fail for unrelated reasons.
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut t = Terminal::new(5, 3, 10);
+        t.feed("\x1b[31mA");
+        let c = t.primary.get(0, 0);
+        assert_eq!(c.ch, 'A');
+        assert_eq!(c.style.color_fg_source, crate::style::ColorSource::Indexed(1));
+        assert!(c.style.color_fg.is_some());
+    }
+
+    #[test]
+    fn reresolve_palette_updates_all_grids_and_scrollback() {
+        use crate::palette;
+        use crate::style::ColorSource;
+        // Serialize against other palette-touching tests; install is
+        // global state.
+        let _guard = palette::TEST_LOCK.lock().expect("test lock");
+        // Set palette to a known baseline so the test isn't sensitive
+        // to whatever palette the previous test left installed.
+        palette::install(palette::Palette::defaults());
+        // 10×5 grid with generous headroom so the paints below don't
+        // trigger autowrap/scroll into scrollback unintentionally.
+        // The scrollback case is exercised explicitly further down.
+        let mut t = Terminal::new(10, 5, 10);
+
+        // Paint cell (0, 0) with red fg, cell (1, 0) with truecolor
+        // bg. `\r\n` keeps the cursor inside the grid bounds.
+        t.feed("\x1b[31mA\r\n\x1b[48;2;200;100;50mB");
+
+        // Sanity-check the fixture before the palette swap.
+        let painted = t.primary.get(0, 0);
+        assert_eq!(
+            painted.style.color_fg_source,
+            ColorSource::Indexed(1),
+            "fixture: red A should carry Indexed(1) fg",
+        );
+        assert!(painted.style.color_fg.is_some());
+
+        // Paint the alternate grid too — alt cells must also re-resolve.
+        t.feed("\x1b[?1049h\x1b[33mC\x1b[?1049l");
+
+        // Drive one cell into scrollback by feeding enough LFs to
+        // scroll past the grid's row count. With rows=5, we need 5+
+        // LFs from the current position to push the first painted
+        // row off the top.
+        t.feed("\r\n\n\n\n\n\n");
+
+        // Snapshot the indexed-red fg under the OLD palette.
+        let red_before = palette::get().ansi(1, false);
+
+        // Swap palette: rewrite slot 1 to bright green.
+        let mut new_palette = palette::Palette::defaults();
+        new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
+        palette::install(new_palette);
+
+        // Scrollback row 0 is the displaced first-paint row. Before
+        // re-resolve, it still carries the OLD red.
+        assert!(!t.scrollback.is_empty(), "fixture: row 0 should have scrolled off");
+        let sb_row = &t.scrollback[0];
+        assert_eq!(sb_row[0].ch, 'A');
+        assert_eq!(sb_row[0].style.color_fg_source, ColorSource::Indexed(1));
+        assert_eq!(sb_row[0].style.color_fg, Some(red_before));
+
+        t.reresolve_palette();
+
+        // Scrollback row 0 updated.
+        let sb_row = &t.scrollback[0];
+        assert_eq!(sb_row[0].style.color_fg, Some([0.0, 1.0, 0.0, 1.0]));
+
+        // Truecolor cell (originally cell (1, 0); after scrolling
+        // it's at scrollback[1][0]) stays put.
+        assert!(t.scrollback.len() >= 2);
+        let tc_cell = &t.scrollback[1][0];
+        assert_eq!(tc_cell.ch, 'B');
+        assert_eq!(tc_cell.style.color_bg_source, ColorSource::Truecolor);
+        let tc_bg_after = tc_cell.style.color_bg.expect("bg set");
+        assert_eq!(
+            crate::palette::linear_to_srgb_u8(tc_bg_after[0]),
+            200,
+            "truecolor R component preserved across re-resolve",
+        );
+
+        // Alt grid was also painted; SGR 33 = yellow = slot 3.
+        let cell = t.alternate.get(0, 0);
+        assert_eq!(cell.style.color_fg_source, ColorSource::Indexed(3));
+        assert_eq!(cell.style.color_fg, Some(palette::get().ansi(3, false)));
+
+        palette::install(palette::Palette::defaults());
     }
 
     /// Dump the visible grid as newline-separated row strings, with trailing
