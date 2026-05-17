@@ -1,3 +1,21 @@
+/// Where a cell's foreground / background color came from. Stored
+/// alongside the resolved RGBA so a live palette swap (Cmd-Shift-R
+/// after editing the color scheme) can sweep every cell and
+/// re-resolve `Indexed` slots against the new palette without
+/// disturbing `Truecolor` cells (whose RGB was an absolute value
+/// from the app, not palette-relative).
+///
+/// `Indexed(n)` covers the full xterm-256 space: 0..=15 = ANSI
+/// (matching what SGR 30..37 / 90..97 / 40..47 / 100..107 / 38;5;0..15
+/// produce); 16..=231 = the 6×6×6 cube; 232..=255 = grayscale ramp.
+/// `palette::Palette::xterm_256(n)` handles all three ranges.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColorSource {
+    Default,
+    Indexed(u8),
+    Truecolor,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Style {
     pub bold: bool,
@@ -6,6 +24,12 @@ pub struct Style {
     pub reverse: bool,
     pub color_bg: Option<[f32; 4]>,
     pub color_fg: Option<[f32; 4]>,
+    /// SGR-level provenance of `color_fg`. Tracked so a live palette
+    /// swap can rebuild `color_fg` from the new scheme. Always
+    /// consistent with `color_fg`: `Default` ↔ `None`, anything else
+    /// ↔ `Some(_)`.
+    pub color_fg_source: ColorSource,
+    pub color_bg_source: ColorSource,
 }
 
 impl Style {
@@ -17,6 +41,8 @@ impl Style {
             reverse: false,
             color_bg: None,
             color_fg: None,
+            color_fg_source: ColorSource::Default,
+            color_bg_source: ColorSource::Default,
         }
     }
 
@@ -37,22 +63,48 @@ impl Style {
                 23 => self.italic = false,
                 24 => self.underline = false,
                 27 => self.reverse = false,
-                30..=37 => self.color_fg = Some(ansi_color((params[i] - 30) as u8, false)),
-                39 => self.color_fg = None,
-                40..=47 => self.color_bg = Some(ansi_color((params[i] - 40) as u8, false)),
-                49 => self.color_bg = None,
-                90..=97 => self.color_fg = Some(ansi_color((params[i] - 90) as u8, true)),
-                100..=107 => self.color_bg = Some(ansi_color((params[i] - 100) as u8, true)),
+                30..=37 => {
+                    let idx = (params[i] - 30) as u8;
+                    self.color_fg = Some(ansi_color(idx, false));
+                    self.color_fg_source = ColorSource::Indexed(idx);
+                }
+                39 => {
+                    self.color_fg = None;
+                    self.color_fg_source = ColorSource::Default;
+                }
+                40..=47 => {
+                    let idx = (params[i] - 40) as u8;
+                    self.color_bg = Some(ansi_color(idx, false));
+                    self.color_bg_source = ColorSource::Indexed(idx);
+                }
+                49 => {
+                    self.color_bg = None;
+                    self.color_bg_source = ColorSource::Default;
+                }
+                90..=97 => {
+                    // Bright ANSI maps to xterm-256 indices 8..15.
+                    let idx = (params[i] - 90) as u8 + 8;
+                    self.color_fg = Some(ansi_color(idx - 8, true));
+                    self.color_fg_source = ColorSource::Indexed(idx);
+                }
+                100..=107 => {
+                    let idx = (params[i] - 100) as u8 + 8;
+                    self.color_bg = Some(ansi_color(idx - 8, true));
+                    self.color_bg_source = ColorSource::Indexed(idx);
+                }
                 38 | 48 => {
                     let target_fg = params[i] == 38;
                     if i + 1 < params.len() {
                         match params[i + 1] {
                             5 if i + 2 < params.len() => {
-                                let c = xterm_256(params[i + 2] as u8);
+                                let n = params[i + 2] as u8;
+                                let c = xterm_256(n);
                                 if target_fg {
                                     self.color_fg = Some(c);
+                                    self.color_fg_source = ColorSource::Indexed(n);
                                 } else {
                                     self.color_bg = Some(c);
+                                    self.color_bg_source = ColorSource::Indexed(n);
                                 }
                                 i += 2;
                             }
@@ -64,8 +116,10 @@ impl Style {
                                 );
                                 if target_fg {
                                     self.color_fg = Some(c);
+                                    self.color_fg_source = ColorSource::Truecolor;
                                 } else {
                                     self.color_bg = Some(c);
+                                    self.color_bg_source = ColorSource::Truecolor;
                                 }
                                 i += 4;
                             }
@@ -76,6 +130,22 @@ impl Style {
                 _ => {}
             }
             i += 1;
+        }
+    }
+
+    /// Re-resolve `Indexed` foreground / background colors against the
+    /// currently-installed palette. No-op for `Default` (the color
+    /// stays `None`) and `Truecolor` (the absolute RGB stays as the
+    /// app emitted it). Called by [`crate::terminal::Terminal::reresolve_palette`]
+    /// after Cmd-Shift-R loads a new color scheme so already-painted
+    /// cells reflect the new palette without re-running their SGR
+    /// sequences.
+    pub fn reresolve_palette(&mut self) {
+        if let ColorSource::Indexed(n) = self.color_fg_source {
+            self.color_fg = Some(xterm_256(n));
+        }
+        if let ColorSource::Indexed(n) = self.color_bg_source {
+            self.color_bg = Some(xterm_256(n));
         }
     }
 }
@@ -219,5 +289,97 @@ mod tests {
         let mut s = Style::new();
         s.apply_sgr(&[38, 2, 10]);
         assert_eq!(s.color_fg, None);
+    }
+
+    #[test]
+    fn sgr_sets_color_source_alongside_rgba() {
+        // Basic ANSI fg.
+        let mut s = Style::new();
+        s.apply_sgr(&[31]);
+        assert_eq!(s.color_fg_source, ColorSource::Indexed(1));
+        // Bright ANSI fg maps to indices 8..15.
+        let mut s = Style::new();
+        s.apply_sgr(&[91]);
+        assert_eq!(s.color_fg_source, ColorSource::Indexed(9));
+        // 256-color cube preserves the raw index.
+        let mut s = Style::new();
+        s.apply_sgr(&[38, 5, 196]);
+        assert_eq!(s.color_fg_source, ColorSource::Indexed(196));
+        // Truecolor flags as such — must NOT be re-resolved later.
+        let mut s = Style::new();
+        s.apply_sgr(&[38, 2, 200, 100, 50]);
+        assert_eq!(s.color_fg_source, ColorSource::Truecolor);
+        // bg parallel
+        let mut s = Style::new();
+        s.apply_sgr(&[41]);
+        assert_eq!(s.color_bg_source, ColorSource::Indexed(1));
+        // Default clears the source back to Default.
+        let mut s = Style::new();
+        s.apply_sgr(&[31]);
+        s.apply_sgr(&[39]);
+        assert_eq!(s.color_fg_source, ColorSource::Default);
+        assert_eq!(s.color_fg, None);
+    }
+
+    #[test]
+    fn reresolve_palette_updates_indexed_rgba_after_palette_swap() {
+        // Regression for the live-reload bug: a cell whose fg was set
+        // via SGR 31 (red, indexed) carries the OLD palette's red RGBA
+        // until reresolve runs.
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut s = Style::new();
+        s.apply_sgr(&[31]);
+        let before = s.color_fg.expect("fg set");
+
+        // Swap palette: rewrite ansi[1] (red slot) to bright green.
+        let mut new_palette = crate::palette::Palette::defaults();
+        new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
+        crate::palette::install(new_palette);
+
+        // Before re-resolve, the cell still carries the OLD red.
+        assert_eq!(s.color_fg, Some(before));
+
+        // After re-resolve, it tracks the new palette's slot 1.
+        s.reresolve_palette();
+        assert_eq!(s.color_fg, Some([0.0, 1.0, 0.0, 1.0]));
+
+        // Restore defaults so the next test sees a clean palette.
+        crate::palette::install(crate::palette::Palette::defaults());
+    }
+
+    #[test]
+    fn reresolve_palette_leaves_truecolor_alone() {
+        // Truecolor cells carry absolute RGB the app specified — a
+        // palette swap must NOT touch them.
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut s = Style::new();
+        s.apply_sgr(&[38, 2, 200, 100, 50]);
+        let before = s.color_fg.expect("fg set");
+
+        let mut new_palette = crate::palette::Palette::defaults();
+        new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
+        crate::palette::install(new_palette);
+
+        s.reresolve_palette();
+        assert_eq!(s.color_fg, Some(before), "truecolor must not be re-resolved");
+
+        crate::palette::install(crate::palette::Palette::defaults());
+    }
+
+    #[test]
+    fn reresolve_palette_leaves_default_alone() {
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut s = Style::new();
+        // No fg SGR — color_fg is None / source Default.
+        let mut new_palette = crate::palette::Palette::defaults();
+        new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
+        crate::palette::install(new_palette);
+        s.reresolve_palette();
+        assert_eq!(s.color_fg, None);
+        assert_eq!(s.color_fg_source, ColorSource::Default);
+        crate::palette::install(crate::palette::Palette::defaults());
     }
 }

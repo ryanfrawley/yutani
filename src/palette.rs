@@ -170,6 +170,15 @@ pub fn get() -> Palette {
     *PALETTE.read().expect("palette lock poisoned")
 }
 
+/// Test-only serialization for any test that mutates the global
+/// `PALETTE`. `cargo test` runs unit tests in parallel by default;
+/// two tests calling `install` concurrently would race the
+/// `RwLock<Palette>` write and corrupt the state observed by their
+/// peers. Tests grab this mutex before installing a custom palette
+/// and hold it until they've restored defaults.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Parse a YAML-subset scheme file. Missing fields keep their defaults;
 /// malformed lines are logged via `eprintln!` and skipped so a typo in one
 /// color doesn't blank out the rest.
