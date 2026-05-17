@@ -203,10 +203,13 @@ pub struct PendingImageUpload {
 pub struct KittyPlaceholderRun {
     /// Kitty `i=` image id the placeholder cells encoded.
     pub client_id: u32,
-    /// 0-based row index into the grid this run was scanned from.
-    /// The renderer shifts by `view_offset` when converting to a
-    /// viewport coordinate.
-    pub screen_row: usize,
+    /// Visual row coordinate (`extended_cell`'s frame of reference):
+    /// 0..rows is the live grid, negative values are scrollback rows
+    /// pulled into view, and `rows..rows+2` are the bottom phantom
+    /// strip used during smooth scroll. The renderer plugs this
+    /// directly into the cell row→pixel math — no `view_offset`
+    /// shift needed.
+    pub screen_row: isize,
     /// First grid column the run covers.
     pub screen_col_start: usize,
     /// Exclusive end column.
@@ -883,13 +886,14 @@ impl Terminal {
         self.kitty_image_cell_extents.get(&client_id).copied()
     }
 
-    /// Scan the active grid for Kitty virtual-placement cells
-    /// (`U+10EEEE` with an encoded image id) and emit one run per
-    /// contiguous horizontal stretch that the renderer can draw as a
-    /// single quad with a correct UV sub-rect.
+    /// Scan visible rows — including scrollback pulled into view via
+    /// `view_offset` and the phantom strips above / below the live
+    /// grid — for Kitty unicode-placeholder cells (`U+10EEEE` with an
+    /// encoded image id), and emit one run per contiguous horizontal
+    /// stretch the renderer can draw as a single textured quad.
     ///
     /// A run extends a previous cell when ALL of these hold:
-    ///   - same screen row
+    ///   - same visual row
     ///   - same `client_id`
     ///   - same `image_row` diacritic value
     ///   - `image_col == prev.image_col + 1`
@@ -897,27 +901,39 @@ impl Terminal {
     /// Any other transition (non-placeholder cell, id change, row
     /// change, image_col gap) starts a new run.
     ///
-    /// This lets the renderer draw each surviving stretch with its
-    /// correct slice of the source image, so partial overwrites
-    /// (e.g. tmux scrolling new output over the top rows of an
-    /// image) visibly clip instead of distorting. The previous
-    /// merged-bbox approach stretched whatever image we had into
-    /// whatever bbox survived — fine for an undisturbed grid, bad
-    /// for anything else.
+    /// Walking via [`Self::extended_cell`] rather than `active_grid`
+    /// directly is what makes the image survive scrolling off the
+    /// top: once placeholder cells are in scrollback the active grid
+    /// no longer holds them, but `extended_cell` looks them up in
+    /// the scrollback ring at the matching visual row whenever
+    /// `view_offset > 0`. The same call also covers the
+    /// `r_lo..r_hi = -2..rows+2` phantom strips that the cell-vertex
+    /// loop uses during smooth-scroll, so a placeholder coming
+    /// in/out of view doesn't pop at scroll-tick boundaries.
     ///
-    /// Grouping happens per screen row only — vertical run-length
+    /// Grouping happens per visual row only — vertical run-length
     /// compression would require the renderer to know that adjacent
-    /// rows belong to the same image, which the bbox path got wrong
-    /// (the merge swallowed valid sub-rect boundaries). Per-row is
-    /// the smallest useful unit: a 29×15 image collapses to 15
-    /// quads per frame, well under the renderer's per-call cost.
+    /// rows belong to the same image, which the older merged-bbox
+    /// path got wrong (the merge swallowed valid sub-rect
+    /// boundaries). Per-row is the smallest useful unit: a 29×15
+    /// image collapses to 15 quads per frame, well under the
+    /// renderer's per-call cost.
     pub fn kitty_placeholder_runs(&self) -> Vec<KittyPlaceholderRun> {
         let mut runs: Vec<KittyPlaceholderRun> = Vec::new();
-        let grid = self.active_grid();
-        for r in 0..grid.rows {
+        // Same phantom-row window the cell-vertex loop uses
+        // (`update_vertices`'s `r_lo..r_hi`): two strips top + two
+        // bottom so smooth-scroll doesn't pop.
+        let r_lo: isize = -2;
+        let r_hi: isize = self.rows as isize + 2;
+        for r in r_lo..r_hi {
             let mut current: Option<KittyPlaceholderRun> = None;
-            for c in 0..grid.cols {
-                let cell = grid.get(r, c);
+            for c in 0..self.cols {
+                let Some(cell) = self.extended_cell(r, c) else {
+                    if let Some(run) = current.take() {
+                        runs.push(run);
+                    }
+                    continue;
+                };
                 let Some(id) = cell.placeholder_image_id else {
                     if let Some(run) = current.take() {
                         runs.push(run);
@@ -8114,6 +8130,65 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.feed("hello world");
         assert!(t.kitty_placeholder_runs().is_empty());
+    }
+
+    #[test]
+    fn placeholder_runs_survive_scrolling_into_scrollback() {
+        // Regression: after the image scrolls off the top and the
+        // user scrolls back up to view it, the placeholder cells
+        // still need to be found by the scanner. Pre-fix the scanner
+        // only walked `active_grid()`, so once the cells migrated to
+        // the scrollback ring the image silently disappeared
+        // (visible as the space where the image had been but blank).
+        //
+        // Now `kitty_placeholder_runs` walks via `extended_cell`
+        // which transparently picks up scrollback rows when
+        // `view_offset > 0`. The returned run's `screen_row` is the
+        // negative visual-row coord those scrollback cells now
+        // occupy.
+        let mut t = Terminal::new(20, 5, 100);
+        // Paint a single placeholder row at the top.
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // row 0, col 0 of image
+        // Sanity: the run exists at visual row 0 with no scroll.
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1, "fixture: placeholder is on row 0");
+        assert_eq!(runs[0].screen_row, 0);
+
+        // Scroll the placeholder well past the phantom-row window so
+        // it's fully out of the cell renderer's reach. With rows=5
+        // and the 2-row phantom strip above, we need at least 8
+        // line feeds to push the placeholder past visual_row=-2.
+        for _ in 0..10 {
+            t.feed("\r\n");
+        }
+        assert!(
+            t.scrollback.len() >= 5,
+            "fixture: placeholder should have scrolled well off the top, sb={}",
+            t.scrollback.len(),
+        );
+        assert!(
+            t.kitty_placeholder_runs().is_empty(),
+            "placeholder is past the phantom-row window with view_offset=0",
+        );
+
+        // Pull the scrollback into view. With view_offset = sb_len,
+        // the scrolled-off content fills the top of the viewport
+        // and the placeholder lands on a positive visual row.
+        let sb_len = t.scrollback.len();
+        t.scroll_up(sb_len);
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(
+            runs.len(),
+            1,
+            "placeholder must re-appear once scrolled back into view",
+        );
+        assert!(
+            (0..t.rows as isize).contains(&runs[0].screen_row),
+            "screen_row must land on a visible viewport row: got {}",
+            runs[0].screen_row,
+        );
     }
 
     #[test]

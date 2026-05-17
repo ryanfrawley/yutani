@@ -4519,14 +4519,16 @@ impl State {
                     continue;
                 };
                 let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
-                let viewport_row = Self::live_placement_viewport_row(
-                    run.screen_row as isize, view_offset, rows,
-                );
+                // `run.screen_row` is already in the same visual-row
+                // frame `update_vertices` uses (the scanner walks
+                // `extended_cell(-2..rows+2, ..)`), so plug it
+                // straight into the cell row→pixel math. No
+                // `view_offset` shift needed.
                 let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
                 let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
                 let y_px = WINDOW_PADDING
                     + decorator_offset
-                    + (viewport_row as f32) * line_height
+                    + (run.screen_row as f32) * line_height
                     + scroll_y;
                 let w_px = cells_wide * cell_w;
                 let h_px = line_height;
