@@ -21,6 +21,7 @@ pub mod system_fonts {
     use core_text::font_descriptor::*;
     use core_text::font_descriptor::{self, TraitAccessors};
     use core_text;
+    use freetype;
     use std::fs::File;
     use std::mem;
     use std::ptr;
@@ -114,12 +115,24 @@ pub mod system_fonts {
         return None
     }
 
-    /// Strictly match a family + style. Walks all matching descriptors and
-    /// returns the bytes of the first whose actual italic/bold traits equal
-    /// the requested ones. Core Text's plain `get()` happily substitutes the
-    /// regular cut when a styled face isn't installed; this helper rejects
-    /// that substitution so callers can tell "real bold cut found" from "no
-    /// styled cut available".
+    /// Strictly match a family + style. Walks all matching descriptors
+    /// and returns the bytes + face index of the first whose actual
+    /// content really has the requested bold/italic combination,
+    /// verified against FreeType's own `style_flags`.
+    ///
+    /// Core Text's trait match is loose: it considers SemiBold "bold-
+    /// enough" via `kCTFontBoldTrait`, so a request for bold+italic
+    /// against "Iosevka Term" returns `SGr-IosevkaTerm-SemiBold.ttc`
+    /// first — but no face inside that TTC has FT's BOLD style flag.
+    /// The actual Bold-Italic face lives in `SGr-IosevkaTerm-Bold.ttc`
+    /// at face index 4. Trusting Core Text's first match here meant
+    /// bold-italic silently rendered as semi-bold regular.
+    ///
+    /// Now we filter by FT style flags across every matching
+    /// descriptor's file. The first file that contains an exact-match
+    /// face wins, and the returned `c_int` is the face index inside
+    /// that TTC so callers can hand it straight to
+    /// `library.new_memory_face(data, index)`.
     pub fn get_strict(family: &str, bold: bool, italic: bool) -> Option<(Vec<u8>, c_int)> {
         let mut want: CTFontSymbolicTraits = 0;
         if bold { want |= kCTFontBoldTrait; }
@@ -142,6 +155,14 @@ pub mod system_fonts {
         };
 
         let mask = kCTFontBoldTrait | kCTFontItalicTrait;
+        // Track files we've already loaded so we don't open Iosevka's
+        // 16-descriptor bold-italic list 16 times.
+        let mut tried_paths: std::collections::BTreeSet<std::path::PathBuf> =
+            std::collections::BTreeSet::new();
+        // Fallback: if FT-side verification finds no exact match in
+        // any candidate, return the first readable file at face 0 so
+        // the user gets *something*. Better than a hard load failure.
+        let mut fallback: Option<(Vec<u8>, c_int)> = None;
         for desc in descs.iter() {
             let traits = desc.traits().symbolic_traits();
             if traits & mask != want {
@@ -161,11 +182,44 @@ pub mod system_fonts {
                 }
                 TCFType::wrap_under_get_rule(mem::transmute(value.as_CFTypeRef()))
             };
-            if let Some(path) = url.to_path() {
-                let mut buffer = Vec::new();
-                if File::open(path).and_then(|mut f| f.read_to_end(&mut buffer)).is_ok() {
-                    return Some((buffer, 0));
-                }
+            let Some(path) = url.to_path() else { continue };
+            if !tried_paths.insert(path.clone()) {
+                continue;
+            }
+            let mut buffer = Vec::new();
+            if File::open(&path).and_then(|mut f| f.read_to_end(&mut buffer)).is_err() {
+                continue;
+            }
+            if let Some(idx) = ft_face_index_for_style(&buffer, bold, italic) {
+                return Some((buffer, idx));
+            }
+            if fallback.is_none() {
+                fallback = Some((buffer, 0));
+            }
+        }
+        fallback
+    }
+
+    /// Scan a TTC's faces with FreeType, returning the index of the
+    /// first one whose `style_flags` match the requested bold/italic
+    /// combination. Returns `None` when no packed face has the right
+    /// flags — that's the signal for `get_strict` to try the next
+    /// candidate file rather than fall through to a regular-face
+    /// substitution.
+    fn ft_face_index_for_style(data: &[u8], want_bold: bool, want_italic: bool) -> Option<c_int> {
+        let library = freetype::Library::init().ok()?;
+        let probe = library.new_memory_face(data.to_vec(), 0).ok()?;
+        let n = probe.num_faces() as isize;
+        for i in 0..n {
+            let face = match library.new_memory_face(data.to_vec(), i) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let flags = face.style_flags();
+            let bold = flags.contains(freetype::face::StyleFlag::BOLD);
+            let italic = flags.contains(freetype::face::StyleFlag::ITALIC);
+            if bold == want_bold && italic == want_italic {
+                return Some(i as c_int);
             }
         }
         None
@@ -192,5 +246,61 @@ pub mod system_fonts {
             .iter()
             .map(|desc| desc.family_name())
             .collect::<Vec<_>>()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Resolve `(family, bold, italic)` through `get_strict`, open
+        /// the returned face with FT, and assert its style flags
+        /// strictly match. Skips if the family isn't installed.
+        fn assert_strict_match(family: &str, bold: bool, italic: bool) {
+            let Some((data, idx)) = get_strict(family, bold, italic) else {
+                eprintln!("skipping: {family} {bold}/{italic} not installed");
+                return;
+            };
+            let library = freetype::Library::init().expect("ft init");
+            let face = library
+                .new_memory_face(data, idx as isize)
+                .unwrap_or_else(|e| panic!("ft open at idx {idx}: {e}"));
+            let flags = face.style_flags();
+            let got_bold = flags.contains(freetype::face::StyleFlag::BOLD);
+            let got_italic = flags.contains(freetype::face::StyleFlag::ITALIC);
+            assert_eq!(
+                (got_bold, got_italic),
+                (bold, italic),
+                "get_strict({family:?}, bold={bold}, italic={italic}) returned a face \
+                 with the wrong FT style flags (idx={idx} style={:?})",
+                face.style_name(),
+            );
+        }
+
+        #[test]
+        fn get_strict_iosevka_term_all_combinations() {
+            // Regression for the bold-italic bug. Iosevka Term's
+            // bold-italic face lives at index 4 of
+            // `SGr-IosevkaTerm-Bold.ttc`. Core Text's first match for
+            // bold+italic on this family is the SemiBold.ttc instead
+            // (semi-bold satisfies kCTFontBoldTrait), so a naive
+            // implementation that trusts CoreText's first descriptor
+            // returns a semibold-italic file whose faces have FT's
+            // ITALIC flag but not BOLD — meaning the user sees italic
+            // semi-bold instead of full bold-italic. `get_strict`
+            // must verify against FT and walk to the next candidate
+            // file when needed.
+            //
+            // Skips when Iosevka Term isn't installed (CI machines).
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                assert_strict_match("Iosevka Term", bold, italic);
+            }
+        }
+
+        #[test]
+        fn ft_face_index_for_style_returns_none_for_empty_data() {
+            // Defensive: garbage data must not panic; returning None
+            // signals get_strict to try the next candidate file.
+            assert_eq!(ft_face_index_for_style(&[], true, true), None);
+        }
     }
 }

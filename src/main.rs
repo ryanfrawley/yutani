@@ -4724,7 +4724,10 @@ async fn run() {
     // rasterize) and hand the other to FreeType. Only primary cuts are
     // shaped — fallbacks aren't asked to ligate.
     let mut shaper = shaper::Shaper::new();
-    shaper.set_variant(font::FaceVariant::Regular, &primary_data);
+    // Regular comes from the primary lookup (no traits requested) so
+    // it's almost always face 0 of whatever Core Text picks; passing
+    // 0 here is correct AND matches `Font::new`'s implicit behavior.
+    shaper.set_variant(font::FaceVariant::Regular, &primary_data, 0);
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
 
@@ -4732,17 +4735,25 @@ async fn run() {
     // effort: when a cut isn't installed the styled lookup falls back to the
     // regular face. Cores like Iosevka ship all four; users without them get
     // un-styled text rather than synthetic bolding/oblique.
+    //
+    // Iosevka and most large families pack multiple weight/italic cuts
+    // into a single TTC file, so the file Core Text hands us for the
+    // italic descriptor is usually the SAME file as the regular — just
+    // a different face index inside. `find_face_index` scans the TTC
+    // for the face whose style_flags match the requested variant. Pre-
+    // fix, both the FreeType and HarfBuzz loaders opened face 0 of the
+    // TTC, so italic and bold-italic silently rendered as regular.
     for (variant, bold, italic) in [
         (font::FaceVariant::Bold, true, false),
         (font::FaceVariant::Italic, false, true),
         (font::FaceVariant::BoldItalic, true, true),
     ] {
-        let Some(data) = load_family_styled(&primary_name, bold, italic) else {
+        let Some((data, face_index)) = load_family_styled(&primary_name, bold, italic) else {
             continue;
         };
-        shaper.set_variant(variant, &data);
-        if font.set_variant(variant, data, pt_size, dpi) {
-            println!("primary {:?}: {}", variant, primary_name);
+        shaper.set_variant(variant, &data, face_index as u32);
+        if font.set_variant(variant, data, face_index, pt_size, dpi) {
+            println!("primary {:?}: {} (face index {})", variant, primary_name, face_index);
         }
     }
 
@@ -4807,11 +4818,14 @@ async fn run() {
             {
                 continue;
             }
-            let Some(data) = load_family_styled(&family, bold, italic) else {
+            let Some((data, face_index)) = load_family_styled(&family, bold, italic) else {
                 continue;
             };
-            if font.add_fallback(variant, data, pt_size, dpi) {
-                println!("fallback {} {:?}: {}", label, variant, family);
+            if font.add_fallback(variant, data, face_index, pt_size, dpi) {
+                println!(
+                    "fallback {} {:?}: {} (face index {})",
+                    label, variant, family, face_index,
+                );
             }
         }
     }
@@ -4964,13 +4978,26 @@ fn load_family(family: &str) -> Option<Vec<u8>> {
 // substitution by re-checking the matched descriptor's actual traits. Other
 // platforms fall back to the trait-tagged builder + plain `get`, which is
 // best-effort.
+/// Load the bytes of a styled face plus the face index inside its
+/// (possibly TTC-packed) file. The index is what the caller must hand
+/// to `freetype`'s `new_memory_face` / `harfbuzz_rs::Face::from_bytes`
+/// to actually open the right face; passing 0 always lands on the
+/// first packed face (usually regular), which is what made italic and
+/// bold-italic silently render as regular in earlier revisions.
+///
+/// On macOS, `get_strict` already verifies against FreeType style
+/// flags and returns the correct (file, face_index) tuple. On other
+/// platforms we don't have an equivalent strict matcher, so we use
+/// `find_face_index` as a best-effort second pass over whatever
+/// Core/Fontconfig hand us.
 #[cfg(target_os = "macos")]
-fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
-    font_loader::system_fonts::get_strict(family, bold, italic).map(|(data, _)| data)
+fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<(Vec<u8>, isize)> {
+    font_loader::system_fonts::get_strict(family, bold, italic)
+        .map(|(data, idx)| (data, idx as isize))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>> {
+fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<(Vec<u8>, isize)> {
     let mut b = font_loader::system_fonts::FontPropertyBuilder::new().family(family);
     if bold {
         b = b.bold();
@@ -4978,7 +5005,10 @@ fn load_family_styled(family: &str, bold: bool, italic: bool) -> Option<Vec<u8>>
     if italic {
         b = b.italic();
     }
-    font_loader::system_fonts::get(&b.build()).map(|(data, _)| data)
+    font_loader::system_fonts::get(&b.build()).map(|(data, _)| {
+        let idx = font::find_face_index(&data, font::FaceVariant::from_flags(bold, italic));
+        (data, idx)
+    })
 }
 
 /// Serialize a linear-space RGBA back to a `0xRRGGBB` literal so the

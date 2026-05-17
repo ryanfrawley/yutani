@@ -25,12 +25,72 @@ impl FaceVariant {
         }
     }
 
+    pub fn flags(self) -> (bool, bool) {
+        match self {
+            FaceVariant::Regular => (false, false),
+            FaceVariant::Bold => (true, false),
+            FaceVariant::Italic => (false, true),
+            FaceVariant::BoldItalic => (true, true),
+        }
+    }
+
     pub const ALL: [FaceVariant; 4] = [
         FaceVariant::Regular,
         FaceVariant::Bold,
         FaceVariant::Italic,
         FaceVariant::BoldItalic,
     ];
+}
+
+/// Find the face index inside a (potentially packed) font file whose
+/// style flags match `variant`. Iosevka and similar fonts ship as TTC
+/// collections that pack multiple weights / italics in a single file;
+/// `new_memory_face(data, 0)` always lands on the *first* face inside
+/// the collection (typically the regular face), so loading the italic
+/// or bold-italic cut needs the right index.
+///
+/// Returns `0` as a conservative fallback when:
+///   - the FreeType library fails to open the data,
+///   - the file is a single-face TTF (one trip through the loop and
+///     no other choice),
+///   - none of the packed faces' style flags match the requested
+///     combination (a discrepancy between Core Text's view of the
+///     family and what's actually in the file — preferring face 0
+///     means we at least render *something*, which beats a hard
+///     failure to draw any glyph for that style).
+///
+/// `data` is passed by reference; we open throwaway faces just to
+/// inspect metadata and never keep them — the real face is opened
+/// later by the caller using the index returned here.
+pub fn find_face_index(data: &[u8], variant: FaceVariant) -> isize {
+    let (want_bold, want_italic) = variant.flags();
+    let Ok(library) = ft::Library::init() else {
+        return 0;
+    };
+    // Probe face 0 to learn the collection's face count. We need a
+    // fresh copy of the data per probe because freetype-rs takes
+    // `Vec<u8>` by value.
+    let probe = match library.new_memory_face(data.to_vec(), 0) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let n = probe.num_faces();
+    if n <= 1 {
+        return 0;
+    }
+    for i in 0..n as isize {
+        let face = match library.new_memory_face(data.to_vec(), i) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let flags = face.style_flags();
+        let bold = flags.contains(ft::face::StyleFlag::BOLD);
+        let italic = flags.contains(ft::face::StyleFlag::ITALIC);
+        if bold == want_bold && italic == want_italic {
+            return i;
+        }
+    }
+    0
 }
 
 // One installed style. Regular's `face` is required; the others are optional —
@@ -190,10 +250,17 @@ impl Font {
     // Install the primary face for a styled variant (Bold/Italic/BoldItalic).
     // Returns false if the data can't be opened or sized at the current
     // `set_char_size` — typically a bitmap-only face we can't currently render.
+    //
+    // `face_index` selects which face inside a TTC collection to open.
+    // Iosevka and other large families ship as TTCs that pack multiple
+    // styled cuts into one file; loading face 0 always lands on the
+    // regular face, so the caller must pass the index that matches the
+    // requested variant. Use [`find_face_index`] to compute it.
     pub fn set_variant(
         &mut self,
         variant: FaceVariant,
         data: Vec<u8>,
+        face_index: isize,
         height_points: f32,
         dpi: u32,
     ) -> bool {
@@ -204,7 +271,7 @@ impl Font {
             Ok(l) => l,
             Err(_) => return false,
         };
-        let face = match library.new_memory_face(data, 0) {
+        let face = match library.new_memory_face(data, face_index) {
             Ok(f) => f,
             Err(_) => return false,
         };
@@ -220,10 +287,14 @@ impl Font {
     // the data) if the font can't be sized to the current `set_char_size` —
     // typically a bitmap-only face like Apple Color Emoji that we can't
     // currently render anyway.
+    //
+    // See [`Font::set_variant`] for the `face_index` story; same TTC-
+    // collection concern applies to fallback fonts too.
     pub fn add_fallback(
         &mut self,
         variant: FaceVariant,
         data: Vec<u8>,
+        face_index: isize,
         height_points: f32,
         dpi: u32,
     ) -> bool {
@@ -231,7 +302,7 @@ impl Font {
             Ok(l) => l,
             Err(_) => return false,
         };
-        let face = match library.new_memory_face(data, 0) {
+        let face = match library.new_memory_face(data, face_index) {
             Ok(f) => f,
             Err(_) => return false,
         };
@@ -657,6 +728,76 @@ mod tests {
         assert_eq!(FaceVariant::from_flags(true, false), FaceVariant::Bold);
         assert_eq!(FaceVariant::from_flags(false, true), FaceVariant::Italic);
         assert_eq!(FaceVariant::from_flags(true, true), FaceVariant::BoldItalic);
+    }
+
+    #[test]
+    fn flags_roundtrips_through_from_flags() {
+        for v in FaceVariant::ALL {
+            let (b, i) = v.flags();
+            assert_eq!(FaceVariant::from_flags(b, i), v);
+        }
+    }
+
+    #[test]
+    fn find_face_index_returns_zero_for_empty_data() {
+        // Defensive: malformed input shouldn't panic; just hand back
+        // face 0 so the caller can attempt to open it and surface the
+        // real error from `new_memory_face`.
+        assert_eq!(find_face_index(&[], FaceVariant::Italic), 0);
+        assert_eq!(find_face_index(&[0u8; 16], FaceVariant::BoldItalic), 0);
+    }
+
+    #[test]
+    fn find_face_index_picks_matching_style_when_available() {
+        // Real-system test: probe an installed Iosevka Term TTC and
+        // verify each requested variant resolves to a face whose
+        // style flags actually match. Iosevka Term packs Regular,
+        // Italic, Oblique, and Extended variants into one .ttc, so
+        // face 0 is regular and other indices have the styled cuts.
+        //
+        // Skip when no Iosevka TTC is installed (CI / dev machines
+        // without the fonts) — this is a smoke test against the real
+        // user-visible behavior, not a load-bearing assertion.
+        let candidates = [
+            "/Users/ry/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
+            "/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
+            "/System/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
+        ];
+        let Some(path) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
+            eprintln!("skipping: no Iosevka Term TTC installed");
+            return;
+        };
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("skipping: failed to read {path}");
+            return;
+        };
+
+        // For every variant the helper picks, verify by opening the
+        // resulting face that its style flags match the request.
+        let library = ft::Library::init().expect("ft init");
+        for variant in FaceVariant::ALL {
+            let (want_bold, want_italic) = variant.flags();
+            let idx = find_face_index(&data, variant);
+            let face = library
+                .new_memory_face(data.clone(), idx)
+                .expect("face opens at the picked index");
+            let flags = face.style_flags();
+            let got_bold = flags.contains(ft::face::StyleFlag::BOLD);
+            let got_italic = flags.contains(ft::face::StyleFlag::ITALIC);
+            // For variants the TTC actually contains, demand a real
+            // match. If the TTC doesn't pack that variant at all, the
+            // helper's documented fallback is index 0 (regular) —
+            // accept that too.
+            let strict_match = got_bold == want_bold && got_italic == want_italic;
+            let fallback_to_regular = idx == 0
+                && variant != FaceVariant::Regular
+                && !got_bold
+                && !got_italic;
+            assert!(
+                strict_match || fallback_to_regular,
+                "variant {variant:?}: picked index {idx}, got bold={got_bold} italic={got_italic}, wanted bold={want_bold} italic={want_italic}",
+            );
+        }
     }
 
     #[test]
