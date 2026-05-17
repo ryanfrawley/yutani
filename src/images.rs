@@ -2856,17 +2856,23 @@ mod tests {
     }
 
     #[test]
-    fn e2e_kitty_virtual_placement_through_store_with_placeholder_bbox() {
+    fn e2e_kitty_virtual_placement_through_store_with_placeholder_runs() {
         // Full virtual-placement flow end-to-end:
-        //   1. `a=T,U=1,i=N` transmits PNG bytes and registers a client-id
-        //      → store-id mapping. NO Placement is created, cursor stays
-        //      put. Image survives mark-and-sweep via referenced_image_ids
-        //      because the kitty_image_ids map's values feed it.
-        //   2. Printed U+10EEEE placeholder cells with the matching SGR fg
-        //      produce a bbox via `kitty_placeholder_bboxes()`.
+        //   1. `a=T,U=1,i=N` transmits PNG bytes, records the
+        //      `(c, r)` cell extent, and registers a client-id →
+        //      store-id mapping. NO Placement is created, cursor
+        //      stays put. Image survives mark-and-sweep via
+        //      referenced_image_ids because the kitty_image_ids
+        //      map's values feed it.
+        //   2. Printed `U+10EEEE` placeholder cells (with kitty
+        //      diacritics) produce per-row runs via
+        //      `kitty_placeholder_runs()`. Each run carries the
+        //      image_row + image_col_{start,end} the renderer needs
+        //      to compute the UV sub-rect against the cached
+        //      `(c, r)` extent.
         //   3. The store image registered in step 1 is reachable via
-        //      `Store::peek` for that bbox's id (after main.rs maps client
-        //      → store via `kitty_image_id_lookup`).
+        //      `Store::peek` for that run's id (after main.rs maps
+        //      client → store via `kitty_image_id_lookup`).
         let Some((d, q, p, _)) = try_make_pipeline_and_image() else {
             eprintln!("skipping: no GPU adapter");
             return;
@@ -2876,11 +2882,11 @@ mod tests {
         term.set_cell_size_px(8, 16);
         let cursor_before = term.cursor();
 
-        // 1. a=T,U=1 — transmit but don't display.
+        // 1. a=T,U=1 with c=2,r=2 — transmit, record extent, don't display.
         let png = make_png(4, 4);
         let client_id = 0xABCDEFu32;
         term.feed(&make_kitty_apc(
-            &format!("a=T,U=1,f=100,i={}", client_id),
+            &format!("a=T,U=1,f=100,c=2,r=2,i={}", client_id),
             &png,
         ));
         let uploads = term.take_pending_image_uploads();
@@ -2892,6 +2898,8 @@ mod tests {
         assert!(term.live_placements().is_empty());
         assert_eq!(term.cursor().row, cursor_before.row);
         assert_eq!(term.cursor().col, cursor_before.col);
+        // Cell extent recorded for the renderer's UV denominator.
+        assert_eq!(term.kitty_image_cell_extent(client_id), Some((2, 2)));
 
         // Hand the bytes off to Store and register the mapping (main.rs's job).
         let (_pending, image_id) = store.request_insert(
@@ -2905,25 +2913,32 @@ mod tests {
         // must be in referenced_image_ids so Store::retain keeps it.
         assert!(term.referenced_image_ids().contains(&image_id));
 
-        // 2. Print placeholder cells encoding `client_id` in SGR fg.
+        // 2. Print placeholder cells encoding `client_id` in SGR fg,
+        //    with diacritics for (row, col) tiles 0..2 × 0..2.
         let r = ((client_id >> 16) & 0xFF) as u8;
         let g = ((client_id >> 8) & 0xFF) as u8;
         let b = (client_id & 0xFF) as u8;
         term.feed(&format!("\x1b[38;2;{};{};{}m", r, g, b));
-        term.feed("\x1b[3;5H"); // row 2 col 4 (0-based)
-        term.feed("\u{10EEEE}\u{10EEEE}");
+        // image_row 0.
+        term.feed("\x1b[3;5H"); // screen row 2, col 4 (0-based)
+        term.feed("\u{10EEEE}\u{0305}\u{0305}"); // (0, 0)
+        term.feed("\u{10EEEE}\u{0305}\u{030D}"); // (0, 1)
+        // image_row 1.
         term.feed("\x1b[4;5H");
-        term.feed("\u{10EEEE}\u{10EEEE}");
-        let bboxes = term.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 1, "one bbox per distinct id");
-        let (bbox_id, top, left, rows, cols) = bboxes[0];
-        assert_eq!(bbox_id, client_id);
-        assert_eq!((top, left, rows, cols), (2, 4, 2, 2));
+        term.feed("\u{10EEEE}\u{030D}\u{0305}"); // (1, 0)
+        term.feed("\u{10EEEE}\u{030D}\u{030D}"); // (1, 1)
+        let runs = term.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2, "one run per screen row");
+        assert_eq!(runs[0].client_id, client_id);
+        assert_eq!(runs[0].screen_row, 2);
+        assert_eq!((runs[0].image_row, runs[0].image_col_start, runs[0].image_col_end), (0, 0, 2));
+        assert_eq!(runs[1].screen_row, 3);
+        assert_eq!((runs[1].image_row, runs[1].image_col_start, runs[1].image_col_end), (1, 0, 2));
 
-        // 3. Drive the decode; the image referenced by the bbox's id maps
-        // through to a peek-able Store entry.
+        // 3. Drive the decode; the image referenced by the runs' id
+        //    maps through to a peek-able Store entry.
         let _ = poll_until_result(&mut store, &p, &d, &q, Duration::from_secs(2));
-        let mapped = term.kitty_image_id_lookup(bbox_id).expect("client → store mapping");
+        let mapped = term.kitty_image_id_lookup(client_id).expect("client → store mapping");
         assert_eq!(mapped, image_id);
         assert!(store.peek(mapped).is_some(), "virtual-placement image must be peek-able");
     }
