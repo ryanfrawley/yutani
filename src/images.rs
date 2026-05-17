@@ -1477,6 +1477,21 @@ impl Store {
         self.cap_bytes
     }
 
+    /// Resize the memory cap in place. Used by Cmd-Shift-R config reload
+    /// so changes to `images_memory_cap_mb` take effect live.
+    ///
+    /// This deliberately does **not** evict already-resident images even
+    /// when the new cap is below `bytes()`. Eviction would surprise the
+    /// caller (placements would silently turn into the half-block
+    /// fallback mid-session); instead, the next `request_insert*` that
+    /// would push past the new cap is refused via `BudgetExceeded` and
+    /// mark-and-sweep gets a chance to free space organically as
+    /// placements scroll out of retention.
+    #[allow(dead_code)]
+    pub fn set_cap_bytes(&mut self, cap_bytes: usize) {
+        self.cap_bytes = cap_bytes;
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.images.len()
@@ -1822,6 +1837,92 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.bytes(), 0);
         assert!(s.peek(reserved).is_none());
+    }
+
+    #[test]
+    fn set_cap_bytes_updates_reported_cap() {
+        // No GPU needed: this exercises the plain getter/setter pair.
+        let mut s = Store::new(1024);
+        assert_eq!(s.cap_bytes(), 1024);
+        s.set_cap_bytes(2048);
+        assert_eq!(s.cap_bytes(), 2048);
+        s.set_cap_bytes(0);
+        assert_eq!(s.cap_bytes(), 0);
+    }
+
+    #[test]
+    fn set_cap_bytes_below_current_does_not_evict_resident_images() {
+        // Cmd-Shift-R reload that shrinks the cap below the current
+        // footprint must not silently drop images the user is looking
+        // at. Eviction is left to mark-and-sweep / the next refused
+        // insert, not the setter.
+        let Some((_d, _q, _p, image_a)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let Some((_d2, _q2, _p2, image_b)) = try_make_pipeline_and_image() else {
+            return;
+        };
+        let mut s = Store::new(1024);
+        let id_a = s.insert_synthetic_for_test(image_a, 200);
+        let id_b = s.insert_synthetic_for_test(image_b, 300);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.bytes(), 500);
+
+        // Shrink well below current footprint.
+        s.set_cap_bytes(64);
+        assert_eq!(s.cap_bytes(), 64);
+        // Already-resident images survive; byte accounting unchanged.
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.bytes(), 500);
+        assert!(s.peek(id_a).is_some());
+        assert!(s.peek(id_b).is_some());
+    }
+
+    #[test]
+    fn set_cap_bytes_refuses_next_insert_that_exceeds_new_cap() {
+        // After shrinking the cap below the current footprint, a fresh
+        // `request_insert` whose decoded payload would push the total
+        // past the new cap must be refused — same `BudgetExceeded` path
+        // as a cold-start refusal (see `poll_refuses_upload_that_would_exceed_cap`).
+        let Some((d, q, p, image_a)) = try_make_pipeline_and_image() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut s = Store::new(DEFAULT_CAP_BYTES);
+        // Seed something resident so we exercise "shrink below current
+        // usage" rather than "shrink an empty store".
+        let id_a = s.insert_synthetic_for_test(image_a, 128);
+        assert_eq!(s.bytes(), 128);
+
+        // Shrink the cap to less than the resident footprint. A new
+        // 4x4 PNG (64 bytes decoded) would push past the new cap.
+        s.set_cap_bytes(100);
+        let png = make_png(4, 4);
+        let (pending, reserved) =
+            s.request_insert(png, 100, Duration::from_secs(5), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut results = Vec::new();
+        while results.is_empty() && Instant::now() < deadline {
+            results = s.poll(&p, &d, &q, false);
+            if results.is_empty() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, pending);
+        // 128 already resident leaves 0 available within the new 100-cap
+        // (saturating sub), so the 64-byte upload is refused.
+        assert!(
+            matches!(results[0].1, Err(DecodeError::BudgetExceeded { needed: 64, .. })),
+            "expected BudgetExceeded, got {:?}",
+            results[0].1
+        );
+        // Refusal evicts the reservation but leaves the pre-existing
+        // image untouched.
+        assert!(s.peek(reserved).is_none());
+        assert!(s.peek(id_a).is_some());
+        assert_eq!(s.bytes(), 128);
     }
 
     #[test]

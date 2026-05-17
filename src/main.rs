@@ -473,6 +473,32 @@ impl Config {
     }
 }
 
+/// Copy every `glow_*` slot from `config` onto a `Glow` instance. Used by
+/// both initial construction and Cmd-Shift-R reload, so changing a glow
+/// knob in the config takes effect live. `glow_iterations` is clamped to
+/// `[1, MAX_ITERATIONS]` to keep the dual-Kawase chain bounded — the same
+/// clamp that `Config::parse_str` applies, repeated here so a hand-mutated
+/// `Config` (e.g. tests) can't push past the limit.
+fn apply_glow_config(g: &mut renderer::glow::Glow, config: &Config) {
+    g.match_brightness = config.glow_match_brightness;
+    g.match_bright_ansi = config.glow_match_bright_ansi;
+    g.match_foreground = config.glow_match_foreground;
+    g.threshold = config.glow_threshold;
+    g.intensity = config.glow_intensity;
+    g.softness = config.glow_softness;
+    g.hue_tolerance = config.glow_hue_tolerance_deg;
+    g.fg_tolerance = config.glow_fg_tolerance;
+    g.match_scanlines = config.glow_scanlines;
+    g.scanline_strength = config.glow_scanline_strength;
+    g.scanline_period = config.glow_scanline_period;
+    g.match_content_scanlines = config.glow_scanlines_content;
+    g.content_scanline_strength = config.glow_scanlines_content_strength;
+    g.scanline_color_bright = config.glow_scanline_color_bright;
+    g.scanline_color_dark = config.glow_scanline_color_dark;
+    g.content_scanline_attenuation = config.glow_scanlines_content_attenuation;
+    g.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+}
+
 pub struct ViewportSize {
     char_width: usize,
     char_height: usize,
@@ -1557,23 +1583,7 @@ impl State {
             &scene_fg.view,
         );
         for g in [&mut glow, &mut glow_fg] {
-            g.match_brightness = config.glow_match_brightness;
-            g.match_bright_ansi = config.glow_match_bright_ansi;
-            g.match_foreground = config.glow_match_foreground;
-            g.threshold = config.glow_threshold;
-            g.intensity = config.glow_intensity;
-            g.softness = config.glow_softness;
-            g.hue_tolerance = config.glow_hue_tolerance_deg;
-            g.fg_tolerance = config.glow_fg_tolerance;
-            g.match_scanlines = config.glow_scanlines;
-            g.scanline_strength = config.glow_scanline_strength;
-            g.scanline_period = config.glow_scanline_period;
-            g.match_content_scanlines = config.glow_scanlines_content;
-            g.content_scanline_strength = config.glow_scanlines_content_strength;
-            g.scanline_color_bright = config.glow_scanline_color_bright;
-            g.scanline_color_dark = config.glow_scanline_color_dark;
-            g.content_scanline_attenuation = config.glow_scanlines_content_attenuation;
-            g.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+            apply_glow_config(g, &config);
         }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
@@ -6190,5 +6200,176 @@ mod tests {
         assert_eq!(hover.start_col, 0);
         assert_eq!(hover.end_col, 18);
         assert_eq!(hover.url, "https://example.com");
+    }
+
+    //
+    // apply_glow_config — pure copy from `Config` onto a `Glow`. Building
+    // a real `Glow` needs a headless wgpu device + a scene texture view;
+    // we follow the same skip-on-no-adapter pattern as `images::tests`
+    // so CI without a GPU just sits these out instead of failing.
+    //
+
+    /// Build a headless `Glow` for use in tests. Returns `None` if no
+    /// adapter is available (CI without a GPU); callers should bail
+    /// silently rather than fail the test, matching the precedent in
+    /// `src/images.rs`.
+    fn try_make_test_glow() -> Option<(wgpu::Device, wgpu::Queue, renderer::glow::Glow)> {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        )?;
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
+        )
+        .ok()?;
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        // Dummy scene texture — Glow only needs a TextureView at the
+        // bound size; the contents don't matter for the field-copy path.
+        let scene_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test glow scene"),
+            size: wgpu::Extent3d { width: 16, height: 16, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let glow = renderer::glow::Glow::new(&device, format, 16, 16, &scene_view);
+        Some((device, queue, glow))
+    }
+
+    /// Build a `Config` whose every `glow_*` slot differs from the
+    /// `defaults()` value so a missing assignment in `apply_glow_config`
+    /// shows up as a stale default in the resulting `Glow`.
+    fn non_default_glow_config() -> Config {
+        let mut c = Config::defaults();
+        c.glow_match_brightness = true;
+        c.glow_match_bright_ansi = true;
+        c.glow_match_foreground = true;
+        c.glow_threshold = 0.42;
+        c.glow_intensity = 1.7;
+        c.glow_softness = 0.33;
+        c.glow_hue_tolerance_deg = 27.5;
+        c.glow_fg_tolerance = 0.21;
+        c.glow_scanlines = true;
+        c.glow_scanline_strength = 0.55;
+        c.glow_scanline_period = 6.0;
+        c.glow_scanlines_content = true;
+        c.glow_scanlines_content_strength = 0.66;
+        c.glow_scanline_color_bright = [0.9, 0.7, 0.5, 1.0];
+        c.glow_scanline_color_dark = [0.1, 0.2, 0.3, 1.0];
+        c.glow_scanlines_content_attenuation = 0.77;
+        c.glow_iterations = 5;
+        c
+    }
+
+    #[test]
+    fn apply_glow_config_copies_every_field_from_config() {
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let c = non_default_glow_config();
+        apply_glow_config(&mut g, &c);
+
+        // Every config slot listed in the task spec must appear on the
+        // Glow. A missing line in `apply_glow_config` shows up here as a
+        // stale default (`non_default_glow_config` differs from
+        // `Config::defaults` on every field below).
+        assert_eq!(g.match_brightness, c.glow_match_brightness);
+        assert_eq!(g.match_bright_ansi, c.glow_match_bright_ansi);
+        assert_eq!(g.match_foreground, c.glow_match_foreground);
+        assert!(approx_eq(g.threshold, c.glow_threshold));
+        assert!(approx_eq(g.intensity, c.glow_intensity));
+        assert!(approx_eq(g.softness, c.glow_softness));
+        assert!(approx_eq(g.hue_tolerance, c.glow_hue_tolerance_deg));
+        assert!(approx_eq(g.fg_tolerance, c.glow_fg_tolerance));
+        assert_eq!(g.match_scanlines, c.glow_scanlines);
+        assert!(approx_eq(g.scanline_strength, c.glow_scanline_strength));
+        assert!(approx_eq(g.scanline_period, c.glow_scanline_period));
+        assert_eq!(g.match_content_scanlines, c.glow_scanlines_content);
+        assert!(approx_eq(
+            g.content_scanline_strength,
+            c.glow_scanlines_content_strength,
+        ));
+        assert_eq!(g.scanline_color_bright, c.glow_scanline_color_bright);
+        assert_eq!(g.scanline_color_dark, c.glow_scanline_color_dark);
+        assert!(approx_eq(
+            g.content_scanline_attenuation,
+            c.glow_scanlines_content_attenuation,
+        ));
+        assert_eq!(g.iterations, c.glow_iterations);
+    }
+
+    #[test]
+    fn apply_glow_config_overwrites_prior_state() {
+        // Reload-equivalent: apply once with non-default values, then
+        // apply again with `Config::defaults()`. The Glow must end up
+        // matching defaults — i.e. the second apply replaces every
+        // field, no "sticky" remnants from the first pass.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        apply_glow_config(&mut g, &non_default_glow_config());
+        let defaults = Config::defaults();
+        apply_glow_config(&mut g, &defaults);
+
+        assert_eq!(g.match_brightness, defaults.glow_match_brightness);
+        assert_eq!(g.match_bright_ansi, defaults.glow_match_bright_ansi);
+        assert_eq!(g.match_foreground, defaults.glow_match_foreground);
+        assert!(approx_eq(g.threshold, defaults.glow_threshold));
+        assert!(approx_eq(g.intensity, defaults.glow_intensity));
+        assert!(approx_eq(g.softness, defaults.glow_softness));
+        assert_eq!(g.match_scanlines, defaults.glow_scanlines);
+        assert_eq!(g.match_content_scanlines, defaults.glow_scanlines_content);
+        assert_eq!(g.iterations, defaults.glow_iterations);
+    }
+
+    #[test]
+    fn apply_glow_config_clamps_iterations_above_max() {
+        // `Config::parse_str` clamps `glow_iterations` on the way in,
+        // but a hand-mutated `Config` (or a future code path that sets
+        // the field directly) shouldn't be able to push the Glow's
+        // dual-Kawase chain past `MAX_ITERATIONS`. `apply_glow_config`
+        // re-clamps to enforce that.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = Config::defaults();
+        c.glow_iterations = renderer::glow::MAX_ITERATIONS * 10;
+        apply_glow_config(&mut g, &c);
+        assert_eq!(g.iterations, renderer::glow::MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn apply_glow_config_clamps_iterations_below_one() {
+        // Lower bound: dual-Kawase needs at least one down/up pass to
+        // produce a halo, so 0 (or anything below) must clamp up to 1.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = Config::defaults();
+        c.glow_iterations = 0;
+        apply_glow_config(&mut g, &c);
+        assert_eq!(g.iterations, 1);
+    }
+
+    #[test]
+    fn apply_glow_config_iterations_at_max_unchanged() {
+        // Boundary: a value sitting exactly at `MAX_ITERATIONS` must
+        // pass through unmodified — the clamp is inclusive.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = Config::defaults();
+        c.glow_iterations = renderer::glow::MAX_ITERATIONS;
+        apply_glow_config(&mut g, &c);
+        assert_eq!(g.iterations, renderer::glow::MAX_ITERATIONS);
     }
 }
