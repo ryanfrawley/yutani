@@ -973,47 +973,65 @@ impl Store {
             return Err(DecodeError::BudgetExceeded { needed: total_bytes, available });
         }
 
-        // Pick the source-frame RGBA. `Some(0)` = base, `Some(n)` =
-        // frames[n - 1]. `None` (= `c=` omitted on `a=f`) means
-        // compose against the **previous frame** per Kitty spec, NOT
-        // against the base. Defaulting to base loses accumulated
-        // motion for delta-encoded GIFs — each delta frame would
-        // become `base + just-this-delta`, with the base bleeding
-        // through behind everywhere the current frame didn't paint.
-        // For the first frame in the sequence (no previous yet),
-        // falling back to the base is correct. Stale / out-of-range
-        // explicit indices fall back to the base as a last resort —
-        // the spec is silent on this edge but composing onto blank
-        // would hide the rest of the image.
-        let base_rgba_or_blank = || {
-            parent
-                .base_rgba
-                .clone()
-                .unwrap_or_else(|| vec![0u8; parent_bytes])
+        // Composition strategy.
+        //
+        // Full-frame replacement (no `c=` AND same dims as parent AND
+        // dst at origin): the new payload IS the new frame. icat
+        // sends transparent-GIF frames this way — each frame is the
+        // complete RGBA snapshot for that point in time, with its
+        // own transparency. Alpha-blending onto the prior frame would
+        // make the prior's pixels bleed through wherever the new frame
+        // is transparent, leaving the first frame visibly stuck behind
+        // the animation. The Kitty spec defines `X=1` for this
+        // semantic but icat doesn't send it; treat the shape itself
+        // as the signal (per icat's de-facto convention).
+        //
+        // Otherwise: alpha-blend onto the chosen compose source.
+        //   `Some(0)` → base
+        //   `Some(n)` → frames[n - 1]
+        //   `None`    → previous frame (Kitty spec default), falling
+        //               back to base for the very first a=f.
+        // Stale or out-of-range explicit indices fall back to the
+        // base as a last resort — composing onto blank would hide
+        // the rest of the image.
+        let is_full_replacement = compose_base.is_none()
+            && dst_x == 0
+            && dst_y == 0
+            && decoded.width == base_w
+            && decoded.height == base_h;
+        let composed: Vec<u8> = if is_full_replacement {
+            decoded.rgba.clone()
+        } else {
+            let base_rgba_or_blank = || {
+                parent
+                    .base_rgba
+                    .clone()
+                    .unwrap_or_else(|| vec![0u8; parent_bytes])
+            };
+            let src_rgba: Vec<u8> = match compose_base {
+                Some(0) => base_rgba_or_blank(),
+                Some(n) => parent
+                    .frames
+                    .get((n as usize).saturating_sub(1))
+                    .map(|f| f.rgba.clone())
+                    .unwrap_or_else(base_rgba_or_blank),
+                None => parent
+                    .frames
+                    .last()
+                    .map(|f| f.rgba.clone())
+                    .unwrap_or_else(base_rgba_or_blank),
+            };
+            composite_rgba(
+                &src_rgba,
+                base_w,
+                base_h,
+                &decoded.rgba,
+                decoded.width,
+                decoded.height,
+                dst_x,
+                dst_y,
+            )
         };
-        let src_rgba: Vec<u8> = match compose_base {
-            Some(0) => base_rgba_or_blank(),
-            Some(n) => parent
-                .frames
-                .get((n as usize).saturating_sub(1))
-                .map(|f| f.rgba.clone())
-                .unwrap_or_else(base_rgba_or_blank),
-            None => parent
-                .frames
-                .last()
-                .map(|f| f.rgba.clone())
-                .unwrap_or_else(base_rgba_or_blank),
-        };
-        let composed = composite_rgba(
-            &src_rgba,
-            base_w,
-            base_h,
-            &decoded.rgba,
-            decoded.width,
-            decoded.height,
-            dst_x,
-            dst_y,
-        );
 
         let image = pipeline.upload_rgba(
             device,
@@ -3796,6 +3814,144 @@ mod tests {
         assert_eq!(
             entry.frames[0].rgba, expected,
             "first a=f with no previous frame falls back to base",
+        );
+    }
+
+    #[test]
+    fn request_insert_frame_full_size_no_c_overwrites_instead_of_blending() {
+        // Regression for the "first frame visible behind animating
+        // frames" bug on transparent GIFs. icat sends a=f frames at
+        // the parent's full dimensions, dst=(0,0), no c= — its
+        // de-facto signal that the frame IS the new image (each
+        // payload has its own transparency, including transparent
+        // regions that should show terminal bg, not the prior
+        // frame). Alpha-blending here would let the prior frame's
+        // pixels bleed through and stack across the timeline.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Seed an opaque sentinel frame so we can tell whether the
+        // composite blended against it (bug) or just used the new
+        // payload (fix).
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let prev_rgba = vec![0xCCu8; 2 * 2 * 4];
+        store.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: prev_rgba,
+            delay_ms: 100,
+            bytes: 0,
+        });
+
+        // Fully-transparent 2×2 PNG. Same dims as parent, dst=(0,0),
+        // no compose_base → heuristic should overwrite.
+        let transparent_png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                transparent_png,
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None, // c= omitted → full-replacement heuristic fires
+                0,
+                0, 0, // dst=(0,0)
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The new frame should be fully transparent (all zeros) —
+        // the prior frame's 0xCC sentinel must NOT have bled through.
+        let entry = store.images.get(&parent.0).expect("parent");
+        assert_eq!(
+            entry.frames[1].rgba,
+            vec![0u8; 2 * 2 * 4],
+            "full-size frame at (0,0) with no c= must overwrite, not blend with prior",
+        );
+    }
+
+    #[test]
+    fn request_insert_frame_partial_size_still_blends_against_previous() {
+        // The full-replacement heuristic must NOT fire when the
+        // frame is a true delta (smaller than parent OR offset).
+        // The previous (working) icat GIF used this shape with
+        // explicit c=, but verify that even with c= omitted a
+        // partial frame still blends rather than blanking the
+        // surrounding region.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        // 4x4 parent so a 2x2 frame at (1,1) is genuinely partial.
+        let mut s = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut s, (4, 4)) else {
+            return;
+        };
+        let _ = (d, q, pipeline, parent, store); // hand back the throwaways
+        let Some((d, q, pipeline, parent)) = make_frame_test_image(&mut s, (4, 4)) else {
+            return;
+        };
+        // Seed a prior frame with sentinel pixels everywhere.
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let prev_rgba = vec![0xCCu8; 4 * 4 * 4];
+        s.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: prev_rgba,
+            delay_ms: 100,
+            bytes: 0,
+        });
+        // 2x2 transparent frame at (1,1) — partial size, so the
+        // heuristic shouldn't fire. With c= omitted the new frame
+        // blends against the previous (whose pixels stay outside
+        // the 2x2 region).
+        let transparent_png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 0]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = s
+            .request_insert_frame(
+                parent,
+                transparent_png,
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None,
+                0,
+                1, 1,
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = s.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Partial frame should have kept the prior frame's 0xCC
+        // outside the 2x2 region (and inside the region too, since
+        // the new payload is transparent).
+        let entry = s.images.get(&parent.0).expect("parent");
+        assert_eq!(
+            entry.frames[1].rgba,
+            vec![0xCCu8; 4 * 4 * 4],
+            "partial frame with transparent payload preserves prior frame",
         );
     }
 
