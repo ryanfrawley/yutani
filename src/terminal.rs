@@ -203,10 +203,13 @@ pub struct PendingImageUpload {
 pub struct KittyPlaceholderRun {
     /// Kitty `i=` image id the placeholder cells encoded.
     pub client_id: u32,
-    /// 0-based row index into the grid this run was scanned from.
-    /// The renderer shifts by `view_offset` when converting to a
-    /// viewport coordinate.
-    pub screen_row: usize,
+    /// Visual row coordinate (`extended_cell`'s frame of reference):
+    /// 0..rows is the live grid, negative values are scrollback rows
+    /// pulled into view, and `rows..rows+2` are the bottom phantom
+    /// strip used during smooth scroll. The renderer plugs this
+    /// directly into the cell row→pixel math — no `view_offset`
+    /// shift needed.
+    pub screen_row: isize,
     /// First grid column the run covers.
     pub screen_col_start: usize,
     /// Exclusive end column.
@@ -607,6 +610,15 @@ pub struct Terminal {
     // when that transmission's final chunk (`m=0` / no `m=`) finalizes
     // or when a fresh id-keyed transmission preempts it.
     current_chunked_id: Option<u32>,
+    // Tracks the `i=` of the most recently *completed* transmission
+    // (single-chunk or chunked) so `a=p` / `a=d` / `a=f` / `a=a`
+    // without an explicit `i=` can fall back per the Kitty spec
+    // ("if i is missing, the most recently created image is
+    // targeted"). icat's animation-frame stream emits `a=f` with no
+    // `i=` and no `m=` between control messages; without this
+    // fallback those frames silently drop. Updated whenever
+    // `finalize_kitty_image_bytes` runs with a `kitty_image_id`.
+    last_kitty_image_id: Option<u32>,
     // Kitty client image-id → our store ImageId. Populated when a
     // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
     // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
@@ -717,6 +729,7 @@ impl Terminal {
             kitty_chunks: std::collections::HashMap::new(),
             kitty_chunks_anon: None,
             current_chunked_id: None,
+            last_kitty_image_id: None,
             kitty_image_ids: std::collections::HashMap::new(),
             kitty_image_formats: std::collections::HashMap::new(),
             kitty_image_cell_extents: std::collections::HashMap::new(),
@@ -873,13 +886,14 @@ impl Terminal {
         self.kitty_image_cell_extents.get(&client_id).copied()
     }
 
-    /// Scan the active grid for Kitty virtual-placement cells
-    /// (`U+10EEEE` with an encoded image id) and emit one run per
-    /// contiguous horizontal stretch that the renderer can draw as a
-    /// single quad with a correct UV sub-rect.
+    /// Scan visible rows — including scrollback pulled into view via
+    /// `view_offset` and the phantom strips above / below the live
+    /// grid — for Kitty unicode-placeholder cells (`U+10EEEE` with an
+    /// encoded image id), and emit one run per contiguous horizontal
+    /// stretch the renderer can draw as a single textured quad.
     ///
     /// A run extends a previous cell when ALL of these hold:
-    ///   - same screen row
+    ///   - same visual row
     ///   - same `client_id`
     ///   - same `image_row` diacritic value
     ///   - `image_col == prev.image_col + 1`
@@ -887,27 +901,39 @@ impl Terminal {
     /// Any other transition (non-placeholder cell, id change, row
     /// change, image_col gap) starts a new run.
     ///
-    /// This lets the renderer draw each surviving stretch with its
-    /// correct slice of the source image, so partial overwrites
-    /// (e.g. tmux scrolling new output over the top rows of an
-    /// image) visibly clip instead of distorting. The previous
-    /// merged-bbox approach stretched whatever image we had into
-    /// whatever bbox survived — fine for an undisturbed grid, bad
-    /// for anything else.
+    /// Walking via [`Self::extended_cell`] rather than `active_grid`
+    /// directly is what makes the image survive scrolling off the
+    /// top: once placeholder cells are in scrollback the active grid
+    /// no longer holds them, but `extended_cell` looks them up in
+    /// the scrollback ring at the matching visual row whenever
+    /// `view_offset > 0`. The same call also covers the
+    /// `r_lo..r_hi = -2..rows+2` phantom strips that the cell-vertex
+    /// loop uses during smooth-scroll, so a placeholder coming
+    /// in/out of view doesn't pop at scroll-tick boundaries.
     ///
-    /// Grouping happens per screen row only — vertical run-length
+    /// Grouping happens per visual row only — vertical run-length
     /// compression would require the renderer to know that adjacent
-    /// rows belong to the same image, which the bbox path got wrong
-    /// (the merge swallowed valid sub-rect boundaries). Per-row is
-    /// the smallest useful unit: a 29×15 image collapses to 15
-    /// quads per frame, well under the renderer's per-call cost.
+    /// rows belong to the same image, which the older merged-bbox
+    /// path got wrong (the merge swallowed valid sub-rect
+    /// boundaries). Per-row is the smallest useful unit: a 29×15
+    /// image collapses to 15 quads per frame, well under the
+    /// renderer's per-call cost.
     pub fn kitty_placeholder_runs(&self) -> Vec<KittyPlaceholderRun> {
         let mut runs: Vec<KittyPlaceholderRun> = Vec::new();
-        let grid = self.active_grid();
-        for r in 0..grid.rows {
+        // Same phantom-row window the cell-vertex loop uses
+        // (`update_vertices`'s `r_lo..r_hi`): two strips top + two
+        // bottom so smooth-scroll doesn't pop.
+        let r_lo: isize = -2;
+        let r_hi: isize = self.rows as isize + 2;
+        for r in r_lo..r_hi {
             let mut current: Option<KittyPlaceholderRun> = None;
-            for c in 0..grid.cols {
-                let cell = grid.get(r, c);
+            for c in 0..self.cols {
+                let Some(cell) = self.extended_cell(r, c) else {
+                    if let Some(run) = current.take() {
+                        runs.push(run);
+                    }
+                    continue;
+                };
                 let Some(id) = cell.placeholder_image_id else {
                     if let Some(run) = current.take() {
                         runs.push(run);
@@ -2201,6 +2227,27 @@ impl Terminal {
                 }
             }
         }
+        // Second fallback: per Kitty spec, when `i=` is missing on an
+        // op that targets an existing image (place / delete / animate
+        // / frame), the most recently created image is the implicit
+        // target. icat's animation stream relies on this — frame
+        // transmissions for the GIF being animated arrive as bare
+        // `a=f` with neither `i=` nor `m=` (no in-flight chunked
+        // transmission to inherit from either), so the
+        // `current_chunked_id` thread above doesn't help. Without
+        // this second fallback those frames silently drop and the
+        // animation never plays past frame 1.
+        if ctrl.image_id.is_none() {
+            if matches!(
+                ctrl.action,
+                KittyAction::Place
+                    | KittyAction::Delete
+                    | KittyAction::AnimationFrame
+                    | KittyAction::AnimationControl,
+            ) {
+                ctrl.image_id = self.last_kitty_image_id;
+            }
+        }
         // Update the in-flight tracker. First chunk of an id-keyed
         // stream sets it; the matching final chunk clears it. Single
         // chunks (no `m=` on either side) leave it untouched.
@@ -2977,6 +3024,13 @@ impl Terminal {
         // GIFs, since the app already decoded once.
         if let Some(id) = kitty_image_id {
             self.kitty_image_formats.insert(id, source_format);
+            // Mark this image as "most recently completed" so a
+            // subsequent `a=p` / `a=d` / `a=f` / `a=a` arriving
+            // without `i=` can target it (per the Kitty spec
+            // fallback). icat's animation-frame stream relies on
+            // this — it emits `a=f` with no `i=` and no `m=` between
+            // animation-control messages.
+            self.last_kitty_image_id = Some(id);
             // Cache the image's total cell extent so the per-run
             // placeholder renderer can compute UVs against it. Only
             // record when BOTH dimensions are present — partial
@@ -3049,9 +3103,49 @@ impl Terminal {
         });
     }
 
-    /// Handle a captured DCS payload. Currently we only implement xterm's
-    /// XTGETTCAP query (`+q<hex>;<hex>;...`); other DCS strings are dropped.
+    /// Handle a captured DCS payload. Currently we implement xterm's
+    /// XTGETTCAP query (`+q<hex>;<hex>;...`) and tmux's passthrough
+    /// wrapper (`tmux;<wrapped>`); other DCS strings are dropped.
     fn handle_dcs(&mut self, s: &str) {
+        // tmux passthrough: apps running inside tmux that want to send
+        // escape sequences to the OUTER terminal wrap them as
+        // `ESC P tmux ; <wrapped> ESC \`. Inside `<wrapped>`, literal
+        // ESC bytes are doubled (the ansi.rs parser already
+        // un-doubles them in `dcs_esc`). Tmux strips this wrapper and
+        // forwards the payload — but if someone cats a tmux-wrapped
+        // recording directly into yutani (no tmux in the loop), we'd
+        // never reach the inner sequences. Recognize the wrapper
+        // here, strip it, and re-feed the body so any APC / CSI /
+        // OSC inside dispatches through the normal pipeline.
+        if let Some(wrapped) = s.strip_prefix("tmux;") {
+            // The wrapped body is itself a sequence of escape codes —
+            // re-parse it through a FRESH parser. Reusing
+            // `self.parser` would inherit whatever state the outer
+            // feed's Phase 1 ended in: when the PTY hands us a chunk
+            // that splits a DCS mid-body, the outer parser is in
+            // DcsString when handle_dcs gets called (Phase 2 dispatches
+            // the prior complete DCS events first). Re-feeding the
+            // inner `ESC _G ...` into that stuck state turns the
+            // leading ESC into an unrecognized DCS escape, drops the
+            // partial accumulator, and the rest of the inner APC
+            // prints as plain text — visible as a screenful of base64
+            // gibberish from each tmux-wrapped image transmission.
+            //
+            // A throwaway parser starts in Ground every time, so
+            // re-entry is independent of whatever the outer parser is
+            // in the middle of. Inner events still dispatch through
+            // `self.dispatch`, so they hit the normal pipeline
+            // (kitty_chunks accumulator, animation state, etc.).
+            let mut inner = crate::ansi::Parser::new();
+            let mut events = Vec::new();
+            for ch in wrapped.chars() {
+                inner.feed(ch, |e| events.push(e));
+            }
+            for e in events {
+                self.dispatch(e);
+            }
+            return;
+        }
         let Some(rest) = s.strip_prefix("+q") else {
             return;
         };
@@ -5204,6 +5298,193 @@ mod tests {
         let mut t = Terminal::new(5, 3, 100);
         t.feed("\x1bP$qmhello\x1b\\"); // DECRQSS or similar — not implemented
         assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_unwraps_and_reprocesses_body() {
+        // tmux passthrough wraps an app's escape sequences for the
+        // outer terminal: `ESC P tmux ; <body> ESC \\`, with literal
+        // ESC bytes inside <body> doubled. Cat'ing a recording of
+        // such output directly into yutani (no tmux in the loop)
+        // should still dispatch the wrapped sequences — the ansi
+        // parser un-doubles the ESCs and `handle_dcs` strips the
+        // `tmux;` prefix and re-feeds the body through the parser.
+        //
+        // Pick an inner sequence whose effect we can observe: SGR 31
+        // turns the cursor's fg red, and the printed 'A' should
+        // carry that fg.
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut t = Terminal::new(5, 3, 100);
+        // Doubled-ESC encoding of `ESC [ 3 1 m A`:
+        t.feed("\x1bPtmux;\x1b\x1b[31mA\x1b\\");
+        let cell = t.row(0)[0];
+        assert_eq!(cell.ch, 'A');
+        assert_eq!(
+            cell.style.color_fg_source,
+            crate::style::ColorSource::Indexed(1),
+            "wrapped SGR must have reached apply_sgr",
+        );
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_survives_pty_chunk_split_mid_next_dcs() {
+        // Regression: when a PTY chunk delivers DCS#1 in full plus
+        // the *start* of DCS#2, the outer parser ends Phase 1 in
+        // DcsString (DCS#2 is still accumulating). Phase 2 then
+        // dispatches DCS#1's event. If `handle_dcs` re-parses the
+        // inner body through `self.parser` it inherits that stuck
+        // DcsString state — the leading ESC of the inner APC turns
+        // into an unrecognized DCS escape, the partial buf is
+        // cleared, and the rest of the inner sequence is printed as
+        // text instead of dispatched as an APC. A fresh, independent
+        // parser sidesteps this entirely.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Feed DCS#1 complete + DCS#2's opener (no terminator yet).
+        // DCS#1 wraps `ESC [31m A` (set fg red, print A).
+        let chunk1 = "\x1bPtmux;\x1b\x1b[31mA\x1b\\\x1bPtmux;";
+        t.feed(chunk1);
+        // Without the fix: 'A' is never printed (the SGR + print
+        // sequence got mangled by the stuck-DcsString re-feed).
+        // With the fix: 'A' lands on the grid with red fg via the
+        // properly-dispatched inner SGR + Print.
+        let cell = t.row(0)[0];
+        assert_eq!(cell.ch, 'A', "inner Print event must dispatch even when outer parser is mid-DCS");
+        assert_eq!(
+            cell.style.color_fg_source,
+            crate::style::ColorSource::Indexed(1),
+            "inner SGR 31 must reach apply_sgr",
+        );
+        // Finish DCS#2 with a no-op body so the outer parser returns
+        // to Ground cleanly for any follow-on chunk.
+        t.feed("\x1b\\");
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_dispatches_wrapped_kitty_transmit() {
+        // Mirrors the real file from the bug report (~/bad-kitty.txt):
+        // tmux-wrapped Kitty `a=T,i=N,...` payload. Walking it through
+        // `Terminal::feed` should register the kitty image id so a
+        // later `a=p,i=N` (or any lookup) sees it.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Build a tiny PNG just like the kitty E2E helpers.
+        let png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 255, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Wrap as tmux passthrough: doubled ESCs around the Kitty APC.
+        let wrapped = format!(
+            "\x1bPtmux;\x1b\x1b_Ga=T,f=100,i=4242,U=1;{}\x1b\x1b\\\x1b\\",
+            b64,
+        );
+        t.feed(&wrapped);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(
+            uploads.len(), 1,
+            "tmux-wrapped Kitty a=T must produce one pending upload",
+        );
+        assert_eq!(uploads[0].kitty_image_id, Some(4242));
+    }
+
+    #[test]
+    fn a_f_without_i_targets_most_recently_completed_image() {
+        // Per Kitty spec: when `i=` is missing on `a=f` (and `a=p` /
+        // `a=d` / `a=a`), the most recently created image is the
+        // implicit target. icat's animation stream relies on this —
+        // frame transmissions for the GIF being animated arrive as
+        // bare `a=f` with neither `i=` nor `m=`, no in-flight
+        // chunked transmission to inherit from. Without the
+        // last-completed fallback the frame silently drops and the
+        // animation never plays past the base.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Establish a base image with explicit id 4242.
+        let png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        t.feed(&format!("\x1b_Ga=T,f=100,i=4242,U=1;{}\x1b\\", b64));
+        let base_uploads = t.take_pending_image_uploads();
+        assert_eq!(base_uploads.len(), 1);
+        assert_eq!(base_uploads[0].kitty_image_id, Some(4242));
+
+        // Now send a bare `a=f` — no `i=`, no `m=`. Should attach to
+        // image 4242 via the spec fallback.
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_png);
+        t.feed(&format!("\x1b_Ga=f,q=2;{}\x1b\\", b64));
+        let frame_uploads = t.take_pending_image_uploads();
+        assert_eq!(
+            frame_uploads.len(),
+            1,
+            "bare a=f must produce one frame upload via implicit-i= fallback",
+        );
+        let up = &frame_uploads[0];
+        assert!(up.animation_frame.is_some(), "a=f path flagged");
+        assert_eq!(
+            up.kitty_image_id,
+            Some(4242),
+            "implicit i= must resolve to the most recently completed image",
+        );
+    }
+
+    #[test]
+    fn a_f_without_i_drops_when_no_prior_image() {
+        // Symmetric guard: no prior transmission, no implicit
+        // fallback to leak into. Bare `a=f` must be ignored cleanly
+        // rather than crash or create a stranded entry.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_png);
+        t.feed(&format!("\x1b_Ga=f,q=2;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert!(uploads.is_empty(), "no prior image → drop, don't crash");
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_dispatches_wrapped_apc() {
+        // The real-world case: tmux-wrapped Kitty graphics APC.
+        // After unwrap, the body is `ESC _ G a=q,i=42 ESC \\` — a
+        // Kitty capability query. Its dispatch path writes an `OK`
+        // reply to `pending_response`; checking that proves the
+        // unwrapped APC reached the right handler.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1bPtmux;\x1b\x1b_Ga=q,f=100,i=42\x1b\x1b\\\x1b\\");
+        let reply = String::from_utf8(t.take_response()).unwrap_or_default();
+        assert!(
+            reply.contains("i=42") && reply.contains("OK"),
+            "expected Kitty query OK reply with i=42; got {reply:?}",
+        );
     }
 
     #[test]
@@ -7849,6 +8130,65 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.feed("hello world");
         assert!(t.kitty_placeholder_runs().is_empty());
+    }
+
+    #[test]
+    fn placeholder_runs_survive_scrolling_into_scrollback() {
+        // Regression: after the image scrolls off the top and the
+        // user scrolls back up to view it, the placeholder cells
+        // still need to be found by the scanner. Pre-fix the scanner
+        // only walked `active_grid()`, so once the cells migrated to
+        // the scrollback ring the image silently disappeared
+        // (visible as the space where the image had been but blank).
+        //
+        // Now `kitty_placeholder_runs` walks via `extended_cell`
+        // which transparently picks up scrollback rows when
+        // `view_offset > 0`. The returned run's `screen_row` is the
+        // negative visual-row coord those scrollback cells now
+        // occupy.
+        let mut t = Terminal::new(20, 5, 100);
+        // Paint a single placeholder row at the top.
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // row 0, col 0 of image
+        // Sanity: the run exists at visual row 0 with no scroll.
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1, "fixture: placeholder is on row 0");
+        assert_eq!(runs[0].screen_row, 0);
+
+        // Scroll the placeholder well past the phantom-row window so
+        // it's fully out of the cell renderer's reach. With rows=5
+        // and the 2-row phantom strip above, we need at least 8
+        // line feeds to push the placeholder past visual_row=-2.
+        for _ in 0..10 {
+            t.feed("\r\n");
+        }
+        assert!(
+            t.scrollback.len() >= 5,
+            "fixture: placeholder should have scrolled well off the top, sb={}",
+            t.scrollback.len(),
+        );
+        assert!(
+            t.kitty_placeholder_runs().is_empty(),
+            "placeholder is past the phantom-row window with view_offset=0",
+        );
+
+        // Pull the scrollback into view. With view_offset = sb_len,
+        // the scrolled-off content fills the top of the viewport
+        // and the placeholder lands on a positive visual row.
+        let sb_len = t.scrollback.len();
+        t.scroll_up(sb_len);
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(
+            runs.len(),
+            1,
+            "placeholder must re-appear once scrolled back into view",
+        );
+        assert!(
+            (0..t.rows as isize).contains(&runs[0].screen_row),
+            "screen_row must land on a visible viewport row: got {}",
+            runs[0].screen_row,
+        );
     }
 
     #[test]

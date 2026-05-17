@@ -267,7 +267,16 @@ impl Parser {
                 self.push_digit(ch);
                 self.state = State::CsiParam;
             }
-            ';' => {
+            // `;` is the legacy separator; `:` is ITU T.416 / ECMA-48
+            // sub-parameter separator. Modern apps (and `kitty +kitten
+            // icat`'s unicode-placeholder SGR) emit truecolor as
+            // `\e[38:2:R:G:Bm` rather than `\e[38;2;R;G;Bm`.
+            // Treating them the same here lets the existing SGR
+            // handler see `[38, 2, R, G, B]` and dispatch truecolor
+            // correctly. Worst case (advanced underline `4:N`): the
+            // sub-param leaks as a separate top-level SGR, which is a
+            // slight overload but better than aborting the whole CSI.
+            ';' | ':' => {
                 self.flush_param();
                 self.state = State::CsiParam;
             }
@@ -286,7 +295,8 @@ impl Parser {
     fn csi_param(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
         match ch {
             '0'..='9' => self.push_digit(ch),
-            ';' => self.flush_param(),
+            // See the equivalent `;` | `:` branch in `csi_entry`.
+            ';' | ':' => self.flush_param(),
             ' '..='/' => {
                 self.intermediate = Some(ch);
                 self.state = State::CsiIntermediate;
@@ -352,12 +362,31 @@ impl Parser {
     }
 
     fn dcs_esc(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
-        if ch == '\\' {
-            self.flush_dcs(emit);
-        } else {
-            self.dcs_buf.clear();
+        match ch {
+            // Proper String Terminator: emit the DCS and return to ground.
+            '\\' => {
+                self.flush_dcs(emit);
+                self.state = State::Ground;
+            }
+            // tmux passthrough escapes a literal ESC inside the DCS body
+            // by doubling it (`ESC ESC`). When we see two consecutive
+            // ESCs, treat the pair as a single ESC byte in the body and
+            // stay in DcsString — there's no legitimate DCS use case for
+            // two unescaped ESCs in a row anyway. Without this the next
+            // dcs_esc call would clear the buf and abort the whole DCS,
+            // and any tmux-wrapped content would never reach the
+            // dispatcher.
+            '\x1b' => {
+                self.dcs_buf.push('\x1b');
+                self.state = State::DcsString;
+            }
+            // Anything else after ESC inside DCS aborts the sequence
+            // silently — same policy the OSC / APC paths use.
+            _ => {
+                self.dcs_buf.clear();
+                self.state = State::Ground;
+            }
         }
-        self.state = State::Ground;
     }
 
     fn flush_dcs(&mut self, emit: &mut impl FnMut(Event)) {
@@ -609,6 +638,28 @@ mod tests {
     }
 
     #[test]
+    fn csi_accepts_colon_as_subparam_separator() {
+        // ITU T.416 / ECMA-48 form: colon separates sub-params of a
+        // single parameter. Modern apps (notably `kitty +kitten
+        // icat`'s unicode-placeholder SGR) emit truecolor as
+        // `\e[38:2:R:G:Bm` instead of `\e[38;2;R;G;Bm`. The pre-fix
+        // parser aborted the whole CSI on `:`, so the SGR never
+        // applied, the placeholder cell's fg color was never set,
+        // and `decode_kitty_placeholder_image_id` returned None —
+        // visible as a grid of tofu instead of the image.
+        assert_eq!(
+            collect("\x1b[38:2:252:37:152m"),
+            vec![Event::Sgr(vec![38, 2, 252, 37, 152])],
+        );
+        // Mixed separators in a single sequence still work — params
+        // accumulate uniformly regardless of which delimiter was used.
+        assert_eq!(
+            collect("\x1b[38:2;252:37;152m"),
+            vec![Event::Sgr(vec![38, 2, 252, 37, 152])],
+        );
+    }
+
+    #[test]
     fn private_mode_set_and_reset() {
         assert_eq!(
             collect("\x1b[?25h\x1b[?25l"),
@@ -675,6 +726,42 @@ mod tests {
         assert_eq!(
             collect("a\x1bPjunk\x07b"),
             vec![Event::Print('a'), Event::Dcs("junk".into()), Event::Print('b')],
+        );
+    }
+
+    #[test]
+    fn dcs_doubled_esc_is_treated_as_literal_esc_in_body() {
+        // tmux passthrough convention: inside `ESC P tmux; ...ESC\\`,
+        // a literal ESC byte is doubled. The parser must un-double
+        // them rather than abort the DCS on the first internal ESC.
+        // Without this, the next dcs_esc call would clear the buf
+        // and any tmux-wrapped content would silently vanish.
+        let s = "\x1bPtmux;\x1b\x1b_Gpayload\x1b\\";
+        assert_eq!(
+            collect(s),
+            vec![Event::Dcs("tmux;\x1b_Gpayload".into())],
+        );
+    }
+
+    #[test]
+    fn dcs_unrecognized_esc_intro_still_aborts() {
+        // A solitary ESC followed by something that isn't another
+        // ESC (the tmux-escape signal) and isn't `\\` (the proper
+        // ST) is a malformed DCS — abort silently, same policy as
+        // before the tmux-passthrough change. The aborting char is
+        // consumed by the dcs_esc transition; subsequent chars land
+        // back in Ground and print as ordinary text.
+        let s = "a\x1bPbody\x1bXmore\x1b\\b";
+        assert_eq!(
+            collect(s),
+            vec![
+                Event::Print('a'),
+                Event::Print('m'),
+                Event::Print('o'),
+                Event::Print('r'),
+                Event::Print('e'),
+                Event::Print('b'),
+            ],
         );
     }
 
