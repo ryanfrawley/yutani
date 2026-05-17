@@ -3102,13 +3102,32 @@ impl Terminal {
         // here, strip it, and re-feed the body so any APC / CSI /
         // OSC inside dispatches through the normal pipeline.
         if let Some(wrapped) = s.strip_prefix("tmux;") {
-            // The wrapped body is itself a sequence of escape codes;
-            // run it back through the parser. Safe to re-enter `feed`
-            // because the outer feed's event loop already consumed
-            // the DCS event before calling us, and the parser is in
-            // Ground state at this point.
-            let owned = wrapped.to_string();
-            self.feed(&owned);
+            // The wrapped body is itself a sequence of escape codes —
+            // re-parse it through a FRESH parser. Reusing
+            // `self.parser` would inherit whatever state the outer
+            // feed's Phase 1 ended in: when the PTY hands us a chunk
+            // that splits a DCS mid-body, the outer parser is in
+            // DcsString when handle_dcs gets called (Phase 2 dispatches
+            // the prior complete DCS events first). Re-feeding the
+            // inner `ESC _G ...` into that stuck state turns the
+            // leading ESC into an unrecognized DCS escape, drops the
+            // partial accumulator, and the rest of the inner APC
+            // prints as plain text — visible as a screenful of base64
+            // gibberish from each tmux-wrapped image transmission.
+            //
+            // A throwaway parser starts in Ground every time, so
+            // re-entry is independent of whatever the outer parser is
+            // in the middle of. Inner events still dispatch through
+            // `self.dispatch`, so they hit the normal pipeline
+            // (kitty_chunks accumulator, animation state, etc.).
+            let mut inner = crate::ansi::Parser::new();
+            let mut events = Vec::new();
+            for ch in wrapped.chars() {
+                inner.feed(ch, |e| events.push(e));
+            }
+            for e in events {
+                self.dispatch(e);
+            }
             return;
         }
         let Some(rest) = s.strip_prefix("+q") else {
@@ -5290,6 +5309,40 @@ mod tests {
             crate::style::ColorSource::Indexed(1),
             "wrapped SGR must have reached apply_sgr",
         );
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_survives_pty_chunk_split_mid_next_dcs() {
+        // Regression: when a PTY chunk delivers DCS#1 in full plus
+        // the *start* of DCS#2, the outer parser ends Phase 1 in
+        // DcsString (DCS#2 is still accumulating). Phase 2 then
+        // dispatches DCS#1's event. If `handle_dcs` re-parses the
+        // inner body through `self.parser` it inherits that stuck
+        // DcsString state — the leading ESC of the inner APC turns
+        // into an unrecognized DCS escape, the partial buf is
+        // cleared, and the rest of the inner sequence is printed as
+        // text instead of dispatched as an APC. A fresh, independent
+        // parser sidesteps this entirely.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Feed DCS#1 complete + DCS#2's opener (no terminator yet).
+        // DCS#1 wraps `ESC [31m A` (set fg red, print A).
+        let chunk1 = "\x1bPtmux;\x1b\x1b[31mA\x1b\\\x1bPtmux;";
+        t.feed(chunk1);
+        // Without the fix: 'A' is never printed (the SGR + print
+        // sequence got mangled by the stuck-DcsString re-feed).
+        // With the fix: 'A' lands on the grid with red fg via the
+        // properly-dispatched inner SGR + Print.
+        let cell = t.row(0)[0];
+        assert_eq!(cell.ch, 'A', "inner Print event must dispatch even when outer parser is mid-DCS");
+        assert_eq!(
+            cell.style.color_fg_source,
+            crate::style::ColorSource::Indexed(1),
+            "inner SGR 31 must reach apply_sgr",
+        );
+        // Finish DCS#2 with a no-op body so the outer parser returns
+        // to Ground cleanly for any follow-on chunk.
+        t.feed("\x1b\\");
     }
 
     #[test]
