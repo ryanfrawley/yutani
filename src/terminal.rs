@@ -189,6 +189,38 @@ pub struct PendingImageUpload {
 /// `a=f` per-frame metadata. Carried alongside the raw frame payload
 /// from terminal.rs to main.rs to Store. Pulled into its own struct
 /// so the existing fields of `PendingImageUpload` stay focused on the
+/// One contiguous horizontal stretch of Kitty unicode-placeholder
+/// cells the renderer can draw as a single textured quad. Produced
+/// by [`Terminal::kitty_placeholder_runs`] from the active grid.
+///
+/// Each run corresponds to a strip of one row of the source image:
+/// UV.x spans `[image_col_start / total_cols, image_col_end / total_cols]`,
+/// UV.y spans `[image_row / total_rows, (image_row + 1) / total_rows]`.
+/// The `total_*` denominators come from
+/// [`Terminal::kitty_image_cell_extent`] (the `c=` / `r=` on the
+/// original transmission).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct KittyPlaceholderRun {
+    /// Kitty `i=` image id the placeholder cells encoded.
+    pub client_id: u32,
+    /// 0-based row index into the grid this run was scanned from.
+    /// The renderer shifts by `view_offset` when converting to a
+    /// viewport coordinate.
+    pub screen_row: usize,
+    /// First grid column the run covers.
+    pub screen_col_start: usize,
+    /// Exclusive end column.
+    pub screen_col_end: usize,
+    /// Image-row diacritic value shared by every cell in the run.
+    pub image_row: u16,
+    /// Image-col diacritic value of the leftmost cell.
+    pub image_col_start: u16,
+    /// Image-col diacritic value of the rightmost cell + 1. Always
+    /// `image_col_start + (screen_col_end - screen_col_start)`
+    /// because the grouping rule requires consecutive `image_col`s.
+    pub image_col_end: u16,
+}
+
 /// base-image case.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KittyAnimationFrameSpec {
@@ -594,6 +626,17 @@ pub struct Terminal {
     // Populated whenever a Kitty transmission with a client id
     // finalizes; cleared on `a=d` selectors that drop the image.
     kitty_image_formats: std::collections::HashMap<u32, KittyFormat>,
+    // Image's total cell extent `(cols, rows)` from the original
+    // `a=T` / `a=t` transmission's `c=` / `r=` parameters. Used by
+    // the renderer's per-run draw path as the UV denominator: a
+    // placeholder cell at `(image_row, image_col)` shows the sub-rect
+    // `(image_col/cols, image_row/rows)` to `((image_col+1)/cols,
+    // (image_row+1)/rows)` of the source texture. Without this,
+    // partial overwrites of a placeholder grid would distort the
+    // image (the surviving cells would stretch the whole image into
+    // a shrinking bbox). Cleared on the same `a=d` selectors as
+    // `kitty_image_ids` / `kitty_image_formats`.
+    kitty_image_cell_extents: std::collections::HashMap<u32, (u32, u32)>,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -676,6 +719,7 @@ impl Terminal {
             current_chunked_id: None,
             kitty_image_ids: std::collections::HashMap::new(),
             kitty_image_formats: std::collections::HashMap::new(),
+            kitty_image_cell_extents: std::collections::HashMap::new(),
             cell_w_px: 1,
             line_h_px: 1,
             placeholder_decode: None,
@@ -819,49 +863,91 @@ impl Terminal {
         self.kitty_image_ids.get(&client_id).copied()
     }
 
-    /// Scan the active grid for Kitty virtual-placement cells (U+10EEEE
-    /// with an encoded image id) and return one bounding box per
-    /// distinct image id. The renderer draws each image into its box,
-    /// reusing the existing image-pipeline path.
+    /// Total cell extent `(cols, rows)` from the original `a=T` / `a=t`
+    /// transmission's `c=` / `r=`. The per-run placeholder renderer
+    /// uses these as UV denominators. Returns `None` for ids whose
+    /// transmission omitted one or both of `c=` / `r=` (the renderer
+    /// must then skip the runs — without the denominator there's no
+    /// honest UV).
+    pub fn kitty_image_cell_extent(&self, client_id: u32) -> Option<(u32, u32)> {
+        self.kitty_image_cell_extents.get(&client_id).copied()
+    }
+
+    /// Scan the active grid for Kitty virtual-placement cells
+    /// (`U+10EEEE` with an encoded image id) and emit one run per
+    /// contiguous horizontal stretch that the renderer can draw as a
+    /// single quad with a correct UV sub-rect.
     ///
-    /// MVP simplification: cells encoding the same image id are merged
-    /// into a single bounding box. Real Kitty uses diacritics on the
-    /// placeholder char to position sub-tiles within an image; we don't
-    /// decode those yet, so multiple instances of the same image render
-    /// as one merged rect. Works for the common nvim `image.nvim` /
-    /// `snacks.image` pattern of one image per id.
+    /// A run extends a previous cell when ALL of these hold:
+    ///   - same screen row
+    ///   - same `client_id`
+    ///   - same `image_row` diacritic value
+    ///   - `image_col == prev.image_col + 1`
     ///
-    /// Returns `(client_image_id, top_row, left_col, rows, cols)`.
-    pub fn kitty_placeholder_bboxes(&self) -> Vec<(u32, isize, isize, u16, u16)> {
-        use std::collections::HashMap;
-        // Per-image: min/max row/col observed.
-        let mut bboxes: HashMap<u32, (isize, isize, isize, isize)> = HashMap::new();
+    /// Any other transition (non-placeholder cell, id change, row
+    /// change, image_col gap) starts a new run.
+    ///
+    /// This lets the renderer draw each surviving stretch with its
+    /// correct slice of the source image, so partial overwrites
+    /// (e.g. tmux scrolling new output over the top rows of an
+    /// image) visibly clip instead of distorting. The previous
+    /// merged-bbox approach stretched whatever image we had into
+    /// whatever bbox survived — fine for an undisturbed grid, bad
+    /// for anything else.
+    ///
+    /// Grouping happens per screen row only — vertical run-length
+    /// compression would require the renderer to know that adjacent
+    /// rows belong to the same image, which the bbox path got wrong
+    /// (the merge swallowed valid sub-rect boundaries). Per-row is
+    /// the smallest useful unit: a 29×15 image collapses to 15
+    /// quads per frame, well under the renderer's per-call cost.
+    pub fn kitty_placeholder_runs(&self) -> Vec<KittyPlaceholderRun> {
+        let mut runs: Vec<KittyPlaceholderRun> = Vec::new();
         let grid = self.active_grid();
         for r in 0..grid.rows {
+            let mut current: Option<KittyPlaceholderRun> = None;
             for c in 0..grid.cols {
                 let cell = grid.get(r, c);
-                let Some(id) = cell.placeholder_image_id else { continue };
-                let r = r as isize;
-                let c = c as isize;
-                bboxes
-                    .entry(id)
-                    .and_modify(|b| {
-                        if r < b.0 { b.0 = r; }
-                        if c < b.1 { b.1 = c; }
-                        if r > b.2 { b.2 = r; }
-                        if c > b.3 { b.3 = c; }
-                    })
-                    .or_insert((r, c, r, c));
+                let Some(id) = cell.placeholder_image_id else {
+                    if let Some(run) = current.take() {
+                        runs.push(run);
+                    }
+                    continue;
+                };
+                let image_row = cell.placeholder_image_row;
+                let image_col = cell.placeholder_image_col;
+                match current.as_mut() {
+                    Some(open)
+                        if open.client_id == id
+                            && open.image_row == image_row
+                            && open.image_col_end == image_col
+                            && open.screen_col_end == c =>
+                    {
+                        // Extend.
+                        open.screen_col_end = c + 1;
+                        open.image_col_end = image_col.saturating_add(1);
+                    }
+                    _ => {
+                        if let Some(run) = current.take() {
+                            runs.push(run);
+                        }
+                        current = Some(KittyPlaceholderRun {
+                            client_id: id,
+                            screen_row: r,
+                            screen_col_start: c,
+                            screen_col_end: c + 1,
+                            image_row,
+                            image_col_start: image_col,
+                            image_col_end: image_col.saturating_add(1),
+                        });
+                    }
+                }
+            }
+            if let Some(run) = current.take() {
+                runs.push(run);
             }
         }
-        bboxes
-            .into_iter()
-            .map(|(id, (top, left, bottom, right))| {
-                let rows = (bottom - top + 1) as u16;
-                let cols = (right - left + 1) as u16;
-                (id, top, left, rows, cols)
-            })
-            .collect()
+        runs
     }
 
     /// Remove every placement that references `image_id`, across both
@@ -2583,6 +2669,7 @@ impl Terminal {
                     .retain(|sp| sp.placement.kitty_image_id.is_none());
                 self.kitty_image_ids.clear();
                 self.kitty_image_formats.clear();
+                self.kitty_image_cell_extents.clear();
             }
             KittyDeleteSelector::Image => {
                 let Some(client_id) = ctrl.image_id else { return };
@@ -2590,6 +2677,7 @@ impl Terminal {
                 self.remove_placements_with_image(image_id);
                 self.kitty_image_ids.remove(&client_id);
                 self.kitty_image_formats.remove(&client_id);
+                self.kitty_image_cell_extents.remove(&client_id);
             }
             KittyDeleteSelector::Placement => {
                 let Some(pid) = ctrl.placement_id else { return };
@@ -2889,6 +2977,13 @@ impl Terminal {
         // GIFs, since the app already decoded once.
         if let Some(id) = kitty_image_id {
             self.kitty_image_formats.insert(id, source_format);
+            // Cache the image's total cell extent so the per-run
+            // placeholder renderer can compute UVs against it. Only
+            // record when BOTH dimensions are present — partial
+            // values can't define a tiling.
+            if let (Some(c), Some(r)) = (cells_cols, cells_rows) {
+                self.kitty_image_cell_extents.insert(id, (c, r));
+            }
         }
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
         // falling back to Auto (image's native cell extent) when not.
@@ -7611,47 +7706,230 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_bbox_spans_consecutive_cells() {
-        // Print a 3-col × 2-row block of placeholders all encoding
-        // the same image id. The bbox covers exactly those cells.
+    fn placeholder_runs_single_full_row_collapses_to_one_run() {
+        // Five placeholder cells in one screen row, each with the
+        // same image_row (0) and consecutive image_col (0..5) — the
+        // shape a normal `kitten icat` tiling produces. One run.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(7));
-        // Row 2, cols 5..8.
-        t.feed("\x1b[3;6H"); // CUP row 3 col 6 (1-based) → (2, 5) 0-based
-        t.feed("\u{10EEEE}\u{10EEEE}\u{10EEEE}");
-        // Row 3, cols 5..8.
-        t.feed("\x1b[4;6H");
-        t.feed("\u{10EEEE}\u{10EEEE}\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 1);
-        let (id, top, left, rows, cols) = bboxes[0];
-        assert_eq!(id, 7);
-        assert_eq!((top, left), (2, 5));
-        assert_eq!((rows, cols), (2, 3));
+        t.feed("\x1b[3;6H"); // row 2 (0-based), col 5 (0-based)
+        for col in 0..5u32 {
+            let col_dia = KITTY_PLACEHOLDER_DIACRITICS[col as usize];
+            t.feed("\u{10EEEE}\u{0305}"); // row diacritic = index 0
+            let mut s = String::new();
+            s.push(col_dia);
+            t.feed(&s);
+        }
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1);
+        let r = &runs[0];
+        assert_eq!(r.client_id, 7);
+        assert_eq!(r.screen_row, 2);
+        assert_eq!((r.screen_col_start, r.screen_col_end), (5, 10));
+        assert_eq!(r.image_row, 0);
+        assert_eq!((r.image_col_start, r.image_col_end), (0, 5));
     }
 
     #[test]
-    fn placeholder_bbox_two_distinct_image_ids_produce_two_boxes() {
+    fn placeholder_runs_multi_row_block_emits_one_run_per_screen_row() {
+        // 3×2 grid of placeholders. Each screen row carries a
+        // different image_row diacritic. Output: 2 runs (one per
+        // screen row), each 3 cells wide.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        let row0 = KITTY_PLACEHOLDER_DIACRITICS[0]; // image_row = 0
+        let row1 = KITTY_PLACEHOLDER_DIACRITICS[1]; // image_row = 1
+        // Screen row 2.
+        t.feed("\x1b[3;6H");
+        for col in 0..3u32 {
+            let col_dia = KITTY_PLACEHOLDER_DIACRITICS[col as usize];
+            t.feed("\u{10EEEE}");
+            let mut s = String::new();
+            s.push(row0);
+            s.push(col_dia);
+            t.feed(&s);
+        }
+        // Screen row 3.
+        t.feed("\x1b[4;6H");
+        for col in 0..3u32 {
+            let col_dia = KITTY_PLACEHOLDER_DIACRITICS[col as usize];
+            t.feed("\u{10EEEE}");
+            let mut s = String::new();
+            s.push(row1);
+            s.push(col_dia);
+            t.feed(&s);
+        }
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2, "one run per screen row");
+        assert_eq!(runs[0].screen_row, 2);
+        assert_eq!(runs[0].image_row, 0);
+        assert_eq!(runs[1].screen_row, 3);
+        assert_eq!(runs[1].image_row, 1);
+    }
+
+    #[test]
+    fn placeholder_runs_two_distinct_image_ids_produce_two_runs() {
+        // Adjacent cells encoding different ids must not merge.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(7));
         t.feed("\x1b[1;1H");
-        t.feed("\u{10EEEE}\u{10EEEE}");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // id=7, row=0, col=0
+        t.feed("\u{10EEEE}\u{0305}\u{030D}"); // id=7, row=0, col=1
         t.feed(&placeholder_sgr_fg(9));
-        t.feed("\x1b[5;10H");
-        t.feed("\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 2);
-        let by_id: std::collections::HashMap<u32, (isize, isize, u16, u16)> =
-            bboxes.into_iter().map(|(id, t, l, r, c)| (id, (t, l, r, c))).collect();
-        assert_eq!(by_id[&7], (0, 0, 1, 2));
-        assert_eq!(by_id[&9], (4, 9, 1, 1));
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // id=9, row=0, col=0
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].client_id, 7);
+        assert_eq!((runs[0].screen_col_start, runs[0].screen_col_end), (0, 2));
+        assert_eq!(runs[1].client_id, 9);
+        assert_eq!((runs[1].screen_col_start, runs[1].screen_col_end), (2, 3));
     }
 
     #[test]
-    fn placeholder_bbox_empty_when_no_placeholders() {
+    fn placeholder_runs_break_on_image_col_gap() {
+        // Cells at image_col 0, 1, then 3 (skipping 2) must split
+        // into two runs. Otherwise the renderer would stretch
+        // image_col 0..2 over a 3-cell span and skip image_col 2.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        let col0 = KITTY_PLACEHOLDER_DIACRITICS[0];
+        let col1 = KITTY_PLACEHOLDER_DIACRITICS[1];
+        let col3 = KITTY_PLACEHOLDER_DIACRITICS[3];
+        for col in [col0, col1, col3] {
+            t.feed("\u{10EEEE}");
+            let mut s = String::new();
+            s.push(KITTY_PLACEHOLDER_DIACRITICS[0]); // image_row = 0
+            s.push(col);
+            t.feed(&s);
+        }
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].image_col_start, runs[0].image_col_end), (0, 2));
+        assert_eq!((runs[1].image_col_start, runs[1].image_col_end), (3, 4));
+    }
+
+    #[test]
+    fn placeholder_runs_break_on_image_row_change_within_screen_row() {
+        // Adjacent cells with different image_row diacritics start
+        // separate runs. (Pathological — an encoder doesn't normally
+        // do this — but it pins the contract.)
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // row 0
+        t.feed("\u{10EEEE}\u{030D}\u{030D}"); // row 1
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].image_row, 0);
+        assert_eq!(runs[1].image_row, 1);
+    }
+
+    #[test]
+    fn placeholder_runs_break_on_non_placeholder_cell() {
+        // A plain character cell between placeholders splits the
+        // run. The renderer should draw the left and right halves
+        // as separate quads (each with the correct UV slice) so
+        // the text shows through the gap.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}"); // col 0
+        t.feed("\x1b[39mX"); // plain glyph
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\u{10EEEE}\u{0305}\u{030E}"); // col 2
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].screen_col_start, runs[0].screen_col_end), (0, 1));
+        assert_eq!((runs[1].screen_col_start, runs[1].screen_col_end), (2, 3));
+    }
+
+    #[test]
+    fn placeholder_runs_empty_when_no_placeholders() {
         let mut t = Terminal::new(80, 24, 100);
         t.feed("hello world");
-        assert!(t.kitty_placeholder_bboxes().is_empty());
+        assert!(t.kitty_placeholder_runs().is_empty());
+    }
+
+    #[test]
+    fn placeholder_runs_partial_overwrite_shows_remainder_at_original_scale() {
+        // The regression that motivates this whole shape: a 3-cell
+        // run gets its first cell overwritten by ordinary text.
+        // The remaining 2 cells still encode `image_col` 1..3, so
+        // the renderer draws the right two-thirds of the image
+        // (against the original `c=3` denominator) — NOT the whole
+        // image stretched into a 2-cell rect. This test only proves
+        // the data is preserved; the UV math lives in main.rs.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(7));
+        t.feed("\x1b[1;1H");
+        for col in 0..3u32 {
+            let col_dia = KITTY_PLACEHOLDER_DIACRITICS[col as usize];
+            t.feed("\u{10EEEE}\u{0305}"); // image_row 0
+            let mut s = String::new();
+            s.push(col_dia);
+            t.feed(&s);
+        }
+        // Overwrite the first cell with a regular character.
+        t.feed("\x1b[1;1H");
+        t.feed("\x1b[39mX");
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1, "surviving cells form one contiguous run");
+        let r = &runs[0];
+        assert_eq!((r.screen_col_start, r.screen_col_end), (1, 3));
+        assert_eq!(
+            (r.image_col_start, r.image_col_end),
+            (1, 3),
+            "image-col data preserved so the UV samples the right portion",
+        );
+    }
+
+    #[test]
+    fn kitty_image_cell_extent_recorded_on_a_T_U1_finalize() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,U=1,f=100,c=29,r=15,i=43", &png));
+        // Drain the upload (irrelevant); the side-effect we care
+        // about is the cached extent.
+        let _ = t.take_pending_image_uploads();
+        assert_eq!(t.kitty_image_cell_extent(43), Some((29, 15)));
+    }
+
+    #[test]
+    fn kitty_image_cell_extent_missing_when_c_or_r_omitted() {
+        // Without both `c=` and `r=` we can't define a tiling and
+        // the renderer would have no UV denominator — record None.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,U=1,f=100,c=29,i=44", &png));
+        let _ = t.take_pending_image_uploads();
+        assert_eq!(t.kitty_image_cell_extent(44), None);
+    }
+
+    #[test]
+    fn kitty_image_cell_extent_cleared_on_a_d_i() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,U=1,f=100,c=29,r=15,i=43", &png));
+        let _ = t.take_pending_image_uploads();
+        t.register_kitty_image_id(43, ImageId(1));
+        assert_eq!(t.kitty_image_cell_extent(43), Some((29, 15)));
+        t.feed(&kitty_apc_control_only("a=d,d=i,i=43"));
+        assert_eq!(t.kitty_image_cell_extent(43), None);
+    }
+
+    #[test]
+    fn kitty_image_cell_extent_cleared_on_a_d_a() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        t.feed(&kitty_apc("a=T,U=1,f=100,c=29,r=15,i=43", &png));
+        let _ = t.take_pending_image_uploads();
+        t.feed(&kitty_apc_control_only("a=d,d=a"));
+        assert_eq!(t.kitty_image_cell_extent(43), None);
     }
 
     #[test]
@@ -7946,16 +8224,17 @@ mod tests {
     #[test]
     fn placeholder_cells_scroll_with_grid() {
         // Placeholders ARE just cells — they move with scroll exactly
-        // like any other content. After SU 1, our row=2 placeholder
-        // appears at row 1.
+        // like any other content. After SU 1, our row=2 placeholders
+        // appear at row 1.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(42));
         t.feed("\x1b[3;1H"); // row 2 (0-based)
-        t.feed("\u{10EEEE}\u{10EEEE}");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        t.feed("\u{10EEEE}\u{0305}\u{030D}");
         t.feed("\x1b[1S"); // SU 1
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 1);
-        assert_eq!(bboxes[0].1, 1); // top row shifted from 2 → 1
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].screen_row, 1, "row shifted from 2 → 1");
     }
 
     //
@@ -9496,89 +9775,86 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_bbox_single_cell_has_extent_one_by_one() {
-        // One placeholder cell → bbox of (1, 1). Boundary check for the
-        // bottom-top+1 / right-left+1 math.
+    fn placeholder_runs_single_cell_has_extent_one() {
+        // One placeholder cell at (4, 4) → one run with one-cell
+        // extent. Boundary check for the end = start + 1 math.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(123));
         t.feed("\x1b[5;5H"); // row 4 col 4 (0-based)
-        t.feed("\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 1);
-        assert_eq!(bboxes[0], (123, 4, 4, 1, 1));
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1);
+        let r = &runs[0];
+        assert_eq!(r.client_id, 123);
+        assert_eq!(r.screen_row, 4);
+        assert_eq!((r.screen_col_start, r.screen_col_end), (4, 5));
+        assert_eq!((r.image_col_start, r.image_col_end), (0, 1));
     }
 
     #[test]
-    fn placeholder_bbox_at_origin_handles_zero_indices() {
-        // Placeholder at row 0 col 0 — the bbox math uses isize so
-        // negatives are possible; pin that 0 doesn't underflow.
+    fn placeholder_runs_at_origin_handles_zero_indices() {
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(5));
-        t.feed("\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes, vec![(5, 0, 0, 1, 1)]);
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].screen_row, 0);
+        assert_eq!(runs[0].screen_col_start, 0);
     }
 
     #[test]
-    fn placeholder_bbox_scan_respects_active_grid_alt_screen() {
-        // Placeholders on the primary screen must not appear in the
-        // bbox scan after switching to the alt grid. active_grid()
-        // routing is the only thing keeping this honest.
+    fn placeholder_runs_scan_respects_active_grid_alt_screen() {
+        // Placeholders on the primary screen must not appear in
+        // the scan after switching to the alt grid.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(11));
-        t.feed("\u{10EEEE}");
-        assert_eq!(t.kitty_placeholder_bboxes().len(), 1);
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        assert_eq!(t.kitty_placeholder_runs().len(), 1);
         t.feed("\x1b[?1049h"); // enter alt screen — fresh empty grid
         assert!(
-            t.kitty_placeholder_bboxes().is_empty(),
-            "primary placeholders must not bleed into alt bbox scan"
+            t.kitty_placeholder_runs().is_empty(),
+            "primary placeholders must not bleed into alt scan",
         );
         // And primary's still intact after returning.
         t.feed("\x1b[?1049l");
-        assert_eq!(t.kitty_placeholder_bboxes().len(), 1);
+        assert_eq!(t.kitty_placeholder_runs().len(), 1);
     }
 
     #[test]
-    fn placeholder_bbox_sparse_pattern_covers_outer_rect_as_one() {
-        // MVP limitation: same-id placeholders separated by non-placeholder
-        // cells still produce a single bbox spanning min..max on both axes.
-        // Pins this so a future per-tile-decoding upgrade is a deliberate
-        // contract change.
+    fn placeholder_runs_same_id_with_gap_produces_two_runs() {
+        // Same-id placeholders separated by non-placeholder cells
+        // must produce TWO runs, NOT one merged bbox. The previous
+        // bbox API merged them into one stretched rect — exactly
+        // the distortion the per-cell rendering was designed to
+        // fix.
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(42));
         t.feed("\x1b[1;1H");
-        t.feed("\u{10EEEE}");
-        // Gap cell with non-placeholder content.
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        // Gap cell with non-placeholder content somewhere later.
         t.feed("\x1b[3;5Hx");
         // Another placeholder of the same id.
         t.feed(&placeholder_sgr_fg(42));
         t.feed("\x1b[5;10H");
-        t.feed("\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        assert_eq!(bboxes.len(), 1, "sparse same-id placeholders → one merged bbox");
-        // Spans rows 0..=4 and cols 0..=9.
-        assert_eq!(bboxes[0], (42, 0, 0, 5, 10));
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 2, "disjoint same-id placeholders → two runs");
     }
 
     #[test]
-    fn placeholder_bbox_zero_id_cells_excluded_from_scan() {
-        // (0,0,0) fg encodes id 0 which decode_kitty_placeholder_image_id
-        // treats as the "no id" sentinel — those cells must NOT produce a
-        // bbox. Pair with a real placeholder elsewhere to verify the
-        // scan still finds the real one.
+    fn placeholder_runs_zero_id_cells_excluded_from_scan() {
+        // (0,0,0) fg encodes id 0, which is the "no id" sentinel.
+        // Those cells must NOT appear in any run.
         let mut t = Terminal::new(80, 24, 100);
-        // Real placeholder at (0,0) with id 7.
         t.feed(&placeholder_sgr_fg(7));
-        t.feed("\u{10EEEE}");
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
         // Sentinel placeholder at (2,3) with rgb(0,0,0).
         t.feed("\x1b[3;4H");
         t.feed("\x1b[38;2;0;0;0m");
-        t.feed("\u{10EEEE}");
-        let bboxes = t.kitty_placeholder_bboxes();
-        // Only the real id-7 placeholder should appear; the sentinel
-        // doesn't produce a (id=0, …) entry and doesn't extend id 7's box.
-        assert_eq!(bboxes.len(), 1);
-        assert_eq!(bboxes[0], (7, 0, 0, 1, 1));
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        let runs = t.kitty_placeholder_runs();
+        assert_eq!(runs.len(), 1, "only the id=7 placeholder appears");
+        assert_eq!(runs[0].client_id, 7);
     }
 
     #[test]

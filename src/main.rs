@@ -3718,6 +3718,30 @@ impl State {
         top_row + view_offset as isize
     }
 
+    /// Compute the UV sub-rect for one Kitty placeholder run against
+    /// the source image's total cell extent `(total_cols, total_rows)`.
+    /// Clamps to `[0.0, 1.0]` so a malformed encoder (or a placeholder
+    /// grid that survives a smaller-than-original re-transmission)
+    /// samples the edge instead of wrapping or sampling outside the
+    /// texture. `total_cols` / `total_rows` are clamped to `>= 1`
+    /// since they're the denominator — a 0 here would NaN every UV.
+    /// Returns `(u0, v0, u1, v1)`.
+    fn placeholder_run_uv(
+        image_col_start: u16,
+        image_col_end: u16,
+        image_row: u16,
+        total_cols: u32,
+        total_rows: u32,
+    ) -> (f32, f32, f32, f32) {
+        let denom_cols = total_cols.max(1) as f32;
+        let denom_rows = total_rows.max(1) as f32;
+        let u0 = (image_col_start as f32 / denom_cols).clamp(0.0, 1.0);
+        let u1 = (image_col_end as f32 / denom_cols).clamp(0.0, 1.0);
+        let v0 = (image_row as f32 / denom_rows).clamp(0.0, 1.0);
+        let v1 = ((image_row as f32 + 1.0) / denom_rows).clamp(0.0, 1.0);
+        (u0, v0, u1, v1)
+    }
+
     /// Build the per-cell half-block override map for the upcoming vertex
     /// rebuild. Empty in the common case (images enabled and decoded), so
     /// the lookup in the cell loop is a single hash miss per cell.
@@ -4472,34 +4496,54 @@ impl State {
                 });
             }
 
-            // Kitty virtual placements (U+10EEEE cells). Each distinct
-            // image id encoded across placeholder cells produces one
-            // bounding-box draw. Grid → viewport shift mirrors live
-            // placements; scrollback bboxes aren't computed yet (the
-            // scan is on the active grid only).
-            for (client_id, top, left, prows, pcols) in
-                self.terminal.kitty_placeholder_bboxes()
-            {
-                let Some(store_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+            // Kitty virtual placements (U+10EEEE cells). Each run is
+            // one horizontal stretch of one source-image row,
+            // produced by the per-cell scan in
+            // `Terminal::kitty_placeholder_runs`. Drawing per-run
+            // (instead of one stretched quad over the merged bbox)
+            // means a partial overwrite of the placeholder grid —
+            // tmux scrolling new output across the top, a tear-down
+            // halfway through the image — visibly clips at the
+            // surviving cells instead of distorting the image into
+            // whatever shrinking rect remained.
+            for run in self.terminal.kitty_placeholder_runs() {
+                let Some(store_id) = self.terminal.kitty_image_id_lookup(run.client_id)
+                else {
+                    continue;
+                };
+                let Some((total_cols, total_rows)) =
+                    self.terminal.kitty_image_cell_extent(run.client_id)
+                else {
+                    // No `c=`/`r=` on the transmission — no honest
+                    // UV denominator. Skip rather than guess.
                     continue;
                 };
                 let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
-                let viewport_row =
-                    Self::live_placement_viewport_row(top, view_offset, rows);
-                let x_px = WINDOW_PADDING + (left as f32) * cell_w;
+                let viewport_row = Self::live_placement_viewport_row(
+                    run.screen_row as isize, view_offset, rows,
+                );
+                let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
+                let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
                 let y_px = WINDOW_PADDING
                     + decorator_offset
                     + (viewport_row as f32) * line_height
                     + scroll_y;
-                let w_px = (pcols as f32) * cell_w;
-                let h_px = (prows as f32) * line_height;
+                let w_px = cells_wide * cell_w;
+                let h_px = line_height;
+                let uv = Self::placeholder_run_uv(
+                    run.image_col_start,
+                    run.image_col_end,
+                    run.image_row,
+                    total_cols,
+                    total_rows,
+                );
                 image_draws.push(renderer::images::ImageDraw {
                     image: gpu_img,
                     x_px,
                     y_px,
                     w_px,
                     h_px,
-                    uv_rect: None,
+                    uv_rect: Some(uv),
                 });
             }
         }
@@ -5810,6 +5854,45 @@ mod tests {
         // Sanity: at view_offset <= rows, behavior is unchanged from
         // the pre-clamp version.
         assert_eq!(State::live_placement_viewport_row(5, 20, 24), 25);
+    }
+
+    //
+    // Per-run UV math for Kitty placeholder draws.
+    //
+
+    #[test]
+    fn placeholder_run_uv_full_row_spans_full_width_one_row_height() {
+        // 3 cells wide, image_row 0, total (3, 2) →
+        //   u: 0..3/3 = 0..1
+        //   v: 0..1/2 = 0..0.5
+        let uv = State::placeholder_run_uv(0, 3, 0, 3, 2);
+        assert_eq!(uv, (0.0, 0.0, 1.0, 0.5));
+    }
+
+    #[test]
+    fn placeholder_run_uv_partial_row_samples_proper_strip() {
+        // Cells image_col 1..3 of a 4-col tile, image_row 1 of 2
+        // rows → upper-left at (0.25, 0.5), lower-right at (0.75, 1.0).
+        let uv = State::placeholder_run_uv(1, 3, 1, 4, 2);
+        assert_eq!(uv, (0.25, 0.5, 0.75, 1.0));
+    }
+
+    #[test]
+    fn placeholder_run_uv_clamps_out_of_range_to_unit_square() {
+        // image_col_end past the right edge, image_row past the
+        // bottom — both clamp to 1.0 rather than wrap or NaN.
+        let uv = State::placeholder_run_uv(5, 10, 7, 4, 2);
+        assert_eq!(uv, (1.0, 1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn placeholder_run_uv_zero_total_dims_treated_as_one() {
+        // A `c=0` / `r=0` transmission shouldn't reach this helper
+        // (the renderer skips runs without a recorded extent), but
+        // guard the denominator so we never NaN. With cols=0 →
+        // denom 1, image_col_end=0 → u1=0.0 clamped from 0 itself.
+        let uv = State::placeholder_run_uv(0, 0, 0, 0, 0);
+        assert_eq!(uv, (0.0, 0.0, 0.0, 1.0));
     }
 
     #[test]
