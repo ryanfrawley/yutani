@@ -87,6 +87,32 @@ fn scheme_path(name: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{}.yaml", name)))
 }
 
+/// Byte size of the grid's vertex and index buffers for a viewport of
+/// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
+/// truth so the `State::new` and `resize_buffers` paths can't drift.
+///
+/// Capacity model: each cell emits two quads (background + glyph), so
+/// `area = cols * rows` cells contribute `2 * area` quads. The slack
+/// term covers the per-row content the renderer emits *outside* the
+/// visible grid — `update_vertices` walks `r_lo..r_hi` where
+/// `r_lo = -2, r_hi = rows + 2`, i.e. two phantom rows top + two
+/// bottom. Each phantom row contributes up to `cols` cells × 2 quads
+/// each, so the total phantom-row contribution is `4 * cols * 2 = 8 *
+/// cols` quads worth of vertices. The `+5` covers the cursor quad
+/// plus a handful of edge-fade and decorator overlays.
+///
+/// Expressed as `2 * (area + extra_quads)` where
+/// `extra_quads = 4 * cols + 5` — i.e. one phantom-row strip per side
+/// plus the fixed extras, doubled to cover both top and bottom strips.
+fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
+    let area = cols * rows;
+    let extra_quads = 4 * cols + 5;
+    let quads = 2 * area + 2 * extra_quads;
+    let vertex_bytes = quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
+    let index_bytes = quads * std::mem::size_of::<u16>() * 6;
+    (vertex_bytes, index_bytes)
+}
+
 #[derive(Clone)]
 struct Config {
     font_size: f32,
@@ -1509,25 +1535,21 @@ impl State {
         // Each cell contributes two quads (background + glyph) = 8 verts.
         // Slack covers four phantom rows (two top + two bottom) used during
         // smooth scrolling, the cursor quad, and the two edge-fade quads.
-        let area = viewport.char_height * viewport.char_width;
-        let extra_quads = 4 * viewport.char_width + 5;
-        let mut vertex_buf: Vec<u8> = Vec::with_capacity(
-            (2 * area + 2 * extra_quads) * std::mem::size_of::<renderer::vertex::Vertex>() * 4,
-        );
-        for _ in 0..vertex_buf.capacity() {
-            vertex_buf.push(0);
-        }
+        // The exact formula lives in `grid_buffer_byte_sizes` so the init
+        // and resize paths can't drift apart (which they did — pre-fix the
+        // resize path allocated half the slack, and the next time
+        // `update_vertices` ran near a scroll edge, `queue.write_buffer`
+        // panicked with a "Copy ... would end up overrunning" validation
+        // error).
+        let (vbuf_bytes, ibuf_bytes) =
+            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
+        let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
             contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
-        let mut index_buf: Vec<u8> = Vec::with_capacity(
-            (2 * area + 2 * extra_quads) * std::mem::size_of::<u16>() * 6,
-        );
-        for _ in 0..index_buf.capacity() {
-            index_buf.push(0);
-        }
+        let index_buf: Vec<u8> = vec![0; ibuf_bytes];
         let index_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("index buffer"),
             contents: &bytemuck::cast_slice(&index_buf),
@@ -1808,15 +1830,9 @@ impl State {
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         println!("w: {} h: {}", viewport.char_width, viewport.char_height);
-        let extra_quads = 4 * viewport.char_width + 5;
-        let mut vertex_buf: Vec<u8> = Vec::with_capacity(
-            (2 * viewport.char_height * viewport.char_width + extra_quads)
-                * std::mem::size_of::<renderer::vertex::Vertex>()
-                * 4,
-        );
-        for _ in 0..vertex_buf.capacity() {
-            vertex_buf.push(0);
-        }
+        let (vbuf_bytes, ibuf_bytes) =
+            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
+        let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         self.vertex_buffer =
             self.gpu
                 .device
@@ -1825,12 +1841,7 @@ impl State {
                     contents: &bytemuck::cast_slice(&vertex_buf),
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
-        let mut index_buf: Vec<u8> = Vec::with_capacity(
-            (2 * viewport.char_height * viewport.char_width + extra_quads) * std::mem::size_of::<u16>() * 6,
-        );
-        for _ in 0..index_buf.capacity() {
-            index_buf.push(0);
-        }
+        let index_buf: Vec<u8> = vec![0; ibuf_bytes];
         self.index_buffer =
             self.gpu
                 .device
@@ -5294,6 +5305,47 @@ mod tests {
 
     fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
         approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    #[test]
+    fn grid_buffer_byte_sizes_uses_full_phantom_row_slack() {
+        // Pin the exact byte counts so a future "let me halve the
+        // slack to save memory" tweak surfaces as a unit test failure
+        // rather than a hard-to-reproduce wgpu validation panic at
+        // scroll time. The buffer must cover `update_vertices`'s walk
+        // over `r_lo..r_hi = -2..rows+2` — two phantom strips top +
+        // two bottom, plus the cursor and edge-fade extras.
+        let cols = 98;
+        let rows = 35;
+        let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows);
+        let extra_quads = 4 * cols + 5;
+        let area = cols * rows;
+        let quads = 2 * area + 2 * extra_quads;
+        let v = std::mem::size_of::<renderer::vertex::Vertex>();
+        assert_eq!(vbuf, quads * v * 4);
+        assert_eq!(ibuf, quads * std::mem::size_of::<u16>() * 6);
+    }
+
+    #[test]
+    fn grid_buffer_byte_sizes_covers_full_update_vertices_walk() {
+        // Symbolic upper bound on what `update_vertices` can push:
+        // the row loop covers `rows + 4` rows (two phantom strips on
+        // each side) × `cols` cells × 2 quads (bg + glyph) per cell,
+        // plus a cursor quad and two edge-fade quads. The vertex
+        // buffer must fit at least this many vertices, otherwise
+        // `queue.write_buffer` overruns at scroll time.
+        for (cols, rows) in [(80, 24), (98, 35), (200, 60), (32, 8)] {
+            let (vbuf, _) = grid_buffer_byte_sizes(cols, rows);
+            let worst_case_quads = (rows + 4) * cols * 2 + 3;
+            let worst_case_bytes =
+                worst_case_quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
+            assert!(
+                vbuf >= worst_case_bytes,
+                "grid_buffer_byte_sizes({cols}, {rows}) = {vbuf} bytes; \
+                 needs at least {worst_case_bytes} to cover the worst-case \
+                 walk through `update_vertices`",
+            );
+        }
     }
 
     #[test]
