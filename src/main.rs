@@ -3528,15 +3528,27 @@ impl State {
 
     /// Convert a live placement's grid-coord `top_row` into the viewport
     /// row the renderer should draw at, given the current scrollback
-    /// view offset. Mirrors what `extended_cell` does for cells: when the
-    /// user has pulled `view_offset` rows of history into the top of the
-    /// viewport, live content shifts down by `min(view_offset, rows)`.
+    /// view offset. Mirrors what `extended_cell` does for cells: live
+    /// row R lands at viewport row `R + view_offset`. The shift is
+    /// uncapped — `view_offset > rows` is still meaningful because
+    /// smooth-scroll's `scroll_y` interpolates between view_offset
+    /// ticks. Clamping at `rows` here makes the discrete viewport_row
+    /// stop moving past the bottom while scroll_y keeps advancing,
+    /// which produces a visible snap each time scroll_y crosses a
+    /// line boundary (the image slides a row visually via scroll_y,
+    /// then jumps back when the tick fires because viewport_row
+    /// didn't move).
     ///
     /// Scrollback placements come pre-shifted out of
-    /// `Terminal::scrollback_placements_in_view`, so this helper applies
-    /// only to live placements.
-    fn live_placement_viewport_row(top_row: isize, view_offset: usize, rows: usize) -> isize {
-        top_row + view_offset.min(rows) as isize
+    /// `Terminal::scrollback_placements_in_view`, so this helper
+    /// applies only to live placements. Off-screen draws are
+    /// naturally clipped by the rasterizer; passing a viewport_row
+    /// well past `rows` costs only the vertex buffer write.
+    ///
+    /// `rows` is kept on the signature so call sites don't change
+    /// shape if a future clamp becomes desirable.
+    fn live_placement_viewport_row(top_row: isize, view_offset: usize, _rows: usize) -> isize {
+        top_row + view_offset as isize
     }
 
     /// Build the per-cell half-block override map for the upcoming vertex
@@ -5440,12 +5452,20 @@ mod tests {
     }
 
     #[test]
-    fn live_placement_viewport_row_clamps_at_rows() {
-        // When `view_offset` exceeds the viewport height, the entire
-        // viewport is scrollback and live content is fully off-screen
-        // below. The shift saturates at `rows`, matching the cap
-        // `cursor_visual_row` and the cell iteration apply.
-        assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 24);
+    fn live_placement_viewport_row_does_not_clamp_at_rows() {
+        // Regression: the helper used to clamp `view_offset` at `rows`,
+        // which froze the image's discrete viewport_row when scrolled
+        // deeper into history. Smooth-scroll's `scroll_y` kept
+        // interpolating between ticks, so the image visually slid by
+        // a row each tick then snapped back when the tick fired
+        // (viewport_row hadn't moved). Without the clamp, viewport_row
+        // moves in lockstep with view_offset and scroll_y, giving a
+        // continuous slide as the image enters from below.
+        assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 100);
+        assert_eq!(State::live_placement_viewport_row(0, 50, 24), 50);
+        // Sanity: at view_offset <= rows, behavior is unchanged from
+        // the pre-clamp version.
+        assert_eq!(State::live_placement_viewport_row(5, 20, 24), 25);
     }
 
     #[test]
