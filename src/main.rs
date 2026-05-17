@@ -212,6 +212,12 @@ struct Config {
     /// (only empty terminal area gets scanlines). Has no effect when
     /// `glow_scanlines_skip_primary_bg` is off.
     glow_scanlines_content_attenuation: f32,
+    /// When true, any `glow_*` override declared by the active color scheme
+    /// (see `palette::GlowOverrides`) wins over the matching field in this
+    /// `Config`. When false (the default), config values always win and
+    /// scheme overrides are ignored — preserves prior behavior for users
+    /// whose schemes happen to carry stray glow keys.
+    theme_overrides_glow: bool,
     /// Master switch for the image-placement feature. When false, the
     /// Cmd-Shift-I keybind and the `YUTANI_TEST_IMAGE` startup hook
     /// silently no-op, and image-protocol payloads (once parsers land
@@ -290,6 +296,7 @@ impl Config {
             glow_scanline_color_dark: renderer::glow::DEFAULT_SCANLINE_COLOR_DARK,
             glow_scanlines_skip_primary_bg: false,
             glow_scanlines_content_attenuation: renderer::glow::DEFAULT_CONTENT_SCANLINE_ATTENUATION,
+            theme_overrides_glow: false,
             images_enabled: true,
             images_memory_cap_mb: images::DEFAULT_CAP_BYTES / (1024 * 1024),
             images_max_pixels: 16 * 1024 * 1024,
@@ -373,6 +380,7 @@ impl Config {
                 "glow_scanlines_content_attenuation" => if let Ok(x) = v.parse::<f32>() {
                     c.glow_scanlines_content_attenuation = x.clamp(0.0, 1.0);
                 },
+                "theme_overrides_glow" => if let Ok(x) = v.parse() { c.theme_overrides_glow = x; },
                 "images_enabled" => if let Ok(x) = v.parse() { c.images_enabled = x; },
                 "images_memory_cap_mb" => if let Ok(x) = v.parse::<usize>() {
                     c.images_memory_cap_mb = x;
@@ -459,7 +467,8 @@ impl Config {
              glow_scanline_color_bright = {}\n\
              glow_scanline_color_dark = {}\n\
              glow_scanlines_skip_primary_bg = {}\n\
-             glow_scanlines_content_attenuation = {}\n",
+             glow_scanlines_content_attenuation = {}\n\
+             theme_overrides_glow = {}\n",
             self.glow_match_brightness,
             self.glow_match_bright_ansi,
             self.glow_match_foreground,
@@ -478,6 +487,7 @@ impl Config {
             format_hex_rgb(self.glow_scanline_color_dark),
             self.glow_scanlines_skip_primary_bg,
             self.glow_scanlines_content_attenuation,
+            self.theme_overrides_glow,
         ));
         s.push_str(&format!(
             "images_enabled = {}\n\
@@ -499,30 +509,72 @@ impl Config {
     }
 }
 
-/// Copy every `glow_*` slot from `config` onto a `Glow` instance. Used by
-/// both initial construction and Cmd-Shift-R reload, so changing a glow
-/// knob in the config takes effect live. `glow_iterations` is clamped to
-/// `[1, MAX_ITERATIONS]` to keep the dual-Kawase chain bounded — the same
-/// clamp that `Config::parse_str` applies, repeated here so a hand-mutated
-/// `Config` (e.g. tests) can't push past the limit.
-fn apply_glow_config(g: &mut renderer::glow::Glow, config: &Config) {
-    g.match_brightness = config.glow_match_brightness;
-    g.match_bright_ansi = config.glow_match_bright_ansi;
-    g.match_foreground = config.glow_match_foreground;
-    g.threshold = config.glow_threshold;
-    g.intensity = config.glow_intensity;
-    g.softness = config.glow_softness;
-    g.hue_tolerance = config.glow_hue_tolerance_deg;
-    g.fg_tolerance = config.glow_fg_tolerance;
-    g.match_scanlines = config.glow_scanlines;
-    g.scanline_strength = config.glow_scanline_strength;
-    g.scanline_period = config.glow_scanline_period;
-    g.match_content_scanlines = config.glow_scanlines_content;
-    g.content_scanline_strength = config.glow_scanlines_content_strength;
-    g.scanline_color_bright = config.glow_scanline_color_bright;
-    g.scanline_color_dark = config.glow_scanline_color_dark;
-    g.content_scanline_attenuation = config.glow_scanlines_content_attenuation;
-    g.iterations = config.glow_iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+/// Copy every `glow_*` slot from `config` onto a `Glow` instance, letting
+/// the active color scheme's `GlowOverrides` win when
+/// `config.theme_overrides_glow` is set. Used by both initial construction
+/// and Cmd-Shift-R reload, so changing a glow knob in the config — or
+/// switching to a scheme that carries its own glow keys — takes effect
+/// live. `glow_iterations` is clamped to `[1, MAX_ITERATIONS]` to keep the
+/// dual-Kawase chain bounded — the same clamp that `Config::parse_str`
+/// applies, repeated here so a hand-mutated `Config` or a scheme that
+/// asked for too many iterations can't push past the limit.
+fn apply_glow_config(
+    g: &mut renderer::glow::Glow,
+    config: &Config,
+    overrides: &palette::GlowOverrides,
+) {
+    fn pick<T>(theme_wins: bool, scheme: Option<T>, cfg: T) -> T {
+        if theme_wins { scheme.unwrap_or(cfg) } else { cfg }
+    }
+    let t = config.theme_overrides_glow;
+    g.match_brightness = pick(t, overrides.match_brightness, config.glow_match_brightness);
+    g.match_bright_ansi = pick(t, overrides.match_bright_ansi, config.glow_match_bright_ansi);
+    g.match_foreground = pick(t, overrides.match_foreground, config.glow_match_foreground);
+    g.threshold = pick(t, overrides.threshold, config.glow_threshold);
+    g.intensity = pick(t, overrides.intensity, config.glow_intensity);
+    g.softness = pick(t, overrides.softness, config.glow_softness);
+    g.hue_tolerance = pick(t, overrides.hue_tolerance_deg, config.glow_hue_tolerance_deg);
+    g.fg_tolerance = pick(t, overrides.fg_tolerance, config.glow_fg_tolerance);
+    g.match_scanlines = pick(t, overrides.scanlines, config.glow_scanlines);
+    g.scanline_strength = pick(t, overrides.scanline_strength, config.glow_scanline_strength);
+    g.scanline_period = pick(t, overrides.scanline_period, config.glow_scanline_period);
+    g.match_content_scanlines = pick(t, overrides.scanlines_content, config.glow_scanlines_content);
+    g.content_scanline_strength = pick(
+        t,
+        overrides.scanlines_content_strength,
+        config.glow_scanlines_content_strength,
+    );
+    g.scanline_color_bright = pick(
+        t,
+        overrides.scanline_color_bright,
+        config.glow_scanline_color_bright,
+    );
+    g.scanline_color_dark = pick(
+        t,
+        overrides.scanline_color_dark,
+        config.glow_scanline_color_dark,
+    );
+    g.content_scanline_attenuation = pick(
+        t,
+        overrides.scanlines_content_attenuation,
+        config.glow_scanlines_content_attenuation,
+    );
+    let iterations = pick(t, overrides.iterations, config.glow_iterations);
+    g.iterations = iterations.clamp(1, renderer::glow::MAX_ITERATIONS);
+}
+
+/// Resolve `glow_scanlines_skip_primary_bg` against the active scheme's
+/// override, honouring the `theme_overrides_glow` tiebreaker. Used at draw
+/// time because this slot is read straight off `Config` rather than mirrored
+/// onto the `Glow` instance (it selects between two render pipelines).
+fn effective_skip_primary_bg(config: &Config, overrides: &palette::GlowOverrides) -> bool {
+    if config.theme_overrides_glow {
+        overrides
+            .scanlines_skip_primary_bg
+            .unwrap_or(config.glow_scanlines_skip_primary_bg)
+    } else {
+        config.glow_scanlines_skip_primary_bg
+    }
 }
 
 pub struct ViewportSize {
@@ -1611,8 +1663,9 @@ impl State {
             gpu.config.height,
             &scene_fg.view,
         );
+        let initial_overrides = palette::get().glow;
         for g in [&mut glow, &mut glow_fg] {
-            apply_glow_config(g, &config);
+            apply_glow_config(g, &config, &initial_overrides);
         }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
@@ -3219,7 +3272,7 @@ impl State {
             p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
         ];
         for g in [&mut self.glow, &mut self.glow_fg] {
-            apply_glow_config(g, &self.config);
+            apply_glow_config(g, &self.config, &p.glow);
             g.set_bright_palette(&self.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
@@ -4755,7 +4808,7 @@ impl State {
             // the bg scene matches the window's primary background
             // colour — scanlines disappear over empty areas.
             if content_overlay_on {
-                if self.config.glow_scanlines_skip_primary_bg {
+                if effective_skip_primary_bg(&self.config, &palette::get().glow) {
                     // Layered path has both scene textures — mask
                     // samples bg + fg so glyphs on default-bg cells
                     // still get scanlines.
@@ -6549,7 +6602,7 @@ mod tests {
             return;
         };
         let c = non_default_glow_config();
-        apply_glow_config(&mut g, &c);
+        apply_glow_config(&mut g, &c, &palette::GlowOverrides::NONE);
 
         // Every config slot listed in the task spec must appear on the
         // Glow. A missing line in `apply_glow_config` shows up here as a
@@ -6590,9 +6643,9 @@ mod tests {
             eprintln!("skipping: no GPU adapter");
             return;
         };
-        apply_glow_config(&mut g, &non_default_glow_config());
+        apply_glow_config(&mut g, &non_default_glow_config(), &palette::GlowOverrides::NONE);
         let defaults = Config::defaults();
-        apply_glow_config(&mut g, &defaults);
+        apply_glow_config(&mut g, &defaults, &palette::GlowOverrides::NONE);
 
         assert_eq!(g.match_brightness, defaults.glow_match_brightness);
         assert_eq!(g.match_bright_ansi, defaults.glow_match_bright_ansi);
@@ -6618,7 +6671,7 @@ mod tests {
         };
         let mut c = Config::defaults();
         c.glow_iterations = renderer::glow::MAX_ITERATIONS * 10;
-        apply_glow_config(&mut g, &c);
+        apply_glow_config(&mut g, &c, &palette::GlowOverrides::NONE);
         assert_eq!(g.iterations, renderer::glow::MAX_ITERATIONS);
     }
 
@@ -6632,7 +6685,7 @@ mod tests {
         };
         let mut c = Config::defaults();
         c.glow_iterations = 0;
-        apply_glow_config(&mut g, &c);
+        apply_glow_config(&mut g, &c, &palette::GlowOverrides::NONE);
         assert_eq!(g.iterations, 1);
     }
 
@@ -6646,7 +6699,275 @@ mod tests {
         };
         let mut c = Config::defaults();
         c.glow_iterations = renderer::glow::MAX_ITERATIONS;
-        apply_glow_config(&mut g, &c);
+        apply_glow_config(&mut g, &c, &palette::GlowOverrides::NONE);
         assert_eq!(g.iterations, renderer::glow::MAX_ITERATIONS);
+    }
+
+    //
+    // theme_overrides_glow tiebreaker: when set, `Some(_)` slots on the
+    // scheme's `GlowOverrides` win over the matching `Config` field; when
+    // clear, the config always wins regardless of override state. These
+    // pin both branches end-to-end through `apply_glow_config` and the
+    // matching `effective_skip_primary_bg` helper.
+    //
+
+    /// Build a `GlowOverrides` whose every field is `Some(_)` and
+    /// distinct from the values produced by `non_default_glow_config`.
+    /// A passing override-wins test then proves each slot came through
+    /// the override path rather than the config path.
+    fn fully_populated_overrides() -> palette::GlowOverrides {
+        palette::GlowOverrides {
+            match_brightness: Some(false),
+            match_bright_ansi: Some(false),
+            match_foreground: Some(false),
+            threshold: Some(0.11),
+            intensity: Some(0.22),
+            softness: Some(0.13),
+            hue_tolerance_deg: Some(91.0),
+            fg_tolerance: Some(1.1),
+            iterations: Some(3),
+            scanlines: Some(false),
+            scanline_strength: Some(0.14),
+            scanline_period: Some(7.5),
+            scanlines_content: Some(false),
+            scanlines_content_strength: Some(0.17),
+            scanline_color_bright: Some([0.1, 0.2, 0.3, 1.0]),
+            scanline_color_dark: Some([0.4, 0.5, 0.6, 1.0]),
+            scanlines_skip_primary_bg: Some(true),
+            scanlines_content_attenuation: Some(0.19),
+        }
+    }
+
+    #[test]
+    fn apply_glow_config_ignores_overrides_when_flag_off() {
+        // Default `theme_overrides_glow = false`: even a fully-populated
+        // `GlowOverrides` must be ignored. Glow ends up matching config
+        // verbatim — same outcome as the existing
+        // `apply_glow_config_copies_every_field_from_config` test.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = non_default_glow_config();
+        c.theme_overrides_glow = false;
+        let o = fully_populated_overrides();
+        apply_glow_config(&mut g, &c, &o);
+
+        assert_eq!(g.match_brightness, c.glow_match_brightness);
+        assert_eq!(g.match_bright_ansi, c.glow_match_bright_ansi);
+        assert_eq!(g.match_foreground, c.glow_match_foreground);
+        assert!(approx_eq(g.threshold, c.glow_threshold));
+        assert!(approx_eq(g.intensity, c.glow_intensity));
+        assert!(approx_eq(g.softness, c.glow_softness));
+        assert!(approx_eq(g.hue_tolerance, c.glow_hue_tolerance_deg));
+        assert!(approx_eq(g.fg_tolerance, c.glow_fg_tolerance));
+        assert_eq!(g.match_scanlines, c.glow_scanlines);
+        assert!(approx_eq(g.scanline_strength, c.glow_scanline_strength));
+        assert!(approx_eq(g.scanline_period, c.glow_scanline_period));
+        assert_eq!(g.match_content_scanlines, c.glow_scanlines_content);
+        assert!(approx_eq(
+            g.content_scanline_strength,
+            c.glow_scanlines_content_strength,
+        ));
+        assert_eq!(g.scanline_color_bright, c.glow_scanline_color_bright);
+        assert_eq!(g.scanline_color_dark, c.glow_scanline_color_dark);
+        assert!(approx_eq(
+            g.content_scanline_attenuation,
+            c.glow_scanlines_content_attenuation,
+        ));
+        assert_eq!(g.iterations, c.glow_iterations);
+    }
+
+    #[test]
+    fn apply_glow_config_overrides_win_when_flag_on() {
+        // Flip the tiebreaker on: every `Some(_)` override now wins
+        // over the corresponding config field. Pin each slot against
+        // the override value (not the config value) so a regression
+        // that wires a slot to the wrong source shows up here.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = non_default_glow_config();
+        c.theme_overrides_glow = true;
+        let o = fully_populated_overrides();
+        apply_glow_config(&mut g, &c, &o);
+
+        assert_eq!(g.match_brightness, o.match_brightness.unwrap());
+        assert_eq!(g.match_bright_ansi, o.match_bright_ansi.unwrap());
+        assert_eq!(g.match_foreground, o.match_foreground.unwrap());
+        assert!(approx_eq(g.threshold, o.threshold.unwrap()));
+        assert!(approx_eq(g.intensity, o.intensity.unwrap()));
+        assert!(approx_eq(g.softness, o.softness.unwrap()));
+        assert!(approx_eq(g.hue_tolerance, o.hue_tolerance_deg.unwrap()));
+        assert!(approx_eq(g.fg_tolerance, o.fg_tolerance.unwrap()));
+        assert_eq!(g.match_scanlines, o.scanlines.unwrap());
+        assert!(approx_eq(g.scanline_strength, o.scanline_strength.unwrap()));
+        assert!(approx_eq(g.scanline_period, o.scanline_period.unwrap()));
+        assert_eq!(g.match_content_scanlines, o.scanlines_content.unwrap());
+        assert!(approx_eq(
+            g.content_scanline_strength,
+            o.scanlines_content_strength.unwrap(),
+        ));
+        assert_eq!(g.scanline_color_bright, o.scanline_color_bright.unwrap());
+        assert_eq!(g.scanline_color_dark, o.scanline_color_dark.unwrap());
+        assert!(approx_eq(
+            g.content_scanline_attenuation,
+            o.scanlines_content_attenuation.unwrap(),
+        ));
+        assert_eq!(g.iterations, o.iterations.unwrap());
+    }
+
+    #[test]
+    fn apply_glow_config_none_override_falls_through_to_config_when_flag_on() {
+        // Per-slot granularity: with the flag on, `None` slots still
+        // defer to the config. Override only `threshold`; `intensity`
+        // must come from the config because its override is `None`.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = non_default_glow_config();
+        c.theme_overrides_glow = true;
+        let o = palette::GlowOverrides {
+            threshold: Some(0.07),
+            ..palette::GlowOverrides::NONE
+        };
+        apply_glow_config(&mut g, &c, &o);
+
+        assert!(approx_eq(g.threshold, 0.07));
+        assert!(approx_eq(g.intensity, c.glow_intensity));
+        assert_eq!(g.match_brightness, c.glow_match_brightness);
+        assert_eq!(g.match_scanlines, c.glow_scanlines);
+    }
+
+    #[test]
+    fn apply_glow_config_clamps_iterations_above_max_via_override() {
+        // The iterations clamp runs *after* the override pick, so an
+        // outsize scheme value can't smuggle a bigger dual-Kawase chain
+        // past `MAX_ITERATIONS`.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = true;
+        let o = palette::GlowOverrides {
+            iterations: Some(renderer::glow::MAX_ITERATIONS * 10),
+            ..palette::GlowOverrides::NONE
+        };
+        apply_glow_config(&mut g, &c, &o);
+        assert_eq!(g.iterations, renderer::glow::MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn apply_glow_config_clamps_iterations_below_one_via_override() {
+        // Same clamp on the low end: `Some(0)` from a scheme still
+        // floors at 1 after the pick.
+        let Some((_d, _q, mut g)) = try_make_test_glow() else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = true;
+        let o = palette::GlowOverrides {
+            iterations: Some(0),
+            ..palette::GlowOverrides::NONE
+        };
+        apply_glow_config(&mut g, &c, &o);
+        assert_eq!(g.iterations, 1);
+    }
+
+    //
+    // `effective_skip_primary_bg` is the one glow slot resolved at draw
+    // time rather than mirrored onto the `Glow` struct (it picks between
+    // two render pipelines). The same tiebreaker applies; these tests
+    // don't need a GPU.
+    //
+
+    #[test]
+    fn effective_skip_primary_bg_flag_off_ignores_override() {
+        // Override present but the tiebreaker is off → config wins.
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = false;
+        c.glow_scanlines_skip_primary_bg = false;
+        let o = palette::GlowOverrides {
+            scanlines_skip_primary_bg: Some(true),
+            ..palette::GlowOverrides::NONE
+        };
+        assert!(!effective_skip_primary_bg(&c, &o));
+    }
+
+    #[test]
+    fn effective_skip_primary_bg_flag_on_none_falls_through_to_config() {
+        // Flag on but no override candidate → config still wins.
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = true;
+        c.glow_scanlines_skip_primary_bg = true;
+        assert!(effective_skip_primary_bg(&c, &palette::GlowOverrides::NONE));
+    }
+
+    #[test]
+    fn effective_skip_primary_bg_flag_on_override_wins() {
+        // Override present and flag on → override wins, even when it
+        // disagrees with the config value.
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = true;
+        c.glow_scanlines_skip_primary_bg = false;
+        let o = palette::GlowOverrides {
+            scanlines_skip_primary_bg: Some(true),
+            ..palette::GlowOverrides::NONE
+        };
+        assert!(effective_skip_primary_bg(&c, &o));
+
+        // And the inverse — override `false` beats config `true`.
+        c.glow_scanlines_skip_primary_bg = true;
+        let o = palette::GlowOverrides {
+            scanlines_skip_primary_bg: Some(false),
+            ..palette::GlowOverrides::NONE
+        };
+        assert!(!effective_skip_primary_bg(&c, &o));
+    }
+
+    //
+    // theme_overrides_glow round-trips through Config::serialize /
+    // Config::parse_str (both polarities) and starts at `false` so
+    // upgrading the binary doesn't silently start honouring stray glow
+    // keys in users' existing schemes.
+    //
+
+    #[test]
+    fn config_defaults_theme_overrides_glow_is_false() {
+        // Opt-in by design: schemes may carry glow keys but they're
+        // ignored until the user explicitly turns this on.
+        assert!(!Config::defaults().theme_overrides_glow);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_theme_overrides_glow_true() {
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = true;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.theme_overrides_glow);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_theme_overrides_glow_false() {
+        // Explicit `false` must also survive the round-trip — if the
+        // serializer silently dropped the field, a downgrade-then-upgrade
+        // cycle would reset everyone to the default.
+        let mut c = Config::defaults();
+        c.theme_overrides_glow = false;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(!parsed.theme_overrides_glow);
+    }
+
+    #[test]
+    fn config_parse_theme_overrides_glow_true_sets_field() {
+        // Direct parse of the user-facing config syntax — pins the
+        // exact key name so a rename here would fail the test rather
+        // than silently break every existing user's config file.
+        let parsed = Config::parse_str("theme_overrides_glow = true\n");
+        assert!(parsed.theme_overrides_glow);
     }
 }

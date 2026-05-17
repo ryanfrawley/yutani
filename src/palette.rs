@@ -50,6 +50,63 @@ pub struct Palette {
     /// Color-depth ceiling. Cell colors exceeding it are snapped via
     /// `project()` before going to the GPU.
     pub max_colors: ColorCap,
+    /// Per-scheme glow + scanline overrides. Each `Some(_)` field is a
+    /// candidate override for the matching `glow_*` config slot; the
+    /// `theme_overrides_glow` config setting decides whether scheme values
+    /// or config values win when both are present. `None` always defers
+    /// to the config value.
+    pub glow: GlowOverrides,
+}
+
+/// Optional per-scheme overrides for the renderer's glow + scanline knobs.
+/// Mirrors the `glow_*` fields on the runtime `Config` struct in `main.rs`
+/// one-for-one. A scheme can override any subset; unset fields stay `None`
+/// and let the config value through unchanged.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct GlowOverrides {
+    pub match_brightness: Option<bool>,
+    pub match_bright_ansi: Option<bool>,
+    pub match_foreground: Option<bool>,
+    pub threshold: Option<f32>,
+    pub intensity: Option<f32>,
+    pub softness: Option<f32>,
+    pub hue_tolerance_deg: Option<f32>,
+    pub fg_tolerance: Option<f32>,
+    pub iterations: Option<usize>,
+    pub scanlines: Option<bool>,
+    pub scanline_strength: Option<f32>,
+    pub scanline_period: Option<f32>,
+    pub scanlines_content: Option<bool>,
+    pub scanlines_content_strength: Option<f32>,
+    pub scanline_color_bright: Option<[f32; 4]>,
+    pub scanline_color_dark: Option<[f32; 4]>,
+    pub scanlines_skip_primary_bg: Option<bool>,
+    pub scanlines_content_attenuation: Option<f32>,
+}
+
+impl GlowOverrides {
+    /// All-`None` initializer usable from `const fn` (notably
+    /// `Palette::defaults`). `Default::default()` is not const-callable.
+    pub const NONE: Self = Self {
+        match_brightness: None,
+        match_bright_ansi: None,
+        match_foreground: None,
+        threshold: None,
+        intensity: None,
+        softness: None,
+        hue_tolerance_deg: None,
+        fg_tolerance: None,
+        iterations: None,
+        scanlines: None,
+        scanline_strength: None,
+        scanline_period: None,
+        scanlines_content: None,
+        scanlines_content_strength: None,
+        scanline_color_bright: None,
+        scanline_color_dark: None,
+        scanlines_skip_primary_bg: None,
+        scanlines_content_attenuation: None,
+    };
 }
 
 impl Palette {
@@ -83,6 +140,7 @@ impl Palette {
                 [1.0, 1.0, 1.0, 1.0],
             ],
             max_colors: ColorCap::Truecolor,
+            glow: GlowOverrides::NONE,
         }
     }
 
@@ -256,9 +314,39 @@ fn apply(p: &mut Palette, key: &str, value: &str) -> Result<(), String> {
         "cyan" => set_pair(&mut p.ansi, 6, value)?,
         "white" => set_pair(&mut p.ansi, 7, value)?,
         "max_colors" => p.max_colors = parse_color_cap(value)?,
+        "glow_match_brightness" => p.glow.match_brightness = Some(parse_bool(value)?),
+        "glow_match_bright_ansi" => p.glow.match_bright_ansi = Some(parse_bool(value)?),
+        "glow_match_foreground" => p.glow.match_foreground = Some(parse_bool(value)?),
+        "glow_threshold" => p.glow.threshold = Some(parse_f32(value)?.clamp(0.0, 1.0)),
+        "glow_intensity" => p.glow.intensity = Some(parse_f32(value)?.max(0.0)),
+        "glow_softness" => p.glow.softness = Some(parse_f32(value)?.clamp(0.0, 1.0)),
+        "glow_hue_tolerance_deg" => p.glow.hue_tolerance_deg = Some(parse_f32(value)?.clamp(0.0, 180.0)),
+        "glow_fg_tolerance" => p.glow.fg_tolerance = Some(parse_f32(value)?.clamp(0.0, 3.0_f32.sqrt())),
+        "glow_iterations" => p.glow.iterations = Some(parse_usize(value)?),
+        "glow_scanlines" => p.glow.scanlines = Some(parse_bool(value)?),
+        "glow_scanline_strength" => p.glow.scanline_strength = Some(parse_f32(value)?.clamp(0.0, 1.0)),
+        "glow_scanline_period" => p.glow.scanline_period = Some(parse_f32(value)?.max(1.0)),
+        "glow_scanlines_content" => p.glow.scanlines_content = Some(parse_bool(value)?),
+        "glow_scanlines_content_strength" => p.glow.scanlines_content_strength = Some(parse_f32(value)?.clamp(0.0, 1.0)),
+        "glow_scanline_color_bright" => p.glow.scanline_color_bright = Some(rgba_from(value)?),
+        "glow_scanline_color_dark" => p.glow.scanline_color_dark = Some(rgba_from(value)?),
+        "glow_scanlines_skip_primary_bg" => p.glow.scanlines_skip_primary_bg = Some(parse_bool(value)?),
+        "glow_scanlines_content_attenuation" => p.glow.scanlines_content_attenuation = Some(parse_f32(value)?.clamp(0.0, 1.0)),
         _ => return Err(format!("unknown key '{}'", key)),
     }
     Ok(())
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    value.parse::<bool>().map_err(|_| format!("expected true/false, got '{}'", value))
+}
+
+fn parse_f32(value: &str) -> Result<f32, String> {
+    value.parse::<f32>().map_err(|_| format!("expected number, got '{}'", value))
+}
+
+fn parse_usize(value: &str) -> Result<usize, String> {
+    value.parse::<usize>().map_err(|_| format!("expected non-negative integer, got '{}'", value))
 }
 
 fn parse_color_cap(value: &str) -> Result<ColorCap, String> {
@@ -723,5 +811,175 @@ blue: [0x0000ab, 0x5555ff]
         // Mid-gray (128/255 ≈ 0.502 sRGB) lands near 0.216 in linear space.
         let mid = srgb_to_linear(128);
         assert!((mid - 0.2159).abs() < 0.001, "mid-gray linearized to {}", mid);
+    }
+
+    //
+    // GlowOverrides: per-scheme overrides for the renderer's glow + scanline
+    // knobs. The fields below pin the parser-side contract — clamping,
+    // forgiving error handling, and the const initializer — so the
+    // tiebreaker logic in `main.rs` can rely on well-formed `Option<T>`
+    // values regardless of what the scheme file said.
+    //
+
+    #[test]
+    fn defaults_glow_overrides_are_all_none() {
+        // No scheme key → no override candidate. The tiebreaker in
+        // `apply_glow_config` requires every slot to start `None` so
+        // config values pass through unmodified for schemes that don't
+        // opt in.
+        assert_eq!(Palette::defaults().glow, GlowOverrides::NONE);
+    }
+
+    #[test]
+    fn glow_overrides_none_const_matches_default() {
+        // `GlowOverrides::NONE` is a hand-written const for use in
+        // `Palette::defaults()` (which is `const fn` and so can't call
+        // `Default::default()`). If anyone adds a field to the struct
+        // without extending NONE, this catches the drift.
+        assert_eq!(GlowOverrides::NONE, GlowOverrides::default());
+    }
+
+    #[test]
+    fn empty_yaml_leaves_glow_overrides_none() {
+        // Sanity: the parser doesn't synthesise glow overrides out of
+        // thin air. Schemes without any glow_ keys must round-trip to
+        // `NONE`.
+        let p = parse_yaml("# only comments\nbackground: 0x000000\n");
+        assert_eq!(p.glow, GlowOverrides::NONE);
+    }
+
+    #[test]
+    fn parses_glow_bool_overrides() {
+        let src = "\
+glow_match_brightness: true
+glow_match_bright_ansi: false
+glow_match_foreground: true
+glow_scanlines: true
+glow_scanlines_content: false
+glow_scanlines_skip_primary_bg: true
+";
+        let p = parse_yaml(src);
+        assert_eq!(p.glow.match_brightness, Some(true));
+        assert_eq!(p.glow.match_bright_ansi, Some(false));
+        assert_eq!(p.glow.match_foreground, Some(true));
+        assert_eq!(p.glow.scanlines, Some(true));
+        assert_eq!(p.glow.scanlines_content, Some(false));
+        assert_eq!(p.glow.scanlines_skip_primary_bg, Some(true));
+    }
+
+    #[test]
+    fn parses_glow_numeric_overrides_in_range() {
+        // Each numeric override key writes its value verbatim when it
+        // sits inside the slot's permitted range — no clamping should
+        // alter the result here.
+        let src = "\
+glow_threshold: 0.7
+glow_intensity: 1.5
+glow_softness: 0.4
+glow_hue_tolerance_deg: 30
+glow_fg_tolerance: 0.5
+glow_iterations: 4
+glow_scanline_strength: 0.6
+glow_scanline_period: 5
+glow_scanlines_content_strength: 0.3
+glow_scanlines_content_attenuation: 0.8
+";
+        let p = parse_yaml(src);
+        assert_eq!(p.glow.threshold, Some(0.7));
+        assert_eq!(p.glow.intensity, Some(1.5));
+        assert_eq!(p.glow.softness, Some(0.4));
+        assert_eq!(p.glow.hue_tolerance_deg, Some(30.0));
+        assert_eq!(p.glow.fg_tolerance, Some(0.5));
+        assert_eq!(p.glow.iterations, Some(4));
+        assert_eq!(p.glow.scanline_strength, Some(0.6));
+        assert_eq!(p.glow.scanline_period, Some(5.0));
+        assert_eq!(p.glow.scanlines_content_strength, Some(0.3));
+        assert_eq!(p.glow.scanlines_content_attenuation, Some(0.8));
+    }
+
+    #[test]
+    fn parses_glow_scanline_color_overrides() {
+        // Color overrides go through the same `rgba_from` path as
+        // foreground/background, so the linear-space round-trip and
+        // alpha == 1.0 contract apply.
+        let p = parse_yaml("glow_scanline_color_bright: 0xff00ff\nglow_scanline_color_dark: 0x112233\n");
+        let bright = p.glow.scanline_color_bright.expect("bright override");
+        let dark = p.glow.scanline_color_dark.expect("dark override");
+        assert_eq!(to_bytes(bright), [0xff, 0x00, 0xff]);
+        assert_eq!(to_bytes(dark), [0x11, 0x22, 0x33]);
+        assert_eq!(bright[3], 1.0);
+        assert_eq!(dark[3], 1.0);
+    }
+
+    #[test]
+    fn glow_threshold_clamps_high() {
+        // Threshold lives on [0, 1]; an out-of-range scheme value must
+        // be clamped on parse so downstream consumers don't need to
+        // sanitise the override themselves.
+        let p = parse_yaml("glow_threshold: 2.0\n");
+        assert_eq!(p.glow.threshold, Some(1.0));
+    }
+
+    #[test]
+    fn glow_softness_clamps_low() {
+        // Softness lives on [0, 1]; negative values clamp up to 0.
+        let p = parse_yaml("glow_softness: -0.2\n");
+        assert_eq!(p.glow.softness, Some(0.0));
+    }
+
+    #[test]
+    fn glow_scanline_period_clamps_to_one() {
+        // Period < 1 would produce a sub-pixel scanline ridge that
+        // aliases badly; the parser floors it at 1.0.
+        let p = parse_yaml("glow_scanline_period: 0.5\n");
+        assert_eq!(p.glow.scanline_period, Some(1.0));
+    }
+
+    #[test]
+    fn glow_intensity_clamps_low() {
+        // Intensity is unbounded above but pinned at 0 below — a
+        // negative scheme value would subtract light, which the
+        // pipeline can't represent.
+        let p = parse_yaml("glow_intensity: -1.0\n");
+        assert_eq!(p.glow.intensity, Some(0.0));
+    }
+
+    #[test]
+    fn glow_hue_tolerance_clamps_high() {
+        // Hue tolerance lives on [0, 180] degrees; values beyond 180
+        // would match the entire colour wheel twice.
+        let p = parse_yaml("glow_hue_tolerance_deg: 500\n");
+        assert_eq!(p.glow.hue_tolerance_deg, Some(180.0));
+    }
+
+    #[test]
+    fn glow_fg_tolerance_clamps_to_sqrt3() {
+        // The fg-tolerance ceiling is sqrt(3), the max linear-RGB
+        // Euclidean distance between black and white.
+        let p = parse_yaml("glow_fg_tolerance: 5.0\n");
+        let got = p.glow.fg_tolerance.expect("fg_tolerance override");
+        assert!((got - 3.0_f32.sqrt()).abs() < 1e-6, "got {}", got);
+    }
+
+    #[test]
+    fn invalid_glow_lines_dont_poison_good_ones() {
+        // Same forgiving contract as `bad_lines_dont_poison_good_ones`:
+        // a malformed glow value leaves its slot at `None` but sibling
+        // glow keys still parse.
+        let src = "\
+glow_threshold: notanumber
+glow_intensity: 1.25
+glow_match_brightness: maybe
+glow_match_foreground: true
+glow_scanline_color_bright: nothex
+glow_scanline_period: 4
+";
+        let p = parse_yaml(src);
+        assert_eq!(p.glow.threshold, None);
+        assert_eq!(p.glow.intensity, Some(1.25));
+        assert_eq!(p.glow.match_brightness, None);
+        assert_eq!(p.glow.match_foreground, Some(true));
+        assert_eq!(p.glow.scanline_color_bright, None);
+        assert_eq!(p.glow.scanline_period, Some(4.0));
     }
 }
