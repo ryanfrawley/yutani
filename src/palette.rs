@@ -37,6 +37,13 @@ pub struct Palette {
     /// Stored un-premultiplied. The renderer applies a theme-dependent alpha
     /// at draw time and premultiplies there.
     pub selection: [f32; 4],
+    /// Optional override applied to a cell's glyph color while that cell is
+    /// part of the active selection. `None` (the default) leaves selected
+    /// text in its underlying fg so the translucent selection overlay just
+    /// tints it; `Some(c)` paints the glyph in `c` instead — useful when a
+    /// scheme's selection bg doesn't have enough contrast against the
+    /// default fg.
+    pub selection_fg: Option<[f32; 4]>,
     /// Index 0..=7 normal, 8..=15 bright. Order matches ANSI:
     /// black, red, green, yellow, blue, magenta, cyan, white.
     pub ansi: [[f32; 4]; 16],
@@ -56,6 +63,7 @@ impl Palette {
             foreground: [0.0, 0.0, 0.0, 1.0],
             cursor: [0.1, 0.0, 0.8, 1.0],
             selection: [0.20, 0.40, 0.85, 1.0],
+            selection_fg: None,
             ansi: [
                 [0.0, 0.0, 0.0, 1.0],
                 [0.67, 0.0, 0.0, 1.0],
@@ -238,6 +246,7 @@ fn apply(p: &mut Palette, key: &str, value: &str) -> Result<(), String> {
         "foreground" => p.foreground = rgba_from(value)?,
         "cursor" => p.cursor = rgba_from(value)?,
         "selection" => p.selection = rgba_from(value)?,
+        "selection_fg" | "selection_foreground" => p.selection_fg = Some(rgba_from(value)?),
         "black" => set_pair(&mut p.ansi, 0, value)?,
         "red" => set_pair(&mut p.ansi, 1, value)?,
         "green" => set_pair(&mut p.ansi, 2, value)?,
@@ -527,6 +536,25 @@ red: [0xab0000, 0xff5555]
 blue: [0x0000ab, 0x5555ff]
 ";
         assert_eq!(parse_yaml(src), parse_yaml(src));
+    }
+
+    #[test]
+    fn selection_fg_defaults_to_none() {
+        // Omitting the key keeps the legacy behavior — selected text retains
+        // its underlying fg and only the translucent overlay tints it.
+        assert_eq!(Palette::defaults().selection_fg, None);
+        assert_eq!(parse_yaml("background: 0x111111\n").selection_fg, None);
+    }
+
+    #[test]
+    fn parses_selection_fg() {
+        let p = parse_yaml("selection_fg: 0xffeeaa\n");
+        let c = p.selection_fg.expect("selection_fg should be set");
+        assert_eq!(to_bytes(c), [0xff, 0xee, 0xaa]);
+        // Alias spelling — kitty-style — must reach the same field.
+        let p = parse_yaml("selection_foreground: 0x010203\n");
+        let c = p.selection_fg.expect("alias should populate selection_fg");
+        assert_eq!(to_bytes(c), [0x01, 0x02, 0x03]);
     }
 
     #[test]
