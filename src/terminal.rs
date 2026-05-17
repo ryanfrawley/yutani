@@ -607,6 +607,15 @@ pub struct Terminal {
     // when that transmission's final chunk (`m=0` / no `m=`) finalizes
     // or when a fresh id-keyed transmission preempts it.
     current_chunked_id: Option<u32>,
+    // Tracks the `i=` of the most recently *completed* transmission
+    // (single-chunk or chunked) so `a=p` / `a=d` / `a=f` / `a=a`
+    // without an explicit `i=` can fall back per the Kitty spec
+    // ("if i is missing, the most recently created image is
+    // targeted"). icat's animation-frame stream emits `a=f` with no
+    // `i=` and no `m=` between control messages; without this
+    // fallback those frames silently drop. Updated whenever
+    // `finalize_kitty_image_bytes` runs with a `kitty_image_id`.
+    last_kitty_image_id: Option<u32>,
     // Kitty client image-id → our store ImageId. Populated when a
     // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
     // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
@@ -717,6 +726,7 @@ impl Terminal {
             kitty_chunks: std::collections::HashMap::new(),
             kitty_chunks_anon: None,
             current_chunked_id: None,
+            last_kitty_image_id: None,
             kitty_image_ids: std::collections::HashMap::new(),
             kitty_image_formats: std::collections::HashMap::new(),
             kitty_image_cell_extents: std::collections::HashMap::new(),
@@ -2201,6 +2211,27 @@ impl Terminal {
                 }
             }
         }
+        // Second fallback: per Kitty spec, when `i=` is missing on an
+        // op that targets an existing image (place / delete / animate
+        // / frame), the most recently created image is the implicit
+        // target. icat's animation stream relies on this — frame
+        // transmissions for the GIF being animated arrive as bare
+        // `a=f` with neither `i=` nor `m=` (no in-flight chunked
+        // transmission to inherit from either), so the
+        // `current_chunked_id` thread above doesn't help. Without
+        // this second fallback those frames silently drop and the
+        // animation never plays past frame 1.
+        if ctrl.image_id.is_none() {
+            if matches!(
+                ctrl.action,
+                KittyAction::Place
+                    | KittyAction::Delete
+                    | KittyAction::AnimationFrame
+                    | KittyAction::AnimationControl,
+            ) {
+                ctrl.image_id = self.last_kitty_image_id;
+            }
+        }
         // Update the in-flight tracker. First chunk of an id-keyed
         // stream sets it; the matching final chunk clears it. Single
         // chunks (no `m=` on either side) leave it untouched.
@@ -2977,6 +3008,13 @@ impl Terminal {
         // GIFs, since the app already decoded once.
         if let Some(id) = kitty_image_id {
             self.kitty_image_formats.insert(id, source_format);
+            // Mark this image as "most recently completed" so a
+            // subsequent `a=p` / `a=d` / `a=f` / `a=a` arriving
+            // without `i=` can target it (per the Kitty spec
+            // fallback). icat's animation-frame stream relies on
+            // this — it emits `a=f` with no `i=` and no `m=` between
+            // animation-control messages.
+            self.last_kitty_image_id = Some(id);
             // Cache the image's total cell extent so the per-run
             // placeholder renderer can compute UVs against it. Only
             // record when BOTH dimensions are present — partial
@@ -5285,6 +5323,83 @@ mod tests {
             "tmux-wrapped Kitty a=T must produce one pending upload",
         );
         assert_eq!(uploads[0].kitty_image_id, Some(4242));
+    }
+
+    #[test]
+    fn a_f_without_i_targets_most_recently_completed_image() {
+        // Per Kitty spec: when `i=` is missing on `a=f` (and `a=p` /
+        // `a=d` / `a=a`), the most recently created image is the
+        // implicit target. icat's animation stream relies on this —
+        // frame transmissions for the GIF being animated arrive as
+        // bare `a=f` with neither `i=` nor `m=`, no in-flight
+        // chunked transmission to inherit from. Without the
+        // last-completed fallback the frame silently drops and the
+        // animation never plays past the base.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Establish a base image with explicit id 4242.
+        let png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        t.feed(&format!("\x1b_Ga=T,f=100,i=4242,U=1;{}\x1b\\", b64));
+        let base_uploads = t.take_pending_image_uploads();
+        assert_eq!(base_uploads.len(), 1);
+        assert_eq!(base_uploads[0].kitty_image_id, Some(4242));
+
+        // Now send a bare `a=f` — no `i=`, no `m=`. Should attach to
+        // image 4242 via the spec fallback.
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_png);
+        t.feed(&format!("\x1b_Ga=f,q=2;{}\x1b\\", b64));
+        let frame_uploads = t.take_pending_image_uploads();
+        assert_eq!(
+            frame_uploads.len(),
+            1,
+            "bare a=f must produce one frame upload via implicit-i= fallback",
+        );
+        let up = &frame_uploads[0];
+        assert!(up.animation_frame.is_some(), "a=f path flagged");
+        assert_eq!(
+            up.kitty_image_id,
+            Some(4242),
+            "implicit i= must resolve to the most recently completed image",
+        );
+    }
+
+    #[test]
+    fn a_f_without_i_drops_when_no_prior_image() {
+        // Symmetric guard: no prior transmission, no implicit
+        // fallback to leak into. Bare `a=f` must be ignored cleanly
+        // rather than crash or create a stranded entry.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        let frame_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([9, 9, 9, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame_png);
+        t.feed(&format!("\x1b_Ga=f,q=2;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert!(uploads.is_empty(), "no prior image → drop, don't crash");
     }
 
     #[test]
