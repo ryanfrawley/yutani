@@ -157,8 +157,7 @@ pub struct Glow {
     bright_pipeline: wgpu::RenderPipeline,
     down_pipeline: wgpu::RenderPipeline,
     up_pipeline: wgpu::RenderPipeline,
-    pub composite_pipeline: wgpu::RenderPipeline,
-    /// Variant of `composite_pipeline` that also samples a mask texture
+    /// Variant of the unmasked composite pipeline that also samples a mask texture
     /// (group 1) and multiplies the halo by `(1 - mask.a)`. Used by the
     /// layered render path with the bg scene as the mask, so a glyph's
     /// halo doesn't paint over adjacent cells' colored backgrounds and
@@ -416,8 +415,6 @@ impl Glow {
         // the same blend but multiplies output by `(1 - suppression)` so
         // colored cells aren't tinted by the halo.
         let alpha_blend = wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING;
-        let composite_pipeline =
-            make_pipeline("fs_composite", "glow composite pipeline", Some(alpha_blend));
         // Multiply blend: result.rgb = src.rgb * dst.rgb. The overlay
         // shader emits rgb = scanline_factor (0..1), darkening every
         // pixel in dark scan rows and leaving bright rows untouched.
@@ -569,7 +566,6 @@ impl Glow {
             bright_pipeline,
             down_pipeline,
             up_pipeline,
-            composite_pipeline,
             composite_masked_pipeline,
             scanline_overlay_pipeline,
             scanline_overlay_masked_pipeline,
@@ -967,6 +963,7 @@ fn hsv_saturation(rgb: [f32; 3]) -> f32 {
 
 /// CPU mirror of the shader's `hsv_value` — max channel, used as the
 /// brightness signal by the BRIGHTNESS match mode.
+#[cfg(test)]
 fn hsv_value(rgb: [f32; 3]) -> f32 {
     rgb[0].max(rgb[1]).max(rgb[2])
 }
@@ -974,6 +971,7 @@ fn hsv_value(rgb: [f32; 3]) -> f32 {
 /// CPU mirror of the shader's bright-pass saturation `smoothstep` weight.
 /// The `0.0001` floor on `softness` matches the shader and keeps the result
 /// finite when the caller asks for a hard cutoff.
+#[cfg(test)]
 fn bright_weight(sat: f32, threshold: f32, softness: f32) -> f32 {
     let lo = threshold;
     let hi = (lo + softness.max(0.0001)).min(1.0);
@@ -984,6 +982,7 @@ fn bright_weight(sat: f32, threshold: f32, softness: f32) -> f32 {
 /// CPU mirror of the shader's `foreground_weight`. Returns a 0..=1 weight
 /// from RGB Euclidean distance, ramped down across a `softness`-wide band
 /// past `tolerance`.
+#[cfg(test)]
 fn foreground_weight(rgb: [f32; 3], fg: [f32; 3], tolerance: f32, softness: f32) -> f32 {
     let dx = rgb[0] - fg[0];
     let dy = rgb[1] - fg[1];

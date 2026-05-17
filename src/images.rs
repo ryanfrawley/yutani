@@ -1171,6 +1171,7 @@ impl Store {
     /// Number of in-flight decode requests. Useful for diagnostics — a
     /// number that doesn't shrink across frames suggests the worker is
     /// stuck or the result channel is starving.
+    #[allow(dead_code)]
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -1178,6 +1179,7 @@ impl Store {
     /// Look up a previously-inserted image. Bumps its `last_used`. Returns
     /// `None` for unknown ids AND for pre-allocated ids whose decode is
     /// still in flight — callers should treat both the same way (skip).
+    #[allow(dead_code)]
     pub fn get(&mut self, id: ImageId) -> Option<&GpuImage> {
         let entry = self.images.get_mut(&id.0)?;
         entry.last_used = Instant::now();
@@ -1316,18 +1318,22 @@ impl Store {
 
     /// Total bytes-on-GPU across all stored images. Approximate (4 bytes
     /// per pixel; ignores mipmaps and alignment padding).
+    #[allow(dead_code)]
     pub fn bytes(&self) -> usize {
         self.total_bytes
     }
 
+    #[allow(dead_code)]
     pub fn cap_bytes(&self) -> usize {
         self.cap_bytes
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.images.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
     }
@@ -1676,7 +1682,7 @@ mod tests {
             return;
         };
         let mut s = Store::new(DEFAULT_CAP_BYTES);
-        let (pending, reserved) = s.request_insert(b"not a png".to_vec(), 100, Duration::from_secs(5), None);
+        let (pending, _reserved) = s.request_insert(b"not a png".to_vec(), 100, Duration::from_secs(5), None);
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut results = Vec::new();
         while results.is_empty() && Instant::now() < deadline {
@@ -2964,6 +2970,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn apply_animation_control_s3_vN_sets_finite_loops() {
         let mut store = Store::new(DEFAULT_CAP_BYTES);
         let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {

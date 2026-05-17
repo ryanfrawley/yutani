@@ -3,11 +3,6 @@ use std::collections::HashMap;
 
 use crate::box_drawing;
 
-pub struct Glyph {
-    pub bitmap: ft::Bitmap,
-    pub metrics: ft::GlyphMetrics,
-}
-
 // Style variant of a face. The numeric value is also a (bold,italic) bitmask
 // (bit 0 = bold, bit 1 = italic) and indexes into Font::variants /
 // Atlas::variants.
@@ -176,7 +171,6 @@ pub struct AtlasEntry {
     pub height: usize,
     pub bearing_y: isize,
     pub bearing_x: isize,
-    pub advance_x: usize,
 }
 
 impl Font {
@@ -257,20 +251,6 @@ impl Font {
             .face
             .as_ref()
             .expect("regular face missing")
-    }
-
-    fn regular_face_mut(&mut self) -> &mut ft::Face {
-        self.variants[FaceVariant::Regular as usize]
-            .face
-            .as_mut()
-            .expect("regular face missing")
-    }
-
-    pub fn load_glyph(&mut self, character: char) -> Glyph {
-        let face = self.regular_face_mut();
-        face.load_char(character as usize, ft::face::LoadFlag::RENDER).unwrap();
-        let glyph = face.glyph();
-        Glyph { metrics: glyph.metrics(), bitmap: glyph.bitmap() }
     }
 
     // Width of a representative ASCII cell. For monospace fonts that ship
@@ -516,7 +496,6 @@ fn pack_synth(
         height: h,
         bearing_x: bm.bearing_x,
         bearing_y: bm.bearing_y,
-        advance_x: bm.advance_x,
     };
     *x += stride;
     Some(entry)
@@ -611,7 +590,6 @@ fn pack_glyph(
         width: w,
         height: h,
         bearing_x: glyph.bitmap_left() as isize,
-        advance_x: advance,
         bearing_y: glyph.bitmap_top() as isize,
     };
     // Step the atlas cursor past the bitmap's full footprint, not just the
@@ -638,7 +616,6 @@ mod tests {
             height: 1,
             bearing_x: 0,
             bearing_y: 0,
-            advance_x: 1,
         }
     }
 

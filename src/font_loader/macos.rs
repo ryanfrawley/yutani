@@ -51,6 +51,7 @@ pub mod system_fonts {
             self
         }
 
+        #[allow(dead_code)]
         pub fn oblique(self) -> FontPropertyBuilder {
             self.italic()
         }

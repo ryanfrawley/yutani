@@ -60,6 +60,7 @@ impl Placement {
     }
 
     /// Column immediately past the last covered column (exclusive).
+    #[allow(dead_code)]
     pub fn right_col(&self) -> isize {
         self.left_col + self.cols as isize
     }
@@ -993,6 +994,7 @@ impl Terminal {
         std::mem::take(&mut self.pending_response)
     }
 
+    #[allow(dead_code)]
     pub fn row(&self, row: usize) -> &[Cell] {
         self.active_grid().row(row)
     }
