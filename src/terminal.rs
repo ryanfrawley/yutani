@@ -2061,8 +2061,16 @@ impl Terminal {
             let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
             raw = inflated;
         }
+        // icat (and other apps) sometimes omits `f=` on a=T payloads
+        // that are actually raw RGB/RGBA. The parser turns omitted
+        // `f=` into the PNG default, which would send the raw bytes
+        // through the PNG decoder and fail with "image format could
+        // not be determined". Run the same size-based inference the
+        // a=f path uses, with no fallback since this IS the base.
+        let effective_format =
+            resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
         let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
+            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2081,7 +2089,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
-            ctrl.format,
+            effective_format,
         );
     }
 
@@ -2266,20 +2274,11 @@ impl Terminal {
 
     /// Pick the right pixel format for an `a=f` raw payload.
     ///
-    /// Kitty's `kitten icat` is loose about the `f=` key on frame
-    /// transmissions: it sends `f=24` (RGB) on some frames, `f=32`
-    /// (RGBA) on others, and omits `f=` entirely on a meaningful
-    /// fraction. The parser turns omitted-`f` into the PNG default
-    /// (the sentinel value for "not specified"), which is wrong for
-    /// every actual GIF frame.
-    ///
-    /// Resolution order:
-    ///   1. PNG signature in the raw bytes → really PNG. Trust it.
-    ///   2. Source dims + raw byte count match RGB or RGBA within
-    ///      one page (16 KB on macOS SHM padding) → use that format.
-    ///   3. Recorded base format for this id → use it.
-    ///   4. Hand back whatever the parser saw — `normalize_kitty_payload`
-    ///      will reject if it can't make sense of it.
+    /// Thin wrapper around [`resolve_kitty_format`] that supplies the
+    /// recorded base format for this image id as the last-resort
+    /// fallback. Frame payloads inherit the base's format when the
+    /// app omits `f=` AND the byte count isn't a clean RGB / RGBA
+    /// match (a degenerate case, but worth handling).
     fn resolve_frame_format(
         &self,
         client_id: u32,
@@ -2288,44 +2287,13 @@ impl Terminal {
         source_w: Option<u32>,
         source_h: Option<u32>,
     ) -> KittyFormat {
-        // Explicit non-PNG always wins — the app told us.
-        if !matches!(parsed_format, KittyFormat::Png) {
-            return parsed_format;
-        }
-        // Real PNG always starts with the 8-byte signature. If we see
-        // it, treat as PNG regardless of any size hints.
-        const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        if raw.starts_with(PNG_SIG) {
-            return KittyFormat::Png;
-        }
-        // Size inference. SHM segments on macOS are 16 KB-page
-        // aligned, so the actual byte count exceeds w*h*c by less
-        // than one page. The two candidate ranges don't overlap for
-        // anything but trivially small frames (where the page padding
-        // dwarfs the per-pixel diff).
-        if let (Some(w), Some(h)) = (source_w, source_h) {
-            const PAGE: usize = 16 * 1024;
-            let pixels = (w as usize).saturating_mul(h as usize);
-            let rgb_bytes = pixels.saturating_mul(3);
-            let rgba_bytes = pixels.saturating_mul(4);
-            if raw.len() >= rgba_bytes && raw.len() < rgba_bytes + PAGE {
-                return KittyFormat::Rgba;
-            }
-            if raw.len() >= rgb_bytes && raw.len() < rgb_bytes + PAGE {
-                return KittyFormat::Rgb;
-            }
-            // Neither range matches. Prefer RGBA when over-large
-            // (modern default); the normalizer truncates to fit.
-            if raw.len() >= rgba_bytes {
-                return KittyFormat::Rgba;
-            }
-        }
-        // Last resort: whatever the base was. Better than PNG, which
-        // we already know doesn't match (no signature above).
-        self.kitty_image_formats
-            .get(&client_id)
-            .copied()
-            .unwrap_or(parsed_format)
+        resolve_kitty_format(
+            parsed_format,
+            raw,
+            source_w,
+            source_h,
+            self.kitty_image_formats.get(&client_id).copied(),
+        )
     }
 
     /// Shared tail of the `a=f` path. Builds the `PendingImageUpload`
@@ -2580,8 +2548,10 @@ impl Terminal {
             let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
             raw = inflated;
         }
+        let effective_format =
+            resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
         let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
+            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2598,7 +2568,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
-            ctrl.format,
+            effective_format,
         );
     }
 
@@ -2617,8 +2587,10 @@ impl Terminal {
             let Some(inflated) = inflate_kitty_zlib(&raw) else { return };
             raw = inflated;
         }
+        let effective_format =
+            resolve_kitty_format(acc.format, &raw, acc.source_w, acc.source_h, None);
         let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(acc.format, &raw, acc.source_w, acc.source_h)
+            normalize_kitty_payload(effective_format, &raw, acc.source_w, acc.source_h)
         else {
             return;
         };
@@ -2634,7 +2606,7 @@ impl Terminal {
             (0, 0),
             0,
             None,
-            acc.format,
+            effective_format,
         );
     }
 
@@ -2662,8 +2634,10 @@ impl Terminal {
 
         // Run through the same normalizer the direct path uses so
         // raw formats over temp file (icat for big JPGs) work too.
+        let effective_format =
+            resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
         let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(ctrl.format, &raw, ctrl.source_w, ctrl.source_h)
+            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2682,7 +2656,7 @@ impl Terminal {
             pixel_offset,
             z_index,
             src_rect,
-            ctrl.format,
+            effective_format,
         );
     }
 
@@ -3485,6 +3459,55 @@ fn kitty_placement_params(
         _ => None,
     };
     (pixel_offset, z_index, src_rect)
+}
+
+/// Resolve the effective pixel format for any Kitty raw payload —
+/// base image (`a=T` / `a=t`) or animation frame (`a=f`).
+///
+/// `kitten icat` is loose about `f=` on transmissions: it sends
+/// `f=24` (RGB) on some payloads, `f=32` (RGBA) on others, and omits
+/// `f=` entirely on a meaningful fraction. The parser turns omitted
+/// `f=` into the PNG default (the sentinel for "not specified"),
+/// which is wrong for any raw GIF payload. Resolution order:
+///
+///   1. Explicit non-PNG from the parser → trust it.
+///   2. PNG signature in the raw bytes → really is PNG.
+///   3. Source dims + raw byte count match RGB or RGBA within one
+///      page (16 KB on macOS SHM padding) → use that format.
+///   4. `fallback` (recorded base format for `a=f` callers, `None`
+///      for base-image callers) → use it.
+///   5. Hand back the parser's view — `normalize_kitty_payload` will
+///      reject if it can't decode.
+pub(crate) fn resolve_kitty_format(
+    parsed_format: KittyFormat,
+    raw: &[u8],
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+    fallback: Option<KittyFormat>,
+) -> KittyFormat {
+    if !matches!(parsed_format, KittyFormat::Png) {
+        return parsed_format;
+    }
+    const PNG_SIG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    if raw.starts_with(PNG_SIG) {
+        return KittyFormat::Png;
+    }
+    if let (Some(w), Some(h)) = (source_w, source_h) {
+        const PAGE: usize = 16 * 1024;
+        let pixels = (w as usize).saturating_mul(h as usize);
+        let rgb_bytes = pixels.saturating_mul(3);
+        let rgba_bytes = pixels.saturating_mul(4);
+        if raw.len() >= rgba_bytes && raw.len() < rgba_bytes + PAGE {
+            return KittyFormat::Rgba;
+        }
+        if raw.len() >= rgb_bytes && raw.len() < rgb_bytes + PAGE {
+            return KittyFormat::Rgb;
+        }
+        if raw.len() >= rgba_bytes {
+            return KittyFormat::Rgba;
+        }
+    }
+    fallback.unwrap_or(parsed_format)
 }
 
 /// Inflate a zlib-compressed payload (`o=z` in the Kitty control
@@ -6000,6 +6023,60 @@ mod tests {
             .expect("animation_frame populated");
         assert_eq!(spec.dst_x, 10, "lowercase x= must reach dst_x");
         assert_eq!(spec.dst_y, 20, "lowercase y= must reach dst_y");
+    }
+
+    #[test]
+    fn a_t_base_image_with_omitted_f_infers_rgb_format() {
+        // Regression: icat sometimes sends a=T with no f=. The
+        // payload is raw RGB or RGBA but the parser defaults f= to
+        // PNG, so the bytes get sent to the PNG decoder and fail
+        // with "image format could not be determined". The dispatch
+        // path must run the same size-based inference the a=f path
+        // uses, with no fallback (this IS the base — there's no
+        // earlier recorded format to inherit).
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        let raw_rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i % 256) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb);
+        // No f= → parser defaults to Png; s=4, v=4 → byte count
+        // 4*4*3 matches RGB exactly.
+        t.feed(&format!("\x1b_Ga=T,s=4,v=4,I=99;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "base normalizes despite omitted f=");
+        let up = &uploads[0];
+        assert_eq!(up.kitty_image_id, Some(99));
+        // Bytes should be PNG re-encoded from the RGB payload (proof
+        // the format inference fired and the normalizer ran).
+        assert!(
+            up.bytes.starts_with(b"\x89PNG"),
+            "raw RGB base normalized via format inference",
+        );
+        // And subsequent a=f frames with omitted f= inherit RGB via
+        // the recorded format map (sanity check that the inference's
+        // result was stored for inheritance).
+        let raw_rgb_frame: Vec<u8> = (0..2 * 2 * 3).map(|_| 0x33u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_frame);
+        t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=99,z=30;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let img = image::load_from_memory(&uploads[0].bytes).expect("frame re-decode");
+        assert_eq!(img.width(), 2);
+        assert_eq!(img.height(), 2);
+    }
+
+    #[test]
+    fn a_t_base_image_with_omitted_f_infers_rgba_format() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        // 4*4*4 byte payload → infer RGBA.
+        let raw_rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| (i % 256) as u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba);
+        t.feed(&format!("\x1b_Ga=T,s=4,v=4,I=100;{}\x1b\\", b64));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        assert!(uploads[0].bytes.starts_with(b"\x89PNG"));
     }
 
     #[test]
