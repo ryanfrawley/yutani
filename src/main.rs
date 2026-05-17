@@ -1211,10 +1211,6 @@ impl Selection {
         }
     }
 
-    fn contains(&self, line: isize, col: usize) -> bool {
-        let (s, e) = self.range();
-        (line, col) >= s && (line, col) <= e
-    }
 }
 
 impl State {
@@ -1853,7 +1849,7 @@ impl State {
         let bg_v = 1.0 / atlas_h;
         let scroll_y = self.scroll_y as f32;
 
-        let mut push_quad =
+        let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
              idxs: &mut Vec<u16>,
              x: f32,
@@ -2060,11 +2056,11 @@ impl State {
         // calls against the resulting buffer so the glow pipeline can
         // bloom each layer independently.
         let strip_pad = (line_height - bg_h) * 0.5;
-        let mut emit_bg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
-                                    idxs: &mut Vec<u16>,
-                                    r: isize,
-                                    c: usize,
-                                    bg: [f32; 4]| {
+        let emit_bg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
+                                idxs: &mut Vec<u16>,
+                                r: isize,
+                                c: usize,
+                                bg: [f32; 4]| {
             let x = col_x(c);
             let baseline_y = row_y(r);
             // Background quad spans one line-height strip, centered on the
@@ -2090,13 +2086,13 @@ impl State {
 
         // FG quad only — glyph for the cell. See `emit_bg_for_cell` above
         // for why bg/fg are split.
-        let mut emit_fg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
-                                    idxs: &mut Vec<u16>,
-                                    fg_source: GlyphSource,
-                                    variant: font::FaceVariant,
-                                    r: isize,
-                                    c: usize,
-                                    fg: [f32; 4]| {
+        let emit_fg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
+                                idxs: &mut Vec<u16>,
+                                fg_source: GlyphSource,
+                                variant: font::FaceVariant,
+                                r: isize,
+                                c: usize,
+                                fg: [f32; 4]| {
             let x = col_x(c);
             let baseline_y = row_y(r);
             let bg_y = baseline_y - bg_h - descender - strip_pad + scroll_y;
@@ -2704,19 +2700,18 @@ impl State {
         // rather than popping out from a hard edge.
         let top_fade_height = self.config.top_fade_height;
         let bottom_fade_height_max = self.config.bottom_fade_height;
-        let fade_rgb = [1.0, 1.0, 1.0];
         let clear = [0.0, 0.0, 0.0, 0.0];
 
         // Strip quads live in their own vertex/index buffer — they're drawn
         // by the blur strip pipeline in the composite pass.
         let mut strip_vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(16);
         let mut strip_indices: Vec<u16> = Vec::with_capacity(32);
-        let mut push_strip = |vertices: &mut Vec<renderer::vertex::Vertex>,
-                              indices: &mut Vec<u16>,
-                              y0: f32,
-                              y1: f32,
-                              c0: [f32; 4],
-                              c1: [f32; 4]| {
+        let push_strip = |vertices: &mut Vec<renderer::vertex::Vertex>,
+                          indices: &mut Vec<u16>,
+                          y0: f32,
+                          y1: f32,
+                          c0: [f32; 4],
+                          c1: [f32; 4]| {
             let start = vertices.len() as u16;
             // radii = 0 so the shader skips the SDF mask; local_pos /
             // half_size go unused but we have to populate them.
@@ -2755,23 +2750,6 @@ impl State {
             });
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };
-
-        // Premultiplied; passing an alpha multiplier scales RGB and alpha together.
-        let scaled_opaque = |alpha: f32| {
-            [
-                fade_rgb[0] * alpha,
-                fade_rgb[1] * alpha,
-                fade_rgb[2] * alpha,
-                alpha,
-            ]
-        };
-
-        // Both fades emerge as the user scrolls away from a boundary. Each
-        // edge tracks its own boundary independently — the top fade only
-        // vanishes at the top of scrollback (where the topmost row sits
-        // fully below the toolbar via decorator_offset), and the bottom
-        // fade only vanishes at the live grid.
-        let height_ramp_end = line_height * 4.0;
 
         // Edge fade animations: each phase ramps 0→1 the moment its
         // boundary distance leaves zero (and 1→0 when it returns) at a
@@ -3806,7 +3784,7 @@ impl State {
     fn input(
         &mut self,
         event: &WindowEvent,
-        elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+        _elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
     ) -> bool {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
