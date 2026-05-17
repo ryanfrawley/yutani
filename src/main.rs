@@ -51,6 +51,25 @@ fn config_path() -> Option<std::path::PathBuf> {
     Some(p)
 }
 
+/// Read the named color scheme from disk and install it as the live
+/// palette. `None` (or any read failure) reverts to the built-in defaults
+/// so a config edit that *removes* `color_scheme` actually goes back to
+/// neutral, not back to whatever was last loaded.
+fn install_color_scheme(name: Option<&str>) {
+    let palette_for = |name: &str| -> Option<palette::Palette> {
+        let path = scheme_path(name)?;
+        match std::fs::read_to_string(&path) {
+            Ok(src) => Some(palette::parse_yaml(&src)),
+            Err(e) => {
+                eprintln!("palette: failed to read {}: {}", path.display(), e);
+                None
+            }
+        }
+    };
+    let p = name.and_then(palette_for).unwrap_or(palette::Palette::defaults());
+    palette::install(p);
+}
+
 /// Resolve a scheme name to an on-disk path. Accepts either `.yml` or
 /// `.yaml`; `.yml` wins when both exist so users can pick the shorter
 /// extension without surprise.
@@ -3092,6 +3111,43 @@ impl State {
             || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
     }
 
+    /// Re-read `~/.config/yutani/config` and re-install the color scheme,
+    /// pushing palette-derived state into the GPU. Triggered by Cmd-Shift-R.
+    ///
+    /// Scope is deliberately narrow: only `color_scheme` (and the bits of
+    /// `Config` the renderer reads each frame, like the glow toggles) take
+    /// effect live. Fields baked into one-shot resources at startup —
+    /// `font_family`, `font_size`, pipeline creation, etc. — still need a
+    /// restart. A future expansion can grow this method without changing
+    /// the keybind.
+    fn reload_config(&mut self) {
+        let new_config = Config::load();
+        install_color_scheme(new_config.color_scheme.as_deref());
+        self.config = new_config;
+
+        // Glow uniforms cache palette-derived values (bright ANSI hues,
+        // foreground / background RGB) — they don't re-read palette::get()
+        // each frame the way the cell renderer does. Re-push them so the
+        // halo, mask, and overlay all reflect the new scheme.
+        let p = palette::get();
+        let bright: [[f32; 4]; 8] = [
+            p.ansi[8], p.ansi[9], p.ansi[10], p.ansi[11],
+            p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
+        ];
+        for g in [&mut self.glow, &mut self.glow_fg] {
+            g.set_bright_palette(&self.gpu.queue, &bright);
+            g.set_foreground(p.foreground);
+            g.set_background(p.background);
+            g.write_glow_params(&self.gpu.queue);
+        }
+
+        // OSC 10/11/12 reports and the title-bar appearance both need to
+        // reflect the new bg / fg.
+        self.sync_theme_colors();
+        self.window.set_theme(Some(theme_for_bg(p.background)));
+        self.invalidate();
+    }
+
     /// Push the current theme's foreground / background / cursor colors into
     /// the terminal so OSC 10/11/12 queries report something consistent with
     /// what the user actually sees.
@@ -4036,6 +4092,16 @@ impl State {
                                 }
                                 return true;
                             }
+                            // Cmd-Shift-R: re-read the config file and
+                            // swap the color scheme without restarting.
+                            // Other config fields (font, pipeline knobs)
+                            // still need a restart — see `reload_config`.
+                            if self.modifiers.shift_key()
+                                && (s.eq_ignore_ascii_case("r"))
+                            {
+                                self.reload_config();
+                                return true;
+                            }
                             // Cmd-Shift-I: load and place a debug image at
                             // the cursor. Path comes from `YUTANI_DEBUG_IMAGE`
                             // or `~/.config/yutani/debug_image.png`. Silent
@@ -4705,14 +4771,7 @@ async fn run() {
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
     // doesn't take the terminal down.
-    if let Some(name) = &config.color_scheme {
-        if let Some(path) = scheme_path(name) {
-            match std::fs::read_to_string(&path) {
-                Ok(src) => palette::install(palette::parse_yaml(&src)),
-                Err(e) => eprintln!("palette: failed to read {}: {}", path.display(), e),
-            }
-        }
-    }
+    install_color_scheme(config.color_scheme.as_deref());
     // Match the NSAppearance to the palette so the title-bar text the OS
     // draws over our transparent chrome reads against the actual bg —
     // otherwise dark schemes render black "Yutani" text on a dark fill.

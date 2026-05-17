@@ -3,7 +3,7 @@
 //! colors through `palette::get()`; if no scheme was loaded, the defaults
 //! match the previously-hardcoded values byte-for-byte.
 
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Palette {
@@ -85,16 +85,18 @@ impl Palette {
     }
 }
 
-static PALETTE: OnceLock<Palette> = OnceLock::new();
-static DEFAULTS: Palette = Palette::defaults();
+static PALETTE: RwLock<Palette> = RwLock::new(Palette::defaults());
 
+/// Replace the live palette. Cmd-Shift-R / the Config::load path call this
+/// at runtime to swap color schemes without restarting; callers are
+/// responsible for re-pushing any palette-derived data baked into GPU
+/// uniforms (see `State::reload_config`).
 pub fn install(p: Palette) {
-    // Startup-only; if something already installed a palette we keep it.
-    let _ = PALETTE.set(p);
+    *PALETTE.write().expect("palette lock poisoned") = p;
 }
 
-pub fn get() -> &'static Palette {
-    PALETTE.get().unwrap_or(&DEFAULTS)
+pub fn get() -> Palette {
+    *PALETTE.read().expect("palette lock poisoned")
 }
 
 /// Parse a YAML-subset scheme file. Missing fields keep their defaults;
@@ -429,6 +431,23 @@ blue: [0x0000ab, 0x5555ff]
         for b in 0..=255u8 {
             assert_eq!(linear_to_srgb_u8(srgb_to_linear(b)), b);
         }
+    }
+
+    #[test]
+    fn install_overwrites_live_palette() {
+        // The Cmd-Shift-R reload path depends on `install` actually replacing
+        // the live palette — the prior OnceLock storage would silently keep
+        // the first installed value. This pins overwrite semantics so a
+        // regression would surface in tests instead of in the user's running
+        // terminal. Serialised against itself by being the only test that
+        // mutates PALETTE.
+        let baseline = get();
+        let mut p = Palette::defaults();
+        p.background = [0.12, 0.34, 0.56, 1.0];
+        install(p);
+        assert_eq!(get().background, [0.12, 0.34, 0.56, 1.0]);
+        // Restore so any test added later doesn't observe poisoned state.
+        install(baseline);
     }
 
     #[test]
