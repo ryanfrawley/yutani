@@ -3049,9 +3049,30 @@ impl Terminal {
         });
     }
 
-    /// Handle a captured DCS payload. Currently we only implement xterm's
-    /// XTGETTCAP query (`+q<hex>;<hex>;...`); other DCS strings are dropped.
+    /// Handle a captured DCS payload. Currently we implement xterm's
+    /// XTGETTCAP query (`+q<hex>;<hex>;...`) and tmux's passthrough
+    /// wrapper (`tmux;<wrapped>`); other DCS strings are dropped.
     fn handle_dcs(&mut self, s: &str) {
+        // tmux passthrough: apps running inside tmux that want to send
+        // escape sequences to the OUTER terminal wrap them as
+        // `ESC P tmux ; <wrapped> ESC \`. Inside `<wrapped>`, literal
+        // ESC bytes are doubled (the ansi.rs parser already
+        // un-doubles them in `dcs_esc`). Tmux strips this wrapper and
+        // forwards the payload — but if someone cats a tmux-wrapped
+        // recording directly into yutani (no tmux in the loop), we'd
+        // never reach the inner sequences. Recognize the wrapper
+        // here, strip it, and re-feed the body so any APC / CSI /
+        // OSC inside dispatches through the normal pipeline.
+        if let Some(wrapped) = s.strip_prefix("tmux;") {
+            // The wrapped body is itself a sequence of escape codes;
+            // run it back through the parser. Safe to re-enter `feed`
+            // because the outer feed's event loop already consumed
+            // the DCS event before calling us, and the parser is in
+            // Ground state at this point.
+            let owned = wrapped.to_string();
+            self.feed(&owned);
+            return;
+        }
         let Some(rest) = s.strip_prefix("+q") else {
             return;
         };
@@ -5204,6 +5225,82 @@ mod tests {
         let mut t = Terminal::new(5, 3, 100);
         t.feed("\x1bP$qmhello\x1b\\"); // DECRQSS or similar — not implemented
         assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_unwraps_and_reprocesses_body() {
+        // tmux passthrough wraps an app's escape sequences for the
+        // outer terminal: `ESC P tmux ; <body> ESC \\`, with literal
+        // ESC bytes inside <body> doubled. Cat'ing a recording of
+        // such output directly into yutani (no tmux in the loop)
+        // should still dispatch the wrapped sequences — the ansi
+        // parser un-doubles the ESCs and `handle_dcs` strips the
+        // `tmux;` prefix and re-feeds the body through the parser.
+        //
+        // Pick an inner sequence whose effect we can observe: SGR 31
+        // turns the cursor's fg red, and the printed 'A' should
+        // carry that fg.
+        let _guard = crate::palette::TEST_LOCK.lock().expect("test lock");
+        crate::palette::install(crate::palette::Palette::defaults());
+        let mut t = Terminal::new(5, 3, 100);
+        // Doubled-ESC encoding of `ESC [ 3 1 m A`:
+        t.feed("\x1bPtmux;\x1b\x1b[31mA\x1b\\");
+        let cell = t.row(0)[0];
+        assert_eq!(cell.ch, 'A');
+        assert_eq!(
+            cell.style.color_fg_source,
+            crate::style::ColorSource::Indexed(1),
+            "wrapped SGR must have reached apply_sgr",
+        );
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_dispatches_wrapped_kitty_transmit() {
+        // Mirrors the real file from the bug report (~/bad-kitty.txt):
+        // tmux-wrapped Kitty `a=T,i=N,...` payload. Walking it through
+        // `Terminal::feed` should register the kitty image id so a
+        // later `a=p,i=N` (or any lookup) sees it.
+        let mut t = Terminal::new(20, 5, 100);
+        t.set_cell_size_px(8, 16);
+        // Build a tiny PNG just like the kitty E2E helpers.
+        let png = {
+            let buf = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 255, 255]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        // Wrap as tmux passthrough: doubled ESCs around the Kitty APC.
+        let wrapped = format!(
+            "\x1bPtmux;\x1b\x1b_Ga=T,f=100,i=4242,U=1;{}\x1b\x1b\\\x1b\\",
+            b64,
+        );
+        t.feed(&wrapped);
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(
+            uploads.len(), 1,
+            "tmux-wrapped Kitty a=T must produce one pending upload",
+        );
+        assert_eq!(uploads[0].kitty_image_id, Some(4242));
+    }
+
+    #[test]
+    fn dcs_tmux_passthrough_dispatches_wrapped_apc() {
+        // The real-world case: tmux-wrapped Kitty graphics APC.
+        // After unwrap, the body is `ESC _ G a=q,i=42 ESC \\` — a
+        // Kitty capability query. Its dispatch path writes an `OK`
+        // reply to `pending_response`; checking that proves the
+        // unwrapped APC reached the right handler.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1bPtmux;\x1b\x1b_Ga=q,f=100,i=42\x1b\x1b\\\x1b\\");
+        let reply = String::from_utf8(t.take_response()).unwrap_or_default();
+        assert!(
+            reply.contains("i=42") && reply.contains("OK"),
+            "expected Kitty query OK reply with i=42; got {reply:?}",
+        );
     }
 
     #[test]
