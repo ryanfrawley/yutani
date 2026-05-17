@@ -2272,8 +2272,25 @@ impl State {
             fg: [f32; 4],
         }
         let mut resolved: Vec<ResolvedCell> = Vec::with_capacity(rows * cols);
+        // Optional per-scheme override for glyph color inside the selection.
+        // Resolved once: `None` short-circuits the per-cell membership test
+        // so the common (unselected / no-override) path stays branch-cheap.
+        let selection_fg = pal.selection_fg;
+        let selection_range = selection.as_ref().map(|s| s.range());
         for r in r_lo..r_hi {
             let over = row_overrides.get(&r);
+            // Selection strip on this row (inclusive cols), or None if the
+            // row falls outside the selection. Mirrors `strip_at` further
+            // down where the overlay quads are emitted.
+            let sel_strip = selection_range.and_then(|(start, end)| {
+                let abs_line = self.terminal.visual_to_abs_line(r);
+                if abs_line < start.0 || abs_line > end.0 {
+                    return None;
+                }
+                let from = if abs_line == start.0 { start.1 } else { 0 };
+                let to = if abs_line == end.0 { end.1 } else { cols - 1 };
+                if from > to || from >= cols { None } else { Some((from, to.min(cols - 1))) }
+            });
             for c in 0..cols {
                 // Half-block fallback: substitute the underlying cell
                 // (typically a blank reserved by the placement) with a
@@ -2283,12 +2300,19 @@ impl State {
                 // real text the user expects to see here.
                 if let Some(hb) = halfblock_overrides.get(&(r, c)) {
                     emit_bg_for_cell(&mut vertices, &mut indices, r, c, hb.bg);
+                    // Image-replacement glyphs honour selection_fg too so a
+                    // selection that runs through an image preview keeps a
+                    // consistent text color.
+                    let fg = match (selection_fg, sel_strip) {
+                        (Some(sfg), Some((from, to))) if c >= from && c <= to => sfg,
+                        _ => hb.fg,
+                    };
                     resolved.push(ResolvedCell {
                         fg_source: GlyphSource::Char(images::HALFBLOCK_CHAR),
                         variant: font::FaceVariant::Regular,
                         r,
                         c,
-                        fg: hb.fg,
+                        fg,
                     });
                     continue;
                 }
@@ -2314,6 +2338,14 @@ impl State {
                 // applied only to cell colors — cursor, selection, and
                 // chrome remain at scheme-author fidelity.
                 let (fg, bg) = (pal.project(fg), pal.project(bg));
+                // Scheme-provided selection_fg wins over the cell's own fg
+                // (including the post-reverse swap). Applied after projection
+                // so it stays at scheme-author fidelity, matching how
+                // cursor/selection chrome behave.
+                let fg = match (selection_fg, sel_strip) {
+                    (Some(sfg), Some((from, to))) if c >= from && c <= to => sfg,
+                    _ => fg,
+                };
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
                 let fg_source = match over.and_then(|cs| cs[c]) {
