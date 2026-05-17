@@ -90,6 +90,13 @@ struct Config {
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
     /// back to defaults.
     color_scheme: Option<String>,
+    /// Preferred font family name. `None` (or empty) falls back to the
+    /// built-in preference list (Iosevka Term → Iosevka → Fira Code → Menlo).
+    /// Matched by exact family name first; failing that, by substring (so
+    /// "Iosevka" picks up "Iosevka Term", etc.). A `Some(_)` value that
+    /// doesn't match any installed family warns and falls back to the
+    /// built-in list.
+    font_family: Option<String>,
     /// When true, pixels whose HSV value (max channel) exceeds
     /// `glow_threshold` contribute to the glow. Brightness drives the
     /// glow intensity — brighter pixels bloom harder.
@@ -219,6 +226,7 @@ impl Config {
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
+            font_family: None,
             glow_match_brightness: false,
             glow_match_bright_ansi: false,
             glow_threshold: renderer::glow::DEFAULT_THRESHOLD,
@@ -275,6 +283,7 @@ impl Config {
                     c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
                 },
                 "color_scheme" => c.color_scheme = if v.is_empty() { None } else { Some(v.to_string()) },
+                "font_family" => c.font_family = if v.is_empty() { None } else { Some(v.to_string()) },
                 "glow_match_brightness" => if let Ok(x) = v.parse() { c.glow_match_brightness = x; },
                 "glow_match_bright_ansi" => if let Ok(x) = v.parse() { c.glow_match_bright_ansi = x; },
                 "glow_threshold" => if let Ok(x) = v.parse::<f32>() {
@@ -383,6 +392,9 @@ impl Config {
         );
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", name));
+        }
+        if let Some(name) = &self.font_family {
+            s.push_str(&format!("font_family = {}\n", name));
         }
         s.push_str(&format!(
             "glow_match_brightness = {}\n\
@@ -4645,6 +4657,8 @@ async fn run() {
 
     // event_loop.set_control_flow(ControlFlow::Poll);
 
+    let config = Config::load();
+
     let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
         .monospace()
         .build();
@@ -4652,18 +4666,41 @@ async fn run() {
     mono_fonts.dedup();
     let installed = font_loader::system_fonts::query_all();
 
-    // let family = &fonts[rand::prelude::random::<usize>() % fonts.len()];
-    let primary_name = ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
-        .iter()
-        .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
-        .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
-        .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
-        .expect("no monospace primary font found")
-        .clone();
+    // User override wins over the built-in preference list. Exact-name
+    // match first (so "Iosevka" doesn't pick "Iosevka Term" when the user
+    // typed the bare name), then substring as a forgiving fallback. We
+    // search the full `installed` list so users can opt into a
+    // proportional / display family if they want — monospace isn't
+    // enforced. A `Some(_)` value with no match warns and falls through
+    // to the default selection so a typo in the config doesn't take the
+    // terminal down.
+    let configured_primary = config.font_family.as_deref().and_then(|want| {
+        let hit = installed
+            .iter()
+            .find(|f| f.as_str() == want)
+            .or_else(|| installed.iter().find(|f| f.contains(want)))
+            .cloned();
+        if hit.is_none() {
+            eprintln!(
+                "font: configured font_family {:?} not installed, falling back to defaults",
+                want,
+            );
+        }
+        hit
+    });
+
+    let primary_name = configured_primary.unwrap_or_else(|| {
+        ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
+            .iter()
+            .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
+            .expect("no monospace primary font found")
+            .clone()
+    });
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
 
-    let config = Config::load();
     // Install the color scheme before constructing State so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
@@ -5374,6 +5411,53 @@ mod tests {
         c.images_halfblock_for_missing = true;
         let parsed = Config::parse_str(&c.serialize());
         assert!(parsed.images_halfblock_for_missing);
+    }
+
+    #[test]
+    fn config_font_family_default_is_none() {
+        assert!(Config::defaults().font_family.is_none());
+    }
+
+    #[test]
+    fn config_font_family_round_trips_some() {
+        let mut c = Config::defaults();
+        c.font_family = Some("Fira Code".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.font_family.as_deref(), Some("Fira Code"));
+    }
+
+    #[test]
+    fn config_font_family_round_trips_none() {
+        let c = Config::defaults();
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.font_family.is_none());
+    }
+
+    #[test]
+    fn config_font_family_empty_parses_as_none() {
+        // Matches `color_scheme` semantics: an empty RHS explicitly clears
+        // the override rather than installing the empty string.
+        let parsed = Config::parse_str("font_family = \n");
+        assert!(parsed.font_family.is_none());
+    }
+
+    #[test]
+    fn config_font_family_preserves_spaces_in_name() {
+        let parsed = Config::parse_str("font_family = JetBrains Mono\n");
+        assert_eq!(parsed.font_family.as_deref(), Some("JetBrains Mono"));
+    }
+
+    #[test]
+    fn config_font_family_trims_surrounding_whitespace() {
+        // `parse_str` trims both sides of the value; whitespace-only RHS
+        // must collapse to None (same as the bare-empty case) and a
+        // padded name must not carry trailing/leading spaces into the
+        // font lookup, where they would silently miss every installed
+        // family.
+        let only_ws = Config::parse_str("font_family =    \n");
+        assert!(only_ws.font_family.is_none());
+        let padded = Config::parse_str("font_family =   Fira Code   \n");
+        assert_eq!(padded.font_family.as_deref(), Some("Fira Code"));
     }
 
     //
