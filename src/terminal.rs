@@ -265,6 +265,11 @@ impl Grid {
         self.cells[i] = cell;
     }
 
+    pub fn get_mut(&mut self, row: usize, col: usize) -> &mut Cell {
+        let i = self.idx(row, col);
+        &mut self.cells[i]
+    }
+
     pub fn row(&self, row: usize) -> &[Cell] {
         let start = row * self.cols;
         &self.cells[start..start + self.cols]
@@ -562,6 +567,14 @@ pub struct Terminal {
     // overwrites (matching the implicit "only one anonymous stream"
     // contract).
     kitty_chunks_anon: Option<KittyChunks>,
+    // Tracks the `i=` of the most recently opened id-keyed chunked
+    // transmission. icat puts `i=` on the first chunk and omits it
+    // on every continuation — without this thread, continuation
+    // chunks fall through to the anonymous bucket and the id-keyed
+    // entry leaks. Set when an `m=1` chunk with `i=` arrives, cleared
+    // when that transmission's final chunk (`m=0` / no `m=`) finalizes
+    // or when a fresh id-keyed transmission preempts it.
+    current_chunked_id: Option<u32>,
     // Kitty client image-id → our store ImageId. Populated when a
     // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
     // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
@@ -588,6 +601,26 @@ pub struct Terminal {
     // placement rather than panicking.
     cell_w_px: u32,
     line_h_px: u32,
+    /// In-flight Kitty Unicode-placeholder absorbtion state. The
+    /// placeholder protocol writes `U+10EEEE` followed by up to three
+    /// combining diacritics encoding (image_row, image_col,
+    /// image_id_high_byte). The diacritics must attach to the
+    /// preceding cell rather than landing in their own cells as
+    /// glyph-less "tofu". This state points at the cell that received
+    /// the most recent `U+10EEEE` and tracks which diacritic slot is
+    /// next. Reset on the first non-diacritic `print()`.
+    placeholder_decode: Option<PlaceholderDecode>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct PlaceholderDecode {
+    /// Grid coordinates of the U+10EEEE cell the upcoming diacritics
+    /// attach to.
+    cell_row: usize,
+    cell_col: usize,
+    /// 0 = next diacritic is the image row, 1 = column, 2 = image id
+    /// high byte. After 3, the state clears.
+    next_slot: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -640,10 +673,12 @@ impl Terminal {
             pending_image_uploads: Vec::new(),
             kitty_chunks: std::collections::HashMap::new(),
             kitty_chunks_anon: None,
+            current_chunked_id: None,
             kitty_image_ids: std::collections::HashMap::new(),
             kitty_image_formats: std::collections::HashMap::new(),
             cell_w_px: 1,
             line_h_px: 1,
+            placeholder_decode: None,
         }
     }
 
@@ -1428,6 +1463,22 @@ impl Terminal {
     }
 
     fn print(&mut self, ch: char) {
+        // Kitty Unicode-placeholder absorption: when the most recent
+        // print was U+10EEEE, the next up-to-three diacritics encode
+        // position (row, col, id-high-byte) and must attach to that
+        // cell instead of spawning their own. Without this, every
+        // diacritic lands in its own cell with no glyph — the
+        // user-visible "bunch of characters without glyphs" symptom
+        // under tmux, where kitten icat falls back to the placeholder
+        // protocol.
+        if let Some(state) = self.placeholder_decode {
+            if let Some(index) = kitty_placeholder_diacritic_index(ch) {
+                self.apply_placeholder_diacritic(state, index);
+                return;
+            }
+        }
+        self.placeholder_decode = None;
+
         // With DECLRMM enabled, autowrap pivots on the right margin instead
         // of the screen edge, and wraps back to the left margin. We detect
         // the "inside LRM" case so that cursor positions sitting *outside*
@@ -1459,6 +1510,13 @@ impl Terminal {
         let col = self.cursor.col;
         if row < self.rows && col < self.cols {
             self.active_grid_mut().set(row, col, cell);
+            if ch == '\u{10EEEE}' && cell.placeholder_image_id.is_some() {
+                self.placeholder_decode = Some(PlaceholderDecode {
+                    cell_row: row,
+                    cell_col: col,
+                    next_slot: 0,
+                });
+            }
         }
         if self.cursor.col >= wrap_at {
             if self.autowrap {
@@ -1468,6 +1526,31 @@ impl Terminal {
         } else {
             self.cursor.col += 1;
         }
+    }
+
+    /// Apply one decoded Kitty placeholder diacritic to the cell that
+    /// the most recent `U+10EEEE` print landed in. `slot` advances
+    /// row → col → id-high-byte; after the third diacritic the
+    /// absorption state clears (a fourth diacritic in a row will fall
+    /// through to the normal print path and behave like any other
+    /// combining mark).
+    fn apply_placeholder_diacritic(&mut self, mut state: PlaceholderDecode, index: u32) {
+        if state.cell_row < self.rows && state.cell_col < self.cols {
+            let cell = self.active_grid_mut().get_mut(state.cell_row, state.cell_col);
+            match state.next_slot {
+                0 => cell.placeholder_image_row = index.min(u16::MAX as u32) as u16,
+                1 => cell.placeholder_image_col = index.min(u16::MAX as u32) as u16,
+                2 => {
+                    if let Some(id) = cell.placeholder_image_id {
+                        let high = (index & 0xFF) << 24;
+                        cell.placeholder_image_id = Some((id & 0x00FF_FFFF) | high);
+                    }
+                }
+                _ => {}
+            }
+        }
+        state.next_slot = state.next_slot.saturating_add(1);
+        self.placeholder_decode = if state.next_slot < 3 { Some(state) } else { None };
     }
 
     fn backspace(&mut self) {
@@ -2007,9 +2090,48 @@ impl Terminal {
             Some((c, p)) => (c, p),
             None => (rest, ""),
         };
-        let Some(ctrl) = parse_kitty_control(ctrl_str) else {
+        let Some(mut ctrl) = parse_kitty_control(ctrl_str) else {
             return;
         };
+
+        // Thread continuation chunks back to the in-flight chunked
+        // transmission. `kitten icat` (and many other apps) puts
+        // `i=` on the FIRST chunk of a chunked image / frame and
+        // omits it on every continuation — the spec lets the
+        // terminal "remember" which transmission is currently being
+        // assembled. Without this injection, continuation chunks
+        // get routed to the anonymous-stream bucket and the
+        // id-keyed entry leaks, so `kitty_image_id_lookup` later
+        // returns None and the placeholder cells render as tofu.
+        if ctrl.image_id.is_none() {
+            if let Some(id) = self.current_chunked_id {
+                if matches!(
+                    ctrl.action,
+                    KittyAction::Transmit
+                        | KittyAction::TransmitAndDisplay
+                        | KittyAction::AnimationFrame
+                ) {
+                    ctrl.image_id = Some(id);
+                }
+            }
+        }
+        // Update the in-flight tracker. First chunk of an id-keyed
+        // stream sets it; the matching final chunk clears it. Single
+        // chunks (no `m=` on either side) leave it untouched.
+        if matches!(
+            ctrl.action,
+            KittyAction::Transmit
+                | KittyAction::TransmitAndDisplay
+                | KittyAction::AnimationFrame
+        ) {
+            if let Some(id) = ctrl.image_id {
+                if ctrl.more_chunks {
+                    self.current_chunked_id = Some(id);
+                } else if self.current_chunked_id == Some(id) {
+                    self.current_chunked_id = None;
+                }
+            }
+        }
 
         // Capability handshake. Apps query each (format, transmission)
         // combo on startup; we must answer truthfully or they'll pick a
@@ -2217,6 +2339,7 @@ impl Terminal {
                         kitty_placement_id: None,
                         display_immediately: false,
                         compressed_zlib: ctrl.compressed_zlib,
+                        anim_first_chunk: Some(kitty_anim_frame_spec_from_ctrl(ctrl)),
                     });
                 append_b64_filtered(&mut entry.b64, payload);
                 return;
@@ -2246,6 +2369,7 @@ impl Terminal {
                 );
                 // Fast path: raw RGB/RGBA bypasses the worker. See
                 // `convert_kitty_raw_to_rgba` for the rationale.
+                let spec_override = acc.anim_first_chunk;
                 if matches!(
                     effective_format,
                     KittyFormat::Rgb | KittyFormat::Rgba,
@@ -2259,7 +2383,7 @@ impl Terminal {
                         return;
                     };
                     self.queue_animation_frame_upload(
-                        client_id, rgba, ctrl, Some((w, h)),
+                        client_id, rgba, ctrl, Some((w, h)), spec_override,
                     );
                     return;
                 }
@@ -2268,7 +2392,7 @@ impl Terminal {
                 else {
                     return;
                 };
-                self.queue_animation_frame_upload(client_id, bytes, ctrl, None);
+                self.queue_animation_frame_upload(client_id, bytes, ctrl, None, spec_override);
                 return;
             }
         }
@@ -2328,7 +2452,7 @@ impl Terminal {
             ) else {
                 return;
             };
-            self.queue_animation_frame_upload(client_id, rgba, ctrl, Some((w, h)));
+            self.queue_animation_frame_upload(client_id, rgba, ctrl, Some((w, h)), None);
             return;
         }
         let Some((bytes, _pixel_size)) =
@@ -2336,7 +2460,7 @@ impl Terminal {
         else {
             return;
         };
-        self.queue_animation_frame_upload(client_id, bytes, ctrl, None);
+        self.queue_animation_frame_upload(client_id, bytes, ctrl, None, None);
     }
 
     /// Pick the right pixel format for an `a=f` raw payload.
@@ -2375,7 +2499,15 @@ impl Terminal {
         bytes: Vec<u8>,
         ctrl: &KittyControl,
         raw_rgba_dims: Option<(u32, u32)>,
+        spec_override: Option<KittyAnimationFrameSpec>,
     ) {
+        // Chunked finalize passes `spec_override` lifted from the
+        // FIRST chunk; only the first chunk carries `z=` (gap_ms),
+        // `x=`/`y=` (dst), `r=` (target_slot), `c=` (compose_base)
+        // — taking them from `ctrl` (the last chunk) zeros them all
+        // out and the animation runs at the 1ms floor.
+        let animation_frame =
+            spec_override.unwrap_or_else(|| kitty_anim_frame_spec_from_ctrl(ctrl));
         self.pending_image_uploads.push(PendingImageUpload {
             bytes,
             pixel_size: None,
@@ -2392,21 +2524,7 @@ impl Terminal {
             pixel_offset: (0, 0),
             z_index: 0,
             src_rect: None,
-            animation_frame: Some(KittyAnimationFrameSpec {
-                target_slot: ctrl.anim_frame_num,
-                compose_base: ctrl.anim_compose_base.filter(|&n| n > 0),
-                gap_ms: ctrl.anim_gap_ms.unwrap_or(0),
-                // For `a=f`, the Kitty spec overloads lowercase `x=`
-                // and `y=` (normally source-crop on `a=T`) as the
-                // destination top-left within the parent frame. The
-                // parser populated them into `crop_x` / `crop_y`;
-                // capital `X=`/`Y=` aren't defined for `a=f`. Fall
-                // back to `pixel_offset_x/y` only if the lowercase
-                // pair is absent, for forward-compat with apps that
-                // pick the opposite convention.
-                dst_x: ctrl.crop_x.or(ctrl.pixel_offset_x).unwrap_or(0),
-                dst_y: ctrl.crop_y.or(ctrl.pixel_offset_y).unwrap_or(0),
-            }),
+            animation_frame: Some(animation_frame),
             animation_control: None,
             raw_rgba_dims,
         });
@@ -2534,9 +2652,12 @@ impl Terminal {
     fn handle_apc_direct(&mut self, payload: &str, ctrl: &KittyControl) {
         // Branch on chunking. Four states: (id present, more chunks),
         // (id present, last chunk), (no id, more chunks), (no id, last
-        // chunk). The two id-less branches use `kitty_chunks_anon`
-        // because `kitty +kitten icat` omits `i=` for raw / JPG
-        // streams but still expects accumulation.
+        // chunk). Continuation chunks without an explicit `i=` arrive
+        // here with `ctrl.image_id` already injected by `handle_apc`'s
+        // chunk-threading pre-step (see `current_chunked_id`), so the
+        // id-keyed branches catch them just like real id-bearing
+        // chunks. The two id-less branches handle genuinely anonymous
+        // streams (`kitten icat` raw-JPG path, etc).
         //
         // Hot path: a typical 1MB image arrives in ~250 chunks, so the
         // per-chunk work has to stay minimal. Stream the whitespace
@@ -2563,6 +2684,7 @@ impl Terminal {
                     kitty_placement_id: ctrl.placement_id,
                     display_immediately: display,
                     compressed_zlib: ctrl.compressed_zlib,
+                    anim_first_chunk: None, // a=T/a=t aren't animation frames
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
@@ -2588,6 +2710,7 @@ impl Terminal {
                     kitty_placement_id: ctrl.placement_id,
                     display_immediately: display,
                     compressed_zlib: ctrl.compressed_zlib,
+                    anim_first_chunk: None, // a=T/a=t aren't animation frames
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
@@ -3356,6 +3479,16 @@ struct KittyChunks {
     /// `o=z` from the first chunk: payload should be zlib-inflated
     /// before normalizing. Set on the first chunk only (spec contract).
     compressed_zlib: bool,
+    /// First-chunk animation-frame metadata. Only the first chunk
+    /// carries `z=` (gap_ms), lowercase `x=` / `y=` (dst position),
+    /// `r=` (target_slot), and `c=` (compose_base); continuation
+    /// chunks omit them and the parser turns them into defaults.
+    /// Stashing them here means the final-chunk finalize doesn't
+    /// have to look at the LAST chunk's `ctrl` (which has all those
+    /// fields zeroed) and accidentally turn every animation frame
+    /// into a 0ms delay — symptom: animations run at thousands of
+    /// fps because `delay_ms.max(1)` clamps to 1ms.
+    anim_first_chunk: Option<KittyAnimationFrameSpec>,
 }
 
 /// Decode a Kitty virtual-placement image id from a cell's foreground
@@ -3373,6 +3506,69 @@ struct KittyChunks {
 /// Style colors are stored as linear-space `[f32; 4]`; we round-trip
 /// through sRGB to recover the original u8 channels. `color_fg`
 /// `None` (cell didn't explicitly set a fg color) returns `None`.
+/// Sorted list of the 297 combining marks the Kitty Unicode-placeholder
+/// protocol uses to encode `(row, column, image-id-high-byte)` after
+/// each `U+10EEEE` cell. The lookup `kitty_placeholder_diacritic_index`
+/// binary-searches this table and returns the codepoint's index — that
+/// index IS the encoded value (0..=296). The set is copied verbatim
+/// from kitty's `rowcolumn_diacritics.txt`; do not reorder.
+const KITTY_PLACEHOLDER_DIACRITICS: &[char] = &[
+    '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}',
+    '\u{033F}', '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}',
+    '\u{0352}', '\u{0357}', '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}',
+    '\u{0367}', '\u{0368}', '\u{0369}', '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}',
+    '\u{036E}', '\u{036F}', '\u{0483}', '\u{0484}', '\u{0485}', '\u{0486}', '\u{0487}',
+    '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}', '\u{0598}', '\u{0599}',
+    '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}', '\u{05A8}',
+    '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
+    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}',
+    '\u{0658}', '\u{0659}', '\u{065A}', '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}',
+    '\u{06D7}', '\u{06D8}', '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}',
+    '\u{06E0}', '\u{06E1}', '\u{06E2}', '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EB}',
+    '\u{06EC}', '\u{0730}', '\u{0732}', '\u{0733}', '\u{0735}', '\u{0736}', '\u{073A}',
+    '\u{073D}', '\u{073F}', '\u{0740}', '\u{0741}', '\u{0743}', '\u{0745}', '\u{0747}',
+    '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}', '\u{07ED}', '\u{07EE}', '\u{07EF}',
+    '\u{07F0}', '\u{07F1}', '\u{07F3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}',
+    '\u{081B}', '\u{081C}', '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}',
+    '\u{0822}', '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}',
+    '\u{082B}', '\u{082C}', '\u{082D}', '\u{0951}', '\u{0953}', '\u{0954}', '\u{0F82}',
+    '\u{0F83}', '\u{0F86}', '\u{0F87}', '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}',
+    '\u{193A}', '\u{1A17}', '\u{1A75}', '\u{1A76}', '\u{1A77}', '\u{1A78}', '\u{1A79}',
+    '\u{1A7A}', '\u{1A7B}', '\u{1A7C}', '\u{1B6B}', '\u{1B6D}', '\u{1B6E}', '\u{1B6F}',
+    '\u{1B70}', '\u{1B71}', '\u{1B72}', '\u{1B73}', '\u{1CD0}', '\u{1CD1}', '\u{1CD2}',
+    '\u{1CDA}', '\u{1CDB}', '\u{1CE0}', '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}',
+    '\u{1DC5}', '\u{1DC6}', '\u{1DC7}', '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}',
+    '\u{1DD1}', '\u{1DD2}', '\u{1DD3}', '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}',
+    '\u{1DD8}', '\u{1DD9}', '\u{1DDA}', '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}',
+    '\u{1DDF}', '\u{1DE0}', '\u{1DE1}', '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}',
+    '\u{1DE6}', '\u{1DFE}', '\u{20D0}', '\u{20D1}', '\u{20D4}', '\u{20D5}', '\u{20D6}',
+    '\u{20D7}', '\u{20DB}', '\u{20DC}', '\u{20E1}', '\u{20E7}', '\u{20E9}', '\u{20F0}',
+    '\u{2CEF}', '\u{2CF0}', '\u{2CF1}', '\u{2DE0}', '\u{2DE1}', '\u{2DE2}', '\u{2DE3}',
+    '\u{2DE4}', '\u{2DE5}', '\u{2DE6}', '\u{2DE7}', '\u{2DE8}', '\u{2DE9}', '\u{2DEA}',
+    '\u{2DEB}', '\u{2DEC}', '\u{2DED}', '\u{2DEE}', '\u{2DEF}', '\u{2DF0}', '\u{2DF1}',
+    '\u{2DF2}', '\u{2DF3}', '\u{2DF4}', '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}',
+    '\u{2DF9}', '\u{2DFA}', '\u{2DFB}', '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}',
+    '\u{A66F}', '\u{A67C}', '\u{A67D}', '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}',
+    '\u{A8E2}', '\u{A8E3}', '\u{A8E4}', '\u{A8E5}', '\u{A8E6}', '\u{A8E7}', '\u{A8E8}',
+    '\u{A8E9}', '\u{A8EA}', '\u{A8EB}', '\u{A8EC}', '\u{A8ED}', '\u{A8EE}', '\u{A8EF}',
+    '\u{A8F0}', '\u{A8F1}', '\u{AAB0}', '\u{AAB2}', '\u{AAB3}', '\u{AAB7}', '\u{AAB8}',
+    '\u{AABE}', '\u{AABF}', '\u{AAC1}', '\u{FE20}', '\u{FE21}', '\u{FE22}', '\u{FE23}',
+    '\u{FE24}', '\u{FE25}', '\u{FE26}', '\u{10A0F}', '\u{10A38}', '\u{1D185}', '\u{1D186}',
+    '\u{1D187}', '\u{1D188}', '\u{1D189}', '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}',
+    '\u{1D1AD}', '\u{1D242}', '\u{1D243}', '\u{1D244}',
+];
+
+/// Look up a codepoint in the Kitty placeholder diacritic table; the
+/// returned index is the encoded `(row | column | id-high-byte)` value.
+/// Returns `None` for any non-diacritic — caller treats that as "end
+/// of the placeholder's trailing diacritic run".
+pub(crate) fn kitty_placeholder_diacritic_index(ch: char) -> Option<u32> {
+    KITTY_PLACEHOLDER_DIACRITICS
+        .binary_search(&ch)
+        .ok()
+        .map(|i| i as u32)
+}
+
 fn decode_kitty_placeholder_image_id(style: &crate::style::Style) -> Option<u32> {
     let fg = style.color_fg?;
     let r = crate::palette::linear_to_srgb_u8(fg[0]) as u32;
@@ -3523,6 +3719,29 @@ fn append_b64_filtered(dest: &mut String, payload: &str) {
 /// z-index, `x=`/`y=`/`w=`/`h=` source crop) from a `KittyControl` in
 /// the format `finalize_kitty_image_bytes` and `insert_placement_kitty`
 /// expect. Centralizes the defaults so all dispatch sites agree.
+/// Lift the per-frame metadata out of a `KittyControl` for `a=f`.
+/// Single-chunk callers and the first-chunk capture in the chunked
+/// path share this — the chunked finalize then plays back the
+/// stashed spec rather than re-reading the last chunk's `ctrl`
+/// (which has these fields zeroed because icat omits them on
+/// continuations).
+fn kitty_anim_frame_spec_from_ctrl(ctrl: &KittyControl) -> KittyAnimationFrameSpec {
+    KittyAnimationFrameSpec {
+        target_slot: ctrl.anim_frame_num,
+        compose_base: ctrl.anim_compose_base.filter(|&n| n > 0),
+        gap_ms: ctrl.anim_gap_ms.unwrap_or(0),
+        // For `a=f`, the Kitty spec overloads lowercase `x=` and
+        // `y=` (normally source-crop on `a=T`) as the destination
+        // top-left within the parent frame. The parser populated
+        // them into `crop_x` / `crop_y`; capital `X=`/`Y=` aren't
+        // defined for `a=f`. Fall back to `pixel_offset_x/y` only if
+        // the lowercase pair is absent, for forward-compat with apps
+        // that pick the opposite convention.
+        dst_x: ctrl.crop_x.or(ctrl.pixel_offset_x).unwrap_or(0),
+        dst_y: ctrl.crop_y.or(ctrl.pixel_offset_y).unwrap_or(0),
+    }
+}
+
 fn kitty_placement_params(
     ctrl: &KittyControl,
 ) -> ((i32, i32), i32, Option<(u32, u32, u32, u32)>) {
@@ -3554,9 +3773,16 @@ fn kitty_placement_params(
 ///   2. PNG signature in the raw bytes → really is PNG.
 ///   3. Source dims + raw byte count match RGB or RGBA within one
 ///      page (16 KB on macOS SHM padding) → use that format.
-///   4. `fallback` (recorded base format for `a=f` callers, `None`
+///   4. Source dims set but raw byte count sits in the gap between
+///      RGB and RGBA exact-match windows → assume the larger format
+///      it's still big enough for, so a frame whose inflated size is
+///      slightly off doesn't get misrouted to the PNG decoder.
+///      Closes "image decode failed: The image format could not be
+///      determined" on kitty animations where one frame's inflated
+///      length falls between `w*h*3 + PAGE` and `w*h*4`.
+///   5. `fallback` (recorded base format for `a=f` callers, `None`
 ///      for base-image callers) → use it.
-///   5. Hand back the parser's view — `normalize_kitty_payload` will
+///   6. Hand back the parser's view — `normalize_kitty_payload` will
 ///      reject if it can't decode.
 pub(crate) fn resolve_kitty_format(
     parsed_format: KittyFormat,
@@ -3585,6 +3811,19 @@ pub(crate) fn resolve_kitty_format(
         }
         if raw.len() >= rgba_bytes {
             return KittyFormat::Rgba;
+        }
+        // Mid-gap: between RGB and RGBA exact-match windows. Prefer
+        // the base format if known (frames inherit per spec); else
+        // fall through to RGB so the raw-bypass path can run rather
+        // than handing the bytes to the PNG decoder, which has no
+        // chance of recognizing the format.
+        if raw.len() >= rgb_bytes {
+            if let Some(fb) = fallback {
+                if matches!(fb, KittyFormat::Rgb | KittyFormat::Rgba) {
+                    return fb;
+                }
+            }
+            return KittyFormat::Rgb;
         }
     }
     fallback.unwrap_or(parsed_format)
@@ -6238,6 +6477,48 @@ mod tests {
     }
 
     #[test]
+    fn a_f_mid_gap_byte_count_falls_back_to_base_format_not_png() {
+        // Repro for "image decode failed: The image format could not
+        // be determined" on kitty animations: a frame whose inflated
+        // byte count sits between w*h*3+PAGE and w*h*4 used to fall
+        // through every byte-count branch and end up at PNG (the
+        // parser's "no f= seen" sentinel). The PNG decoder can't
+        // recognize raw RGB(A) and prints the user-visible error.
+        // With the fix, the resolver consults the base format and
+        // accepts RGB/RGBA so the raw-bypass path runs.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        // Base: f=24 RGB at 4x4 → kitty_image_formats[42] = Rgb.
+        let raw_rgb_base: Vec<u8> = (0..4 * 4 * 3).map(|_| 0x11u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_base);
+        t.feed(&format!("\x1b_Ga=T,f=24,s=4,v=4,I=42;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+
+        // Frame omits f=. Build a payload sized to land in the gap
+        // between w*h*3+PAGE and w*h*4 for w=h=64 (rgb=12288,
+        // rgba=16384, PAGE=16384 so the +PAGE windows cover both —
+        // pick larger dims to expose the gap).
+        let (w, h) = (450u32, 450u32);
+        let rgb = (w as usize) * (h as usize) * 3; // 607500
+        let rgba = (w as usize) * (h as usize) * 4; // 810000
+        let mid = rgb + 16 * 1024 + 10_000; // 633884 — past rgb+PAGE, under rgba
+        assert!(mid > rgb + 16 * 1024);
+        assert!(mid < rgba);
+        let mid_payload = vec![0x77u8; mid];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&mid_payload);
+        t.feed(&format!("\x1b_Ga=f,s={},v={},I=42,z=10;{}\x1b\\", w, h, b64));
+        let uploads = t.take_pending_image_uploads();
+        // Frame queues via the raw-bypass path. Without the fix this
+        // assertion fired because the frame got routed through the
+        // PNG worker and was rejected before producing an upload.
+        assert_eq!(uploads.len(), 1, "mid-gap frame must not be dropped");
+        let up = &uploads[0];
+        assert!(up.animation_frame.is_some());
+        assert!(up.raw_rgba_dims.is_some(), "raw-bypass path taken (not PNG decoder)");
+    }
+
+    #[test]
     fn a_f_uses_lowercase_xy_as_destination_position() {
         // icat's a=f messages carry the frame's parent-coords via
         // lowercase `x=` / `y=` (not capital X/Y). On a=T those keys
@@ -6496,6 +6777,134 @@ mod tests {
         // Round-trip the payload: peek_dimensions on the assembled
         // bytes should still see 4×4.
         assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_continuation_chunks_without_i_thread_to_first_chunks_id() {
+        // Regression for the tmux-icat tofu bug: `kitten icat` puts
+        // `i=` only on the FIRST chunk of a chunked transmission and
+        // omits it on every continuation (and on the terminator).
+        // Without the `current_chunked_id` threading in `handle_apc`,
+        // continuation chunks fall into the anonymous bucket and the
+        // id-keyed entry leaks — `register_kitty_image_id` never
+        // fires, so placeholder cells later resolve to nothing.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let chunk_size = (b64.len() / 3 + 1).max(4);
+        let c1 = &b64[..chunk_size];
+        let c2 = &b64[chunk_size..2 * chunk_size];
+        let c3 = &b64[2 * chunk_size..];
+        // First chunk: i=43 (carries the sizing).
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=43,m=1;{}\x1b\\", c1));
+        // Continuation: NO i=, just m=1 — must still land in the id=43 entry.
+        t.feed(&format!("\x1b_Ga=T,m=1;{}\x1b\\", c2));
+        // Final chunk: NO i=, NO m= — must finalize the id=43 entry.
+        t.feed(&format!("\x1b_Ga=T;{}\x1b\\", c3));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "id=43 stream must finalize");
+        assert_eq!(uploads[0].kitty_image_id, Some(43));
+        assert_eq!(uploads[0].pixel_size, Some((4, 4)));
+    }
+
+    #[test]
+    fn kitty_apc_chunked_id_cleared_after_terminator() {
+        // After an id-keyed chunked stream finalizes, a subsequent
+        // unrelated chunked-without-id transmission must NOT inherit
+        // the stale id. Otherwise a second image would pile onto the
+        // first's bucket and corrupt both.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        let png = kitty_png(4, 4);
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let mid = b64.len() / 2;
+        // First image: id=43, two chunks, continuation drops `i=`.
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,i=43,m=1;{}\x1b\\", &b64[..mid]));
+        t.feed(&format!("\x1b_Ga=T;{}\x1b\\", &b64[mid..]));
+        let first = t.take_pending_image_uploads();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kitty_image_id, Some(43));
+        // Second image: chunked, never says `i=`. Must go to the
+        // anonymous bucket — NOT into a stale id=43 entry.
+        t.feed(&format!("\x1b_Ga=T,f=100,c=2,r=1,m=1;{}\x1b\\", &b64[..mid]));
+        t.feed(&format!("\x1b_Ga=T;{}\x1b\\", &b64[mid..]));
+        let second = t.take_pending_image_uploads();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].kitty_image_id, None);
+    }
+
+    #[test]
+    fn kitty_apc_a_f_continuation_chunks_without_i_thread_to_first_chunks_id() {
+        // Same threading guarantee for animation frames: icat sends
+        // `i=43` on the first `a=f` chunk and omits it on
+        // continuations. Without injection the continuation chunks
+        // get dropped on the floor at the `client_id` guard at the
+        // top of `handle_apc_animation_frame`.
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        // Base image so kitty_image_formats[43] is recorded.
+        use base64::Engine;
+        let base_rgba = vec![0u8; 4 * 4 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&base_rgba);
+        t.feed(&format!("\x1b_Ga=T,f=32,s=4,v=4,i=43;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+        // Frame in 3 chunks; only the first carries `i=43`.
+        let frame: Vec<u8> = vec![0xCDu8; 2 * 2 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame);
+        let chunk = (b64.len() / 3 + 1).max(4);
+        let c1 = &b64[..chunk];
+        let c2 = &b64[chunk..2 * chunk];
+        let c3 = &b64[2 * chunk..];
+        t.feed(&format!("\x1b_Ga=f,f=32,s=2,v=2,i=43,m=1;{}\x1b\\", c1));
+        t.feed(&format!("\x1b_Ga=f,m=1;{}\x1b\\", c2));
+        t.feed(&format!("\x1b_Ga=f;{}\x1b\\", c3));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1, "frame must finalize despite missing i=");
+        assert!(uploads[0].animation_frame.is_some());
+    }
+
+    #[test]
+    fn kitty_apc_a_f_chunked_frame_keeps_first_chunks_gap_ms() {
+        // Regression for "animations run way too fast" under tmux.
+        // `kitten icat` puts `z=N` (gap_ms), `x=`/`y=` (dst), `r=`
+        // (target_slot), `c=` (compose_base) only on the FIRST `a=f`
+        // chunk and omits them on continuations. The chunked
+        // finalize was reading these off the LAST chunk's `ctrl`,
+        // which zeroed them all — so every frame's gap_ms came out
+        // as 0 and the playback ran at the 1ms floor (~1000 fps).
+        let mut t = Terminal::new(80, 24, 100);
+        t.set_cell_size_px(8, 16);
+        use base64::Engine;
+        // Base so kitty_image_formats[43] is recorded.
+        let base_rgba = vec![0u8; 4 * 4 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&base_rgba);
+        t.feed(&format!("\x1b_Ga=T,f=32,s=4,v=4,i=43;{}\x1b\\", b64));
+        let _ = t.take_pending_image_uploads();
+        // Frame in 2 chunks. First carries z=100 (gap_ms), x=5,
+        // y=7, r=2 (target_slot), c=1 (compose_base). Second drops
+        // all of them along with `i=`.
+        let frame: Vec<u8> = vec![0xCDu8; 2 * 2 * 4];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&frame);
+        let mid = b64.len() / 2;
+        t.feed(&format!(
+            "\x1b_Ga=f,f=32,s=2,v=2,i=43,z=100,x=5,y=7,r=2,c=1,m=1;{}\x1b\\",
+            &b64[..mid],
+        ));
+        t.feed(&format!("\x1b_Ga=f;{}\x1b\\", &b64[mid..]));
+        let uploads = t.take_pending_image_uploads();
+        assert_eq!(uploads.len(), 1);
+        let frame_spec = uploads[0]
+            .animation_frame
+            .as_ref()
+            .expect("animation_frame spec present");
+        assert_eq!(frame_spec.gap_ms, 100, "gap_ms preserved from first chunk");
+        assert_eq!(frame_spec.dst_x, 5, "dst_x preserved from first chunk");
+        assert_eq!(frame_spec.dst_y, 7, "dst_y preserved from first chunk");
+        assert_eq!(frame_spec.target_slot, Some(2));
+        assert_eq!(frame_spec.compose_base, Some(1));
     }
 
     #[test]
@@ -7243,6 +7652,295 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.feed("hello world");
         assert!(t.kitty_placeholder_bboxes().is_empty());
+    }
+
+    #[test]
+    fn placeholder_diacritics_attach_to_previous_cell_not_their_own() {
+        // Regression for the tmux unicode-placeholder bug: each cell
+        // in the placeholder grid is U+10EEEE followed by combining
+        // diacritics encoding (row, col). If the diacritics land in
+        // their own cells they show up as glyph-less "tofu" because
+        // most of those codepoints have no rasterized glyph.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x111111));
+        // U+10EEEE + 1st diacritic (row 0) + 2nd diacritic (col 0).
+        t.feed("\u{10EEEE}\u{0305}\u{0305}");
+        let cell0 = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell0.placeholder_image_id, Some(0x111111));
+        assert_eq!(cell0.placeholder_image_row, 0);
+        assert_eq!(cell0.placeholder_image_col, 0);
+        // Diacritics MUST NOT have landed in cells 1 and 2.
+        let cell1 = t.extended_cell(0, 1).unwrap();
+        let cell2 = t.extended_cell(0, 2).unwrap();
+        assert_eq!(cell1.ch, ' ', "diacritic 1 must not occupy its own cell");
+        assert_eq!(cell2.ch, ' ', "diacritic 2 must not occupy its own cell");
+    }
+
+    #[test]
+    fn placeholder_diacritics_decode_row_and_column() {
+        // Second diacritic in the kitty table → row 1; fourth → col 3.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0xCAFE00));
+        t.feed("\u{10EEEE}\u{030D}\u{0310}"); // row=1, col=3
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.placeholder_image_row, 1);
+        assert_eq!(cell.placeholder_image_col, 3);
+    }
+
+    #[test]
+    fn placeholder_third_diacritic_extends_image_id_high_byte() {
+        // Third diacritic encodes the high byte (bits 24..31) of the
+        // image id. The low 24 bits come from the FG truecolor; the
+        // high byte adds the 25..32 bits without disturbing them.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x00ABCDEF)); // low 24 bits
+        // 1st='\u{0305}'→row 0, 2nd='\u{0305}'→col 0, 3rd='\u{030D}'→high=1
+        t.feed("\u{10EEEE}\u{0305}\u{0305}\u{030D}");
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.placeholder_image_id, Some(0x01ABCDEF));
+    }
+
+    #[test]
+    fn placeholder_diacritic_absorption_clears_on_non_diacritic_char() {
+        // After printing a real glyph, the absorption state must
+        // reset — subsequent diacritics belong to that glyph (or
+        // nothing), NOT the prior placeholder.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x222222));
+        t.feed("\u{10EEEE}");
+        t.feed("a"); // breaks the absorption window
+        t.feed("\u{0305}"); // should now land in its own cell
+        // Placeholder at col 0, 'a' at col 1, diacritic at col 2.
+        let cell0 = t.extended_cell(0, 0).unwrap();
+        let cell1 = t.extended_cell(0, 1).unwrap();
+        let cell2 = t.extended_cell(0, 2).unwrap();
+        assert_eq!(cell0.placeholder_image_id, Some(0x222222));
+        assert_eq!(cell1.ch, 'a');
+        assert_eq!(cell2.ch, '\u{0305}');
+    }
+
+    #[test]
+    fn placeholder_diacritics_after_three_stop_being_absorbed() {
+        // The protocol allows at most 3 diacritics after each
+        // U+10EEEE. A fourth diacritic must be treated like any
+        // other character (lands in its own cell here).
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x333333));
+        t.feed("\u{10EEEE}\u{0305}\u{0305}\u{0305}\u{0305}");
+        let cell0 = t.extended_cell(0, 0).unwrap();
+        let cell1 = t.extended_cell(0, 1).unwrap();
+        assert_eq!(cell0.placeholder_image_id, Some(0x00333333));
+        assert_eq!(cell1.ch, '\u{0305}', "4th diacritic falls through");
+    }
+
+    #[test]
+    fn placeholder_full_row_with_diacritics_keeps_cursor_aligned() {
+        // Pin the regression that motivated all of this: a row of
+        // placeholders (each U+10EEEE + 2 diacritics) leaves the
+        // cursor exactly where it would be without diacritics. If
+        // absorption were broken the cursor would land further right
+        // and subsequent text would wrap.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x444444));
+        // 5 placeholder cells, each "U+10EEEE + row + col" diacritics.
+        for col in 0..5u32 {
+            let col_dia = KITTY_PLACEHOLDER_DIACRITICS[col as usize];
+            t.feed("\u{10EEEE}\u{0305}");
+            let mut s = String::new();
+            s.push(col_dia);
+            t.feed(&s);
+        }
+        // Cursor must be at col 5 (one per placeholder), not 15
+        // (one per placeholder + diacritic + diacritic).
+        assert_eq!(t.cursor().col, 5);
+    }
+
+    #[test]
+    fn kitty_placeholder_diacritic_index_lookup_round_trips() {
+        // Sanity: first → 0, second → 1, last → 296. Anything not in
+        // the table returns None.
+        assert_eq!(kitty_placeholder_diacritic_index('\u{0305}'), Some(0));
+        assert_eq!(kitty_placeholder_diacritic_index('\u{030D}'), Some(1));
+        assert_eq!(kitty_placeholder_diacritic_index('\u{1D244}'), Some(296));
+        assert_eq!(kitty_placeholder_diacritic_index('a'), None);
+        assert_eq!(kitty_placeholder_diacritic_index('\u{10EEEE}'), None);
+    }
+
+    #[test]
+    fn kitty_placeholder_diacritic_table_is_sorted_for_binary_search() {
+        // The lookup is a binary search and silently returns wrong
+        // indices if the table ever ends up unsorted. Cheap structural
+        // invariant — pin it so a future edit can't corrupt the lookup
+        // without tripping a test.
+        for pair in KITTY_PLACEHOLDER_DIACRITICS.windows(2) {
+            assert!(pair[0] < pair[1], "table must be strictly ascending");
+        }
+        assert_eq!(KITTY_PLACEHOLDER_DIACRITICS.len(), 297);
+    }
+
+    #[test]
+    fn kitty_placeholder_diacritic_index_returns_none_for_char_between_table_entries() {
+        // U+0306 sits between table[0]=U+0305 and table[1]=U+030D.
+        // Binary search must report "not found" rather than the bracket
+        // index — a regression in the comparator would leak a Some.
+        assert_eq!(kitty_placeholder_diacritic_index('\u{0306}'), None);
+    }
+
+    #[test]
+    fn diacritic_with_no_prior_placeholder_lands_in_own_cell() {
+        // First-char-in-the-feed diacritic: placeholder_decode is None,
+        // so absorption must not engage. The diacritic prints as a
+        // normal (glyph-less) cell at col 0 and the cursor advances.
+        // Regression risk: an unconditional "if diacritic, absorb"
+        // would silently eat the first diacritic the user types.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\u{0305}");
+        let cell = t.extended_cell(0, 0).unwrap();
+        assert_eq!(cell.ch, '\u{0305}');
+        assert_eq!(cell.placeholder_image_id, None);
+        assert_eq!(t.cursor().col, 1);
+    }
+
+    #[test]
+    fn placeholder_without_fg_color_does_not_absorb_following_diacritics() {
+        // U+10EEEE with no SGR fg → placeholder_image_id stays None,
+        // so the print() path leaves placeholder_decode = None.
+        // Subsequent diacritics MUST fall through to normal print
+        // (each in its own cell), since the protocol's row/col/id-high
+        // encoding has nothing to attach to.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\u{10EEEE}\u{0305}\u{030D}");
+        let cell0 = t.extended_cell(0, 0).unwrap();
+        let cell1 = t.extended_cell(0, 1).unwrap();
+        let cell2 = t.extended_cell(0, 2).unwrap();
+        assert_eq!(cell0.placeholder_image_id, None);
+        assert_eq!(cell0.placeholder_image_row, 0);
+        assert_eq!(cell0.placeholder_image_col, 0);
+        assert_eq!(cell1.ch, '\u{0305}', "diacritic 1 falls through");
+        assert_eq!(cell2.ch, '\u{030D}', "diacritic 2 falls through");
+        assert_eq!(t.cursor().col, 3);
+    }
+
+    #[test]
+    fn placeholder_zero_id_fg_does_not_absorb_following_diacritics() {
+        // (0,0,0) fg encodes id 0, which decode treats as "no id".
+        // Same contract as the no-fg case: absorption must not engage.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[38;2;0;0;0m\u{10EEEE}\u{0305}");
+        let cell0 = t.extended_cell(0, 0).unwrap();
+        let cell1 = t.extended_cell(0, 1).unwrap();
+        assert_eq!(cell0.placeholder_image_id, None);
+        assert_eq!(cell1.ch, '\u{0305}');
+    }
+
+    #[test]
+    fn placeholder_decode_state_survives_cup_between_placeholder_and_diacritic() {
+        // CUP doesn't go through print(), so placeholder_decode is NOT
+        // cleared by cursor movement. A diacritic after a CUP still
+        // attaches to the cell the most recent U+10EEEE landed in —
+        // NOT at the CUP destination. Pin this so a future "clear on
+        // any cursor move" change is at least intentional and reviewed.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed(&placeholder_sgr_fg(0x555555));
+        t.feed("\u{10EEEE}");
+        // Jump elsewhere on screen, then feed one diacritic.
+        t.feed("\x1b[10;20H\u{030D}"); // table[1] → row=1
+        let original = t.extended_cell(0, 0).unwrap();
+        let cup_dest = t.extended_cell(9, 19).unwrap();
+        assert_eq!(original.placeholder_image_row, 1, "diacritic landed on original cell");
+        assert_eq!(cup_dest.ch, ' ', "diacritic did NOT land at CUP destination");
+        assert_ne!(cup_dest.placeholder_image_row, 1);
+    }
+
+    #[test]
+    fn resolve_kitty_format_mid_gap_with_none_fallback_defaults_to_rgb() {
+        // Base-image (a=T) callers pass fallback=None. If the byte
+        // count lands in the mid-gap (past rgb+PAGE, under rgba), the
+        // resolver still must not hand the bytes to the PNG decoder —
+        // it defaults to RGB so the raw-bypass path can run.
+        let (w, h) = (450u32, 450u32);
+        let rgb = (w as usize) * (h as usize) * 3;
+        let mid = rgb + 16 * 1024 + 10_000;
+        let payload = vec![0u8; mid];
+        let resolved =
+            resolve_kitty_format(KittyFormat::Png, &payload, Some(w), Some(h), None);
+        assert!(matches!(resolved, KittyFormat::Rgb));
+    }
+
+    #[test]
+    fn resolve_kitty_format_mid_gap_with_png_fallback_defaults_to_rgb() {
+        // fallback=Some(Png) is degenerate — it means "the base was
+        // also a PNG", which shouldn't happen for a mid-gap raw
+        // payload. The resolver explicitly only honors RGB/RGBA
+        // fallbacks; for Png it falls through to the RGB default
+        // rather than ping-ponging the bytes through the PNG decoder.
+        let (w, h) = (450u32, 450u32);
+        let rgb = (w as usize) * (h as usize) * 3;
+        let mid = rgb + 16 * 1024 + 10_000;
+        let payload = vec![0u8; mid];
+        let resolved = resolve_kitty_format(
+            KittyFormat::Png,
+            &payload,
+            Some(w),
+            Some(h),
+            Some(KittyFormat::Png),
+        );
+        assert!(matches!(resolved, KittyFormat::Rgb));
+    }
+
+    #[test]
+    fn resolve_kitty_format_exact_rgb_byte_count_beats_rgba_fallback() {
+        // Pin the contract the existing
+        // `a_f_size_inference_picks_rgb_when_byte_count_matches_w_h_3`
+        // integration test depends on: when the payload is exactly
+        // w*h*3 bytes, the resolver returns Rgb regardless of what
+        // the base format said. Byte-count exact-match must beat
+        // base-format inheritance — otherwise frames that change
+        // bit-depth would be mis-decoded.
+        let (w, h) = (2u32, 2u32);
+        let rgb_payload = vec![0u8; (w as usize) * (h as usize) * 3];
+        let resolved = resolve_kitty_format(
+            KittyFormat::Png,
+            &rgb_payload,
+            Some(w),
+            Some(h),
+            Some(KittyFormat::Rgba),
+        );
+        assert!(matches!(resolved, KittyFormat::Rgb));
+    }
+
+    #[test]
+    fn resolve_kitty_format_real_png_passthrough_ignores_fallback() {
+        // The PNG signature short-circuit fires before any byte-count
+        // or fallback logic. Without this, a payload that happens to
+        // start with the PNG magic but whose length lands in the gap
+        // would be mis-routed.
+        let png = kitty_png(4, 4);
+        let resolved = resolve_kitty_format(
+            KittyFormat::Png,
+            &png,
+            Some(4),
+            Some(4),
+            Some(KittyFormat::Rgb),
+        );
+        assert!(matches!(resolved, KittyFormat::Png));
+    }
+
+    #[test]
+    fn resolve_kitty_format_non_png_parsed_format_returns_as_is() {
+        // When the parser already saw an explicit f=24 or f=32, the
+        // resolver must not second-guess it — even if dimensions and
+        // bytes would otherwise infer differently. Pin so the
+        // resolver stays a narrow "fill in for PNG default" helper.
+        let payload = vec![0u8; 999];
+        let resolved = resolve_kitty_format(
+            KittyFormat::Rgb,
+            &payload,
+            Some(2),
+            Some(2),
+            Some(KittyFormat::Rgba),
+        );
+        assert!(matches!(resolved, KittyFormat::Rgb));
     }
 
     #[test]

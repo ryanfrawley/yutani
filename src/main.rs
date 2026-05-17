@@ -2301,6 +2301,14 @@ impl State {
                     continue;
                 }
                 let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
+                // Kitty unicode-placeholder cells (`U+10EEEE` + image-id
+                // encoded in fg). The image quad draws over this cell on
+                // its own pipeline pass — emitting the U+10EEEE glyph
+                // and the cell's fg-as-id color would just paint tofu
+                // and ID-colored background on top of the image.
+                if cell.placeholder_image_id.is_some() {
+                    continue;
+                }
                 // SGR 7 (reverse) swaps fg/bg. Resolve unset colors to concrete
                 // theme defaults before swapping — `default_bg` is transparent
                 // so the window shows through, but reverse needs a solid bg
@@ -3497,7 +3505,16 @@ impl State {
     /// successful ones into placements. Errors log and the pending entry
     /// is dropped; the render loop is otherwise unaffected.
     fn poll_pending_images(&mut self) {
-        if self.pending_placements.is_empty() {
+        // Skip when both main.rs's placement queue AND the store's
+        // own pending queue are empty. The store-side check matters
+        // for Kitty animation frames (`a=f`): each frame insert
+        // bumps `Store::pending` and queues an `immediate_results`
+        // entry, but goes nowhere near `pending_placements`. Without
+        // the store-side check, frames pile up unprocessed once the
+        // base image's PendingImagePlacement finalizes and
+        // `pending_placements` empties — and the animation stays
+        // pinned on its first frame forever.
+        if self.pending_placements.is_empty() && self.image_store.pending_count() == 0 {
             return;
         }
         let nearest = self.config.images_filter == "nearest";
@@ -3582,6 +3599,33 @@ impl State {
         // (The "keep ticking while pending" redraw was issued up-front,
         // before the early-return for empty `results` — see the comment
         // there. Avoid double-requesting the same frame.)
+    }
+
+    /// Decide whether `poll_pending_images` should auto-create a
+    /// Placement when this upload's decode succeeds.
+    ///
+    /// Three buckets:
+    ///   - Cmd-Shift-I debug-paste flow: no `kitty_image_id`, no
+    ///     up-front display → main.rs computes extent from pixel
+    ///     dims and places at the cursor on decode. Returns `false`
+    ///     here (meaning: deferred-auto-place IS desired, caller
+    ///     stores `None`).
+    ///   - `a=T` (Transmit and Display) without `U=1` →
+    ///     `insert_placement_kitty` already ran before this point;
+    ///     no auto-place needed.
+    ///   - Any Kitty transmit-only path (`a=t`, `a=T,U=1`) → client
+    ///     owns placement timing. Either an `a=p` later, or
+    ///     `U+10EEEE` placeholder cells. Auto-placing a second
+    ///     Placement at the cursor produces a ghost image that
+    ///     renders alongside the placeholder-bbox draw.
+    ///
+    /// Returns `true` when the upload should suppress the deferred
+    /// auto-placement.
+    fn suppress_deferred_placement(
+        display_immediately: bool,
+        kitty_image_id: Option<u32>,
+    ) -> bool {
+        display_immediately || kitty_image_id.is_some()
     }
 
     /// Decision oracle for "should we render this placement as half-block
@@ -3869,7 +3913,10 @@ impl State {
                 request: pending,
                 row,
                 col,
-                preplaced_image_id: if up.display_immediately {
+                preplaced_image_id: if Self::suppress_deferred_placement(
+                    up.display_immediately,
+                    up.kitty_image_id,
+                ) {
                     Some(image_id)
                 } else {
                     None
@@ -5651,6 +5698,44 @@ mod tests {
         // cleanup hasn't fired. Only honored when the user opts in.
         assert!(!State::should_halfblock(true, false, false, false));
         assert!(State::should_halfblock(true, true, false, false));
+    }
+
+    //
+    // Deferred-placement suppression. Drives the ghost-image regression:
+    // without `kitty_image_id` gating, an `a=T,U=1` upload would leave
+    // `preplaced_image_id = None`, and the deferred-place branch in
+    // `poll_pending_images` would stamp a second Placement at the cursor
+    // row alongside the placeholder-bbox draw.
+    //
+
+    #[test]
+    fn suppress_deferred_placement_cmd_shift_i_keeps_deferred_place_active() {
+        // Cmd-Shift-I debug-paste: no Kitty id, no up-front display.
+        // Caller stores `None` so the on-decode-success branch creates
+        // the Placement at the cursor.
+        assert!(!State::suppress_deferred_placement(false, None));
+    }
+
+    #[test]
+    fn suppress_deferred_placement_a_t_capital_already_placed_skips_deferred_place() {
+        // `a=T` without `U=1`: `insert_placement_kitty` already ran.
+        // No second Placement should be auto-created.
+        assert!(State::suppress_deferred_placement(true, Some(42)));
+    }
+
+    #[test]
+    fn suppress_deferred_placement_a_t_capital_with_virtual_placement_skips_deferred_place() {
+        // `a=T,U=1`: placeholder cells own the placement. A deferred
+        // auto-place would produce the "ghost image" regression.
+        assert!(State::suppress_deferred_placement(false, Some(42)));
+    }
+
+    #[test]
+    fn suppress_deferred_placement_a_t_transmit_only_skips_deferred_place() {
+        // `a=t`: client will issue `a=p` later. Auto-placing at
+        // cursor would beat the client's explicit placement to the
+        // screen and end up double-drawn after `a=p` arrives.
+        assert!(State::suppress_deferred_placement(false, Some(7)));
     }
 
     //

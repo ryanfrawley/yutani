@@ -1319,8 +1319,11 @@ impl Store {
 
     /// Number of in-flight decode requests. Useful for diagnostics — a
     /// number that doesn't shrink across frames suggests the worker is
-    /// stuck or the result channel is starving.
-    #[allow(dead_code)]
+    /// stuck or the result channel is starving. Also drives the
+    /// `poll_pending_images` early-return in main.rs: animation
+    /// frame inserts (`request_insert_frame*`) bump this without
+    /// touching `pending_placements`, so the early-return must
+    /// check both queues.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -4090,6 +4093,34 @@ mod tests {
         let results = store.poll(&pipeline, &d, &q, false);
         assert!(results.iter().any(|(p, _)| *p == pid));
         assert_eq!(store.frame_count(parent), 1);
+    }
+
+    #[test]
+    fn frame_insert_bumps_pending_count_so_main_loop_keeps_polling() {
+        // Regression for the "animation stuck on first frame" bug.
+        // The bypass path queues frames via `immediate_results` and
+        // also bumps `pending`. main.rs's `poll_pending_images`
+        // early-returns when its own `pending_placements` is empty,
+        // so the frame-side queue must be visible via
+        // `pending_count()` — otherwise the renderer never calls
+        // `Store::poll`, the frames never composite, and the
+        // animation pin to the base image forever.
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let baseline = store.pending_count();
+        let rgba = vec![0u8; 2 * 2 * 4];
+        store
+            .request_insert_frame_rgba(
+                parent, rgba, 2, 2, None, None, None, 50, 0, 0,
+            )
+            .expect("parent exists");
+        assert_eq!(
+            store.pending_count(),
+            baseline + 1,
+            "frame insert must register as pending work",
+        );
     }
 
     #[test]

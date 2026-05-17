@@ -159,12 +159,30 @@ pub struct Cell {
     /// reconstruct the per-image bounding box and draw the tile.
     /// `None` for every other cell (the common case), so the existing
     /// `Cell::new(' ', _)` defaults are unchanged.
+    ///
+    /// The low 24 bits come from the cell's FG truecolor; the high 8
+    /// bits come from an optional third combining diacritic on the
+    /// placeholder char (kitty's "image id high byte" extension).
     pub placeholder_image_id: Option<u32>,
+    /// 0-based row index within the image's cell grid, set from the
+    /// first combining diacritic that follows U+10EEEE. Meaningful
+    /// only when `placeholder_image_id` is `Some`.
+    pub placeholder_image_row: u16,
+    /// 0-based column index within the image's cell grid, set from
+    /// the second combining diacritic that follows U+10EEEE.
+    /// Meaningful only when `placeholder_image_id` is `Some`.
+    pub placeholder_image_col: u16,
 }
 
 impl Cell {
     pub fn new(ch: char, style: Style) -> Self {
-        Self { ch, style, placeholder_image_id: None }
+        Self {
+            ch,
+            style,
+            placeholder_image_id: None,
+            placeholder_image_row: 0,
+            placeholder_image_col: 0,
+        }
     }
 }
 
