@@ -2290,6 +2290,12 @@ impl State {
                         cell.style.color_bg.unwrap_or(default_bg),
                     )
                 };
+                // Quantise to whatever the scheme advertises (e.g. Mono /
+                // Ansi16). Identity for the common Truecolor cap. Done
+                // after reverse so reverse-video respects the cap too;
+                // applied only to cell colors — cursor, selection, and
+                // chrome remain at scheme-author fidelity.
+                let (fg, bg) = (pal.project(fg), pal.project(bg));
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
                 let fg_source = match over.and_then(|cs| cs[c]) {

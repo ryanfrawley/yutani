@@ -5,6 +5,30 @@
 
 use std::sync::RwLock;
 
+/// Color-depth cap a scheme advertises. Cells whose resolved color exceeds
+/// the cap (e.g. a truecolor SGR under `Ansi16`) are snapped onto the
+/// supported set at render time by [`Palette::project`].
+///
+/// 88-color (rxvt's compact 4×4×4 cube) is deliberately omitted — the
+/// schemes ecosystem effectively doesn't ship 88-color content, and
+/// supporting it would mean carrying a second snap table for no real
+/// payoff.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ColorCap {
+    /// Strict two-tone: every cell collapses to either `foreground` or
+    /// `background` based on its perceptual luma.
+    Mono,
+    /// Normal ANSI 0..=7 only. Bright variants get folded onto their
+    /// matching normal entry (saturation, not brightness, wins).
+    Ansi8,
+    /// Normal + bright ANSI (`ansi[0..16]`).
+    Ansi16,
+    /// xterm-256: ANSI + 6×6×6 cube + 24-step grays.
+    Xterm256,
+    /// Pass-through — no projection. The default.
+    Truecolor,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Palette {
     pub background: [f32; 4],
@@ -16,6 +40,9 @@ pub struct Palette {
     /// Index 0..=7 normal, 8..=15 bright. Order matches ANSI:
     /// black, red, green, yellow, blue, magenta, cyan, white.
     pub ansi: [[f32; 4]; 16],
+    /// Color-depth ceiling. Cell colors exceeding it are snapped via
+    /// `project()` before going to the GPU.
+    pub max_colors: ColorCap,
 }
 
 impl Palette {
@@ -47,6 +74,50 @@ impl Palette {
                 [0.33, 1.0, 1.0, 1.0],
                 [1.0, 1.0, 1.0, 1.0],
             ],
+            max_colors: ColorCap::Truecolor,
+        }
+    }
+
+    /// Snap an arbitrary linear-RGB cell color onto whatever this
+    /// palette's [`ColorCap`] permits. Transparent input (alpha == 0)
+    /// passes through unchanged — it's a "no color" sentinel used by the
+    /// renderer's masking paths, not an actual sample to be quantised.
+    /// Likewise [`ColorCap::Truecolor`] is identity, so the common case
+    /// (no cap) costs one branch.
+    pub fn project(&self, c: [f32; 4]) -> [f32; 4] {
+        if c[3] == 0.0 || self.max_colors == ColorCap::Truecolor {
+            return c;
+        }
+        match self.max_colors {
+            ColorCap::Truecolor => c,
+            ColorCap::Mono => {
+                // Pick whichever end the input is closer to in linear RGB.
+                // "Closest" — not "above midpoint luma" — is the right
+                // model for both dark-on-light and light-on-dark schemes:
+                // dim grey on a white-bg scheme should snap to fg (black
+                // ink), and bright grey on a black-bg scheme should snap
+                // to fg (white ink). A luma-threshold model gets the
+                // second case but inverts the first.
+                nearest(c, &[self.foreground, self.background])
+            }
+            ColorCap::Ansi8 => nearest(c, &self.ansi[0..8]),
+            ColorCap::Ansi16 => nearest(c, &self.ansi[0..16]),
+            ColorCap::Xterm256 => {
+                // Walk all 256 entries via xterm_256 so we share the cube /
+                // gray-ramp definition with cell rendering — no second
+                // hand-coded table to drift out of sync.
+                let mut best_idx = 0u8;
+                let mut best_d = f32::INFINITY;
+                for n in 0..=255u8 {
+                    let entry = self.xterm_256(n);
+                    let d = luma_dist_sq(c, entry);
+                    if d < best_d {
+                        best_d = d;
+                        best_idx = n;
+                    }
+                }
+                self.xterm_256(best_idx)
+            }
         }
     }
 
@@ -122,6 +193,29 @@ pub fn parse_yaml(src: &str) -> Palette {
     p
 }
 
+/// Squared Euclidean distance weighted by Rec. 601 luma coefficients.
+/// Luma-weighted because raw RGB distance treats green changes the same
+/// as blue, which under-counts how visible green shifts actually are.
+fn luma_dist_sq(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let dr = a[0] - b[0];
+    let dg = a[1] - b[1];
+    let db = a[2] - b[2];
+    0.299 * dr * dr + 0.587 * dg * dg + 0.114 * db * db
+}
+
+fn nearest(c: [f32; 4], candidates: &[[f32; 4]]) -> [f32; 4] {
+    let mut best = candidates[0];
+    let mut best_d = luma_dist_sq(c, best);
+    for &cand in &candidates[1..] {
+        let d = luma_dist_sq(c, cand);
+        if d < best_d {
+            best_d = d;
+            best = cand;
+        }
+    }
+    best
+}
+
 fn strip_comment(s: &str) -> &str {
     match s.find('#') {
         Some(i) => &s[..i],
@@ -143,9 +237,24 @@ fn apply(p: &mut Palette, key: &str, value: &str) -> Result<(), String> {
         "magenta" => set_pair(&mut p.ansi, 5, value)?,
         "cyan" => set_pair(&mut p.ansi, 6, value)?,
         "white" => set_pair(&mut p.ansi, 7, value)?,
+        "max_colors" => p.max_colors = parse_color_cap(value)?,
         _ => return Err(format!("unknown key '{}'", key)),
     }
     Ok(())
+}
+
+fn parse_color_cap(value: &str) -> Result<ColorCap, String> {
+    match value {
+        "mono" | "monochrome" => Ok(ColorCap::Mono),
+        "8" => Ok(ColorCap::Ansi8),
+        "16" => Ok(ColorCap::Ansi16),
+        "256" => Ok(ColorCap::Xterm256),
+        "truecolor" | "16m" | "16777216" => Ok(ColorCap::Truecolor),
+        _ => Err(format!(
+            "max_colors: expected one of mono | 8 | 16 | 256 | truecolor, got '{}'",
+            value
+        )),
+    }
 }
 
 fn set_pair(ansi: &mut [[f32; 4]; 16], hue: usize, value: &str) -> Result<(), String> {
@@ -431,6 +540,123 @@ blue: [0x0000ab, 0x5555ff]
         for b in 0..=255u8 {
             assert_eq!(linear_to_srgb_u8(srgb_to_linear(b)), b);
         }
+    }
+
+    #[test]
+    fn default_cap_is_truecolor() {
+        // Existing schemes don't carry a cap → must behave as truecolor so
+        // upgrading the binary doesn't suddenly quantise everyone's terminal.
+        assert_eq!(Palette::defaults().max_colors, ColorCap::Truecolor);
+    }
+
+    #[test]
+    fn parse_max_colors_values() {
+        let cases = [
+            ("mono", ColorCap::Mono),
+            ("monochrome", ColorCap::Mono),
+            ("8", ColorCap::Ansi8),
+            ("16", ColorCap::Ansi16),
+            ("256", ColorCap::Xterm256),
+            ("truecolor", ColorCap::Truecolor),
+            ("16m", ColorCap::Truecolor),
+        ];
+        for (literal, want) in cases {
+            let p = parse_yaml(&format!("max_colors: {}\n", literal));
+            assert_eq!(p.max_colors, want, "literal '{}'", literal);
+        }
+    }
+
+    #[test]
+    fn parse_max_colors_unknown_keeps_default() {
+        // Typos shouldn't escalate into a full reset — same contract as
+        // other invalid palette values.
+        let p = parse_yaml("max_colors: 42\n");
+        assert_eq!(p.max_colors, ColorCap::Truecolor);
+    }
+
+    #[test]
+    fn project_truecolor_is_identity() {
+        // Truecolor cap = pass-through, including alpha. A non-identity
+        // result here would change rendered output for every existing user.
+        let p = Palette::defaults();
+        let c = [0.123, 0.456, 0.789, 1.0];
+        assert_eq!(p.project(c), c);
+    }
+
+    #[test]
+    fn project_preserves_transparent() {
+        // Alpha == 0 is the "no SGR bg set, let the window show through"
+        // sentinel; projecting it would paint the palette bg over every
+        // unstyled cell and break the layered glow path.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Mono;
+        assert_eq!(p.project([0.0, 0.0, 0.0, 0.0]), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn project_mono_picks_fg_for_light_input_on_dark_scheme() {
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        // White input → fg; black → bg.
+        assert_eq!(p.project([1.0, 1.0, 1.0, 1.0]), p.foreground);
+        assert_eq!(p.project([0.0, 0.0, 0.0, 1.0]), p.background);
+    }
+
+    #[test]
+    fn project_mono_midpoint_split_works_for_light_scheme() {
+        // Dark-on-light scheme: the threshold should bend with the scheme,
+        // not stay pinned at 0.5. A dim grey on a white-bg scheme should
+        // still land on fg (the only "ink") rather than vanishing into bg.
+        let mut p = Palette::defaults();
+        p.background = [1.0, 1.0, 1.0, 1.0];
+        p.foreground = [0.0, 0.0, 0.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        let dim_grey = [0.3, 0.3, 0.3, 1.0];
+        assert_eq!(p.project(dim_grey), p.foreground);
+    }
+
+    #[test]
+    fn project_ansi16_snaps_pure_red_to_red_entry() {
+        // The defaults' red entries are (0.67, 0, 0) and (1.0, 0.33, 0.33).
+        // A solid red input should choose one of those, not a stray hue.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Ansi16;
+        let out = p.project([1.0, 0.0, 0.0, 1.0]);
+        // Either normal-red or bright-red is acceptable — both are red and
+        // either is correct under the Ansi16 cap; pinning to one over the
+        // other would couple the test to the chosen distance metric.
+        let candidates = [p.ansi[1], p.ansi[9]];
+        assert!(
+            candidates.contains(&out),
+            "expected red snap, got {:?}",
+            out,
+        );
+    }
+
+    #[test]
+    fn project_ansi8_excludes_bright_entries() {
+        // Ansi8 cap must NOT return any bright slot, even if the input
+        // would be closer to one — that's the whole point of the cap.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Ansi8;
+        // Pick a bright-leaning input.
+        let out = p.project([1.0, 0.33, 0.33, 1.0]);
+        for bright in &p.ansi[8..16] {
+            assert_ne!(&out, bright, "bright entry leaked under Ansi8 cap");
+        }
+    }
+
+    #[test]
+    fn project_xterm256_in_palette_input_is_stable() {
+        // Re-projecting an already-in-cube color must round-trip to the
+        // same entry — drift here would mean palette-indexed cells changed
+        // colour just by passing through projection.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Xterm256;
+        let c196 = p.xterm_256(196);
+        assert_eq!(p.project(c196), c196);
     }
 
     #[test]
