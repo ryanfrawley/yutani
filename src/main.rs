@@ -3138,12 +3138,10 @@ impl State {
     /// Re-read `~/.config/yutani/config` and re-install the color scheme,
     /// pushing palette-derived state into the GPU. Triggered by Cmd-Shift-R.
     ///
-    /// Scope is deliberately narrow: only `color_scheme` (and the bits of
-    /// `Config` the renderer reads each frame, like the glow toggles) take
-    /// effect live. Fields baked into one-shot resources at startup —
-    /// `font_family`, `font_size`, pipeline creation, etc. — still need a
-    /// restart. A future expansion can grow this method without changing
-    /// the keybind.
+    /// Covers `color_scheme`, every `glow_*` knob, and any field the
+    /// renderer reads off `self.config` each frame. Fields baked into
+    /// one-shot resources at startup — pipeline creation, font face
+    /// objects, etc. — still need a restart.
     fn reload_config(&mut self) {
         let new_config = Config::load();
         install_color_scheme(new_config.color_scheme.as_deref());
@@ -3152,13 +3150,17 @@ impl State {
         // Glow uniforms cache palette-derived values (bright ANSI hues,
         // foreground / background RGB) — they don't re-read palette::get()
         // each frame the way the cell renderer does. Re-push them so the
-        // halo, mask, and overlay all reflect the new scheme.
+        // halo, mask, and overlay all reflect the new scheme. Also re-mirror
+        // every `glow_*` config slot so threshold / intensity / scanline
+        // edits take effect — Glow holds its own copy of each field and
+        // write_glow_params serializes whatever's on the instance.
         let p = palette::get();
         let bright: [[f32; 4]; 8] = [
             p.ansi[8], p.ansi[9], p.ansi[10], p.ansi[11],
             p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
         ];
         for g in [&mut self.glow, &mut self.glow_fg] {
+            apply_glow_config(g, &self.config);
             g.set_bright_palette(&self.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
