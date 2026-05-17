@@ -1999,12 +1999,20 @@ impl State {
         for r in r_lo..r_hi {
             row_chars.clear();
             for c in 0..cols {
-                row_chars.push(
-                    self.terminal
-                        .extended_cell(r, c)
-                        .map(|cell| cell.ch)
-                        .unwrap_or(' '),
-                );
+                let cell = self.terminal.extended_cell(r, c);
+                let ch = cell.map(|cell| cell.ch).unwrap_or(' ');
+                // Pre-pack any char outside build_atlas's fixed ranges
+                // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
+                // the render-time lookup below hits the variant chain
+                // — including fallback fonts — instead of notdef.
+                if let Some(cell) = cell {
+                    let variant = font::FaceVariant::from_flags(
+                        cell.style.bold,
+                        cell.style.italic,
+                    );
+                    self.atlas.ensure_char(&mut self.font, variant, ch);
+                }
+                row_chars.push(ch);
             }
             let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
             let mut c = 0;
