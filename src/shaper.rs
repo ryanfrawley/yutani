@@ -60,9 +60,14 @@ impl Shaper {
         }
     }
 
-    pub fn set_variant(&mut self, variant: FaceVariant, data: &[u8]) -> bool {
+    pub fn set_variant(
+        &mut self,
+        variant: FaceVariant,
+        data: &[u8],
+        face_index: u32,
+    ) -> bool {
         let leaked: &'static [u8] = Box::leak(data.to_vec().into_boxed_slice());
-        let face = harfbuzz_rs::Face::from_bytes(leaked, 0);
+        let face = harfbuzz_rs::Face::from_bytes(leaked, face_index);
         let font = harfbuzz_rs::Font::new(face);
         self.fonts[variant as usize] = Some(font);
         true

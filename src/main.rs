@@ -4683,7 +4683,10 @@ async fn run() {
     // rasterize) and hand the other to FreeType. Only primary cuts are
     // shaped — fallbacks aren't asked to ligate.
     let mut shaper = shaper::Shaper::new();
-    shaper.set_variant(font::FaceVariant::Regular, &primary_data);
+    // Regular comes from the primary lookup (no traits requested) so
+    // it's almost always face 0 of whatever Core Text picks; passing
+    // 0 here is correct AND matches `Font::new`'s implicit behavior.
+    shaper.set_variant(font::FaceVariant::Regular, &primary_data, 0);
     let mut font = font::Font::new(primary_data);
     font.set_char_size(pt_size, dpi);
 
@@ -4691,17 +4694,28 @@ async fn run() {
     // effort: when a cut isn't installed the styled lookup falls back to the
     // regular face. Cores like Iosevka ship all four; users without them get
     // un-styled text rather than synthetic bolding/oblique.
+    //
+    // Iosevka and most large families pack multiple weight/italic cuts
+    // into a single TTC file, so the file Core Text hands us for the
+    // italic descriptor is usually the SAME file as the regular — just
+    // a different face index inside. `find_face_index` scans the TTC
+    // for the face whose style_flags match the requested variant. Pre-
+    // fix, both the FreeType and HarfBuzz loaders opened face 0 of the
+    // TTC, so italic and bold-italic silently rendered as regular.
     for (variant, bold, italic) in [
         (font::FaceVariant::Bold, true, false),
         (font::FaceVariant::Italic, false, true),
         (font::FaceVariant::BoldItalic, true, true),
     ] {
+        let _ = bold;
+        let _ = italic;
         let Some(data) = load_family_styled(&primary_name, bold, italic) else {
             continue;
         };
-        shaper.set_variant(variant, &data);
-        if font.set_variant(variant, data, pt_size, dpi) {
-            println!("primary {:?}: {}", variant, primary_name);
+        let face_index = font::find_face_index(&data, variant);
+        shaper.set_variant(variant, &data, face_index as u32);
+        if font.set_variant(variant, data, face_index, pt_size, dpi) {
+            println!("primary {:?}: {} (face index {})", variant, primary_name, face_index);
         }
     }
 
@@ -4769,8 +4783,12 @@ async fn run() {
             let Some(data) = load_family_styled(&family, bold, italic) else {
                 continue;
             };
-            if font.add_fallback(variant, data, pt_size, dpi) {
-                println!("fallback {} {:?}: {}", label, variant, family);
+            let face_index = font::find_face_index(&data, variant);
+            if font.add_fallback(variant, data, face_index, pt_size, dpi) {
+                println!(
+                    "fallback {} {:?}: {} (face index {})",
+                    label, variant, family, face_index,
+                );
             }
         }
     }
