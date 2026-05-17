@@ -973,21 +973,36 @@ impl Store {
             return Err(DecodeError::BudgetExceeded { needed: total_bytes, available });
         }
 
-        // Pick the source-frame RGBA. `0` = base, `n` = frames[n - 1].
-        // Stale or out-of-range indices fall back to the base — the
-        // spec is silent on this edge but composing onto blank would
-        // hide the rest of the image.
-        let src_rgba: Vec<u8> = match compose_base.unwrap_or(0) {
-            0 => parent
+        // Pick the source-frame RGBA. `Some(0)` = base, `Some(n)` =
+        // frames[n - 1]. `None` (= `c=` omitted on `a=f`) means
+        // compose against the **previous frame** per Kitty spec, NOT
+        // against the base. Defaulting to base loses accumulated
+        // motion for delta-encoded GIFs — each delta frame would
+        // become `base + just-this-delta`, with the base bleeding
+        // through behind everywhere the current frame didn't paint.
+        // For the first frame in the sequence (no previous yet),
+        // falling back to the base is correct. Stale / out-of-range
+        // explicit indices fall back to the base as a last resort —
+        // the spec is silent on this edge but composing onto blank
+        // would hide the rest of the image.
+        let base_rgba_or_blank = || {
+            parent
                 .base_rgba
                 .clone()
-                .unwrap_or_else(|| vec![0u8; parent_bytes]),
-            n => parent
+                .unwrap_or_else(|| vec![0u8; parent_bytes])
+        };
+        let src_rgba: Vec<u8> = match compose_base {
+            Some(0) => base_rgba_or_blank(),
+            Some(n) => parent
                 .frames
                 .get((n as usize).saturating_sub(1))
                 .map(|f| f.rgba.clone())
-                .or_else(|| parent.base_rgba.clone())
-                .unwrap_or_else(|| vec![0u8; parent_bytes]),
+                .unwrap_or_else(base_rgba_or_blank),
+            None => parent
+                .frames
+                .last()
+                .map(|f| f.rgba.clone())
+                .unwrap_or_else(base_rgba_or_blank),
         };
         let composed = composite_rgba(
             &src_rgba,
@@ -3610,8 +3625,10 @@ mod tests {
 
     #[test]
     fn request_insert_frame_compose_base_n_uses_prior_frame_rgba() {
-        // Verify the 1-based → 0-based mapping in compose_base:
-        // None / Some(0) / Some(1) → base, Some(2) → frames[0], etc.
+        // Verify the 1-based → 0-based mapping for explicit compose_base:
+        // Some(0) / Some(1) → base, Some(2) → frames[0], etc.
+        // (The None / omitted case is exercised separately by
+        // `request_insert_frame_compose_base_none_uses_previous_frame`.)
         let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
         let mut store = Store::new(DEFAULT_CAP_BYTES);
         let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
@@ -3662,6 +3679,117 @@ mod tests {
         // against.
         let entry = store.images.get(&parent.0).expect("parent");
         assert_eq!(entry.frames[1].rgba, frame2_rgba);
+    }
+
+    #[test]
+    fn request_insert_frame_compose_base_none_uses_previous_frame() {
+        // Regression for the "base shows through behind animating
+        // frames" bug. icat sends a=f with no c=, so compose_base
+        // arrives as None. The Kitty spec says the default is to
+        // compose against the previous frame (the most recent one),
+        // not against the base. For a delta-encoded GIF, defaulting
+        // to base would discard accumulated motion every frame.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // Set up a prior frame with a sentinel RGBA pattern. If the
+        // compose source is the BASE (the bug), this pattern will
+        // not appear in the new frame. If the compose source is the
+        // PREVIOUS frame (the fix), it will.
+        let (_d, _q, _p, image) = try_make_pipeline_and_image().expect("gpu");
+        let prev_rgba = vec![42u8; 2 * 2 * 4];
+        store.images.get_mut(&parent.0).expect("parent").frames.push(Frame {
+            image,
+            rgba: prev_rgba.clone(),
+            delay_ms: 100,
+            bytes: 0,
+        });
+
+        // Fully-transparent 1×1 PNG so the composite output equals
+        // the source. Compose_base = None — spec says use previous.
+        let transparent_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                transparent_png,
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None, // <-- the key bit: compose_base omitted
+                0,
+                0, 0,
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let entry = store.images.get(&parent.0).expect("parent");
+        assert_eq!(
+            entry.frames[1].rgba, prev_rgba,
+            "omitted c= must compose against the previous frame, not the base",
+        );
+    }
+
+    #[test]
+    fn request_insert_frame_compose_base_none_falls_back_to_base_for_first_frame() {
+        // For the *first* a=f after the base (no previous frame in
+        // the sequence yet), None must fall back to the base —
+        // there's nothing else to compose against.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        // make_frame_test_image set base_rgba to all 0x55s. No prior
+        // frames in the sequence — None should resolve to that base.
+        let transparent_png = {
+            let buf = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+            let mut bytes = Vec::new();
+            image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+                .expect("encode");
+            bytes
+        };
+        let pid = store
+            .request_insert_frame(
+                parent,
+                transparent_png,
+                100,
+                Duration::from_secs(5),
+                None,
+                None,
+                None,
+                0,
+                0, 0,
+            )
+            .expect("parent exists");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let r = store.poll(&pipeline, &d, &q, false);
+            if r.iter().any(|(id, _)| *id == pid) { break; }
+            if Instant::now() > deadline { panic!("decode timeout"); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let entry = store.images.get(&parent.0).expect("parent");
+        let expected = vec![0x55u8; 2 * 2 * 4];
+        assert_eq!(
+            entry.frames[0].rgba, expected,
+            "first a=f with no previous frame falls back to base",
+        );
     }
 
     #[test]
