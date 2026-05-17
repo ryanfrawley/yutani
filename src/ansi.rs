@@ -267,7 +267,16 @@ impl Parser {
                 self.push_digit(ch);
                 self.state = State::CsiParam;
             }
-            ';' => {
+            // `;` is the legacy separator; `:` is ITU T.416 / ECMA-48
+            // sub-parameter separator. Modern apps (and `kitty +kitten
+            // icat`'s unicode-placeholder SGR) emit truecolor as
+            // `\e[38:2:R:G:Bm` rather than `\e[38;2;R;G;Bm`.
+            // Treating them the same here lets the existing SGR
+            // handler see `[38, 2, R, G, B]` and dispatch truecolor
+            // correctly. Worst case (advanced underline `4:N`): the
+            // sub-param leaks as a separate top-level SGR, which is a
+            // slight overload but better than aborting the whole CSI.
+            ';' | ':' => {
                 self.flush_param();
                 self.state = State::CsiParam;
             }
@@ -286,7 +295,8 @@ impl Parser {
     fn csi_param(&mut self, ch: char, emit: &mut impl FnMut(Event)) {
         match ch {
             '0'..='9' => self.push_digit(ch),
-            ';' => self.flush_param(),
+            // See the equivalent `;` | `:` branch in `csi_entry`.
+            ';' | ':' => self.flush_param(),
             ' '..='/' => {
                 self.intermediate = Some(ch);
                 self.state = State::CsiIntermediate;
@@ -624,6 +634,28 @@ mod tests {
         assert_eq!(
             collect("\x1b[1;31;48;5;16m"),
             vec![Event::Sgr(vec![1, 31, 48, 5, 16])],
+        );
+    }
+
+    #[test]
+    fn csi_accepts_colon_as_subparam_separator() {
+        // ITU T.416 / ECMA-48 form: colon separates sub-params of a
+        // single parameter. Modern apps (notably `kitty +kitten
+        // icat`'s unicode-placeholder SGR) emit truecolor as
+        // `\e[38:2:R:G:Bm` instead of `\e[38;2;R;G;Bm`. The pre-fix
+        // parser aborted the whole CSI on `:`, so the SGR never
+        // applied, the placeholder cell's fg color was never set,
+        // and `decode_kitty_placeholder_image_id` returned None —
+        // visible as a grid of tofu instead of the image.
+        assert_eq!(
+            collect("\x1b[38:2:252:37:152m"),
+            vec![Event::Sgr(vec![38, 2, 252, 37, 152])],
+        );
+        // Mixed separators in a single sequence still work — params
+        // accumulate uniformly regardless of which delimiter was used.
+        assert_eq!(
+            collect("\x1b[38:2;252:37;152m"),
+            vec![Event::Sgr(vec![38, 2, 252, 37, 152])],
         );
     }
 
