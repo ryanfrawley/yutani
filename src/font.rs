@@ -1,5 +1,5 @@
 extern crate freetype as ft;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::box_drawing;
 
@@ -141,6 +141,13 @@ pub struct Atlas {
     pack_y: usize,
     pack_row_height: usize,
     pub dirty: bool,
+    // Per-variant set of chars `ensure_char` has already attempted to
+    // pack. Distinct from `variants` because a styled-variant attempt
+    // may legitimately leave the styled slot empty (the glyph isn't in
+    // the styled chain, so Atlas::lookup falls through to Regular).
+    // Without this set we'd re-attempt face_for + the surrounding work
+    // every frame for any such char.
+    tried_chars: [HashSet<char>; 4],
 }
 
 impl Atlas {
@@ -220,6 +227,86 @@ impl Atlas {
         self.ligatures[vi].insert(glyph_id, entry);
         self.dirty = true;
         true
+    }
+
+    /// Rasterize and pack a char into the atlas if not already present.
+    /// Walks the variant's primary + fallback face chain via
+    /// `Variant::face_for`; the first face to provide a glyph wins.
+    ///
+    /// Build-time pre-pack only covers a fixed set of codepoint ranges
+    /// (printable ASCII, common symbols, Powerline PUA), so any char
+    /// outside those — Nerd Font icons in SPUA, CJK, arbitrary symbols —
+    /// reaches the render path with no atlas entry and would otherwise
+    /// fall to `notdef`. This is the on-demand counterpart to
+    /// `ensure_glyph_id`, but keyed by codepoint and walking fallbacks.
+    ///
+    /// Styled variants stay sparse: when the styled chain doesn't carry
+    /// the glyph, the slot is left empty and `Atlas::lookup` falls back
+    /// to Regular (same shape as `build_atlas`). `tried_chars` records
+    /// the attempt so we don't redo the work each frame.
+    pub fn ensure_char(&mut self, font: &mut Font, variant: FaceVariant, ch: char) {
+        let vi = variant as usize;
+        if !self.tried_chars[vi].insert(ch) {
+            return;
+        }
+        // Styled variant with no primary face: any rendering for this
+        // char will fall through to Regular via Atlas::lookup, so make
+        // sure Regular is the one that gets ensured.
+        if vi != 0 && font.variants[vi].face.is_none() {
+            self.ensure_char(font, FaceVariant::Regular, ch);
+            return;
+        }
+        // Compute cell metrics BEFORE loading the glyph — `cell_width`
+        // calls `load_char('M', DEFAULT)` on the Regular face and the
+        // shared FT_GlyphSlot would otherwise overwrite the bitmap we
+        // just rendered. Same dance as `ensure_glyph_id`.
+        let cell_w = font.cell_width();
+        let metrics = font
+            .face()
+            .size_metrics()
+            .expect("primary face has no size metrics");
+        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+
+        let face = match font.variants[vi].face_for(ch) {
+            Some(f) => f,
+            None => {
+                // No face in this variant's chain has the glyph. For a
+                // styled variant, ensure Regular is also tried so its
+                // fallback chain (which can differ — Apple Symbols ships
+                // no bold cut, for example) gets a chance. For Regular,
+                // leave the slot empty; `Atlas::lookup` returns `notdef`.
+                if vi != 0 {
+                    self.ensure_char(font, FaceVariant::Regular, ch);
+                }
+                return;
+            }
+        };
+        if face
+            .load_char(ch as usize, ft::face::LoadFlag::RENDER)
+            .is_err()
+        {
+            if vi != 0 {
+                self.ensure_char(font, FaceVariant::Regular, ch);
+            }
+            return;
+        }
+        let Some(entry) = pack_glyph(
+            face.glyph(),
+            &mut self.buffer,
+            self.width,
+            self.height,
+            &mut self.pack_x,
+            &mut self.pack_y,
+            &mut self.pack_row_height,
+            cell_w,
+            cell_h,
+        ) else {
+            // Atlas is full. We've already marked `tried`, so no retry
+            // storm; `Atlas::lookup` will return `notdef` for this char.
+            return;
+        };
+        self.variants[vi].insert(ch, entry);
+        self.dirty = true;
     }
 }
 
@@ -520,6 +607,12 @@ impl Font {
             pack_y: y,
             pack_row_height: row_height,
             dirty: false,
+            tried_chars: [
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+            ],
         }
     }
 }
@@ -719,6 +812,12 @@ mod tests {
             pack_y: 0,
             pack_row_height: 0,
             dirty: false,
+            tried_chars: [
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+            ],
         }
     }
 
@@ -1047,5 +1146,265 @@ mod tests {
 
         let g = a.lookup_glyph_id(42, FaceVariant::BoldItalic);
         assert_eq!(g.x, 99, "unknown glyph id on bold-italic → notdef");
+    }
+
+    // ---------- ensure_char tests ----------
+
+    /// Try to construct a real `Font` for `ensure_char` tests. We need a
+    /// loaded FT face — there's no hermetic fake that satisfies
+    /// `Font::face()` / `cell_width()`. Returns `None` (and the caller
+    /// prints `skipping: …`) when no candidate font is installed, matching
+    /// the pattern used by `find_face_index_picks_matching_style_when_available`
+    /// and `assert_strict_match` in `font_loader::macos::tests`.
+    fn load_test_font() -> Option<Font> {
+        let candidates = [
+            "/Users/ry/Library/Fonts/HackNerdFont-Regular.ttf",
+            "/Users/ry/Library/Fonts/FiraCode-Regular.ttf",
+            "/Library/Fonts/HackNerdFont-Regular.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
+        ];
+        let path = candidates.iter().find(|p| std::path::Path::new(p).exists())?;
+        let data = std::fs::read(path).ok()?;
+        let mut font = Font::new(data);
+        font.set_char_size(14.0, 96);
+        Some(font)
+    }
+
+    /// Same as `load_test_font` but also installs a Bold primary face so
+    /// the styled-variant branches of `ensure_char` can be exercised.
+    fn load_test_font_with_bold() -> Option<Font> {
+        let mut font = load_test_font()?;
+        let bold_candidates = [
+            "/Users/ry/Library/Fonts/HackNerdFont-Bold.ttf",
+            "/Users/ry/Library/Fonts/FiraCode-Bold.ttf",
+            "/Library/Fonts/HackNerdFont-Bold.ttf",
+        ];
+        let bold_path = bold_candidates.iter().find(|p| std::path::Path::new(p).exists())?;
+        let bold_data = std::fs::read(bold_path).ok()?;
+        if !font.set_variant(FaceVariant::Bold, bold_data, 0, 14.0, 96) {
+            return None;
+        }
+        Some(font)
+    }
+
+    /// A real atlas with a usable packing buffer. `atlas_with` produces a
+    /// zero-sized buffer which is fine for lookup tests but blows up
+    /// `pack_glyph`. Tests that actually exercise the packing path call
+    /// this instead.
+    fn real_atlas() -> Atlas {
+        let width = 512;
+        let height = 512;
+        Atlas {
+            width,
+            height,
+            buffer: vec![0u8; width * height],
+            variants: [
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ],
+            ligatures: [
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            ],
+            notdef: entry(99),
+            pack_x: 2,
+            pack_y: 0,
+            pack_row_height: 0,
+            dirty: false,
+            tried_chars: [
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+                HashSet::new(),
+            ],
+        }
+    }
+
+    // Second call for the same (variant, char) is a no-op — the
+    // `tried_chars` set short-circuits before any FT work. Without this
+    // gate every frame would redo `face_for` (and potentially pack again)
+    // for any char whose styled chain legitimately leaves the slot empty.
+    #[test]
+    fn ensure_char_short_circuits_on_repeat_call() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let mut atlas = real_atlas();
+
+        atlas.ensure_char(&mut font, FaceVariant::Regular, 'A');
+        assert!(
+            atlas.tried_chars[FaceVariant::Regular as usize].contains(&'A'),
+            "first call should record the attempt in tried_chars",
+        );
+        let dirty_before = atlas.dirty;
+        let entries_before = atlas.variants[FaceVariant::Regular as usize].len();
+        let pack_x_before = atlas.pack_x;
+        let pack_y_before = atlas.pack_y;
+
+        // Force-reset dirty so we can detect any mutation the second call
+        // might do (real packing also sets dirty=true).
+        atlas.dirty = false;
+        atlas.ensure_char(&mut font, FaceVariant::Regular, 'A');
+
+        assert!(!atlas.dirty, "repeat call must not set dirty");
+        assert_eq!(
+            atlas.variants[FaceVariant::Regular as usize].len(),
+            entries_before,
+            "repeat call must not insert a duplicate entry",
+        );
+        assert_eq!(atlas.pack_x, pack_x_before, "pack cursor x must not move");
+        assert_eq!(atlas.pack_y, pack_y_before, "pack cursor y must not move");
+        // Sanity that we actually exercised the success path on the first call.
+        assert!(dirty_before, "first call should have set dirty for a real glyph");
+    }
+
+    // A successful ensure_char inserts an entry in the requested variant
+    // map and flips `dirty` so the renderer re-uploads the texture.
+    #[test]
+    fn ensure_char_successful_pack_inserts_entry_and_sets_dirty() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let mut atlas = real_atlas();
+        assert!(!atlas.dirty, "fresh atlas starts clean");
+        assert!(atlas.variants[FaceVariant::Regular as usize].is_empty());
+
+        // 'A' is in printable ASCII — every plausible test font has it.
+        atlas.ensure_char(&mut font, FaceVariant::Regular, 'A');
+
+        assert!(atlas.dirty, "successful pack must set dirty");
+        assert!(
+            atlas.variants[FaceVariant::Regular as usize].contains_key(&'A'),
+            "Regular variant should now have an entry for 'A'",
+        );
+        assert!(
+            atlas.tried_chars[FaceVariant::Regular as usize].contains(&'A'),
+            "successful pack still records the attempt",
+        );
+    }
+
+    // No face anywhere in the variant chain has the glyph. For the
+    // Regular variant the slot is left empty (Atlas::lookup → notdef),
+    // dirty stays false, and `tried_chars` marks the attempt so we don't
+    // pay the face_for walk every frame.
+    #[test]
+    fn ensure_char_missing_glyph_leaves_slot_empty_and_marks_tried() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let mut atlas = real_atlas();
+
+        // U+10FFFD is in Supplementary Private Use Area-B. Hack and the
+        // other candidate test fonts ship nothing there, and we don't
+        // install fallbacks in `load_test_font`, so the face_for walk is
+        // guaranteed to come up empty.
+        let ch = '\u{10FFFD}';
+        atlas.ensure_char(&mut font, FaceVariant::Regular, ch);
+
+        assert!(!atlas.dirty, "missing glyph must not dirty the atlas");
+        assert!(
+            !atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "missing glyph must not create an entry (lookup falls back to notdef)",
+        );
+        assert!(
+            atlas.tried_chars[FaceVariant::Regular as usize].contains(&ch),
+            "missing glyph must still be marked tried — that's the whole point of the set",
+        );
+
+        // And the short-circuit applies on retry: cursor/state unchanged.
+        let pack_x = atlas.pack_x;
+        let pack_y = atlas.pack_y;
+        atlas.ensure_char(&mut font, FaceVariant::Regular, ch);
+        assert!(!atlas.dirty);
+        assert_eq!(atlas.pack_x, pack_x);
+        assert_eq!(atlas.pack_y, pack_y);
+    }
+
+    // Styled variant has no installed primary face → ensure_char recurses
+    // into Regular, leaves the styled slot empty, and marks BOTH the
+    // styled and Regular variant `tried_chars` (the styled mark from the
+    // top of the call, the Regular mark from the recursion). Atlas::lookup
+    // then correctly returns the Regular entry for a Bold request.
+    #[test]
+    fn ensure_char_styled_without_primary_recurses_to_regular() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        // Precondition for the branch under test.
+        assert!(
+            font.variants[FaceVariant::Bold as usize].face.is_none(),
+            "load_test_font should leave Bold uninstalled — this test assumes it",
+        );
+        let mut atlas = real_atlas();
+
+        atlas.ensure_char(&mut font, FaceVariant::Bold, 'B');
+
+        assert!(
+            atlas.tried_chars[FaceVariant::Bold as usize].contains(&'B'),
+            "Bold attempt should be marked tried at the top of the call",
+        );
+        assert!(
+            atlas.tried_chars[FaceVariant::Regular as usize].contains(&'B'),
+            "recursion into Regular should also mark Regular tried",
+        );
+        assert!(
+            !atlas.variants[FaceVariant::Bold as usize].contains_key(&'B'),
+            "Bold slot stays empty — lookup falls through to Regular",
+        );
+        assert!(
+            atlas.variants[FaceVariant::Regular as usize].contains_key(&'B'),
+            "Regular slot should be populated by the recursive call",
+        );
+        assert!(atlas.dirty, "recursive pack into Regular must set dirty");
+
+        // Atlas::lookup on Bold should return the Regular entry (not notdef).
+        let g = atlas.lookup('B', FaceVariant::Bold);
+        assert_ne!(g.x, atlas.notdef.x, "Bold lookup must resolve via Regular, not notdef");
+    }
+
+    // Styled variant whose chain doesn't carry the glyph still recurses
+    // into Regular so Regular's (possibly broader) fallback chain gets a
+    // chance. This is the `face_for` returns None branch with `vi != 0`.
+    // We exercise it by installing Bold and asking for a codepoint
+    // neither variant's primary actually has — both Bold and Regular's
+    // chains miss, but the side-effect we're checking is the recursion
+    // structure: the Regular tried_chars set picks up the mark.
+    #[test]
+    fn ensure_char_styled_chain_miss_recurses_into_regular() {
+        let Some(mut font) = load_test_font_with_bold() else {
+            eprintln!("skipping: no bold test font installed");
+            return;
+        };
+        let mut atlas = real_atlas();
+        // SPUA-B codepoint that no plain monospace coding font ships.
+        let ch = '\u{10FFFD}';
+
+        atlas.ensure_char(&mut font, FaceVariant::Bold, ch);
+
+        assert!(
+            atlas.tried_chars[FaceVariant::Bold as usize].contains(&ch),
+            "Bold attempt marked tried",
+        );
+        assert!(
+            atlas.tried_chars[FaceVariant::Regular as usize].contains(&ch),
+            "missing styled glyph must recurse into Regular (which also marks tried)",
+        );
+        assert!(
+            !atlas.variants[FaceVariant::Bold as usize].contains_key(&ch),
+            "Bold slot stays empty",
+        );
+        assert!(
+            !atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "Regular chain also misses → slot stays empty (Atlas::lookup → notdef)",
+        );
+        assert!(!atlas.dirty, "no pack happened on either variant");
     }
 }
