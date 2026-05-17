@@ -15,6 +15,56 @@ pub const MOUSE_RIGHT: MouseButton = 2;
 pub const MOUSE_WHEEL_UP: MouseButton = 64;
 pub const MOUSE_WHEEL_DOWN: MouseButton = 65;
 
+/// How many wheel-up and wheel-down notches a pixel delta should produce
+/// when forwarding scroll to an app that has asked for mouse tracking
+/// (tmux, vim, less, htop).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WheelNotches {
+    pub up: u32,
+    pub down: u32,
+}
+
+/// Drain a pixel accumulator into discrete wheel notches.
+///
+/// Trackpads stream many sub-line `PixelDelta` events; truncating each one
+/// independently rounds every event to 0 and produces no wheel reports
+/// until a single large event finally crosses the line-height threshold
+/// (and then fires a burst). This accumulates pixels across events and
+/// emits one notch per `line_height` drained.
+///
+/// A direction change zeroes residue first so leftover pixels from a
+/// prior up-scroll can't fire as a stale down event after the user
+/// reverses (or vice versa).
+///
+/// Returns the number of up and down notches to emit; the caller is
+/// responsible for sending them to the PTY.
+pub fn drain_wheel_accum(
+    accum: &mut f64,
+    delta_pixels: f64,
+    line_height: f64,
+) -> WheelNotches {
+    if line_height <= 0.0 {
+        return WheelNotches::default();
+    }
+    if delta_pixels.signum() != 0.0
+        && accum.signum() != 0.0
+        && delta_pixels.signum() != accum.signum()
+    {
+        *accum = 0.0;
+    }
+    *accum += delta_pixels;
+    let mut notches = WheelNotches::default();
+    while *accum >= line_height {
+        notches.up += 1;
+        *accum -= line_height;
+    }
+    while *accum <= -line_height {
+        notches.down += 1;
+        *accum += line_height;
+    }
+    notches
+}
+
 /// Encode a mouse event for the PTY in either SGR (1006) or legacy X10 form.
 /// `col`/`row` are 1-based cell positions. `motion` is set for events emitted
 /// by drag/move tracking. `press` is true on button-down (and for wheel
@@ -406,5 +456,125 @@ mod tests {
             encode_key(&Key::Named(NamedKey::Enter), None, ModifiersState::ALT, false),
             Some(vec![0x1b, b'\r']),
         );
+    }
+
+    // --- drain_wheel_accum ---------------------------------------------
+    //
+    // The conventions tested below mirror the PTY mouse-tracking path in
+    // `WindowEvent::MouseWheel`: positive pixels mean "scroll up" (content
+    // moves down, wheel-up notches), negative means "scroll down".
+
+    const LH: f64 = 20.0;
+
+    #[test]
+    fn slow_subline_events_accumulate_into_one_up_notch() {
+        // Ten 2-pixel ticks (total 20px = one line) should fire exactly one
+        // wheel-up notch — not zero, which is what the old truncating
+        // `(p.y / line_height) as i32` produced.
+        let mut accum = 0.0;
+        let mut total = WheelNotches::default();
+        for _ in 0..10 {
+            let n = drain_wheel_accum(&mut accum, 2.0, LH);
+            total.up += n.up;
+            total.down += n.down;
+        }
+        assert_eq!(total, WheelNotches { up: 1, down: 0 });
+        // Residue should be ~0 after consuming exactly one line worth.
+        assert!(accum.abs() < 1e-9, "accum = {}", accum);
+    }
+
+    #[test]
+    fn slow_subline_events_eventually_emit_after_residue() {
+        // Nine 2-pixel ticks (18px) is below the threshold — no notch yet.
+        let mut accum = 0.0;
+        for _ in 0..9 {
+            assert_eq!(
+                drain_wheel_accum(&mut accum, 2.0, LH),
+                WheelNotches::default(),
+            );
+        }
+        assert!((accum - 18.0).abs() < 1e-9);
+        // One more 2px tick crosses 20px and fires.
+        assert_eq!(
+            drain_wheel_accum(&mut accum, 2.0, LH),
+            WheelNotches { up: 1, down: 0 },
+        );
+    }
+
+    #[test]
+    fn fast_single_event_fires_multiple_notches() {
+        // A single 65-pixel kick at line-height 20 should produce 3 notches
+        // and leave 5px of residue.
+        let mut accum = 0.0;
+        let n = drain_wheel_accum(&mut accum, 65.0, LH);
+        assert_eq!(n, WheelNotches { up: 3, down: 0 });
+        assert!((accum - 5.0).abs() < 1e-9, "accum = {}", accum);
+    }
+
+    #[test]
+    fn fast_single_event_fires_multiple_down_notches() {
+        let mut accum = 0.0;
+        let n = drain_wheel_accum(&mut accum, -45.0, LH);
+        assert_eq!(n, WheelNotches { up: 0, down: 2 });
+        assert!((accum - -5.0).abs() < 1e-9, "accum = {}", accum);
+    }
+
+    #[test]
+    fn direction_change_drops_prior_residue() {
+        // Scroll up enough to leave +18px residue (no notch yet).
+        let mut accum = 0.0;
+        let n = drain_wheel_accum(&mut accum, 18.0, LH);
+        assert_eq!(n, WheelNotches::default());
+        assert!((accum - 18.0).abs() < 1e-9);
+        // User reverses with a small downward tick. The 18px of prior
+        // up-residue must be discarded — otherwise the new -2px would only
+        // bring the accumulator down to +16, and a *third* downward tick
+        // would still owe an up notch from the original gesture.
+        let n = drain_wheel_accum(&mut accum, -2.0, LH);
+        assert_eq!(n, WheelNotches::default());
+        assert!((accum - -2.0).abs() < 1e-9, "accum = {}", accum);
+    }
+
+    #[test]
+    fn same_direction_preserves_residue() {
+        // Two same-direction events should NOT trigger the reset.
+        let mut accum = 0.0;
+        drain_wheel_accum(&mut accum, 12.0, LH);
+        drain_wheel_accum(&mut accum, 12.0, LH);
+        // 24px total → one notch fires, 4px residue retained.
+        assert!((accum - 4.0).abs() < 1e-9, "accum = {}", accum);
+    }
+
+    #[test]
+    fn line_delta_converted_to_pixels_uses_same_drain() {
+        // Caller multiplies the LineDelta by line_height before calling, so
+        // one full line of LineDelta input becomes exactly one notch with
+        // zero residue, matching a single 20px PixelDelta event.
+        let mut accum = 0.0;
+        let line_delta = 1.0_f32;
+        let pixels = line_delta as f64 * LH;
+        let n = drain_wheel_accum(&mut accum, pixels, LH);
+        assert_eq!(n, WheelNotches { up: 1, down: 0 });
+        assert!(accum.abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_delta_is_noop() {
+        let mut accum = 7.0;
+        let n = drain_wheel_accum(&mut accum, 0.0, LH);
+        assert_eq!(n, WheelNotches::default());
+        // A zero delta has no sign, so it must not trigger the
+        // direction-change reset — residue is preserved.
+        assert!((accum - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nonpositive_line_height_is_safe() {
+        // Defensive: a degenerate font metric must not loop forever or
+        // panic. No notches, no accumulator mutation.
+        let mut accum = 5.0;
+        let n = drain_wheel_accum(&mut accum, 100.0, 0.0);
+        assert_eq!(n, WheelNotches::default());
+        assert!((accum - 5.0).abs() < 1e-9);
     }
 }

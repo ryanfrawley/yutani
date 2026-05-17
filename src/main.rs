@@ -637,6 +637,13 @@ struct State {
     terminal: terminal::Terminal,
     modifiers: winit::keyboard::ModifiersState,
     scroll_y: f64,
+    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
+    /// less, htop). Trackpads stream small PixelDelta events — without
+    /// accumulation, every event truncates to 0 lines and slow scrolls
+    /// produce no wheel reports at all until one event finally crosses the
+    /// line-height threshold and emits a burst. Drained per `line_height`
+    /// just like `scroll_y` so the rate matches the local-scrollback path.
+    wheel_pty_accum: f64,
     /// Drop in-flight trackpad momentum once a newer command (a keystroke
     /// that snaps to the bottom) has overridden the user's scroll intent.
     /// Cleared when momentum runs out OR a fresh gesture begins after a
@@ -1676,6 +1683,7 @@ impl State {
             ),
             modifiers: winit::keyboard::ModifiersState::empty(),
             scroll_y: 0.0,
+            wheel_pty_accum: 0.0,
             scroll_suppressed: false,
             last_wheel_at: None,
             mouse_x: 0.0,
@@ -3995,19 +4003,24 @@ impl State {
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
                 if self.terminal.mouse_protocol().enabled() {
-                    let lines = match delta {
-                        MouseScrollDelta::LineDelta(_, d) => d.round() as i32,
-                        MouseScrollDelta::PixelDelta(p) => (p.y / line_height) as i32,
+                    // Accumulate pixels so a slow trackpad gesture (many
+                    // sub-line events) still produces wheel reports instead
+                    // of truncating every event to 0. LineDelta synthesizes
+                    // pixels at line_height so both inputs share the drain.
+                    let pixels = match delta {
+                        MouseScrollDelta::LineDelta(_, d) => *d as f64 * line_height,
+                        MouseScrollDelta::PixelDelta(p) => p.y,
                     };
-                    let (button, count) = if lines > 0 {
-                        (input::MOUSE_WHEEL_UP, lines.unsigned_abs())
-                    } else if lines < 0 {
-                        (input::MOUSE_WHEEL_DOWN, lines.unsigned_abs())
-                    } else {
-                        return true;
-                    };
-                    for _ in 0..count {
-                        self.report_mouse(button, true, false);
+                    let notches = input::drain_wheel_accum(
+                        &mut self.wheel_pty_accum,
+                        pixels,
+                        line_height,
+                    );
+                    for _ in 0..notches.up {
+                        self.report_mouse(input::MOUSE_WHEEL_UP, true, false);
+                    }
+                    for _ in 0..notches.down {
+                        self.report_mouse(input::MOUSE_WHEEL_DOWN, true, false);
                     }
                     return true;
                 }
