@@ -3674,26 +3674,43 @@ impl State {
                 continue;
             }
             // `a=f` frame transmission — append to the parent image's
-            // frames vec via the dedicated request path.
+            // frames vec via the dedicated request path. Raw RGBA
+            // payloads use the worker-bypass variant; PNG-style
+            // payloads go through the worker.
             if let Some(frame_spec) = up.animation_frame.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
                 let Some(parent) = self.terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
-                let _ = self.image_store.request_insert_frame(
-                    parent,
-                    up.bytes,
-                    self.config.images_max_pixels,
-                    std::time::Duration::from_millis(
-                        self.config.images_decode_timeout_ms,
-                    ),
-                    up.label,
-                    frame_spec.target_slot,
-                    frame_spec.compose_base,
-                    frame_spec.gap_ms,
-                    frame_spec.dst_x,
-                    frame_spec.dst_y,
-                );
+                if let Some((w, h)) = up.raw_rgba_dims {
+                    let _ = self.image_store.request_insert_frame_rgba(
+                        parent,
+                        up.bytes,
+                        w,
+                        h,
+                        up.label,
+                        frame_spec.target_slot,
+                        frame_spec.compose_base,
+                        frame_spec.gap_ms,
+                        frame_spec.dst_x,
+                        frame_spec.dst_y,
+                    );
+                } else {
+                    let _ = self.image_store.request_insert_frame(
+                        parent,
+                        up.bytes,
+                        self.config.images_max_pixels,
+                        std::time::Duration::from_millis(
+                            self.config.images_decode_timeout_ms,
+                        ),
+                        up.label,
+                        frame_spec.target_slot,
+                        frame_spec.compose_base,
+                        frame_spec.gap_ms,
+                        frame_spec.dst_x,
+                        frame_spec.dst_y,
+                    );
+                }
                 self.window.request_redraw();
                 continue;
             }
@@ -3701,8 +3718,17 @@ impl State {
             // variant so the store keeps a CPU RGBA copy of the base
             // — needed if a later `a=f` arrives and has to composite
             // against it. iTerm OSC 1337 / debug-keybind paths skip
-            // this since they can never receive frames.
-            let (pending, image_id) = if up.kitty_image_id.is_some() {
+            // this since they can never receive frames. Raw RGBA
+            // payloads (signaled by `raw_rgba_dims`) skip the decode
+            // worker entirely; PNG-style payloads go through it.
+            let (pending, image_id) = if let Some((w, h)) = up.raw_rgba_dims {
+                self.image_store.request_insert_animatable_rgba(
+                    up.bytes,
+                    w,
+                    h,
+                    up.label,
+                )
+            } else if up.kitty_image_id.is_some() {
                 self.image_store.request_insert_animatable(
                     up.bytes,
                     self.config.images_max_pixels,

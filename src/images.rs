@@ -629,6 +629,15 @@ pub struct Store {
     job_tx: mpsc::Sender<DecodeJob>,
     result_rx: mpsc::Receiver<DecodeResult>,
 
+    /// Bypass queue for raw RGB/RGBA payloads. The Kitty `t=s` SHM
+    /// path lets icat hand us pre-decoded pixel data; PNG-encoding
+    /// it just so the worker can PNG-decode it back wastes ~50-150ms
+    /// per frame at 450x450 — enough to bust the per-job timeout
+    /// when an animation queues 20+ frames in a single PTY chunk.
+    /// `request_insert_*_rgba` pushes a pre-resolved `DecodeResult`
+    /// here; `poll` drains alongside the worker channel.
+    immediate_results: Vec<DecodeResult>,
+
     // Kept so the worker thread is observable in diagnostics. We don't
     // join it on drop — dropping `job_tx` closes the channel and the
     // worker's `recv` returns Err, ending its loop after the current
@@ -657,6 +666,7 @@ impl Store {
             pending: HashMap::new(),
             job_tx,
             result_rx,
+            immediate_results: Vec::new(),
             _worker: worker,
         }
     }
@@ -816,6 +826,116 @@ impl Store {
             bytes,
             max_pixels,
             label,
+        });
+        Some(PendingId(pending_id))
+    }
+
+    /// Animatable base-image insert for callers who already have RGBA
+    /// bytes (e.g. Kitty `t=s` SHM with raw f=24/f=32 payloads).
+    /// Bypasses the worker entirely — the decode step would be a
+    /// no-op since the bytes are already in the format
+    /// `pipeline.upload_rgba` expects, and PNG-round-tripping a
+    /// large RGBA buffer to satisfy the worker's signature wastes
+    /// ~50-150 ms per call on 450x450 noisy data. Caller is
+    /// responsible for converting raw RGB → RGBA (pad alpha=255)
+    /// before calling.
+    pub fn request_insert_animatable_rgba(
+        &mut self,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        label: Option<String>,
+    ) -> (PendingId, ImageId) {
+        let image_id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.images.insert(
+            image_id,
+            StoredImage {
+                image: None,
+                preview: None,
+                bytes: 0,
+                last_used: Instant::now(),
+                base_rgba: None,
+                base_dims: None,
+                frames: Vec::new(),
+                animation: AnimationState::default(),
+                base_delay_ms: 0,
+            },
+        );
+
+        let pending_id = self.next_pending;
+        self.next_pending = self.next_pending.wrapping_add(1).max(1);
+        // The bypass path can't time out (no worker queue to wait in),
+        // but the pending entry still needs a timeout so `poll`'s
+        // sweep doesn't panic on missing fields. Pick something
+        // generous; the immediate_results push below means the entry
+        // resolves on the very next poll anyway.
+        self.pending.insert(
+            pending_id,
+            PendingRequest {
+                image_id,
+                kind: PendingKind::Base { keep_rgba: true },
+                issued_at: Instant::now(),
+                timeout: Duration::from_secs(60),
+            },
+        );
+        self.immediate_results.push(DecodeResult {
+            pending_id,
+            label,
+            outcome: Ok(DecodedPixels { rgba, width, height }),
+        });
+        (PendingId(pending_id), ImageId(image_id))
+    }
+
+    /// Frame insert for callers who already have RGBA bytes.
+    /// Same bypass rationale as [`Store::request_insert_animatable_rgba`]
+    /// — the worker would only be doing a memcpy for a raw payload,
+    /// and serializing tens of those at animation submission time
+    /// busts the per-job decode timeout. Returns `None` if the
+    /// parent doesn't exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_insert_frame_rgba(
+        &mut self,
+        parent: ImageId,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        label: Option<String>,
+        target_slot: Option<u32>,
+        compose_base: Option<u32>,
+        delay_ms: u32,
+        dst_x: u32,
+        dst_y: u32,
+    ) -> Option<PendingId> {
+        self.images.get(&parent.0)?;
+        let compose_base_idx = compose_base.and_then(|n| {
+            if n <= 1 {
+                Some(0u32)
+            } else {
+                Some(n - 1)
+            }
+        });
+        let pending_id = self.next_pending;
+        self.next_pending = self.next_pending.wrapping_add(1).max(1);
+        self.pending.insert(
+            pending_id,
+            PendingRequest {
+                image_id: parent.0,
+                kind: PendingKind::Frame {
+                    dst_x,
+                    dst_y,
+                    compose_base: compose_base_idx,
+                    delay_ms,
+                    target_slot,
+                },
+                issued_at: Instant::now(),
+                timeout: Duration::from_secs(60),
+            },
+        );
+        self.immediate_results.push(DecodeResult {
+            pending_id,
+            label,
+            outcome: Ok(DecodedPixels { rgba, width, height }),
         });
         Some(PendingId(pending_id))
     }
@@ -1130,7 +1250,18 @@ impl Store {
             ));
         }
 
+        // Drain the bypass queue (raw RGB/RGBA inserts) alongside the
+        // worker channel. Both branches resolve through the same
+        // finish_*_decode helpers; the only difference is where the
+        // `DecodedPixels` came from. Worker results are collected
+        // up-front so the loop body can mutate `self` (the from-fn
+        // iterator borrow would conflict otherwise).
+        let mut to_process: Vec<DecodeResult> =
+            std::mem::take(&mut self.immediate_results);
         while let Ok(result) = self.result_rx.try_recv() {
+            to_process.push(result);
+        }
+        for result in to_process {
             let pid = result.pending_id;
             // If the matching pending entry is gone, the request timed out
             // already — silently drop the late result. The reservation
@@ -3808,6 +3939,49 @@ mod tests {
             entry.frames[0].rgba, expected,
             "first a=f with no previous frame falls back to base",
         );
+    }
+
+    #[test]
+    fn request_insert_animatable_rgba_skips_worker_and_resolves_on_next_poll() {
+        // Worker-bypass path for raw RGBA base images. The reservation
+        // is created and the pre-decoded result is queued onto
+        // `immediate_results` synchronously; the next `poll` should
+        // upload to the GPU without ever touching the worker thread.
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let rgba = vec![0x77u8; 4 * 4 * 4];
+        let (pid, _) = store.request_insert_animatable_rgba(rgba, 4, 4, None);
+        assert_eq!(
+            store.pending_count(),
+            1,
+            "reservation tracked",
+        );
+        // One poll resolves the bypass entry — no worker round-trip
+        // required even with a tight cap on iterations.
+        let results = store.poll(&pipeline, &d, &q, false);
+        assert!(
+            results.iter().any(|(p, _)| *p == pid),
+            "bypass entry resolves on the very next poll",
+        );
+        assert_eq!(store.pending_count(), 0);
+    }
+
+    #[test]
+    fn request_insert_frame_rgba_skips_worker_and_resolves_on_next_poll() {
+        let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
+        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut store, (2, 2)) else {
+            return;
+        };
+        let rgba = vec![0u8; 2 * 2 * 4];
+        let pid = store
+            .request_insert_frame_rgba(
+                parent, rgba, 2, 2, None, None, None, 50, 0, 0,
+            )
+            .expect("parent exists");
+        let results = store.poll(&pipeline, &d, &q, false);
+        assert!(results.iter().any(|(p, _)| *p == pid));
+        assert_eq!(store.frame_count(parent), 1);
     }
 
     #[test]

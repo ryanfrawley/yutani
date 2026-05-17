@@ -175,6 +175,14 @@ pub struct PendingImageUpload {
     /// empty and there's nothing to decode — main.rs applies the
     /// control op directly to the store for `kitty_image_id`.
     pub animation_control: Option<KittyAnimationControl>,
+    /// Bypass marker for raw RGBA payloads (Kitty `f=24`/`f=32` SHM,
+    /// post `convert_kitty_raw_to_rgba`). When `Some((w, h))`, `bytes`
+    /// is already in the format `Store::request_insert_*_rgba`
+    /// expects — main.rs's drain routes through the worker-bypass
+    /// path instead of the PNG-encode-then-worker-decode path. PNG
+    /// payloads (and any path that needs real decode) leave this
+    /// `None`.
+    pub raw_rgba_dims: Option<(u32, u32)>,
 }
 
 /// `a=f` per-frame metadata. Carried alongside the raw frame payload
@@ -1910,6 +1918,7 @@ impl Terminal {
             src_rect: None,
             animation_frame: None,
             animation_control: None,
+            raw_rgba_dims: None,
         });
     }
 
@@ -2069,8 +2078,8 @@ impl Terminal {
         // a=f path uses, with no fallback since this IS the base.
         let effective_format =
             resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
-        let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
+        let Some((bytes, pixel_size, raw_rgba_dims)) =
+            prepare_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2090,6 +2099,7 @@ impl Terminal {
             z_index,
             src_rect,
             effective_format,
+            raw_rgba_dims,
         );
     }
 
@@ -2208,12 +2218,31 @@ impl Terminal {
                     acc.source_w,
                     acc.source_h,
                 );
+                // Fast path: raw RGB/RGBA bypasses the worker. See
+                // `convert_kitty_raw_to_rgba` for the rationale.
+                if matches!(
+                    effective_format,
+                    KittyFormat::Rgb | KittyFormat::Rgba,
+                ) {
+                    let Some((rgba, w, h)) = convert_kitty_raw_to_rgba(
+                        effective_format,
+                        &raw,
+                        acc.source_w,
+                        acc.source_h,
+                    ) else {
+                        return;
+                    };
+                    self.queue_animation_frame_upload(
+                        client_id, rgba, ctrl, Some((w, h)),
+                    );
+                    return;
+                }
                 let Some((bytes, _pixel_size)) =
                     normalize_kitty_payload(effective_format, &raw, acc.source_w, acc.source_h)
                 else {
                     return;
                 };
-                self.queue_animation_frame_upload(client_id, bytes, ctrl);
+                self.queue_animation_frame_upload(client_id, bytes, ctrl, None);
                 return;
             }
         }
@@ -2264,12 +2293,24 @@ impl Terminal {
             ctrl.source_w,
             ctrl.source_h,
         );
+        if matches!(effective_format, KittyFormat::Rgb | KittyFormat::Rgba) {
+            let Some((rgba, w, h)) = convert_kitty_raw_to_rgba(
+                effective_format,
+                &raw,
+                ctrl.source_w,
+                ctrl.source_h,
+            ) else {
+                return;
+            };
+            self.queue_animation_frame_upload(client_id, rgba, ctrl, Some((w, h)));
+            return;
+        }
         let Some((bytes, _pixel_size)) =
             normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
-        self.queue_animation_frame_upload(client_id, bytes, ctrl);
+        self.queue_animation_frame_upload(client_id, bytes, ctrl, None);
     }
 
     /// Pick the right pixel format for an `a=f` raw payload.
@@ -2307,6 +2348,7 @@ impl Terminal {
         client_id: u32,
         bytes: Vec<u8>,
         ctrl: &KittyControl,
+        raw_rgba_dims: Option<(u32, u32)>,
     ) {
         self.pending_image_uploads.push(PendingImageUpload {
             bytes,
@@ -2340,6 +2382,7 @@ impl Terminal {
                 dst_y: ctrl.crop_y.or(ctrl.pixel_offset_y).unwrap_or(0),
             }),
             animation_control: None,
+            raw_rgba_dims,
         });
     }
 
@@ -2372,6 +2415,7 @@ impl Terminal {
                 edit_frame: ctrl.anim_frame_num.filter(|&n| n > 0),
                 edit_gap_ms: ctrl.anim_gap_ms,
             }),
+            raw_rgba_dims: None,
         });
     }
 
@@ -2550,8 +2594,8 @@ impl Terminal {
         }
         let effective_format =
             resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
-        let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
+        let Some((bytes, pixel_size, raw_rgba_dims)) =
+            prepare_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2569,6 +2613,7 @@ impl Terminal {
             z_index,
             src_rect,
             effective_format,
+            raw_rgba_dims,
         );
     }
 
@@ -2589,8 +2634,8 @@ impl Terminal {
         }
         let effective_format =
             resolve_kitty_format(acc.format, &raw, acc.source_w, acc.source_h, None);
-        let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(effective_format, &raw, acc.source_w, acc.source_h)
+        let Some((bytes, pixel_size, raw_rgba_dims)) =
+            prepare_kitty_payload(effective_format, &raw, acc.source_w, acc.source_h)
         else {
             return;
         };
@@ -2607,6 +2652,7 @@ impl Terminal {
             0,
             None,
             effective_format,
+            raw_rgba_dims,
         );
     }
 
@@ -2632,12 +2678,13 @@ impl Terminal {
             raw = inflated;
         }
 
-        // Run through the same normalizer the direct path uses so
-        // raw formats over temp file (icat for big JPGs) work too.
+        // Run through the same payload preparer the direct path uses
+        // so raw formats over temp file (icat for big JPGs) skip the
+        // PNG round-trip too.
         let effective_format =
             resolve_kitty_format(ctrl.format, &raw, ctrl.source_w, ctrl.source_h, None);
-        let Some((bytes, pixel_size)) =
-            normalize_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
+        let Some((bytes, pixel_size, raw_rgba_dims)) =
+            prepare_kitty_payload(effective_format, &raw, ctrl.source_w, ctrl.source_h)
         else {
             return;
         };
@@ -2657,6 +2704,7 @@ impl Terminal {
             z_index,
             src_rect,
             effective_format,
+            raw_rgba_dims,
         );
     }
 
@@ -2679,6 +2727,11 @@ impl Terminal {
         z_index: i32,
         src_rect: Option<(u32, u32, u32, u32)>,
         source_format: KittyFormat,
+        // `Some((w, h))` signals that `bytes` is already raw RGBA at
+        // those dims — main.rs's drain routes through the
+        // worker-bypass insert path. `None` means `bytes` is
+        // PNG-or-similar and needs to go through the decode worker.
+        raw_rgba_dims: Option<(u32, u32)>,
     ) {
         // Record the base's format so subsequent `a=f` frames that
         // omit `f=` can inherit it. Per Kitty spec the frame data
@@ -2748,6 +2801,7 @@ impl Terminal {
             src_rect,
             animation_frame: None,
             animation_control: None,
+            raw_rgba_dims,
         });
     }
 
@@ -3590,6 +3644,78 @@ fn normalize_kitty_payload(
             Some((out, Some((w, h))))
         }
         KittyFormat::Other => None,
+    }
+}
+
+/// Pick the right payload shape to hand to the store: raw RGBA
+/// (bypass the decode worker) for `f=24`/`f=32` payloads, or
+/// PNG-or-equivalent bytes (route through the worker) for PNG
+/// inputs. Centralizes the format-conditional dispatch so every
+/// transmission entry point gets the same fast-path treatment.
+///
+/// Returns `(bytes, pixel_size, raw_rgba_dims)`:
+///   - `bytes` — payload to put on the `PendingImageUpload`.
+///   - `pixel_size` — natural pixel dims (`source_w`/`h` for raw,
+///     PNG header peek otherwise).
+///   - `raw_rgba_dims` — `Some((w, h))` when `bytes` is already raw
+///     RGBA (signals the worker-bypass insert path); `None` for the
+///     decode-worker path.
+fn prepare_kitty_payload(
+    format: KittyFormat,
+    raw: &[u8],
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+) -> Option<(Vec<u8>, Option<(u32, u32)>, Option<(u32, u32)>)> {
+    if matches!(format, KittyFormat::Rgb | KittyFormat::Rgba) {
+        let (rgba, w, h) = convert_kitty_raw_to_rgba(format, raw, source_w, source_h)?;
+        return Some((rgba, Some((w, h)), Some((w, h))));
+    }
+    let (bytes, pixel_size) = normalize_kitty_payload(format, raw, source_w, source_h)?;
+    Some((bytes, pixel_size, None))
+}
+
+/// Convert a raw `f=24` (RGB) or `f=32` (RGBA) Kitty payload into a
+/// straight-alpha RGBA byte buffer the GPU pipeline can upload
+/// directly. Returns `(rgba, width, height)`. For PNG inputs the
+/// caller should still route through `normalize_kitty_payload` plus
+/// the decode worker — re-implementing PNG decode here would just
+/// move the worker's job into the dispatcher.
+///
+/// Skipping the PNG round-trip is the whole point of this path: a
+/// 450x450 RGBA payload PNG-encodes in ~50-150 ms (zlib is slow on
+/// noisy GIF deltas), and serializing twenty of those in a single
+/// PTY chunk busts the worker's per-job decode timeout. RGB → RGBA
+/// padding here is a plain memcpy with alpha=255 — single-digit ms
+/// even for full-screen frames.
+pub(crate) fn convert_kitty_raw_to_rgba(
+    format: KittyFormat,
+    raw: &[u8],
+    source_w: Option<u32>,
+    source_h: Option<u32>,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let w = source_w?;
+    let h = source_h?;
+    let pixels = (w as usize).checked_mul(h as usize)?;
+    match format {
+        KittyFormat::Rgba => {
+            let expected = pixels.checked_mul(4)?;
+            if raw.len() < expected {
+                return None;
+            }
+            Some((raw[..expected].to_vec(), w, h))
+        }
+        KittyFormat::Rgb => {
+            let expected = pixels.checked_mul(3)?;
+            if raw.len() < expected {
+                return None;
+            }
+            let mut out = Vec::with_capacity(pixels.checked_mul(4)?);
+            for px in raw[..expected].chunks_exact(3) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            }
+            Some((out, w, h))
+        }
+        _ => None,
     }
 }
 
@@ -5946,9 +6072,8 @@ mod tests {
         let _ = t.take_pending_image_uploads();
 
         // a=f frame, NO `f=`, payload is exactly w*h*4 bytes (RGBA).
-        // Base-format inheritance would PNG-encode 3-byte-stride
-        // garbage and shift colors. Size inference correctly picks
-        // RGBA.
+        // Size inference picks RGBA; the raw-bypass path hands the
+        // bytes through unchanged with `raw_rgba_dims` set.
         let raw_rgba_frame: Vec<u8> = (0..2 * 2 * 4).map(|_| 0x44u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba_frame);
         t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=42,z=100;{}\x1b\\", b64));
@@ -5956,14 +6081,8 @@ mod tests {
         assert_eq!(uploads.len(), 1, "frame queues despite omitted f=");
         let up = &uploads[0];
         assert!(up.animation_frame.is_some());
-        // PNG re-encoded from raw RGBA. Decode it back and verify
-        // dimensions match w*h (proving the format was RGBA, not RGB
-        // — which would have decoded as different dimensions or
-        // failed entirely).
-        assert!(up.bytes.starts_with(b"\x89PNG"));
-        let img = image::load_from_memory(&up.bytes).expect("re-decode");
-        assert_eq!(img.width(), 2);
-        assert_eq!(img.height(), 2);
+        assert_eq!(up.raw_rgba_dims, Some((2, 2)), "RGBA inferred and bypass taken");
+        assert_eq!(up.bytes, raw_rgba_frame);
     }
 
     #[test]
@@ -5980,6 +6099,7 @@ mod tests {
         let _ = t.take_pending_image_uploads();
 
         // a=f with no f=, payload is exactly w*h*3 → must infer RGB.
+        // Raw-bypass pads to RGBA (alpha=255).
         let raw_rgb_frame: Vec<u8> = (0..2 * 2 * 3).map(|_| 0x44u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_frame);
         t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=42,z=100;{}\x1b\\", b64));
@@ -5987,9 +6107,12 @@ mod tests {
         assert_eq!(uploads.len(), 1);
         let up = &uploads[0];
         assert!(up.animation_frame.is_some());
-        let img = image::load_from_memory(&up.bytes).expect("re-decode");
-        assert_eq!(img.width(), 2);
-        assert_eq!(img.height(), 2);
+        assert_eq!(up.raw_rgba_dims, Some((2, 2)));
+        assert_eq!(up.bytes.len(), 2 * 2 * 4);
+        for px in up.bytes.chunks_exact(4) {
+            assert_eq!(px[0..3], [0x44, 0x44, 0x44]);
+            assert_eq!(px[3], 0xFF, "alpha padded to opaque for RGB input");
+        }
     }
 
     #[test]
@@ -6027,42 +6150,43 @@ mod tests {
 
     #[test]
     fn a_t_base_image_with_omitted_f_infers_rgb_format() {
-        // Regression: icat sometimes sends a=T with no f=. The
-        // payload is raw RGB or RGBA but the parser defaults f= to
-        // PNG, so the bytes get sent to the PNG decoder and fail
-        // with "image format could not be determined". The dispatch
-        // path must run the same size-based inference the a=f path
-        // uses, with no fallback (this IS the base — there's no
-        // earlier recorded format to inherit).
+        // Regression: icat sometimes sends a=T with no f=. Payload
+        // is raw RGB/RGBA but the parser defaults f= to PNG; the
+        // dispatch path must run size-based inference. After the
+        // raw-bypass perf change, raw inputs no longer round-trip
+        // through PNG — they ride straight to the GPU upload path
+        // via `raw_rgba_dims`. Assert the bypass marker is set with
+        // the right dims and the bytes are raw RGBA (4 bytes/pixel,
+        // alpha=255 padded from the RGB input).
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
         use base64::Engine;
         let raw_rgb: Vec<u8> = (0..4 * 4 * 3).map(|i| (i % 256) as u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb);
-        // No f= → parser defaults to Png; s=4, v=4 → byte count
-        // 4*4*3 matches RGB exactly.
         t.feed(&format!("\x1b_Ga=T,s=4,v=4,I=99;{}\x1b\\", b64));
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1, "base normalizes despite omitted f=");
         let up = &uploads[0];
         assert_eq!(up.kitty_image_id, Some(99));
-        // Bytes should be PNG re-encoded from the RGB payload (proof
-        // the format inference fired and the normalizer ran).
-        assert!(
-            up.bytes.starts_with(b"\x89PNG"),
-            "raw RGB base normalized via format inference",
+        assert_eq!(
+            up.raw_rgba_dims,
+            Some((4, 4)),
+            "raw RGB took the worker-bypass path",
         );
-        // And subsequent a=f frames with omitted f= inherit RGB via
-        // the recorded format map (sanity check that the inference's
-        // result was stored for inheritance).
+        assert_eq!(up.bytes.len(), 4 * 4 * 4, "RGB padded to RGBA");
+        // Every 4th byte should be 0xFF (padded alpha).
+        for px in up.bytes.chunks_exact(4) {
+            assert_eq!(px[3], 0xFF);
+        }
+        // Subsequent a=f frames also bypass when the format inference
+        // (or inherited base format) lands on a raw variant.
         let raw_rgb_frame: Vec<u8> = (0..2 * 2 * 3).map(|_| 0x33u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgb_frame);
         t.feed(&format!("\x1b_Ga=f,s=2,v=2,I=99,z=30;{}\x1b\\", b64));
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
-        let img = image::load_from_memory(&uploads[0].bytes).expect("frame re-decode");
-        assert_eq!(img.width(), 2);
-        assert_eq!(img.height(), 2);
+        assert_eq!(uploads[0].raw_rgba_dims, Some((2, 2)));
+        assert_eq!(uploads[0].bytes.len(), 2 * 2 * 4);
     }
 
     #[test]
@@ -6070,13 +6194,18 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);
         use base64::Engine;
-        // 4*4*4 byte payload → infer RGBA.
+        // 4*4*4 byte payload → infer RGBA. After the raw-bypass
+        // perf change, the dispatcher hands the bytes through
+        // unchanged with `raw_rgba_dims` set.
         let raw_rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| (i % 256) as u8).collect();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_rgba);
         t.feed(&format!("\x1b_Ga=T,s=4,v=4,I=100;{}\x1b\\", b64));
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
-        assert!(uploads[0].bytes.starts_with(b"\x89PNG"));
+        assert_eq!(uploads[0].raw_rgba_dims, Some((4, 4)));
+        assert_eq!(uploads[0].bytes.len(), 4 * 4 * 4);
+        // Bytes should be the raw payload truncated to expected size.
+        assert_eq!(uploads[0].bytes, raw_rgba);
     }
 
     #[test]
@@ -6606,7 +6735,11 @@ mod tests {
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].pixel_size, Some((w, h)));
-        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        // Raw RGB now takes the worker-bypass path: bytes stay as
+        // raw RGBA (alpha-padded), `raw_rgba_dims` carries the dims
+        // for the store-side upload.
+        assert_eq!(uploads[0].raw_rgba_dims, Some((w, h)));
+        assert_eq!(uploads[0].bytes.len() as u32, w * h * 4);
         assert!(!shm_object_exists(&name));
     }
 
@@ -6690,8 +6823,10 @@ mod tests {
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].pixel_size, Some((w, h)));
-        // PNG signature after re-encode.
-        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        // Raw RGB takes the worker-bypass path; bytes are RGBA
+        // (alpha-padded), not PNG re-encoded.
+        assert_eq!(uploads[0].raw_rgba_dims, Some((w, h)));
+        assert_eq!(uploads[0].bytes.len() as u32, w * h * 4);
         assert!(!path.exists(), "temp file should be deleted");
     }
 
@@ -6763,11 +6898,13 @@ mod tests {
     }
 
     #[test]
-    fn kitty_apc_raw_rgb_direct_decodes_via_png_round_trip() {
+    fn kitty_apc_raw_rgb_direct_takes_worker_bypass() {
         // What `kitty +kitten icat` does for a JPG: decode locally to
-        // raw RGB, ship over t=d, count on the terminal to handle f=24.
-        // We PNG-encode on the receiving side; downstream this looks
-        // like any other PNG upload.
+        // raw RGB, ship over t=d, count on the terminal to handle
+        // f=24. Used to PNG-encode on receive; now takes the
+        // worker-bypass path — bytes stay as raw RGBA (alpha-padded
+        // from RGB) and `raw_rgba_dims` carries the dims for the
+        // store-side upload.
         use base64::Engine;
         let w = 4u32;
         let h = 4u32;
@@ -6783,15 +6920,17 @@ mod tests {
 
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
-        // PNG round-trip should preserve the declared dimensions.
         assert_eq!(uploads[0].pixel_size, Some((w, h)));
-        // First two bytes of a real PNG are 0x89 0x50 (PNG signature) —
-        // proves the payload was re-encoded, not passed raw.
-        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(uploads[0].raw_rgba_dims, Some((w, h)));
+        assert_eq!(uploads[0].bytes.len() as u32, w * h * 4);
+        // Each pixel's alpha byte was padded to 0xFF.
+        for px in uploads[0].bytes.chunks_exact(4) {
+            assert_eq!(px[3], 0xFF);
+        }
     }
 
     #[test]
-    fn kitty_apc_raw_rgba_direct_decodes_via_png_round_trip() {
+    fn kitty_apc_raw_rgba_direct_takes_worker_bypass() {
         use base64::Engine;
         let w = 2u32;
         let h = 2u32;
@@ -6808,7 +6947,9 @@ mod tests {
         let uploads = t.take_pending_image_uploads();
         assert_eq!(uploads.len(), 1);
         assert_eq!(uploads[0].pixel_size, Some((w, h)));
-        assert_eq!(&uploads[0].bytes[..4], &[0x89, b'P', b'N', b'G']);
+        assert_eq!(uploads[0].raw_rgba_dims, Some((w, h)));
+        // Bytes passed through unchanged.
+        assert_eq!(uploads[0].bytes, rgba);
     }
 
     #[test]
