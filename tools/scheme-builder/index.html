@@ -1,0 +1,1848 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Yutani Scheme Builder</title>
+<style>
+  :root {
+    --pane-bg: #1a1a1a;
+    --pane-border: #2d2d2d;
+    --text: #d8d8d8;
+    --muted: #888;
+    --accent: #6aa9ff;
+    --row-hover: #232323;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0f0f0f;
+    color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden;
+  }
+  .app {
+    display: grid;
+    grid-template-columns: 380px 1fr 400px;
+    height: 100vh;
+    gap: 1px;
+    background: var(--pane-border);
+  }
+  .pane {
+    background: var(--pane-bg);
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .pane header {
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    border-bottom: 1px solid var(--pane-border);
+    background: #161616;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .pane header .actions {
+    display: flex;
+    gap: 6px;
+  }
+  button, select {
+    font: inherit;
+    background: #262626;
+    color: var(--text);
+    border: 1px solid #383838;
+    border-radius: 4px;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  button:hover, select:hover { background: #303030; }
+  button.primary { background: var(--accent); color: #0c1a30; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { background: #82b6ff; }
+
+  /* ---------- Pane 1: settings ---------- */
+  .settings { padding: 12px 14px 60px; }
+  .group {
+    margin: 0 0 18px;
+  }
+  .group h3 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 88px 1fr 1fr;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0;
+    border-radius: 4px;
+  }
+  .row > label {
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .row.header-row {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0 0 2px;
+  }
+  .row.header-row span { padding-left: 4px; }
+  .swatch {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #141414;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 3px 6px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .swatch .preview {
+    width: 22px;
+    height: 22px;
+    flex: 0 0 22px;
+    border: 1px solid #444;
+    border-radius: 3px;
+    padding: 0;
+    cursor: pointer;
+    background-clip: padding-box;
+    /* Tiny chessboard so 0-alpha would be visible if it ever shows up. */
+    background-image:
+      linear-gradient(45deg, #333 25%, transparent 25%),
+      linear-gradient(-45deg, #333 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #333 75%),
+      linear-gradient(-45deg, transparent 75%, #333 75%);
+    background-size: 8px 8px;
+    background-position: 0 0, 0 4px, 4px -4px, -4px 0;
+    position: relative;
+  }
+  .swatch .preview::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--preview-color, transparent);
+    border-radius: 2px;
+  }
+  .swatch input[type=text] {
+    flex: 1 1 0;
+    width: 0;
+    min-width: 0;
+    background: transparent;
+    color: var(--text);
+    border: none;
+    outline: none;
+    font: 12px var(--mono);
+    text-transform: lowercase;
+    padding: 0;
+  }
+  .swatch input[type=text].invalid { color: #ff6666; }
+  .row.disabled .swatch { opacity: 0.35; pointer-events: none; }
+  .row.disabled > label { opacity: 0.5; }
+  .row .cap-note {
+    font: 10px var(--mono);
+    color: var(--muted);
+    grid-column: 2 / span 2;
+    padding: 2px 0 0;
+  }
+  .meta-row {
+    display: grid;
+    grid-template-columns: 88px 1fr;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 0;
+  }
+  .meta-row label {
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .meta-row input[type=text], .meta-row select {
+    background: #141414;
+    color: var(--text);
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 4px 6px;
+    font: 12px var(--mono);
+    width: 100%;
+  }
+
+  /* ---------- Pane 2: preview ---------- */
+  .preview-wrap { padding: 14px; display: flex; flex-direction: column; gap: 14px; align-items: stretch; flex: 1; }
+  .terminal {
+    border-radius: 8px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    overflow: hidden;
+    border: 1px solid #2a2a2a;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 360px;
+  }
+  .titlebar {
+    background: #2a2a2a;
+    padding: 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #ccc;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .dot.r { background: #ff5f56; }
+  .dot.y { background: #ffbd2e; }
+  .dot.g { background: #27c93f; }
+  .titlebar .title { margin-left: 8px; opacity: 0.8; }
+
+  .term-body {
+    flex: 1;
+    padding: 14px 16px;
+    font: 13px/1.5 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: auto;
+    position: relative;
+  }
+  .term-body .line { display: block; }
+  .term-body .seg { white-space: pre; }
+  .term-body .sel { padding: 0 1px; }
+  .term-body .cursor {
+    display: inline-block;
+    width: 0.6em;
+    height: 1.1em;
+    vertical-align: text-bottom;
+    margin-left: 1px;
+  }
+
+  .swatch-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 4px;
+    margin-top: 8px;
+  }
+  .swatch-grid .cell {
+    height: 28px;
+    border-radius: 3px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 10px var(--mono);
+    color: rgba(0,0,0,0.55);
+    text-shadow: 0 0 2px rgba(255,255,255,0.5);
+  }
+
+  /* ---------- Pane 3: YAML output ---------- */
+  .yaml-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  textarea.yaml {
+    flex: 1;
+    width: 100%;
+    background: #0c0c0c;
+    color: #d8d8d8;
+    border: none;
+    outline: none;
+    padding: 14px 16px;
+    font: 12px/1.55 var(--mono);
+    resize: none;
+    border-top: 1px solid var(--pane-border);
+    tab-size: 2;
+  }
+  textarea.yaml.invalid { color: #ff8e8e; }
+  .yaml-status {
+    padding: 6px 14px;
+    font-size: 11px;
+    color: var(--muted);
+    background: #141414;
+    border-top: 1px solid var(--pane-border);
+    min-height: 26px;
+  }
+  .yaml-status.error { color: #ff8e8e; }
+  /* ---------- Import modal ---------- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    z-index: 200;
+    display: none;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-backdrop[data-open="1"] { display: flex; }
+  .modal {
+    width: 640px;
+    max-width: calc(100vw - 40px);
+    max-height: calc(100vh - 80px);
+    background: #1a1a1a;
+    border: 1px solid #3a3a3a;
+    border-radius: 10px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.7);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .modal header {
+    padding: 12px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    border-bottom: 1px solid #2a2a2a;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--text);
+    background: #181818;
+  }
+  .modal header .close {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .modal-body {
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex: 1;
+    min-height: 0;
+  }
+  .modal-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+  }
+  .modal-row label { color: var(--muted); }
+  .modal textarea {
+    flex: 1;
+    min-height: 240px;
+    width: 100%;
+    background: #0c0c0c;
+    color: var(--text);
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 10px 12px;
+    font: 12px/1.5 var(--mono);
+    resize: vertical;
+    outline: none;
+    tab-size: 2;
+  }
+  .modal textarea:focus { border-color: var(--accent); }
+  .modal-status {
+    min-height: 18px;
+    font: 11px var(--mono);
+    color: var(--muted);
+  }
+  .modal-status.error { color: #ff8e8e; }
+  .modal-status.ok { color: #82d6a3; }
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  /* ---------- Custom color picker popover ---------- */
+  .picker-pop {
+    position: fixed;
+    z-index: 100;
+    background: #1a1a1a;
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    padding: 12px;
+    width: 240px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    display: none;
+    user-select: none;
+  }
+  .picker-pop[data-open="1"] { display: block; }
+  .picker-pop .sv-pad {
+    position: relative;
+    width: 100%;
+    height: 160px;
+    border-radius: 5px;
+    cursor: crosshair;
+    background:
+      linear-gradient(to top, #000, transparent),
+      linear-gradient(to right, #fff, var(--hue-color, #f00));
+    margin-bottom: 10px;
+    overflow: hidden;
+    touch-action: none;
+  }
+  .picker-pop .sv-cursor {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.6);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+  }
+  .picker-pop .hue-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 14px;
+    border-radius: 7px;
+    background: linear-gradient(to right,
+      #f00 0%, #ff0 17%, #0f0 33%, #0ff 50%,
+      #00f 67%, #f0f 83%, #f00 100%);
+    outline: none;
+    margin-bottom: 10px;
+  }
+  .picker-pop .hue-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    border: 2px solid #1a1a1a;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.5);
+    cursor: pointer;
+  }
+  .picker-pop .field-row {
+    display: grid;
+    grid-template-columns: 1fr repeat(3, 48px);
+    gap: 6px;
+    align-items: center;
+  }
+  .picker-pop .field-row label {
+    display: block;
+    font: 9px var(--mono);
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 2px;
+  }
+  .picker-pop .field-row input {
+    width: 100%;
+    background: #0c0c0c;
+    border: 1px solid #2a2a2a;
+    color: var(--text);
+    border-radius: 4px;
+    padding: 4px 6px;
+    font: 12px var(--mono);
+    outline: none;
+    box-sizing: border-box;
+  }
+  .picker-pop .field-row input:focus { border-color: var(--accent); }
+  .picker-pop .field {
+    display: flex;
+    flex-direction: column;
+  }
+  .picker-pop .arrow {
+    position: absolute;
+    top: -7px;
+    width: 12px;
+    height: 12px;
+    background: #1a1a1a;
+    border-left: 1px solid #3a3a3a;
+    border-top: 1px solid #3a3a3a;
+    transform: rotate(45deg);
+  }
+
+  .toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: #2a2a2a;
+    color: var(--text);
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s, transform 0.2s;
+    border: 1px solid #404040;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- =========================== PANE 1 =========================== -->
+  <section class="pane">
+    <header>
+      <span>Theme settings</span>
+      <div class="actions">
+        <select id="presetSelect" title="Load preset">
+          <option value="">Preset…</option>
+        </select>
+        <button id="importBtn" title="Import from another terminal">Import…</button>
+        <button id="resetBtn" title="Reset to Yutani defaults">Reset</button>
+      </div>
+    </header>
+    <div class="settings">
+      <div class="group">
+        <h3>Window</h3>
+        <div id="window-fields"></div>
+      </div>
+      <div class="group">
+        <h3>Metadata</h3>
+        <div class="meta-row">
+          <label for="max_colors">max_colors</label>
+          <select id="max_colors">
+            <option value="">(unset — truecolor)</option>
+            <option value="mono">mono</option>
+            <option value="8">8</option>
+            <option value="16">16</option>
+            <option value="256">256</option>
+            <option value="truecolor">truecolor</option>
+          </select>
+        </div>
+        <div id="cap-note" style="font: 11px var(--mono); color: var(--muted); padding: 4px 0 0 94px;"></div>
+      </div>
+      <div class="group">
+        <h3>ANSI palette</h3>
+        <div class="row header-row">
+          <span></span><span>Normal</span><span>Bright</span>
+        </div>
+        <div id="ansi-fields"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================== PANE 2 =========================== -->
+  <section class="pane">
+    <header><span>Live preview</span></header>
+    <div class="preview-wrap">
+      <div class="terminal" id="term">
+        <div class="titlebar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="title">yutani — ~/projects/yutani</span>
+        </div>
+        <div class="term-body" id="term-body"></div>
+      </div>
+      <div>
+        <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
+        <div class="swatch-grid" id="ansi-grid"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================== PANE 3 =========================== -->
+  <section class="pane">
+    <header>
+      <span>scheme.yaml</span>
+      <div class="actions">
+        <button id="downloadBtn">Download</button>
+        <button id="copyBtn" class="primary">Copy</button>
+      </div>
+    </header>
+    <div class="yaml-wrap">
+      <textarea class="yaml" id="yaml" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
+      <div class="yaml-status" id="yaml-status">Edits flow back to the pickers.</div>
+    </div>
+  </section>
+</div>
+<div class="toast" id="toast">Copied!</div>
+
+<div class="modal-backdrop" id="import-backdrop">
+  <div class="modal" id="import-modal">
+    <header>
+      <span>Import theme from another terminal</span>
+      <button class="close" id="import-close" aria-label="close">×</button>
+    </header>
+    <div class="modal-body">
+      <div class="modal-row">
+        <label for="import-format">Source format</label>
+        <select id="import-format">
+          <option value="auto">Auto-detect</option>
+          <option value="alacritty-toml">Alacritty (TOML)</option>
+          <option value="alacritty-yaml">Alacritty (YAML)</option>
+          <option value="kitty">Kitty / Ghostty (.conf)</option>
+          <option value="windows-terminal">Windows Terminal (JSON)</option>
+          <option value="iterm2">iTerm2 (.itermcolors)</option>
+          <option value="xresources">Xresources / Xdefaults</option>
+        </select>
+        <span style="flex: 1"></span>
+        <span style="color: var(--muted); font-size: 11px;">Missing fields keep their current value.</span>
+      </div>
+      <textarea id="import-source" spellcheck="false" autocomplete="off" autocapitalize="off"
+        placeholder="Paste a theme file here…&#10;&#10;Supported sources:&#10;  • Alacritty   (.toml or .yml — colors.primary / colors.normal / colors.bright)&#10;  • Kitty/Ghostty (.conf — color0..color15, background, foreground)&#10;  • Windows Terminal (JSON theme object)&#10;  • iTerm2      (.itermcolors plist)&#10;  • Xresources  (*color0, *background, …)"></textarea>
+      <div class="modal-status" id="import-status"></div>
+      <div class="modal-footer">
+        <button id="import-cancel">Cancel</button>
+        <button id="import-go" class="primary">Import</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="picker-pop" id="picker">
+  <div class="arrow" id="picker-arrow"></div>
+  <div class="sv-pad" id="sv-pad">
+    <div class="sv-cursor" id="sv-cursor"></div>
+  </div>
+  <input type="range" class="hue-slider" id="hue-slider" min="0" max="360" step="1">
+  <div class="field-row">
+    <div class="field">
+      <label>hex</label>
+      <input type="text" id="pick-hex" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>r</label>
+      <input type="number" id="pick-r" min="0" max="255" step="1">
+    </div>
+    <div class="field">
+      <label>g</label>
+      <input type="number" id="pick-g" min="0" max="255" step="1">
+    </div>
+    <div class="field">
+      <label>b</label>
+      <input type="number" id="pick-b" min="0" max="255" step="1">
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+ * Yutani scheme model. Mirrors src/palette.rs:
+ *   background, foreground, cursor, selection : single hex
+ *   black/red/green/yellow/blue/magenta/cyan/white : [normal, bright]
+ *   max_colors : mono | 8 | 16 | 256 | truecolor (optional)
+ * ============================================================ */
+const SINGLES = ['background', 'foreground', 'cursor', 'selection'];
+const HUES = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+
+const DEFAULTS = {
+  // Yutani's hardcoded fallback (white bg, black fg). See palette.rs::defaults.
+  background: '#fbfaf7',
+  foreground: '#2d2519',
+  cursor:     '#1a00cc',
+  selection:  '#3366d9',
+  ansi: {
+    black:   ['#000000', '#808080'],
+    red:     ['#ab0000', '#ff5555'],
+    green:   ['#00ab00', '#55ff55'],
+    yellow:  ['#abab00', '#ffff55'],
+    blue:    ['#0000ab', '#5555ff'],
+    magenta: ['#ab00ab', '#ff55ff'],
+    cyan:    ['#00abab', '#55ffff'],
+    white:   ['#ababab', '#ffffff'],
+  },
+  max_colors: '',
+};
+
+const PRESETS = {
+  'Yutani default (light)': structuredClone(DEFAULTS),
+  'Solarized Dark': {
+    background: '#002b36', foreground: '#839496',
+    cursor: '#93a1a1',   selection: '#073642',
+    ansi: {
+      black:   ['#073642', '#002b36'],
+      red:     ['#dc322f', '#cb4b16'],
+      green:   ['#859900', '#586e75'],
+      yellow:  ['#b58900', '#657b83'],
+      blue:    ['#268bd2', '#839496'],
+      magenta: ['#d33682', '#6c71c4'],
+      cyan:    ['#2aa198', '#93a1a1'],
+      white:   ['#eee8d5', '#fdf6e3'],
+    },
+    max_colors: '',
+  },
+  'Solarized Light': {
+    background: '#fdf6e3', foreground: '#657b83',
+    cursor: '#586e75',    selection: '#eee8d5',
+    ansi: {
+      black:   ['#073642', '#002b36'],
+      red:     ['#dc322f', '#cb4b16'],
+      green:   ['#859900', '#586e75'],
+      yellow:  ['#b58900', '#657b83'],
+      blue:    ['#268bd2', '#839496'],
+      magenta: ['#d33682', '#6c71c4'],
+      cyan:    ['#2aa198', '#93a1a1'],
+      white:   ['#eee8d5', '#fdf6e3'],
+    },
+    max_colors: '',
+  },
+  'Dracula': {
+    background: '#282a36', foreground: '#f8f8f2',
+    cursor: '#f8f8f2',    selection: '#44475a',
+    ansi: {
+      black:   ['#21222c', '#6272a4'],
+      red:     ['#ff5555', '#ff6e6e'],
+      green:   ['#50fa7b', '#69ff94'],
+      yellow:  ['#f1fa8c', '#ffffa5'],
+      blue:    ['#bd93f9', '#d6acff'],
+      magenta: ['#ff79c6', '#ff92df'],
+      cyan:    ['#8be9fd', '#a4ffff'],
+      white:   ['#f8f8f2', '#ffffff'],
+    },
+    max_colors: '',
+  },
+  'Gruvbox Dark': {
+    background: '#282828', foreground: '#ebdbb2',
+    cursor: '#ebdbb2',    selection: '#3c3836',
+    ansi: {
+      black:   ['#282828', '#928374'],
+      red:     ['#cc241d', '#fb4934'],
+      green:   ['#98971a', '#b8bb26'],
+      yellow:  ['#d79921', '#fabd2f'],
+      blue:    ['#458588', '#83a598'],
+      magenta: ['#b16286', '#d3869b'],
+      cyan:    ['#689d6a', '#8ec07c'],
+      white:   ['#a89984', '#ebdbb2'],
+    },
+    max_colors: '',
+  },
+  'Nord': {
+    background: '#2e3440', foreground: '#d8dee9',
+    cursor: '#d8dee9',    selection: '#4c566a',
+    ansi: {
+      black:   ['#3b4252', '#4c566a'],
+      red:     ['#bf616a', '#bf616a'],
+      green:   ['#a3be8c', '#a3be8c'],
+      yellow:  ['#ebcb8b', '#ebcb8b'],
+      blue:    ['#81a1c1', '#81a1c1'],
+      magenta: ['#b48ead', '#b48ead'],
+      cyan:    ['#88c0d0', '#8fbcbb'],
+      white:   ['#e5e9f0', '#eceff4'],
+    },
+    max_colors: '',
+  },
+  'Tomorrow Night': {
+    background: '#1d1f21', foreground: '#c5c8c6',
+    cursor: '#c5c8c6',    selection: '#373b41',
+    ansi: {
+      black:   ['#1d1f21', '#969896'],
+      red:     ['#cc6666', '#cc6666'],
+      green:   ['#b5bd68', '#b5bd68'],
+      yellow:  ['#f0c674', '#f0c674'],
+      blue:    ['#81a2be', '#81a2be'],
+      magenta: ['#b294bb', '#b294bb'],
+      cyan:    ['#8abeb7', '#8abeb7'],
+      white:   ['#c5c8c6', '#ffffff'],
+    },
+    max_colors: '',
+  },
+};
+
+let state = clone(PRESETS['Yutani default (light)']);
+let editingYaml = false;     // suppress YAML→model write while typing
+let editingPickers = false;  // suppress picker→YAML loop while regenerating
+
+/* ============================================================
+ * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (YAML).
+ * ============================================================ */
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+function normHex(s) {
+  if (!s) return null;
+  let v = s.trim().toLowerCase();
+  if (v.startsWith('0x') || v.startsWith('0X')) v = v.slice(2);
+  if (v.startsWith('#')) v = v.slice(1);
+  if (v.length === 3) v = v.split('').map(c => c + c).join('');
+  if (v.length !== 6 || !/^[0-9a-f]{6}$/.test(v)) return null;
+  return '#' + v;
+}
+function toYamlHex(hex) {
+  // hex is '#rrggbb' — emit as 0xrrggbb to match palette.rs::parse_hex.
+  return '0x' + hex.slice(1);
+}
+function luma(hex) {
+  const h = hex.slice(1);
+  const r = parseInt(h.slice(0,2),16)/255;
+  const g = parseInt(h.slice(2,4),16)/255;
+  const b = parseInt(h.slice(4,6),16)/255;
+  return 0.299*r + 0.587*g + 0.114*b;
+}
+
+/* ============================================================
+ * Color-cap projection — JS port of palette.rs::Palette::project,
+ * so the preview shows what yutani would actually render after the
+ * scheme's `max_colors` snapping kicks in. Linear-space distance
+ * with Rec. 601 luma weights matches the Rust impl byte-for-byte.
+ * ============================================================ */
+function srgbToLinear(b) {
+  const v = b / 255;
+  return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+function linearToSrgbU8(c) {
+  const v = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1/2.4) - 0.055;
+  return Math.max(0, Math.min(255, Math.round(v * 255)));
+}
+function hexToLin(hex) {
+  const h = hex.slice(1);
+  return [
+    srgbToLinear(parseInt(h.slice(0,2),16)),
+    srgbToLinear(parseInt(h.slice(2,4),16)),
+    srgbToLinear(parseInt(h.slice(4,6),16)),
+  ];
+}
+function linToHex(l) {
+  const [r,g,b] = l.map(linearToSrgbU8);
+  const hx = n => n.toString(16).padStart(2,'0');
+  return '#' + hx(r) + hx(g) + hx(b);
+}
+function lumaDistSq(a, b) {
+  const dr = a[0]-b[0], dg = a[1]-b[1], db = a[2]-b[2];
+  return 0.299*dr*dr + 0.587*dg*dg + 0.114*db*db;
+}
+function nearestLin(c, candidates) {
+  let best = candidates[0], bestD = lumaDistSq(c, best);
+  for (let i = 1; i < candidates.length; i++) {
+    const d = lumaDistSq(c, candidates[i]);
+    if (d < bestD) { bestD = d; best = candidates[i]; }
+  }
+  return best;
+}
+function ansiLinPalette() {
+  const out = [];
+  for (const hue of HUES) out.push(hexToLin(state.ansi[hue][0]));
+  for (const hue of HUES) out.push(hexToLin(state.ansi[hue][1]));
+  return out;
+}
+function xterm256Lin(n) {
+  // Mirror palette.rs::xterm_256: 0..=15 from ANSI, 16..=231 6x6x6 cube,
+  // 232..=255 24-step gray ramp at sRGB bytes 8, 18, ..., 238.
+  const ansi = ansiLinPalette();
+  if (n < 16) return ansi[n];
+  if (n < 232) {
+    const m = n - 16;
+    const r = (m / 36) | 0, g = ((m % 36) / 6) | 0, b = m % 6;
+    const byte = v => v === 0 ? 0 : 55 + v * 40;
+    return [srgbToLinear(byte(r)), srgbToLinear(byte(g)), srgbToLinear(byte(b))];
+  }
+  const byte = 8 + (n - 232) * 10;
+  const v = srgbToLinear(byte);
+  return [v, v, v];
+}
+function projectHex(hex) {
+  const cap = state.max_colors || 'truecolor';
+  if (cap === 'truecolor' || cap === '') return hex;
+  const lin = hexToLin(hex);
+  let snapped;
+  if (cap === 'mono') {
+    snapped = nearestLin(lin, [hexToLin(state.foreground), hexToLin(state.background)]);
+  } else if (cap === '8') {
+    snapped = nearestLin(lin, ansiLinPalette().slice(0, 8));
+  } else if (cap === '16') {
+    snapped = nearestLin(lin, ansiLinPalette());
+  } else if (cap === '256') {
+    const cands = [];
+    for (let i = 0; i < 256; i++) cands.push(xterm256Lin(i));
+    snapped = nearestLin(lin, cands);
+  } else {
+    return hex;
+  }
+  return linToHex(snapped);
+}
+
+/* Which picker rows should be live for a given cap?
+ *   mono  : only window colors — ANSI palette is unused
+ *   8     : ANSI normals; bright variants snap to normals
+ *   16+   : everything
+ */
+function brightEnabled() { return state.max_colors !== 'mono' && state.max_colors !== '8'; }
+function normalAnsiEnabled() { return state.max_colors !== 'mono'; }
+
+/* ============================================================
+ * Picker: custom color popover. Native <input type=color> closes
+ * on any outside click, so swapping fields meant losing the picker
+ * every time. This one stays open until the user clicks outside it
+ * or hits Esc — clicks inside (SV pad, hue slider, hex/rgb inputs)
+ * don't dismiss it.
+ *
+ * Math: a single (h, s, v) is the source of truth while the picker
+ * is open. The SV pad and hue slider drive h/s/v; the hex/RGB
+ * inputs are recomputed from it and round-trip back through it on
+ * edit. We keep h explicit so dragging value to 0 doesn't lose the
+ * hue (a common gotcha with RGB-only state).
+ * ============================================================ */
+const Picker = (() => {
+  const pop = document.getElementById('picker');
+  const arrow = document.getElementById('picker-arrow');
+  const svPad = document.getElementById('sv-pad');
+  const svCursor = document.getElementById('sv-cursor');
+  const hueSlider = document.getElementById('hue-slider');
+  const hexInput = document.getElementById('pick-hex');
+  const rInput = document.getElementById('pick-r');
+  const gInput = document.getElementById('pick-g');
+  const bInput = document.getElementById('pick-b');
+
+  let owner = null;     // the .preview button that opened us
+  let onChange = null;  // emit hex back to the caller
+  let h = 0, s = 0, v = 0;
+  let muteCommit = false;
+
+  function rgbToHsv(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const d = max - min;
+    let H = 0;
+    if (d !== 0) {
+      if (max === r) H = ((g - b) / d) % 6;
+      else if (max === g) H = (b - r) / d + 2;
+      else H = (r - g) / d + 4;
+      H *= 60;
+      if (H < 0) H += 360;
+    }
+    return [H, max === 0 ? 0 : d / max, max];
+  }
+  function hsvToRgb(H, S, V) {
+    const c = V * S;
+    const x = c * (1 - Math.abs(((H / 60) % 2) - 1));
+    const m = V - c;
+    let r, g, b;
+    if (H < 60)       [r,g,b] = [c,x,0];
+    else if (H < 120) [r,g,b] = [x,c,0];
+    else if (H < 180) [r,g,b] = [0,c,x];
+    else if (H < 240) [r,g,b] = [0,x,c];
+    else if (H < 300) [r,g,b] = [x,0,c];
+    else              [r,g,b] = [c,0,x];
+    return [
+      Math.round((r + m) * 255),
+      Math.round((g + m) * 255),
+      Math.round((b + m) * 255),
+    ];
+  }
+  function currentHex() {
+    const [r,g,b] = hsvToRgb(h, s, v);
+    const hx = n => n.toString(16).padStart(2, '0');
+    return '#' + hx(r) + hx(g) + hx(b);
+  }
+  function syncUIFromHsv() {
+    muteCommit = true;
+    // SV pad cursor: x=s, y=1-v
+    svCursor.style.left = (s * 100) + '%';
+    svCursor.style.top = ((1 - v) * 100) + '%';
+    // SV pad hue background (the "pure" color in the top-right)
+    const [pr,pg,pb] = hsvToRgb(h, 1, 1);
+    svPad.style.setProperty('--hue-color', `rgb(${pr},${pg},${pb})`);
+    hueSlider.value = h;
+    const [r,g,b] = hsvToRgb(h, s, v);
+    rInput.value = r; gInput.value = g; bInput.value = b;
+    hexInput.value = currentHex();
+    hexInput.classList.remove('invalid');
+    muteCommit = false;
+  }
+  function commit() {
+    if (muteCommit) return;
+    const hex = currentHex();
+    if (owner) owner.style.setProperty('--preview-color', hex);
+    if (onChange) onChange(hex);
+  }
+  function setFromHex(hex) {
+    const norm = normHex(hex);
+    if (!norm) return false;
+    const r = parseInt(norm.slice(1,3), 16);
+    const g = parseInt(norm.slice(3,5), 16);
+    const b = parseInt(norm.slice(5,7), 16);
+    const [nh, ns, nv] = rgbToHsv(r, g, b);
+    // Only overwrite hue when the color is actually chromatic — preserves the
+    // hue dial when the user drags value to 0 in the SV pad.
+    if (ns > 0.0001) h = nh;
+    s = ns; v = nv;
+    return true;
+  }
+
+  function setFromRgb() {
+    const r = clamp255(rInput.value), g = clamp255(gInput.value), b = clamp255(bInput.value);
+    const [nh, ns, nv] = rgbToHsv(r, g, b);
+    if (ns > 0.0001) h = nh;
+    s = ns; v = nv;
+    syncUIFromHsv();
+    commit();
+  }
+  function clamp255(x) {
+    const n = parseInt(x, 10);
+    if (Number.isNaN(n)) return 0;
+    return Math.max(0, Math.min(255, n));
+  }
+
+  /* ---- SV pad drag handling ---- */
+  let svDragging = false;
+  function svFromEvent(ev) {
+    const rect = svPad.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) / rect.width;
+    const y = (ev.clientY - rect.top) / rect.height;
+    s = Math.max(0, Math.min(1, x));
+    v = 1 - Math.max(0, Math.min(1, y));
+    syncUIFromHsv();
+    commit();
+  }
+  svPad.addEventListener('pointerdown', ev => {
+    svDragging = true;
+    svPad.setPointerCapture(ev.pointerId);
+    svFromEvent(ev);
+  });
+  svPad.addEventListener('pointermove', ev => { if (svDragging) svFromEvent(ev); });
+  svPad.addEventListener('pointerup', ev => { svDragging = false; svPad.releasePointerCapture(ev.pointerId); });
+  svPad.addEventListener('pointercancel', () => { svDragging = false; });
+
+  hueSlider.addEventListener('input', e => {
+    h = parseFloat(e.target.value);
+    syncUIFromHsv();
+    commit();
+  });
+
+  hexInput.addEventListener('input', e => {
+    if (muteCommit) return;
+    const norm = normHex(e.target.value);
+    if (!norm) { hexInput.classList.add('invalid'); return; }
+    hexInput.classList.remove('invalid');
+    setFromHex(norm);
+    syncUIFromHsv();
+    commit();
+  });
+  for (const inp of [rInput, gInput, bInput]) {
+    inp.addEventListener('input', () => { if (!muteCommit) setFromRgb(); });
+  }
+
+  /* ---- Outside-click + Esc dismissal ----
+   * Use a document-level listener attached only while the popover is
+   * open. Clicks within the popover (pad, slider, inputs, arrow) are
+   * filtered by `pop.contains(target)`; the original `.preview`
+   * button is also exempt so re-clicking it doesn't immediately
+   * reopen-then-close. Esc closes too. */
+  function onDocClick(ev) {
+    if (pop.contains(ev.target)) return;
+    if (owner && owner.contains(ev.target)) return;
+    close();
+  }
+  function onKey(ev) {
+    if (ev.key === 'Escape') close();
+  }
+
+  function position(targetEl) {
+    const r = targetEl.getBoundingClientRect();
+    pop.style.visibility = 'hidden';
+    pop.dataset.open = '1';
+    const pw = pop.offsetWidth, ph = pop.offsetHeight;
+    let left = r.right + 8;
+    let top = r.top - 6;
+    if (left + pw > window.innerWidth - 8) {
+      left = r.left - pw - 8;       // flip to the left side
+      arrow.style.right = '-7px';
+      arrow.style.left = '';
+      arrow.style.transform = 'rotate(225deg)';
+    } else {
+      arrow.style.left = '-7px';
+      arrow.style.right = '';
+      arrow.style.transform = 'rotate(-45deg)';
+    }
+    arrow.style.top = (r.top + r.height/2 - top - 6) + 'px';
+    if (top + ph > window.innerHeight - 8) top = window.innerHeight - ph - 8;
+    if (top < 8) top = 8;
+    pop.style.left = left + 'px';
+    pop.style.top = top + 'px';
+    pop.style.visibility = '';
+  }
+
+  function open(targetEl, initialHex, cb) {
+    // Reopening on a different swatch shouldn't briefly close — just rebind.
+    owner = targetEl;
+    onChange = cb;
+    setFromHex(initialHex);
+    syncUIFromHsv();
+    position(targetEl);
+    document.addEventListener('mousedown', onDocClick, true);
+    document.addEventListener('keydown', onKey, true);
+  }
+  function close() {
+    pop.dataset.open = '';
+    owner = null;
+    onChange = null;
+    document.removeEventListener('mousedown', onDocClick, true);
+    document.removeEventListener('keydown', onKey, true);
+  }
+
+  // Called when the inline text input next to a swatch is typed into;
+  // if the picker is open on that swatch, refresh its UI.
+  function syncFromOwner(targetEl, hex) {
+    if (owner !== targetEl) return;
+    setFromHex(hex);
+    syncUIFromHsv();
+  }
+
+  // Keep the popover anchored if the window resizes while it's open.
+  window.addEventListener('resize', () => { if (owner) position(owner); });
+
+  return { open, close, syncFromOwner };
+})();
+
+/* ============================================================
+ * Pane 1: build the picker UI from the model.
+ * ============================================================ */
+function makeSwatch(id, value, onchange) {
+  const wrap = document.createElement('div');
+  wrap.className = 'swatch';
+  const preview = document.createElement('button');
+  preview.type = 'button';
+  preview.className = 'preview';
+  preview.setAttribute('aria-label', 'pick color');
+  preview.style.setProperty('--preview-color', value);
+
+  const text = document.createElement('input');
+  text.type = 'text';
+  text.value = value;
+  text.spellcheck = false;
+  text.autocomplete = 'off';
+
+  function setColor(norm, fromText) {
+    preview.style.setProperty('--preview-color', norm);
+    if (!fromText) text.value = norm;
+    onchange(norm);
+  }
+  text.addEventListener('input', e => {
+    const norm = normHex(e.target.value);
+    if (!norm) { text.classList.add('invalid'); return; }
+    text.classList.remove('invalid');
+    setColor(norm, true);
+    Picker.syncFromOwner(preview, norm);  // mirror into the popover if it's open on this swatch
+  });
+  text.addEventListener('blur', e => {
+    const norm = normHex(e.target.value);
+    if (norm) text.value = norm;
+  });
+  preview.addEventListener('click', e => {
+    e.stopPropagation();
+    Picker.open(preview, text.value, color => {
+      // Picker emits hex; mirror into text and state.
+      text.value = color;
+      text.classList.remove('invalid');
+      setColor(color, true);
+    });
+  });
+
+  wrap.append(preview, text);
+  return wrap;
+}
+
+function buildPane1() {
+  const win = document.getElementById('window-fields');
+  win.innerHTML = '';
+  for (const k of SINGLES) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<label>${k}</label>`;
+    const swatch = makeSwatch(k, state[k], v => { state[k] = v; renderAll(); });
+    row.append(swatch);
+    // singles span the second + third grid columns
+    swatch.style.gridColumn = '2 / span 2';
+    win.append(row);
+  }
+
+  const ansi = document.getElementById('ansi-fields');
+  ansi.innerHTML = '';
+  const normalOn = normalAnsiEnabled();
+  const brightOn = brightEnabled();
+  for (const hue of HUES) {
+    const [normal, bright] = state.ansi[hue];
+    const row = document.createElement('div');
+    row.className = 'row' + (normalOn ? '' : ' disabled');
+    row.innerHTML = `<label>${hue}</label>`;
+    const nSwatch = makeSwatch(hue+'-n', normal, v => { state.ansi[hue][0] = v; renderAll(); });
+    const bSwatch = makeSwatch(hue+'-b', bright, v => { state.ansi[hue][1] = v; renderAll(); });
+    if (!brightOn) bSwatch.style.opacity = '0.35', bSwatch.style.pointerEvents = 'none';
+    row.append(nSwatch, bSwatch);
+    ansi.append(row);
+  }
+
+  const maxSel = document.getElementById('max_colors');
+  maxSel.value = state.max_colors || '';
+  maxSel.onchange = e => { state.max_colors = e.target.value; renderAll(); };
+
+  const note = document.getElementById('cap-note');
+  const cap = state.max_colors || '';
+  if (cap === 'mono') note.textContent = 'ANSI palette unused — every cell snaps to fg/bg.';
+  else if (cap === '8') note.textContent = 'Bright variants disabled — they fold onto the nearest normal.';
+  else if (cap === '16') note.textContent = 'Truecolor cells snap to nearest of the 16 ANSI entries.';
+  else if (cap === '256') note.textContent = 'Truecolor cells snap to the 256-entry xterm cube.';
+  else note.textContent = 'No cap — colors pass through unchanged.';
+}
+
+/* ============================================================
+ * Pane 2: preview a few terminal frames using the live palette.
+ * ============================================================ */
+const PREVIEW_LINES = [
+  // [ {fg, bg?, bold?, text} | string, ... ]
+  [{fg:'green', bold:true, text:'➜  '}, {fg:'cyan', bold:true, text:'~/projects/yutani'}, ' ', {fg:'magenta', text:'git:('}, {fg:'red', text:'main'}, {fg:'magenta', text:') '}, {fg:'yellow', text:'✗'}],
+  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'ls --color'}],
+  [
+    {fg:'blue', bold:true, text:'src/'}, '       ',
+    {fg:'blue', bold:true, text:'target/'}, '    ',
+    {fg:'foreground', text:'Cargo.toml '},
+    {fg:'green', text:'README.md '},
+    {fg:'cyan', text:'scheme.yaml'},
+  ],
+  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'cat src/palette.rs | head'}],
+  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_yaml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
+  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'let mut '}, {fg:'foreground', text:'p = '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:'::'}, {fg:'blue', text:'defaults'}, {fg:'foreground', text:'();'}],
+  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key: value'}],
+  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'for'}, {fg:'foreground', text:' (lineno, raw) '}, {fg:'magenta', text:'in'}, {fg:'foreground', text:' src.'}, {fg:'blue', text:'lines'}, {fg:'foreground', text:'().'}, {fg:'blue', text:'enumerate'}, {fg:'foreground', text:'() {'}],
+  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'git status'}],
+  [{fg:'foreground', text:'On branch '}, {fg:'green', text:'main'}],
+  [{sel:true, fg:'red', text:'  modified:   '}, {sel:true, fg:'foreground', text:'src/palette.rs'}],
+  [{sel:true, fg:'green', text:'  new file:   '}, {sel:true, fg:'foreground', text:'tools/scheme-builder/index.html'}],
+  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'echo '}, {fg:'yellow', text:'"hello, world"'}],
+  [{fg:'yellow', text:'hello, world'}],
+  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'vim ', cursor:true}],
+];
+
+function resolveFg(name, bold) {
+  // Window colors render directly — they're not "cell" colors and skip the
+  // ColorCap::project path in palette.rs.
+  if (name === 'foreground') return state.foreground;
+  if (name === 'background') return state.background;
+  if (name === 'cursor') return state.cursor;
+  const pair = state.ansi[name];
+  if (!pair) return state.foreground;
+  // Under an 8-color cap, the bright slot is unreachable: bold cells still
+  // pick the bright index but it gets folded back to its normal sibling by
+  // project(). Skipping the lookup entirely matches what yutani renders.
+  const raw = (bold && brightEnabled()) ? pair[1] : pair[0];
+  return projectHex(raw);
+}
+
+function renderPreview() {
+  const body = document.getElementById('term-body');
+  body.style.background = state.background;
+  body.style.color = state.foreground;
+  body.style.caretColor = state.cursor;
+  body.innerHTML = '';
+
+  for (const segs of PREVIEW_LINES) {
+    const line = document.createElement('span');
+    line.className = 'line';
+    for (const s of segs) {
+      if (typeof s === 'string') {
+        const t = document.createElement('span');
+        t.className = 'seg';
+        t.textContent = s;
+        line.append(t);
+        continue;
+      }
+      const span = document.createElement('span');
+      span.className = 'seg' + (s.sel ? ' sel' : '');
+      const fg = resolveFg(s.fg || 'foreground', s.bold);
+      span.style.color = fg;
+      if (s.bold) span.style.fontWeight = '600';
+      if (s.sel) {
+        span.style.background = state.selection;
+      }
+      span.textContent = s.text || '';
+      line.append(span);
+      if (s.cursor) {
+        const cur = document.createElement('span');
+        cur.className = 'cursor';
+        cur.style.background = state.cursor;
+        line.append(cur);
+      }
+    }
+    line.append(document.createTextNode('\n'));
+    body.append(line);
+  }
+
+  // ANSI swatch row — render each entry through the active color cap so the
+  // strip mirrors what yutani would actually paint. Slots that the cap
+  // disables (e.g. brights under `8`) get a strikethrough overlay.
+  const grid = document.getElementById('ansi-grid');
+  grid.innerHTML = '';
+  const all = [];
+  for (const hue of HUES) all.push(state.ansi[hue][0]);
+  for (const hue of HUES) all.push(state.ansi[hue][1]);
+  const brightOn = brightEnabled();
+  const normalOn = normalAnsiEnabled();
+  for (let i = 0; i < all.length; i++) {
+    const isBright = i >= 8;
+    const reachable = isBright ? brightOn : normalOn;
+    const shown = reachable ? projectHex(all[i]) : all[i];
+    const c = document.createElement('div');
+    c.className = 'cell';
+    c.style.background = shown;
+    c.style.color = luma(shown) > 0.55 ? '#000' : '#fff';
+    c.style.textShadow = 'none';
+    c.textContent = i;
+    if (!reachable) {
+      c.style.opacity = '0.3';
+      c.style.textDecoration = 'line-through';
+    }
+    const label = i < 8 ? HUES[i] : HUES[i-8] + ' bright';
+    const note = reachable && shown !== all[i] ? ` (snaps to ${shown})` : (reachable ? '' : ' — unreachable under cap');
+    c.title = `${label} — ${all[i]}${note}`;
+    grid.append(c);
+  }
+}
+
+/* ============================================================
+ * Pane 3: serialise model → YAML, and parse it back on edit.
+ * ============================================================ */
+function toYaml() {
+  const lines = [];
+  for (const k of SINGLES) lines.push(`${k}: ${toYamlHex(state[k])}`);
+  lines.push('');
+  // pad keys to a column so values align visually
+  const pad = 'magenta:'.length;
+  for (const hue of HUES) {
+    const [n, b] = state.ansi[hue];
+    const key = (hue + ':').padEnd(pad + 1, ' ');
+    lines.push(`${key}[${toYamlHex(n)}, ${toYamlHex(b)}]`);
+  }
+  if (state.max_colors) {
+    lines.push('');
+    lines.push(`max_colors: ${state.max_colors}`);
+  }
+  return lines.join('\n') + '\n';
+}
+
+// Tiny parser that matches palette.rs::parse_yaml (strict subset of YAML).
+function parseYaml(src) {
+  const out = {
+    background: null, foreground: null, cursor: null, selection: null,
+    ansi: {}, max_colors: '',
+  };
+  const errors = [];
+  const lines = src.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    let raw = lines[i];
+    const hash = raw.indexOf('#');
+    if (hash >= 0) raw = raw.slice(0, hash);
+    const line = raw.trim();
+    if (!line) continue;
+    const idx = line.indexOf(':');
+    if (idx < 0) { errors.push(`line ${i+1}: missing ':'`); continue; }
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (SINGLES.includes(key)) {
+      const h = normHex(value);
+      if (!h) { errors.push(`line ${i+1}: invalid hex '${value}'`); continue; }
+      out[key] = h;
+    } else if (HUES.includes(key)) {
+      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*\]$/);
+      if (!m) { errors.push(`line ${i+1}: expected [normal, bright]`); continue; }
+      const n = normHex(m[1]), b = normHex(m[2]);
+      if (!n || !b) { errors.push(`line ${i+1}: invalid hex in pair`); continue; }
+      out.ansi[key] = [n, b];
+    } else if (key === 'max_colors') {
+      const ok = ['mono','monochrome','8','16','256','truecolor','16m'];
+      if (!ok.includes(value)) {
+        errors.push(`line ${i+1}: max_colors must be one of mono|8|16|256|truecolor`);
+        continue;
+      }
+      // Normalize aliases
+      out.max_colors = (value === 'monochrome') ? 'mono'
+                      : (value === '16m') ? 'truecolor'
+                      : value;
+    } else {
+      errors.push(`line ${i+1}: unknown key '${key}'`);
+    }
+  }
+  return { out, errors };
+}
+
+function renderYaml() {
+  if (editingYaml) return;
+  const ta = document.getElementById('yaml');
+  editingPickers = true;
+  ta.value = toYaml();
+  ta.classList.remove('invalid');
+  document.getElementById('yaml-status').textContent = 'In sync.';
+  document.getElementById('yaml-status').classList.remove('error');
+  editingPickers = false;
+}
+
+function applyYamlEdit() {
+  const ta = document.getElementById('yaml');
+  const { out, errors } = parseYaml(ta.value);
+  const status = document.getElementById('yaml-status');
+  if (errors.length) {
+    ta.classList.add('invalid');
+    status.classList.add('error');
+    status.textContent = errors.slice(0, 3).join(' • ');
+    return;
+  }
+  ta.classList.remove('invalid');
+  status.classList.remove('error');
+  // Merge: missing fields keep their current values (matches palette.rs
+  // behaviour where omitted keys fall back to defaults — but here the user
+  // is editing a live scheme, so keep what they already had).
+  for (const k of SINGLES) if (out[k]) state[k] = out[k];
+  for (const hue of HUES) if (out.ansi[hue]) state.ansi[hue] = out.ansi[hue];
+  state.max_colors = out.max_colors || '';
+  status.textContent = 'In sync.';
+  // Rebuild pickers (values changed) and preview, but DON'T regenerate the
+  // YAML — the textarea already has the source of truth.
+  buildPane1();
+  renderPreview();
+}
+
+/* ============================================================
+ * Importers — convert assorted terminal theme formats into a
+ * partial scheme: { background?, foreground?, cursor?, selection?,
+ * ansi: { hue?: [normal, bright] } }. Each parser is conservative:
+ * fields it doesn't recognise are skipped, and unrecognised lines
+ * never throw. Auto-detect picks one based on shape, but the user
+ * can override via the format dropdown.
+ * ============================================================ */
+const ANSI_BY_INDEX = ['black','red','green','yellow','blue','magenta','cyan','white'];
+
+// Robust hex parser used by all importers. Accepts:
+//   #rrggbb, #rgb, 0xrrggbb, rrggbb (no prefix), or whitespace-wrapped
+// Returns '#rrggbb' or null. Float-triplet variants (iTerm2) bypass this.
+function importHex(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim().replace(/^['"]|['"]$/g, '').trim();
+  if (s.startsWith('0x') || s.startsWith('0X')) s = s.slice(2);
+  if (s.startsWith('#')) s = s.slice(1);
+  if (/^[0-9a-fA-F]{3}$/.test(s)) s = s.split('').map(c => c+c).join('');
+  if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+  return '#' + s.toLowerCase();
+}
+
+function emptyPartial() {
+  return { background: null, foreground: null, cursor: null, selection: null, ansi: {} };
+}
+function setAnsi(partial, idx, hex) {
+  if (idx < 0 || idx > 15 || !hex) return;
+  const hue = ANSI_BY_INDEX[idx % 8];
+  if (!partial.ansi[hue]) partial.ansi[hue] = [null, null];
+  partial.ansi[hue][idx < 8 ? 0 : 1] = hex;
+}
+
+/* ---------- Auto-detect ----------
+ * Cheap shape-based sniffing. Order matters: iTerm2's XML signature is
+ * unambiguous, JSON is checked by leading `{`, then we look at section
+ * headers / key shapes. Falls back to kitty conf, which is the most
+ * forgiving line-based format. */
+function detectFormat(src) {
+  const t = src.trim();
+  if (!t) return null;
+  if (t.startsWith('<?xml') || t.includes('<plist')) return 'iterm2';
+  if (t.startsWith('{')) return 'windows-terminal';
+  if (/^\[colors\.(primary|normal|bright|cursor|selection)\]/m.test(t)) return 'alacritty-toml';
+  if (/^colors\s*:\s*$/m.test(t) && /^\s+(primary|normal|bright)\s*:/m.test(t)) return 'alacritty-yaml';
+  if (/^\s*\*?\.?(color\d+|background|foreground|cursorColor)\s*:/m.test(t)) return 'xresources';
+  if (/^\s*(color\d+|palette|background|foreground|cursor|selection_background)\b/m.test(t)) return 'kitty';
+  return null;
+}
+
+/* ---------- Kitty / Ghostty .conf ----------
+ *   color0  #1d1f21      (kitty)
+ *   color0 = #1d1f21     (also accepted)
+ *   palette = 0=#1d1f21  (ghostty)
+ *   background  #1d1f21
+ *   selection_background #373b41
+ * Lines may have trailing `# comment`; we strip that. Both forms ignore
+ * unknown keys silently. */
+function parseKitty(src) {
+  const p = emptyPartial();
+  for (const rawLine of src.split(/\r?\n/)) {
+    // Kitty/Ghostty use `#` for BOTH comments and hex literals. Treat `#`
+    // as a comment marker only when it leads the line — every other `#`
+    // is the start of a hex value (`color1  #cc6666`).
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) continue;
+    const line = trimmed;
+    // Ghostty: palette = N=#rrggbb
+    let m = line.match(/^palette\s*=\s*(\d+)\s*=\s*(\S+)/i);
+    if (m) { setAnsi(p, parseInt(m[1],10), importHex(m[2])); continue; }
+    // key value | key = value
+    m = line.match(/^([A-Za-z0-9_]+)\s*(?:=\s*|\s+)(.+)$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    const val = m[2].trim();
+    const cm = key.match(/^color(\d+)$/);
+    if (cm) { setAnsi(p, parseInt(cm[1],10), importHex(val)); continue; }
+    switch (key) {
+      case 'background': p.background = importHex(val) || p.background; break;
+      case 'foreground': p.foreground = importHex(val) || p.foreground; break;
+      case 'cursor':
+      case 'cursor_color':
+      case 'cursorcolor':
+        p.cursor = importHex(val) || p.cursor; break;
+      case 'selection_background':
+      case 'selectionbackground':
+      case 'selection-background':
+        p.selection = importHex(val) || p.selection; break;
+    }
+  }
+  return p;
+}
+
+/* ---------- Alacritty TOML (and most of the YAML shape too) ----------
+ * We only care about [colors.*] sections and `key = "..."` lines inside.
+ * A full TOML parser would be overkill — Alacritty themes are flat
+ * enough that this minimal walker covers every theme on alacritty/theme. */
+// Strip a TOML/YAML `#` line-comment while skipping over `'…'` / `"…"`
+// regions — bare regex would eat the `#` from a value like `"#1d1f21"`.
+function stripCommentQuoted(line) {
+  let inStr = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+    } else {
+      if (c === '"' || c === "'") inStr = c;
+      else if (c === '#') return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function parseAlacrittyToml(src) {
+  const p = emptyPartial();
+  let section = null;
+  for (const rawLine of src.split(/\r?\n/)) {
+    const line = stripCommentQuoted(rawLine).trim();
+    if (!line) continue;
+    let m = line.match(/^\[([^\]]+)\]$/);
+    if (m) { section = m[1].trim().toLowerCase(); continue; }
+    m = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$/);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    const val = m[2];
+    applyAlacrittyField(p, section, key, val);
+  }
+  return p;
+}
+
+/* ---------- Alacritty YAML ----------
+ * The legacy YAML config layout:
+ *   colors:
+ *     primary:
+ *       background: '0x1d1f21'
+ *     normal:
+ *       black:   '0x000000'
+ *       ...
+ * Indent-based; we track section by lowest-indent key under `colors:`. */
+function parseAlacrittyYaml(src) {
+  const p = emptyPartial();
+  let inColors = false, section = null, colorsIndent = -1, sectionIndent = -1;
+  for (const rawLine of src.split(/\r?\n/)) {
+    if (/^\s*#/.test(rawLine)) continue;
+    const noComment = stripCommentQuoted(rawLine);
+    if (!noComment.trim()) continue;
+    const indent = noComment.match(/^\s*/)[0].length;
+    const line = noComment.trim();
+    if (line === 'colors:') { inColors = true; colorsIndent = indent; section = null; continue; }
+    if (!inColors) continue;
+    if (indent <= colorsIndent) { inColors = false; continue; }
+    // Section header like `primary:` with no value
+    const sec = line.match(/^([A-Za-z0-9_]+)\s*:\s*$/);
+    if (sec && (sectionIndent < 0 || indent <= sectionIndent || section === null)) {
+      section = sec[1].toLowerCase();
+      sectionIndent = indent;
+      continue;
+    }
+    const kv = line.match(/^([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$/);
+    if (!kv) continue;
+    applyAlacrittyField(p, section, kv[1].toLowerCase(), kv[2]);
+  }
+  return p;
+}
+
+function applyAlacrittyField(p, section, key, value) {
+  if (!section) return;
+  // Section names appear bare (`primary`) in TOML when written as
+  // `[colors.primary]`. We normalize the dotted form too just in case
+  // someone hand-edits the keys.
+  const sec = section.replace(/^colors\./, '');
+  const hex = importHex(value);
+  if (!hex) return;
+  if (sec === 'primary') {
+    if (key === 'background') p.background = hex;
+    else if (key === 'foreground') p.foreground = hex;
+    // bright_foreground / dim_foreground intentionally ignored
+  } else if (sec === 'cursor') {
+    // Alacritty uses `cursor.cursor` for the cursor block color.
+    if (key === 'cursor') p.cursor = hex;
+  } else if (sec === 'selection') {
+    if (key === 'background') p.selection = hex;
+  } else if (sec === 'normal' || sec === 'bright') {
+    const idx = ANSI_BY_INDEX.indexOf(key);
+    if (idx >= 0) setAnsi(p, idx + (sec === 'bright' ? 8 : 0), hex);
+  }
+}
+
+/* ---------- Windows Terminal JSON ----------
+ * Either a bare theme object or an entry from a `schemes` array. We
+ * accept any object with at least one recognised key. */
+function parseWindowsTerminal(src) {
+  let obj;
+  try { obj = JSON.parse(src); }
+  catch (e) { throw new Error('Invalid JSON: ' + e.message); }
+  // If they pasted a profiles.json fragment with `{"schemes": [{...}]}`,
+  // grab the first scheme so the common case works without surgery.
+  if (Array.isArray(obj.schemes) && obj.schemes.length) obj = obj.schemes[0];
+  const p = emptyPartial();
+  p.background = importHex(obj.background) || null;
+  p.foreground = importHex(obj.foreground) || null;
+  p.cursor     = importHex(obj.cursorColor) || null;
+  p.selection  = importHex(obj.selectionBackground) || null;
+  const map = {
+    black: 0, red: 1, green: 2, yellow: 3, blue: 4, purple: 5, cyan: 6, white: 7,
+    brightBlack: 8, brightRed: 9, brightGreen: 10, brightYellow: 11,
+    brightBlue: 12, brightPurple: 13, brightCyan: 14, brightWhite: 15,
+    // Some themes use `magenta` and `brightMagenta` instead of `purple`.
+    magenta: 5, brightMagenta: 13,
+  };
+  for (const [k, idx] of Object.entries(map)) {
+    const hex = importHex(obj[k]);
+    if (hex) setAnsi(p, idx, hex);
+  }
+  return p;
+}
+
+/* ---------- iTerm2 .itermcolors ----------
+ * XML plist where each color is a <dict> with `Red Component`,
+ * `Green Component`, `Blue Component` as floats in [0, 1]. Keys are
+ * named "Ansi 0 Color" .. "Ansi 15 Color", plus "Background Color",
+ * "Foreground Color", "Cursor Color", "Selection Color". */
+function parseIterm2(src) {
+  const doc = new DOMParser().parseFromString(src, 'text/xml');
+  const err = doc.querySelector('parsererror');
+  if (err) throw new Error('Invalid XML / plist');
+  const root = doc.querySelector('plist > dict');
+  if (!root) throw new Error('No <plist><dict> root');
+  const p = emptyPartial();
+  // Walk direct children pair-wise: <key> then a <dict> (or other) sibling.
+  const kids = Array.from(root.children);
+  for (let i = 0; i < kids.length; i++) {
+    const k = kids[i];
+    if (k.tagName !== 'key') continue;
+    const name = k.textContent.trim();
+    const val = kids[i + 1];
+    if (!val || val.tagName !== 'dict') continue;
+    const hex = itermColorDictToHex(val);
+    if (!hex) continue;
+    const m = name.match(/^Ansi\s+(\d+)\s+Color$/i);
+    if (m) { setAnsi(p, parseInt(m[1], 10), hex); continue; }
+    if (/^Background Color$/i.test(name))  p.background = hex;
+    else if (/^Foreground Color$/i.test(name)) p.foreground = hex;
+    else if (/^Cursor Color$/i.test(name))     p.cursor = hex;
+    else if (/^Selection Color$/i.test(name))  p.selection = hex;
+  }
+  return p;
+}
+function itermColorDictToHex(d) {
+  const comps = { red: 0, green: 0, blue: 0 };
+  const kids = Array.from(d.children);
+  for (let i = 0; i < kids.length; i++) {
+    const k = kids[i];
+    if (k.tagName !== 'key') continue;
+    const name = k.textContent.trim().toLowerCase();
+    const val = kids[i + 1];
+    if (!val) continue;
+    const f = parseFloat(val.textContent);
+    if (Number.isNaN(f)) continue;
+    if (name === 'red component')   comps.red = f;
+    else if (name === 'green component') comps.green = f;
+    else if (name === 'blue component')  comps.blue = f;
+    // Alpha is ignored — yutani schemes are opaque.
+  }
+  const to = x => Math.max(0, Math.min(255, Math.round(x * 255))).toString(16).padStart(2,'0');
+  return '#' + to(comps.red) + to(comps.green) + to(comps.blue);
+}
+
+/* ---------- Xresources / .Xdefaults ----------
+ *   *.color0:    #1d1f21
+ *   *color0:     #1d1f21
+ *   URxvt*background: #1d1f21
+ * Pattern: optional prefix, then a recognised key, then `:` and a value. */
+function parseXresources(src) {
+  const p = emptyPartial();
+  for (const rawLine of src.split(/\r?\n/)) {
+    const line = rawLine.replace(/!.*$/, '').trim();  // Xresources uses `!` for comments
+    if (!line) continue;
+    const m = line.match(/^[*A-Za-z0-9_.]*?\.?(color\d+|background|foreground|cursorColor)\s*:\s*(\S+)/);
+    if (!m) continue;
+    const key = m[1];
+    const hex = importHex(m[2]);
+    if (!hex) continue;
+    const cm = key.match(/^color(\d+)$/);
+    if (cm) { setAnsi(p, parseInt(cm[1], 10), hex); continue; }
+    if (key === 'background') p.background = hex;
+    else if (key === 'foreground') p.foreground = hex;
+    else if (key === 'cursorColor') p.cursor = hex;
+  }
+  return p;
+}
+
+const PARSERS = {
+  'alacritty-toml':   parseAlacrittyToml,
+  'alacritty-yaml':   parseAlacrittyYaml,
+  'kitty':            parseKitty,
+  'windows-terminal': parseWindowsTerminal,
+  'iterm2':           parseIterm2,
+  'xresources':       parseXresources,
+};
+
+/* Merge a partial parse into the live state. We DON'T wipe the whole
+ * scheme on import — fields the source format doesn't supply keep
+ * their current value, so e.g. importing a kitty conf that omits the
+ * cursor color preserves what the user already had. Returns a summary
+ * of what landed for the status line. */
+function mergePartial(partial) {
+  const counts = { singles: 0, ansiNormal: 0, ansiBright: 0 };
+  for (const k of SINGLES) {
+    if (partial[k]) { state[k] = partial[k]; counts.singles++; }
+  }
+  for (const hue of HUES) {
+    const pair = partial.ansi[hue];
+    if (!pair) continue;
+    if (pair[0]) { state.ansi[hue][0] = pair[0]; counts.ansiNormal++; }
+    if (pair[1]) { state.ansi[hue][1] = pair[1]; counts.ansiBright++; }
+  }
+  return counts;
+}
+
+/* ============================================================
+ * Wiring
+ * ============================================================ */
+function renderAll() {
+  buildPane1();
+  renderPreview();
+  renderYaml();
+}
+
+function init() {
+  // Preset dropdown
+  const sel = document.getElementById('presetSelect');
+  for (const name of Object.keys(PRESETS)) {
+    const o = document.createElement('option');
+    o.value = name; o.textContent = name;
+    sel.append(o);
+  }
+  sel.addEventListener('change', e => {
+    if (!e.target.value) return;
+    state = clone(PRESETS[e.target.value]);
+    renderAll();
+    e.target.value = '';
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', () => {
+    state = clone(PRESETS['Yutani default (light)']);
+    renderAll();
+  });
+
+  // YAML textarea — debounce edits back into the model so the pickers
+  // don't fight every keystroke.
+  const ta = document.getElementById('yaml');
+  let timer = null;
+  ta.addEventListener('input', () => {
+    if (editingPickers) return;
+    editingYaml = true;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      applyYamlEdit();
+      editingYaml = false;
+    }, 200);
+  });
+
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    await navigator.clipboard.writeText(ta.value);
+    const t = document.getElementById('toast');
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 1200);
+  });
+
+  // -------- Import modal wiring --------
+  const importBtn       = document.getElementById('importBtn');
+  const importBackdrop  = document.getElementById('import-backdrop');
+  const importFormat    = document.getElementById('import-format');
+  const importSource    = document.getElementById('import-source');
+  const importStatus    = document.getElementById('import-status');
+  const importGo        = document.getElementById('import-go');
+  const importCancel    = document.getElementById('import-cancel');
+  const importClose     = document.getElementById('import-close');
+
+  function openImport() {
+    importBackdrop.dataset.open = '1';
+    importStatus.className = 'modal-status';
+    importStatus.textContent = '';
+    setTimeout(() => importSource.focus(), 0);
+  }
+  function closeImport() { importBackdrop.dataset.open = ''; }
+
+  importBtn.addEventListener('click', openImport);
+  importCancel.addEventListener('click', closeImport);
+  importClose.addEventListener('click', closeImport);
+  importBackdrop.addEventListener('mousedown', e => {
+    // Click on the dimmed area (not on the modal itself) dismisses.
+    if (e.target === importBackdrop) closeImport();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && importBackdrop.dataset.open === '1') closeImport();
+  });
+
+  function runImport() {
+    const src = importSource.value;
+    if (!src.trim()) {
+      importStatus.className = 'modal-status error';
+      importStatus.textContent = 'Nothing to import — paste a theme above.';
+      return;
+    }
+    let fmt = importFormat.value;
+    if (fmt === 'auto') {
+      fmt = detectFormat(src);
+      if (!fmt) {
+        importStatus.className = 'modal-status error';
+        importStatus.textContent = "Couldn't auto-detect format — pick one from the dropdown.";
+        return;
+      }
+    }
+    let partial;
+    try { partial = PARSERS[fmt](src); }
+    catch (e) {
+      importStatus.className = 'modal-status error';
+      importStatus.textContent = `${fmt} parse error: ${e.message}`;
+      return;
+    }
+    const counts = mergePartial(partial);
+    const total = counts.singles + counts.ansiNormal + counts.ansiBright;
+    if (total === 0) {
+      importStatus.className = 'modal-status error';
+      importStatus.textContent = `Parsed as ${fmt} but found no recognised colors.`;
+      return;
+    }
+    importStatus.className = 'modal-status ok';
+    importStatus.textContent = `Imported as ${fmt}: ${counts.singles} window color${counts.singles===1?'':'s'}, ${counts.ansiNormal} normal + ${counts.ansiBright} bright ANSI.`;
+    renderAll();
+    // Auto-close shortly after a clean import so the user sees the result.
+    setTimeout(closeImport, 800);
+  }
+  importGo.addEventListener('click', runImport);
+  importSource.addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') runImport();
+  });
+
+  document.getElementById('downloadBtn').addEventListener('click', () => {
+    const blob = new Blob([ta.value], { type: 'text/yaml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'scheme.yaml';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  renderAll();
+}
+
+init();
+</script>
+</body>
+</html>
