@@ -47,7 +47,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
 
 fn config_path() -> Option<std::path::PathBuf> {
     let mut p = config_dir()?;
-    p.push("config");
+    p.push("config.toml");
     Some(p)
 }
 
@@ -59,7 +59,7 @@ fn install_color_scheme(name: Option<&str>) {
     let palette_for = |name: &str| -> Option<palette::Palette> {
         let path = scheme_path(name)?;
         match std::fs::read_to_string(&path) {
-            Ok(src) => Some(palette::parse_yaml(&src)),
+            Ok(src) => Some(palette::parse_toml(&src)),
             Err(e) => {
                 eprintln!("palette: failed to read {}: {}", path.display(), e);
                 None
@@ -70,21 +70,12 @@ fn install_color_scheme(name: Option<&str>) {
     palette::install(p);
 }
 
-/// Resolve a scheme name to an on-disk path. Accepts either `.yml` or
-/// `.yaml`; `.yml` wins when both exist so users can pick the shorter
-/// extension without surprise.
+/// Resolve a scheme name to its on-disk `.toml` path under
+/// `~/.config/yutani/schemes/`.
 fn scheme_path(name: &str) -> Option<std::path::PathBuf> {
     let mut dir = config_dir()?;
     dir.push("schemes");
-    for ext in ["yml", "yaml"] {
-        let p = dir.join(format!("{}.{}", name, ext));
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // Fall through to the .yaml form so the error message points at a
-    // canonical path (the loader will report "failed to read ...").
-    Some(dir.join(format!("{}.yaml", name)))
+    Some(dir.join(format!("{}.toml", name)))
 }
 
 /// Byte size of the grid's vertex and index buffers for a viewport of
@@ -131,7 +122,7 @@ struct Config {
     /// Shared by top and bottom strips — both sample the same blur output.
     /// Per-edge would need a second blur chain.
     blur_iterations: usize,
-    /// Name of a YAML scheme under ~/.config/yutani/schemes/. `None` keeps
+    /// Name of a TOML scheme under ~/.config/yutani/schemes/. `None` keeps
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
     /// back to defaults.
     color_scheme: Option<String>,
@@ -315,103 +306,118 @@ impl Config {
 
     fn parse_str(s: &str) -> Self {
         let mut c = Self::defaults();
-        for line in s.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        let table: toml::Table = match s.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("config: invalid TOML: {}", e);
+                return c;
             }
-            let Some((k, v)) = line.split_once('=') else { continue };
-            let (k, v) = (k.trim(), v.trim());
-            match k {
-                "font_size" => if let Ok(x) = v.parse() { c.font_size = x; },
-                "top_fade_height" => if let Ok(x) = v.parse() { c.top_fade_height = x; },
-                "top_fade_solid_stop" => if let Ok(x) = v.parse() { c.top_fade_solid_stop = x; },
-                "top_fade_anim_secs" => if let Ok(x) = v.parse() { c.top_fade_anim_secs = x; },
-                "bottom_fade_height" => if let Ok(x) = v.parse() { c.bottom_fade_height = x; },
-                "bottom_fade_anim_secs" => if let Ok(x) = v.parse() { c.bottom_fade_anim_secs = x; },
-                "cursor_anim_secs" => if let Ok(x) = v.parse() { c.cursor_anim_secs = x; },
-                "cursor_blink" => if let Ok(x) = v.parse() { c.cursor_blink = x; },
-                "blur_iterations" => if let Ok(x) = v.parse::<usize>() {
-                    c.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
-                },
-                "color_scheme" => c.color_scheme = if v.is_empty() { None } else { Some(v.to_string()) },
-                "font_family" => c.font_family = if v.is_empty() { None } else { Some(v.to_string()) },
-                "glow_match_brightness" => if let Ok(x) = v.parse() { c.glow_match_brightness = x; },
-                "glow_match_bright_ansi" => if let Ok(x) = v.parse() { c.glow_match_bright_ansi = x; },
-                "glow_threshold" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_threshold = x.clamp(0.0, 1.0);
-                },
-                "glow_intensity" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_intensity = x.max(0.0);
-                },
-                "glow_softness" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_softness = x.clamp(0.0, 1.0);
-                },
-                "glow_hue_tolerance_deg" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_hue_tolerance_deg = x.clamp(0.0, 180.0);
-                },
-                "glow_iterations" => if let Ok(x) = v.parse::<usize>() {
-                    c.glow_iterations = x.clamp(1, renderer::glow::MAX_ITERATIONS);
-                },
-                "glow_match_foreground" => if let Ok(x) = v.parse() { c.glow_match_foreground = x; },
-                "glow_fg_tolerance" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_fg_tolerance = x.clamp(0.0, 3.0_f32.sqrt());
-                },
-                "glow_scanlines" => if let Ok(x) = v.parse() { c.glow_scanlines = x; },
-                "glow_scanline_strength" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_scanline_strength = x.clamp(0.0, 1.0);
-                },
-                "glow_scanline_period" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_scanline_period = x.max(1.0);
-                },
-                "glow_scanlines_content" => if let Ok(x) = v.parse() { c.glow_scanlines_content = x; },
-                "glow_scanlines_content_strength" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_scanlines_content_strength = x.clamp(0.0, 1.0);
-                },
-                "glow_scanline_color_bright" => if let Ok(x) = palette::rgba_from(v) {
-                    c.glow_scanline_color_bright = x;
-                },
-                "glow_scanline_color_dark" => if let Ok(x) = palette::rgba_from(v) {
-                    c.glow_scanline_color_dark = x;
-                },
-                "glow_scanlines_skip_primary_bg" => if let Ok(x) = v.parse() {
-                    c.glow_scanlines_skip_primary_bg = x;
-                },
-                "glow_scanlines_content_attenuation" => if let Ok(x) = v.parse::<f32>() {
-                    c.glow_scanlines_content_attenuation = x.clamp(0.0, 1.0);
-                },
-                "theme_overrides_glow" => if let Ok(x) = v.parse() { c.theme_overrides_glow = x; },
-                "images_enabled" => if let Ok(x) = v.parse() { c.images_enabled = x; },
-                "images_memory_cap_mb" => if let Ok(x) = v.parse::<usize>() {
-                    c.images_memory_cap_mb = x;
-                },
-                "images_max_pixels" => if let Ok(x) = v.parse::<u64>() {
-                    // Cap at u32::MAX^2 wouldn't fit a meaningful image
-                    // anyway; just protect against zero by clamping low.
-                    c.images_max_pixels = x.max(1);
-                },
-                "images_decode_timeout_ms" => if let Ok(x) = v.parse::<u64>() {
-                    // 50ms floor — anything lower defeats the worker since
-                    // even a tiny PNG decode takes a millisecond or two.
-                    c.images_decode_timeout_ms = x.max(50);
-                },
-                "images_in_scrollback" => if let Ok(x) = v.parse() {
-                    c.images_in_scrollback = x;
-                },
-                "images_filter" => {
-                    if v == "linear" || v == "nearest" {
-                        c.images_filter = v.to_string();
-                    }
-                    // Silently keep the default on unknown values — same
-                    // contract as the `color_scheme` slot above.
-                },
-                "images_halfblock_for_missing" => if let Ok(x) = v.parse() {
-                    c.images_halfblock_for_missing = x;
-                },
-                _ => (),
-            }
+        };
+        for (k, v) in &table {
+            c.apply(k, v);
         }
         c
+    }
+
+    /// Apply one parsed TOML key/value onto `self`. A value of the wrong
+    /// type or out of range is silently skipped, so one bad key doesn't
+    /// drop the rest of the file — the same forgiving contract the old
+    /// line-based parser had, now at the value level. (A TOML *syntax*
+    /// error still reverts the whole file to defaults, up in `parse_str`,
+    /// since the document can't be walked key-by-key.)
+    fn apply(&mut self, k: &str, v: &toml::Value) {
+        match k {
+            "font_size" => if let Some(x) = cfg_f32(v) { self.font_size = x; },
+            "top_fade_height" => if let Some(x) = cfg_f32(v) { self.top_fade_height = x; },
+            "top_fade_solid_stop" => if let Some(x) = cfg_f32(v) { self.top_fade_solid_stop = x; },
+            "top_fade_anim_secs" => if let Some(x) = cfg_f32(v) { self.top_fade_anim_secs = x; },
+            "bottom_fade_height" => if let Some(x) = cfg_f32(v) { self.bottom_fade_height = x; },
+            "bottom_fade_anim_secs" => if let Some(x) = cfg_f32(v) { self.bottom_fade_anim_secs = x; },
+            "cursor_anim_secs" => if let Some(x) = cfg_f32(v) { self.cursor_anim_secs = x; },
+            "cursor_blink" => if let Some(x) = v.as_bool() { self.cursor_blink = x; },
+            "blur_iterations" => if let Some(x) = cfg_usize(v) {
+                self.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
+            },
+            "color_scheme" => if let Some(x) = v.as_str() {
+                self.color_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "font_family" => if let Some(x) = v.as_str() {
+                self.font_family = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "glow_match_brightness" => if let Some(x) = v.as_bool() { self.glow_match_brightness = x; },
+            "glow_match_bright_ansi" => if let Some(x) = v.as_bool() { self.glow_match_bright_ansi = x; },
+            "glow_threshold" => if let Some(x) = cfg_f32(v) {
+                self.glow_threshold = x.clamp(0.0, 1.0);
+            },
+            "glow_intensity" => if let Some(x) = cfg_f32(v) {
+                self.glow_intensity = x.max(0.0);
+            },
+            "glow_softness" => if let Some(x) = cfg_f32(v) {
+                self.glow_softness = x.clamp(0.0, 1.0);
+            },
+            "glow_hue_tolerance_deg" => if let Some(x) = cfg_f32(v) {
+                self.glow_hue_tolerance_deg = x.clamp(0.0, 180.0);
+            },
+            "glow_iterations" => if let Some(x) = cfg_usize(v) {
+                self.glow_iterations = x.clamp(1, renderer::glow::MAX_ITERATIONS);
+            },
+            "glow_match_foreground" => if let Some(x) = v.as_bool() { self.glow_match_foreground = x; },
+            "glow_fg_tolerance" => if let Some(x) = cfg_f32(v) {
+                self.glow_fg_tolerance = x.clamp(0.0, 3.0_f32.sqrt());
+            },
+            "glow_scanlines" => if let Some(x) = v.as_bool() { self.glow_scanlines = x; },
+            "glow_scanline_strength" => if let Some(x) = cfg_f32(v) {
+                self.glow_scanline_strength = x.clamp(0.0, 1.0);
+            },
+            "glow_scanline_period" => if let Some(x) = cfg_f32(v) {
+                self.glow_scanline_period = x.max(1.0);
+            },
+            "glow_scanlines_content" => if let Some(x) = v.as_bool() { self.glow_scanlines_content = x; },
+            "glow_scanlines_content_strength" => if let Some(x) = cfg_f32(v) {
+                self.glow_scanlines_content_strength = x.clamp(0.0, 1.0);
+            },
+            "glow_scanline_color_bright" => if let Ok(x) = palette::rgb_from_value(v) {
+                self.glow_scanline_color_bright = x;
+            },
+            "glow_scanline_color_dark" => if let Ok(x) = palette::rgb_from_value(v) {
+                self.glow_scanline_color_dark = x;
+            },
+            "glow_scanlines_skip_primary_bg" => if let Some(x) = v.as_bool() {
+                self.glow_scanlines_skip_primary_bg = x;
+            },
+            "glow_scanlines_content_attenuation" => if let Some(x) = cfg_f32(v) {
+                self.glow_scanlines_content_attenuation = x.clamp(0.0, 1.0);
+            },
+            "theme_overrides_glow" => if let Some(x) = v.as_bool() { self.theme_overrides_glow = x; },
+            "images_enabled" => if let Some(x) = v.as_bool() { self.images_enabled = x; },
+            "images_memory_cap_mb" => if let Some(x) = cfg_usize(v) {
+                self.images_memory_cap_mb = x;
+            },
+            "images_max_pixels" => if let Some(x) = cfg_u64(v) {
+                // Cap at u32::MAX^2 wouldn't fit a meaningful image
+                // anyway; just protect against zero by clamping low.
+                self.images_max_pixels = x.max(1);
+            },
+            "images_decode_timeout_ms" => if let Some(x) = cfg_u64(v) {
+                // 50ms floor — anything lower defeats the worker since
+                // even a tiny PNG decode takes a millisecond or two.
+                self.images_decode_timeout_ms = x.max(50);
+            },
+            "images_in_scrollback" => if let Some(x) = v.as_bool() {
+                self.images_in_scrollback = x;
+            },
+            "images_filter" => if let Some(x) = v.as_str() {
+                if x == "linear" || x == "nearest" {
+                    self.images_filter = x.to_string();
+                }
+                // Silently keep the default on unknown values — same
+                // contract as the `color_scheme` slot above.
+            },
+            "images_halfblock_for_missing" => if let Some(x) = v.as_bool() {
+                self.images_halfblock_for_missing = x;
+            },
+            _ => (),
+        }
     }
 
     fn save(&self) {
@@ -423,8 +429,10 @@ impl Config {
     }
 
     fn serialize(&self) -> String {
-        let mut s = format!(
-            "font_size = {}\n\
+        let mut s = String::from("# Yutani configuration\n\n");
+        s.push_str(&format!(
+            "# Display\n\
+             font_size = {}\n\
              top_fade_height = {}\n\
              top_fade_solid_stop = {}\n\
              top_fade_anim_secs = {}\n\
@@ -442,15 +450,16 @@ impl Config {
             self.cursor_anim_secs,
             self.cursor_blink,
             self.blur_iterations,
-        );
+        ));
         if let Some(name) = &self.color_scheme {
-            s.push_str(&format!("color_scheme = {}\n", name));
+            s.push_str(&format!("color_scheme = {}\n", toml_str_lit(name)));
         }
         if let Some(name) = &self.font_family {
-            s.push_str(&format!("font_family = {}\n", name));
+            s.push_str(&format!("font_family = {}\n", toml_str_lit(name)));
         }
         s.push_str(&format!(
-            "glow_match_brightness = {}\n\
+            "\n# Glow + scanlines\n\
+             glow_match_brightness = {}\n\
              glow_match_bright_ansi = {}\n\
              glow_match_foreground = {}\n\
              glow_threshold = {}\n\
@@ -490,7 +499,8 @@ impl Config {
             self.theme_overrides_glow,
         ));
         s.push_str(&format!(
-            "images_enabled = {}\n\
+            "\n# Images\n\
+             images_enabled = {}\n\
              images_memory_cap_mb = {}\n\
              images_max_pixels = {}\n\
              images_decode_timeout_ms = {}\n\
@@ -502,11 +512,34 @@ impl Config {
             self.images_max_pixels,
             self.images_decode_timeout_ms,
             self.images_in_scrollback,
-            self.images_filter,
+            toml_str_lit(&self.images_filter),
             self.images_halfblock_for_missing,
         ));
         s
     }
+}
+
+/// Read a numeric config slot, accepting either a TOML float or a bare
+/// integer (`font_size = 10` and `font_size = 10.0` both work). `None` if
+/// the value isn't a number, so the caller keeps the default.
+fn cfg_f32(v: &toml::Value) -> Option<f32> {
+    v.as_float()
+        .map(|f| f as f32)
+        .or_else(|| v.as_integer().map(|i| i as f32))
+}
+
+fn cfg_usize(v: &toml::Value) -> Option<usize> {
+    v.as_integer().and_then(|i| usize::try_from(i).ok())
+}
+
+fn cfg_u64(v: &toml::Value) -> Option<u64> {
+    v.as_integer().and_then(|i| u64::try_from(i).ok())
+}
+
+/// Encode a string as a TOML basic-string literal (quoted, with escapes),
+/// so values like a font family with spaces round-trip through `parse_str`.
+fn toml_str_lit(s: &str) -> String {
+    toml::Value::String(s.to_string()).to_string()
 }
 
 /// Copy every `glow_*` slot from `config` onto a `Glow` instance, letting
@@ -5751,9 +5784,11 @@ mod tests {
 
     #[test]
     fn config_parse_invalid_cursor_blink_keeps_default() {
-        // Garbage value must not poison the rest of the config — the field
-        // stays at its default (false) and other keys still parse.
-        let parsed = Config::parse_str("cursor_blink = banana\nfont_size = 12.5\n");
+        // A wrong-typed value must not poison the rest of the config — the
+        // field stays at its default (false) and other keys still parse.
+        // (The value stays valid TOML, a string, so the document parses and
+        // the per-key skip kicks in rather than a whole-file syntax error.)
+        let parsed = Config::parse_str("cursor_blink = \"banana\"\nfont_size = 12.5\n");
         assert!(!parsed.cursor_blink);
         assert!(approx_eq(parsed.font_size, 12.5));
     }
@@ -5863,14 +5898,14 @@ mod tests {
 
     #[test]
     fn config_image_filter_rejects_unknown_value() {
-        let parsed = Config::parse_str("images_filter = bicubic\n");
+        let parsed = Config::parse_str("images_filter = \"bicubic\"\n");
         // Unknown values keep the default — matches `color_scheme` semantics.
         assert_eq!(parsed.images_filter, "linear");
     }
 
     #[test]
     fn config_image_invalid_bool_keeps_default() {
-        let parsed = Config::parse_str("images_enabled = banana\n");
+        let parsed = Config::parse_str("images_enabled = \"banana\"\n");
         assert!(parsed.images_enabled);
     }
 
@@ -5914,29 +5949,27 @@ mod tests {
 
     #[test]
     fn config_font_family_empty_parses_as_none() {
-        // Matches `color_scheme` semantics: an empty RHS explicitly clears
+        // Matches `color_scheme` semantics: an explicit empty string clears
         // the override rather than installing the empty string.
-        let parsed = Config::parse_str("font_family = \n");
+        let parsed = Config::parse_str("font_family = \"\"\n");
         assert!(parsed.font_family.is_none());
     }
 
     #[test]
     fn config_font_family_preserves_spaces_in_name() {
-        let parsed = Config::parse_str("font_family = JetBrains Mono\n");
+        // TOML quotes delimit the value, so multi-word family names need no
+        // special handling.
+        let parsed = Config::parse_str("font_family = \"JetBrains Mono\"\n");
         assert_eq!(parsed.font_family.as_deref(), Some("JetBrains Mono"));
     }
 
     #[test]
-    fn config_font_family_trims_surrounding_whitespace() {
-        // `parse_str` trims both sides of the value; whitespace-only RHS
-        // must collapse to None (same as the bare-empty case) and a
-        // padded name must not carry trailing/leading spaces into the
-        // font lookup, where they would silently miss every installed
-        // family.
-        let only_ws = Config::parse_str("font_family =    \n");
-        assert!(only_ws.font_family.is_none());
-        let padded = Config::parse_str("font_family =   Fira Code   \n");
-        assert_eq!(padded.font_family.as_deref(), Some("Fira Code"));
+    fn config_font_family_quoted_value_is_verbatim() {
+        // Unlike the old line-based parser, TOML does not trim — whatever
+        // sits inside the quotes is taken literally. Documented here so a
+        // future "helpfully trim it" change has to break a test on purpose.
+        let parsed = Config::parse_str("font_family = \"  Padded  \"\n");
+        assert_eq!(parsed.font_family.as_deref(), Some("  Padded  "));
     }
 
     //
@@ -6142,7 +6175,9 @@ mod tests {
 
     #[test]
     fn config_glow_scanline_color_invalid_keeps_default() {
-        let parsed = Config::parse_str("glow_scanline_color_bright = notahex\n");
+        // A wrong-typed value (string instead of a hex integer) is skipped
+        // per-key, leaving the default in place.
+        let parsed = Config::parse_str("glow_scanline_color_bright = \"notahex\"\n");
         let d = Config::defaults();
         assert!(approx_eq(parsed.glow_scanline_color_bright[0], d.glow_scanline_color_bright[0]));
     }
@@ -6150,8 +6185,8 @@ mod tests {
     #[test]
     fn config_round_trip_preserves_scanline_colors() {
         let mut c = Config::defaults();
-        c.glow_scanline_color_bright = palette::rgba_from("0xff8800").unwrap();
-        c.glow_scanline_color_dark = palette::rgba_from("0x110022").unwrap();
+        c.glow_scanline_color_bright = palette::rgb_from_value(&toml::Value::Integer(0xff8800)).unwrap();
+        c.glow_scanline_color_dark = palette::rgb_from_value(&toml::Value::Integer(0x110022)).unwrap();
         let parsed = Config::parse_str(&c.serialize());
         // sRGB byte round-trip is exact (palette ensures this).
         assert_eq!(
@@ -6178,8 +6213,12 @@ mod tests {
 
     #[test]
     fn config_glow_threshold_clamped_on_parse() {
-        let parsed = Config::parse_str("glow_threshold = 2.5\nglow_threshold = -1\n");
-        assert!((0.0..=1.0).contains(&parsed.glow_threshold));
+        // TOML forbids duplicate keys, so the high and low ends are exercised
+        // by separate documents.
+        let high = Config::parse_str("glow_threshold = 2.5\n");
+        assert!((0.0..=1.0).contains(&high.glow_threshold));
+        let low = Config::parse_str("glow_threshold = -1\n");
+        assert!((0.0..=1.0).contains(&low.glow_threshold));
     }
 
     #[test]
@@ -6208,6 +6247,212 @@ mod tests {
         assert_eq!(parsed.glow_match_brightness, d.glow_match_brightness);
         assert_eq!(parsed.glow_match_bright_ansi, d.glow_match_bright_ansi);
         assert!(approx_eq(parsed.glow_intensity, d.glow_intensity));
+    }
+
+    //
+    // TOML migration coverage: serialize() must emit valid parseable TOML
+    // (comments / section headers and all), every field must survive a
+    // serialize → parse_str round-trip, numeric slots must accept both
+    // integers and floats, and a syntax-broken document must fall back to
+    // defaults wholesale (mirroring the palette parser's contract).
+    //
+
+    #[test]
+    fn config_serialize_emits_parseable_toml() {
+        // The serializer hand-writes `# comment` section headers and blank
+        // lines between groups. This pins that none of that decoration breaks
+        // the TOML grammar — `serialize()` output must always re-parse as a
+        // table, or `save()` would write a config the next launch can't read.
+        let c = Config::defaults();
+        let table: Result<toml::Table, _> = c.serialize().parse();
+        assert!(table.is_ok(), "serialize() must be valid TOML: {:?}", table.err());
+    }
+
+    #[test]
+    fn config_full_default_round_trip_is_identity() {
+        // The strongest single invariant: serializing the defaults and
+        // parsing them back must reproduce the defaults exactly. Catches any
+        // field the serializer forgets to emit (which would silently revert
+        // to default on the next load) or any asymmetry between the key names
+        // serialize() writes and apply() reads.
+        let d = Config::defaults();
+        let parsed = Config::parse_str(&d.serialize());
+        // Compare field-by-field with float tolerance; Config has no Eq.
+        assert!(approx_eq(parsed.font_size, d.font_size));
+        assert!(approx_eq(parsed.top_fade_height, d.top_fade_height));
+        assert!(approx_eq(parsed.top_fade_solid_stop, d.top_fade_solid_stop));
+        assert!(approx_eq(parsed.top_fade_anim_secs, d.top_fade_anim_secs));
+        assert!(approx_eq(parsed.bottom_fade_height, d.bottom_fade_height));
+        assert!(approx_eq(parsed.bottom_fade_anim_secs, d.bottom_fade_anim_secs));
+        assert!(approx_eq(parsed.cursor_anim_secs, d.cursor_anim_secs));
+        assert_eq!(parsed.cursor_blink, d.cursor_blink);
+        assert_eq!(parsed.blur_iterations, d.blur_iterations);
+        assert_eq!(parsed.color_scheme, d.color_scheme);
+        assert_eq!(parsed.font_family, d.font_family);
+        assert_eq!(parsed.theme_overrides_glow, d.theme_overrides_glow);
+        assert_eq!(parsed.images_enabled, d.images_enabled);
+        assert_eq!(parsed.images_memory_cap_mb, d.images_memory_cap_mb);
+        assert_eq!(parsed.images_max_pixels, d.images_max_pixels);
+        assert_eq!(parsed.images_decode_timeout_ms, d.images_decode_timeout_ms);
+        assert_eq!(parsed.images_in_scrollback, d.images_in_scrollback);
+        assert_eq!(parsed.images_filter, d.images_filter);
+        assert_eq!(parsed.images_halfblock_for_missing, d.images_halfblock_for_missing);
+    }
+
+    #[test]
+    fn config_round_trip_preserves_fade_fields() {
+        // The five fade knobs are floats with no clamp on the parse path, so
+        // any non-default value must survive serialize → parse_str unchanged.
+        // Previously only the glow/image/font groups were round-trip tested.
+        let mut c = Config::defaults();
+        c.top_fade_height = 123.5;
+        c.top_fade_solid_stop = 0.625;
+        c.top_fade_anim_secs = 0.5;
+        c.bottom_fade_height = 64.25;
+        c.bottom_fade_anim_secs = 0.75;
+        c.cursor_anim_secs = 0.12;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(approx_eq(parsed.top_fade_height, 123.5));
+        assert!(approx_eq(parsed.top_fade_solid_stop, 0.625));
+        assert!(approx_eq(parsed.top_fade_anim_secs, 0.5));
+        assert!(approx_eq(parsed.bottom_fade_height, 64.25));
+        assert!(approx_eq(parsed.bottom_fade_anim_secs, 0.75));
+        assert!(approx_eq(parsed.cursor_anim_secs, 0.12));
+    }
+
+    #[test]
+    fn config_round_trip_preserves_blur_iterations() {
+        // blur_iterations is a usize clamped to MAX_BLUR_ITERATIONS on parse.
+        // A non-default in-range value must round-trip exactly.
+        let mut c = Config::defaults();
+        c.blur_iterations = 5;
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.blur_iterations, 5);
+    }
+
+    #[test]
+    fn config_blur_iterations_clamped_to_max() {
+        // Same clamp the renderer relies on: an over-large request is capped
+        // at MAX_BLUR_ITERATIONS so the blur chain stays bounded.
+        let parsed = Config::parse_str(&format!(
+            "blur_iterations = {}\n",
+            renderer::blur::MAX_BLUR_ITERATIONS + 10
+        ));
+        assert_eq!(parsed.blur_iterations, renderer::blur::MAX_BLUR_ITERATIONS);
+    }
+
+    #[test]
+    fn config_font_size_accepts_integer_and_float() {
+        // TOML reads `10` as an integer and `10.0` as a float; `cfg_f32` must
+        // accept both for a numeric slot so users aren't forced to write a
+        // decimal point. Both forms must produce the same value.
+        let from_int = Config::parse_str("font_size = 10\n");
+        let from_float = Config::parse_str("font_size = 10.0\n");
+        assert!(approx_eq(from_int.font_size, 10.0));
+        assert!(approx_eq(from_float.font_size, 10.0));
+    }
+
+    #[test]
+    fn config_color_scheme_round_trips_some() {
+        // A `Some(name)` color_scheme must serialize (quoted) and parse back
+        // to the same name. The serializer omits the key entirely when None,
+        // so the Some path needs its own pin.
+        let mut c = Config::defaults();
+        c.color_scheme = Some("solarized-dark".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.color_scheme.as_deref(), Some("solarized-dark"));
+    }
+
+    #[test]
+    fn config_color_scheme_round_trips_none() {
+        // Default None: the serializer drops the key, and a config without it
+        // parses back to None rather than an empty Some("").
+        let c = Config::defaults();
+        assert!(c.color_scheme.is_none());
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.color_scheme.is_none());
+    }
+
+    #[test]
+    fn config_color_scheme_empty_parses_as_none() {
+        // An explicit empty string clears the override to None rather than
+        // installing the empty name (which would resolve to a missing file).
+        let parsed = Config::parse_str("color_scheme = \"\"\n");
+        assert!(parsed.color_scheme.is_none());
+    }
+
+    #[test]
+    fn config_color_scheme_with_spaces_round_trips() {
+        // Scheme names go through `toml_str_lit` so a name with spaces is
+        // quoted on write and read back verbatim — same machinery as
+        // font_family.
+        let mut c = Config::defaults();
+        c.color_scheme = Some("My Custom Theme".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.color_scheme.as_deref(), Some("My Custom Theme"));
+    }
+
+    #[test]
+    fn config_invalid_toml_falls_back_to_defaults() {
+        // A document that isn't valid TOML at all (a bareword value here)
+        // can't be walked key-by-key, so the whole config reverts to defaults
+        // rather than guessing — the same wholesale-fallback contract the
+        // palette parser has. The good `font_size` before the broken line
+        // must NOT survive, proving the fallback is whole-file not per-key.
+        let parsed = Config::parse_str("font_size = 18.0\nthis is not toml\n");
+        let d = Config::defaults();
+        assert!(approx_eq(parsed.font_size, d.font_size));
+    }
+
+    #[test]
+    fn config_unknown_keys_are_ignored() {
+        // Forward/backward compatibility: an unrecognized key is skipped and
+        // siblings still apply. A future binary's keys in an old config (or
+        // vice versa) must not blank the file out.
+        let parsed = Config::parse_str("totally_made_up_key = 42\nfont_size = 14.0\n");
+        assert!(approx_eq(parsed.font_size, 14.0));
+    }
+
+    #[test]
+    fn config_toml_str_lit_escapes_quotes_and_backslashes() {
+        // A font family containing a double-quote or backslash must be
+        // escaped by `toml_str_lit` so the emitted literal stays valid TOML
+        // and round-trips byte-for-byte. A naive `format!("\"{}\"")` would
+        // produce a parse error here.
+        let mut c = Config::defaults();
+        c.font_family = Some("Weird\"Font\\Name".to_string());
+        let serialized = c.serialize();
+        // The whole document must still parse...
+        assert!(serialized.parse::<toml::Table>().is_ok());
+        // ...and the value must come back exactly as written.
+        let parsed = Config::parse_str(&serialized);
+        assert_eq!(parsed.font_family.as_deref(), Some("Weird\"Font\\Name"));
+    }
+
+    #[test]
+    fn config_cfg_usize_rejects_negative_and_non_integer() {
+        // cfg_usize underpins blur_iterations / images_memory_cap_mb. A
+        // negative or non-integer value must yield None so the slot keeps its
+        // default rather than panicking on the `try_from`.
+        assert_eq!(cfg_usize(&toml::Value::Integer(-1)), None);
+        assert_eq!(cfg_usize(&toml::Value::Float(1.0)), None);
+        assert_eq!(cfg_usize(&toml::Value::Integer(7)), Some(7));
+    }
+
+    #[test]
+    fn config_cfg_u64_rejects_negative() {
+        // cfg_u64 underpins images_max_pixels / images_decode_timeout_ms; a
+        // negative literal must be refused, not wrapped to a huge unsigned.
+        assert_eq!(cfg_u64(&toml::Value::Integer(-5)), None);
+        assert_eq!(cfg_u64(&toml::Value::Integer(5)), Some(5));
+    }
+
+    #[test]
+    fn config_images_memory_cap_accepts_integer() {
+        // images_memory_cap_mb is a plain usize slot; a bare integer must
+        // apply (no clamp), confirming the cfg_usize path is wired up.
+        let parsed = Config::parse_str("images_memory_cap_mb = 512\n");
+        assert_eq!(parsed.images_memory_cap_mb, 512);
     }
 
     /// Build a row of cells from a string for URL-detection tests. Each

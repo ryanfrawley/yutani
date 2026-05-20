@@ -193,7 +193,7 @@ fn ansi_color(n: u8, bright: bool) -> [f32; 4] {
 fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
     // SGR truecolor params are sRGB bytes (`\e[38;2;R;G;Bm` matches what web
     // hex codes mean). Linearize them so the GPU's sRGB-encoded write lands
-    // on the user's intended pixel value — same reason `palette::rgba_from`
+    // on the user's intended pixel value — same reason `palette::rgb_from_value`
     // does this for scheme files.
     use crate::palette::srgb_to_linear;
     [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]
