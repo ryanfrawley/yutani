@@ -8296,6 +8296,9 @@ mod tests {
     }
 
     #[test]
+    // T and U1 name the kitty action (a=T) and unicode-placement (U=1) the
+    // test exercises; keep them capitalized to match the protocol.
+    #[allow(non_snake_case)]
     fn kitty_image_cell_extent_recorded_on_a_T_U1_finalize() {
         let mut t = Terminal::new(80, 24, 100);
         t.set_cell_size_px(8, 16);

@@ -25,6 +25,10 @@ impl FaceVariant {
         }
     }
 
+    // Used by `find_face_index` (non-macOS face selection) and the tests;
+    // macOS builds reach faces through `get_strict` instead, so the method
+    // is dead there but must stay for other platforms.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn flags(self) -> (bool, bool) {
         match self {
             FaceVariant::Regular => (false, false),
@@ -62,6 +66,11 @@ impl FaceVariant {
 /// `data` is passed by reference; we open throwaway faces just to
 /// inspect metadata and never keep them — the real face is opened
 /// later by the caller using the index returned here.
+///
+/// Only the non-macOS `load_family_styled` path calls this; on macOS
+/// `get_strict` already returns the right face index, so the function is
+/// dead there but stays for the other platforms.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn find_face_index(data: &[u8], variant: FaceVariant) -> isize {
     let (want_bold, want_italic) = variant.flags();
     let Ok(library) = ft::Library::init() else {
