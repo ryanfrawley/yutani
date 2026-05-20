@@ -869,6 +869,10 @@ struct State {
     // detection there. Separate from `last_click` (which keys on a grid cell)
     // since toolbar clicks have no cell. A double-click toggles window zoom.
     last_toolbar_click: Option<std::time::Instant>,
+    // Whether the pointer is currently in the title-bar band. Tracked so we
+    // flip the cursor between the grid's I-beam and the arrow only on
+    // crossings, not on every motion event.
+    over_toolbar: bool,
     /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
     /// the pointer isn't over a URL. Drives the underline overlay and the
     /// Cmd-click open behavior.
@@ -1850,6 +1854,7 @@ impl State {
             last_click: None,
             click_count: 0,
             last_toolbar_click: None,
+            over_toolbar: false,
             hover_url: None,
             master,
             perf: PerfLog::new(),
@@ -4187,13 +4192,26 @@ impl State {
                 self.mouse_y = position.y;
                 // Pointer over the title bar / toolbar: swallow it so motion
                 // never becomes a mouse report or extends a selection into the
-                // chrome. Drop any hovered-URL highlight too, since nothing
-                // hoverable is visible up there.
+                // chrome. Show the arrow instead of the grid's I-beam, and drop
+                // any hovered-URL highlight since nothing hoverable is up there.
                 if self.in_top_toolbar(position.y) {
+                    if !self.over_toolbar {
+                        self.over_toolbar = true;
+                        self.window
+                            .set_cursor_icon(winit::window::CursorIcon::Default);
+                    }
                     if self.hover_url.take().is_some() {
                         self.invalidate();
                     }
                     return true;
+                }
+                if self.over_toolbar {
+                    // Crossed back into the grid: restore the I-beam.
+                    // update_hover_url below upgrades it to a pointer if the
+                    // cursor is over a Cmd-hovered URL.
+                    self.over_toolbar = false;
+                    self.window
+                        .set_cursor_icon(winit::window::CursorIcon::Text);
                 }
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.
