@@ -31,6 +31,7 @@ harfbuzz_rs = { version = "2", default-features = false, features = ["build-nati
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 base64 = "0.21"
 flate2 = "1"
+toml = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", default-features = false, features = ["winuser", "wingdi"] }

@@ -1,5 +1,5 @@
 //! 16-color ANSI palette + background/foreground/cursor/selection, loaded
-//! once at startup from a YAML scheme. `style.rs` and `main.rs` resolve all
+//! once at startup from a TOML scheme. `style.rs` and `main.rs` resolve all
 //! colors through `palette::get()`; if no scheme was loaded, the defaults
 //! match the previously-hardcoded values byte-for-byte.
 
@@ -245,24 +245,22 @@ pub fn get() -> Palette {
 #[cfg(test)]
 pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Parse a YAML-subset scheme file. Missing fields keep their defaults;
-/// malformed lines are logged via `eprintln!` and skipped so a typo in one
-/// color doesn't blank out the rest.
-pub fn parse_yaml(src: &str) -> Palette {
+/// Parse a TOML scheme file. Missing keys keep their defaults; a key whose
+/// value is the wrong type or out of range is logged via `eprintln!` and
+/// skipped so one bad color doesn't blank out the rest. A document that
+/// doesn't parse as TOML at all falls back wholesale to the defaults.
+pub fn parse_toml(src: &str) -> Palette {
     let mut p = Palette::defaults();
-    for (lineno, raw) in src.lines().enumerate() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
+    let table: toml::Table = match src.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("palette: invalid TOML: {}", e);
+            return p;
         }
-        let Some((key, value)) = line.split_once(':') else {
-            eprintln!("palette: line {}: missing ':'", lineno + 1);
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim();
+    };
+    for (key, value) in &table {
         if let Err(e) = apply(&mut p, key, value) {
-            eprintln!("palette: line {}: {}", lineno + 1, e);
+            eprintln!("palette: {}: {}", key, e);
         }
     }
     p
@@ -291,20 +289,13 @@ fn nearest(c: [f32; 4], candidates: &[[f32; 4]]) -> [f32; 4] {
     best
 }
 
-fn strip_comment(s: &str) -> &str {
-    match s.find('#') {
-        Some(i) => &s[..i],
-        None => s,
-    }
-}
-
-fn apply(p: &mut Palette, key: &str, value: &str) -> Result<(), String> {
+fn apply(p: &mut Palette, key: &str, value: &toml::Value) -> Result<(), String> {
     match key {
-        "background" => p.background = rgba_from(value)?,
-        "foreground" => p.foreground = rgba_from(value)?,
-        "cursor" => p.cursor = rgba_from(value)?,
-        "selection" => p.selection = rgba_from(value)?,
-        "selection_fg" | "selection_foreground" => p.selection_fg = Some(rgba_from(value)?),
+        "background" => p.background = rgb_from_value(value)?,
+        "foreground" => p.foreground = rgb_from_value(value)?,
+        "cursor" => p.cursor = rgb_from_value(value)?,
+        "selection" => p.selection = rgb_from_value(value)?,
+        "selection_fg" | "selection_foreground" => p.selection_fg = Some(rgb_from_value(value)?),
         "black" => set_pair(&mut p.ansi, 0, value)?,
         "red" => set_pair(&mut p.ansi, 1, value)?,
         "green" => set_pair(&mut p.ansi, 2, value)?,
@@ -314,43 +305,74 @@ fn apply(p: &mut Palette, key: &str, value: &str) -> Result<(), String> {
         "cyan" => set_pair(&mut p.ansi, 6, value)?,
         "white" => set_pair(&mut p.ansi, 7, value)?,
         "max_colors" => p.max_colors = parse_color_cap(value)?,
-        "glow_match_brightness" => p.glow.match_brightness = Some(parse_bool(value)?),
-        "glow_match_bright_ansi" => p.glow.match_bright_ansi = Some(parse_bool(value)?),
-        "glow_match_foreground" => p.glow.match_foreground = Some(parse_bool(value)?),
-        "glow_threshold" => p.glow.threshold = Some(parse_f32(value)?.clamp(0.0, 1.0)),
-        "glow_intensity" => p.glow.intensity = Some(parse_f32(value)?.max(0.0)),
-        "glow_softness" => p.glow.softness = Some(parse_f32(value)?.clamp(0.0, 1.0)),
-        "glow_hue_tolerance_deg" => p.glow.hue_tolerance_deg = Some(parse_f32(value)?.clamp(0.0, 180.0)),
-        "glow_fg_tolerance" => p.glow.fg_tolerance = Some(parse_f32(value)?.clamp(0.0, 3.0_f32.sqrt())),
-        "glow_iterations" => p.glow.iterations = Some(parse_usize(value)?),
-        "glow_scanlines" => p.glow.scanlines = Some(parse_bool(value)?),
-        "glow_scanline_strength" => p.glow.scanline_strength = Some(parse_f32(value)?.clamp(0.0, 1.0)),
-        "glow_scanline_period" => p.glow.scanline_period = Some(parse_f32(value)?.max(1.0)),
-        "glow_scanlines_content" => p.glow.scanlines_content = Some(parse_bool(value)?),
-        "glow_scanlines_content_strength" => p.glow.scanlines_content_strength = Some(parse_f32(value)?.clamp(0.0, 1.0)),
-        "glow_scanline_color_bright" => p.glow.scanline_color_bright = Some(rgba_from(value)?),
-        "glow_scanline_color_dark" => p.glow.scanline_color_dark = Some(rgba_from(value)?),
-        "glow_scanlines_skip_primary_bg" => p.glow.scanlines_skip_primary_bg = Some(parse_bool(value)?),
-        "glow_scanlines_content_attenuation" => p.glow.scanlines_content_attenuation = Some(parse_f32(value)?.clamp(0.0, 1.0)),
+        "glow_match_brightness" => p.glow.match_brightness = Some(want_bool(value)?),
+        "glow_match_bright_ansi" => p.glow.match_bright_ansi = Some(want_bool(value)?),
+        "glow_match_foreground" => p.glow.match_foreground = Some(want_bool(value)?),
+        "glow_threshold" => p.glow.threshold = Some(want_f32(value)?.clamp(0.0, 1.0)),
+        "glow_intensity" => p.glow.intensity = Some(want_f32(value)?.max(0.0)),
+        "glow_softness" => p.glow.softness = Some(want_f32(value)?.clamp(0.0, 1.0)),
+        "glow_hue_tolerance_deg" => p.glow.hue_tolerance_deg = Some(want_f32(value)?.clamp(0.0, 180.0)),
+        "glow_fg_tolerance" => p.glow.fg_tolerance = Some(want_f32(value)?.clamp(0.0, 3.0_f32.sqrt())),
+        "glow_iterations" => p.glow.iterations = Some(want_usize(value)?),
+        "glow_scanlines" => p.glow.scanlines = Some(want_bool(value)?),
+        "glow_scanline_strength" => p.glow.scanline_strength = Some(want_f32(value)?.clamp(0.0, 1.0)),
+        "glow_scanline_period" => p.glow.scanline_period = Some(want_f32(value)?.max(1.0)),
+        "glow_scanlines_content" => p.glow.scanlines_content = Some(want_bool(value)?),
+        "glow_scanlines_content_strength" => p.glow.scanlines_content_strength = Some(want_f32(value)?.clamp(0.0, 1.0)),
+        "glow_scanline_color_bright" => p.glow.scanline_color_bright = Some(rgb_from_value(value)?),
+        "glow_scanline_color_dark" => p.glow.scanline_color_dark = Some(rgb_from_value(value)?),
+        "glow_scanlines_skip_primary_bg" => p.glow.scanlines_skip_primary_bg = Some(want_bool(value)?),
+        "glow_scanlines_content_attenuation" => p.glow.scanlines_content_attenuation = Some(want_f32(value)?.clamp(0.0, 1.0)),
         _ => return Err(format!("unknown key '{}'", key)),
     }
     Ok(())
 }
 
-fn parse_bool(value: &str) -> Result<bool, String> {
-    value.parse::<bool>().map_err(|_| format!("expected true/false, got '{}'", value))
+fn want_bool(value: &toml::Value) -> Result<bool, String> {
+    value
+        .as_bool()
+        .ok_or_else(|| format!("expected true/false, got {}", value.type_str()))
 }
 
-fn parse_f32(value: &str) -> Result<f32, String> {
-    value.parse::<f32>().map_err(|_| format!("expected number, got '{}'", value))
+/// Accept either a TOML float or integer for a numeric slot — TOML reads a
+/// bare `0` as an integer and `0.6` as a float, and we don't want users to
+/// have to remember which keys demand a decimal point.
+fn want_f32(value: &toml::Value) -> Result<f32, String> {
+    if let Some(f) = value.as_float() {
+        Ok(f as f32)
+    } else if let Some(i) = value.as_integer() {
+        Ok(i as f32)
+    } else {
+        Err(format!("expected number, got {}", value.type_str()))
+    }
 }
 
-fn parse_usize(value: &str) -> Result<usize, String> {
-    value.parse::<usize>().map_err(|_| format!("expected non-negative integer, got '{}'", value))
+fn want_usize(value: &toml::Value) -> Result<usize, String> {
+    let i = value
+        .as_integer()
+        .ok_or_else(|| format!("expected non-negative integer, got {}", value.type_str()))?;
+    usize::try_from(i).map_err(|_| format!("expected non-negative integer, got {}", i))
 }
 
-fn parse_color_cap(value: &str) -> Result<ColorCap, String> {
-    match value {
+fn parse_color_cap(value: &toml::Value) -> Result<ColorCap, String> {
+    // Accept the canonical string spellings, plus bare integers (`max_colors
+    // = 16`) since the depth names are mostly numbers anyway.
+    if let Some(n) = value.as_integer() {
+        return match n {
+            8 => Ok(ColorCap::Ansi8),
+            16 => Ok(ColorCap::Ansi16),
+            256 => Ok(ColorCap::Xterm256),
+            16_777_216 => Ok(ColorCap::Truecolor),
+            _ => Err(format!(
+                "max_colors: expected one of mono | 8 | 16 | 256 | truecolor, got {}",
+                n
+            )),
+        };
+    }
+    let s = value
+        .as_str()
+        .ok_or_else(|| format!("max_colors: expected a string or integer, got {}", value.type_str()))?;
+    match s {
         "mono" | "monochrome" => Ok(ColorCap::Mono),
         "8" => Ok(ColorCap::Ansi8),
         "16" => Ok(ColorCap::Ansi16),
@@ -358,27 +380,35 @@ fn parse_color_cap(value: &str) -> Result<ColorCap, String> {
         "truecolor" | "16m" | "16777216" => Ok(ColorCap::Truecolor),
         _ => Err(format!(
             "max_colors: expected one of mono | 8 | 16 | 256 | truecolor, got '{}'",
-            value
+            s
         )),
     }
 }
 
-fn set_pair(ansi: &mut [[f32; 4]; 16], hue: usize, value: &str) -> Result<(), String> {
-    let v = value
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| format!("expected [normal, bright] array, got '{}'", value))?;
-    let parts: Vec<&str> = v.split(',').map(str::trim).collect();
-    if parts.len() != 2 {
-        return Err(format!("expected exactly 2 values, got {}", parts.len()));
+fn set_pair(ansi: &mut [[f32; 4]; 16], hue: usize, value: &toml::Value) -> Result<(), String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("expected [normal, bright] array, got {}", value.type_str()))?;
+    if arr.len() != 2 {
+        return Err(format!("expected exactly 2 values, got {}", arr.len()));
     }
-    ansi[hue] = rgba_from(parts[0])?;
-    ansi[hue + 8] = rgba_from(parts[1])?;
+    ansi[hue] = rgb_from_value(&arr[0])?;
+    ansi[hue + 8] = rgb_from_value(&arr[1])?;
     Ok(())
 }
 
-pub fn rgba_from(s: &str) -> Result<[f32; 4], String> {
-    let rgb = parse_hex(s)?;
+/// Resolve a TOML value to a linear-space RGBA. Colors are written as bare
+/// `0xRRGGBB` hex integers (TOML's native hex literal), so the value must be
+/// an integer in `0..=0xFFFFFF`. Alpha is always 1.0; the renderer applies
+/// its own alpha where it needs translucency.
+pub fn rgb_from_value(value: &toml::Value) -> Result<[f32; 4], String> {
+    let n = value
+        .as_integer()
+        .ok_or_else(|| format!("expected hex color like 0xRRGGBB, got {}", value.type_str()))?;
+    if !(0..=0xFF_FFFF).contains(&n) {
+        return Err(format!("color out of range 0x000000..0xFFFFFF, got {:#x}", n));
+    }
+    let rgb = n as u32;
     let r = srgb_to_linear(((rgb >> 16) & 0xff) as u8);
     let g = srgb_to_linear(((rgb >> 8) & 0xff) as u8);
     let b = srgb_to_linear((rgb & 0xff) as u8);
@@ -410,29 +440,6 @@ pub fn linear_to_srgb_u8(c: f32) -> u8 {
     (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-/// Accepts `0xRRGGBB` (6 hex digits) or `0xRGB` (3 hex digits expanded
-/// CSS-style: each nibble duplicated, so `0xfff` → `0xffffff` not `0x000fff`).
-/// Other lengths are ambiguous (is `0xff` `0x0000ff` blue or `0xffffff` white?)
-/// so they're rejected outright.
-fn parse_hex(s: &str) -> Result<u32, String> {
-    let body = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .ok_or_else(|| format!("expected 0x-prefixed hex literal, got '{}'", s))?;
-    match body.len() {
-        6 => u32::from_str_radix(body, 16).map_err(|e| format!("invalid hex '{}': {}", s, e)),
-        3 => {
-            let v = u32::from_str_radix(body, 16)
-                .map_err(|e| format!("invalid hex '{}': {}", s, e))?;
-            let r = (v >> 8) & 0xf;
-            let g = (v >> 4) & 0xf;
-            let b = v & 0xf;
-            Ok((r * 0x11) << 16 | (g * 0x11) << 8 | (b * 0x11))
-        }
-        _ => Err(format!("hex literal must be 3 or 6 digits, got '{}'", s)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,19 +454,19 @@ mod tests {
 
     #[test]
     fn empty_input_equals_defaults() {
-        assert_eq!(parse_yaml(""), Palette::defaults());
+        assert_eq!(parse_toml(""), Palette::defaults());
     }
 
     #[test]
     fn comments_and_blank_lines_skipped() {
-        let p = parse_yaml("# comment\n\n   \n# another\n");
+        let p = parse_toml("# comment\n\n   \n# another\n");
         assert_eq!(p, Palette::defaults());
     }
 
     #[test]
     fn parses_singletons() {
-        let src = "background: 0xfbfaf7\nforeground: 0x2d2519\ncursor: 0x1a00cc\nselection: 0x3366d9\n";
-        let p = parse_yaml(src);
+        let src = "background = 0xfbfaf7\nforeground = 0x2d2519\ncursor = 0x1a00cc\nselection = 0x3366d9\n";
+        let p = parse_toml(src);
         assert_eq!(to_bytes(p.background), [0xfb, 0xfa, 0xf7]);
         assert_eq!(to_bytes(p.foreground), [0x2d, 0x25, 0x19]);
         assert_eq!(to_bytes(p.cursor), [0x1a, 0x00, 0xcc]);
@@ -468,7 +475,7 @@ mod tests {
 
     #[test]
     fn parses_ansi_pair() {
-        let p = parse_yaml("red: [0xab0000, 0xff5555]\n");
+        let p = parse_toml("red = [0xab0000, 0xff5555]\n");
         assert_eq!(to_bytes(p.ansi[1]), [0xab, 0x00, 0x00]);
         assert_eq!(to_bytes(p.ansi[9]), [0xff, 0x55, 0x55]);
         // Unaffected hue stays default.
@@ -476,44 +483,65 @@ mod tests {
     }
 
     #[test]
-    fn three_digit_hex_is_css_shorthand() {
-        let p = parse_yaml("black: [0x000, 0xfff]\nred: [0xf00, 0x0f0]\n");
-        assert_eq!(to_bytes(p.ansi[0]), [0x00, 0x00, 0x00]);
-        assert_eq!(to_bytes(p.ansi[8]), [0xff, 0xff, 0xff]);
-        // 0xf00 expands to 0xff0000, not 0x000f00.
-        assert_eq!(to_bytes(p.ansi[1]), [0xff, 0x00, 0x00]);
-        assert_eq!(to_bytes(p.ansi[9]), [0x00, 0xff, 0x00]);
+    fn short_hex_is_high_bytes_not_css_shorthand() {
+        // Colors are plain TOML integers now, so `0xff` means 0x0000ff
+        // (blue), NOT the CSS shorthand `0xffffff`. Leading zeroes are
+        // implied by the integer's magnitude.
+        let p = parse_toml("background = 0xff\nforeground = 0xf00\n");
+        assert_eq!(to_bytes(p.background), [0x00, 0x00, 0xff]);
+        assert_eq!(to_bytes(p.foreground), [0x00, 0x0f, 0x00]);
     }
 
     #[test]
-    fn ambiguous_hex_lengths_rejected() {
-        // 4-digit and 5-digit forms have no obvious meaning.
-        let p = parse_yaml("background: 0xabcd\n");
+    fn out_of_range_color_rejected() {
+        // A value past 0xFFFFFF can't be a 24-bit color; the slot keeps
+        // its default rather than wrapping or truncating silently.
+        let p = parse_toml("background = 0x1000000\n");
         assert_eq!(p.background, Palette::defaults().background);
-        let p = parse_yaml("background: 0xabcde\n");
+        // Negative integers are likewise refused.
+        let p = parse_toml("background = -1\n");
         assert_eq!(p.background, Palette::defaults().background);
     }
 
     #[test]
-    fn bad_lines_dont_poison_good_ones() {
-        let src = "background: 0xfbfaf7\nbogus_key: 0x000000\nforeground: nothex\ncursor: 0x1a00cc\n";
-        let p = parse_yaml(src);
+    fn decimal_integer_color_accepted() {
+        // Hex is the convention, but any integer in range is a valid color
+        // — 16777215 == 0xFFFFFF == white.
+        let p = parse_toml("background = 16777215\n");
+        assert_eq!(to_bytes(p.background), [0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn bad_values_dont_poison_good_ones() {
+        // Wrong-typed values (a string where a color integer is expected,
+        // an unknown key) are skipped per-key; sibling keys still apply.
+        let src = "background = 0xfbfaf7\nbogus_key = 0x000000\nforeground = \"nothex\"\ncursor = 0x1a00cc\n";
+        let p = parse_toml(src);
         assert_eq!(to_bytes(p.background), [0xfb, 0xfa, 0xf7]);
         assert_eq!(to_bytes(p.cursor), [0x1a, 0x00, 0xcc]);
-        // Foreground unchanged because the value was invalid.
+        // Foreground unchanged because the value was the wrong type.
         assert_eq!(p.foreground, Palette::defaults().foreground);
     }
 
     #[test]
+    fn invalid_toml_falls_back_to_defaults() {
+        // A document that isn't valid TOML at all (here, a bareword value)
+        // can't be parsed key-by-key, so the whole scheme reverts to
+        // defaults rather than guessing.
+        let p = parse_toml("background = 0x111111\nnonsense\n");
+        assert_eq!(p, Palette::defaults());
+    }
+
+    #[test]
     fn pair_wrong_arity_rejected() {
-        let p = parse_yaml("red: [0xab0000]\n");
+        let p = parse_toml("red = [0xab0000]\n");
         assert_eq!(p.ansi[1], Palette::defaults().ansi[1]);
         assert_eq!(p.ansi[9], Palette::defaults().ansi[9]);
     }
 
     #[test]
     fn trailing_comment_after_value() {
-        let p = parse_yaml("background: 0x123456 # nice color\n");
+        let p = parse_toml("background = 0x123456 # nice color\n");
         assert_eq!(to_bytes(p.background), [0x12, 0x34, 0x56]);
     }
 
@@ -550,32 +578,16 @@ mod tests {
 
     #[test]
     fn uppercase_hex_digits_accepted() {
-        let p = parse_yaml("background: 0xABCDEF\n");
+        let p = parse_toml("background = 0xABCDEF\n");
         assert_eq!(to_bytes(p.background), [0xab, 0xcd, 0xef]);
     }
 
     #[test]
-    fn capital_x_prefix_accepted() {
-        let p = parse_yaml("background: 0X123456\n");
-        assert_eq!(to_bytes(p.background), [0x12, 0x34, 0x56]);
-    }
-
-    #[test]
-    fn missing_prefix_rejected() {
-        // Bare hex (no 0x) is not a valid literal — the line must be skipped
-        // and the default preserved.
-        let p = parse_yaml("background: abcdef\n");
-        assert_eq!(p.background, Palette::defaults().background);
-    }
-
-    #[test]
-    fn line_without_colon_skipped() {
-        // A line missing the ':' separator should be reported and skipped
-        // without affecting sibling lines.
-        let src = "background: 0x111111\nnocolonhere\nforeground: 0x222222\n";
-        let p = parse_yaml(src);
-        assert_eq!(to_bytes(p.background), [0x11, 0x11, 0x11]);
-        assert_eq!(to_bytes(p.foreground), [0x22, 0x22, 0x22]);
+    fn underscore_separated_hex_accepted() {
+        // TOML permits digit-group underscores in integer literals; they
+        // shouldn't change the parsed color.
+        let p = parse_toml("background = 0xab_cd_ef\n");
+        assert_eq!(to_bytes(p.background), [0xab, 0xcd, 0xef]);
     }
 
     #[test]
@@ -583,16 +595,16 @@ mod tests {
         // All hues in a single document should be applied independently and
         // simultaneously — none of them should clobber the others.
         let src = "\
-black:   [0x000000, 0x808080]
-red:     [0xaa0000, 0xff5555]
-green:   [0x00aa00, 0x55ff55]
-yellow:  [0xaa5500, 0xffff55]
-blue:    [0x0000aa, 0x5555ff]
-magenta: [0xaa00aa, 0xff55ff]
-cyan:    [0x00aaaa, 0x55ffff]
-white:   [0xaaaaaa, 0xffffff]
+black   = [0x000000, 0x808080]
+red     = [0xaa0000, 0xff5555]
+green   = [0x00aa00, 0x55ff55]
+yellow  = [0xaa5500, 0xffff55]
+blue    = [0x0000aa, 0x5555ff]
+magenta = [0xaa00aa, 0xff55ff]
+cyan    = [0x00aaaa, 0x55ffff]
+white   = [0xaaaaaa, 0xffffff]
 ";
-        let p = parse_yaml(src);
+        let p = parse_toml(src);
         assert_eq!(to_bytes(p.ansi[0]), [0x00, 0x00, 0x00]);
         assert_eq!(to_bytes(p.ansi[7]), [0xaa, 0xaa, 0xaa]);
         assert_eq!(to_bytes(p.ansi[8]), [0x80, 0x80, 0x80]);
@@ -604,10 +616,10 @@ white:   [0xaaaaaa, 0xffffff]
 
     #[test]
     fn whitespace_tolerance() {
-        // Tabs and extra spaces around the separator, inside the array
-        // brackets, and around the comma should all be tolerated.
-        let src = "background:\t  0x111111\nred:  [  0xaa0000 ,\t0xff5555  ]\n";
-        let p = parse_yaml(src);
+        // Extra spaces around the separator and inside the array brackets
+        // are all tolerated by the TOML grammar.
+        let src = "background   =  0x111111\nred =  [ 0xaa0000 , 0xff5555 ]\n";
+        let p = parse_toml(src);
         assert_eq!(to_bytes(p.background), [0x11, 0x11, 0x11]);
         assert_eq!(to_bytes(p.ansi[1]), [0xaa, 0x00, 0x00]);
         assert_eq!(to_bytes(p.ansi[9]), [0xff, 0x55, 0x55]);
@@ -618,12 +630,12 @@ white:   [0xaaaaaa, 0xffffff]
         // Parsing the same source twice must yield equal Palettes — the parser
         // has no hidden state and starts from defaults each call.
         let src = "\
-background: 0xfbfaf7
-foreground: 0x2d2519
-red: [0xab0000, 0xff5555]
-blue: [0x0000ab, 0x5555ff]
+background = 0xfbfaf7
+foreground = 0x2d2519
+red = [0xab0000, 0xff5555]
+blue = [0x0000ab, 0x5555ff]
 ";
-        assert_eq!(parse_yaml(src), parse_yaml(src));
+        assert_eq!(parse_toml(src), parse_toml(src));
     }
 
     #[test]
@@ -631,16 +643,16 @@ blue: [0x0000ab, 0x5555ff]
         // Omitting the key keeps the legacy behavior — selected text retains
         // its underlying fg and only the translucent overlay tints it.
         assert_eq!(Palette::defaults().selection_fg, None);
-        assert_eq!(parse_yaml("background: 0x111111\n").selection_fg, None);
+        assert_eq!(parse_toml("background = 0x111111\n").selection_fg, None);
     }
 
     #[test]
     fn parses_selection_fg() {
-        let p = parse_yaml("selection_fg: 0xffeeaa\n");
+        let p = parse_toml("selection_fg = 0xffeeaa\n");
         let c = p.selection_fg.expect("selection_fg should be set");
         assert_eq!(to_bytes(c), [0xff, 0xee, 0xaa]);
         // Alias spelling — kitty-style — must reach the same field.
-        let p = parse_yaml("selection_foreground: 0x010203\n");
+        let p = parse_toml("selection_foreground = 0x010203\n");
         let c = p.selection_fg.expect("alias should populate selection_fg");
         assert_eq!(to_bytes(c), [0x01, 0x02, 0x03]);
     }
@@ -650,10 +662,10 @@ blue: [0x0000ab, 0x5555ff]
         // The renderer applies its own theme-dependent alpha at draw time,
         // so the parsed selection color must be stored un-premultiplied with
         // alpha == 1.0 regardless of the RGB value supplied.
-        let p = parse_yaml("selection: 0x000000\n");
+        let p = parse_toml("selection = 0x000000\n");
         assert_eq!(p.selection[3], 1.0);
         assert_eq!(p.selection, [0.0, 0.0, 0.0, 1.0]);
-        let p = parse_yaml("selection: 0x3366d9\n");
+        let p = parse_toml("selection = 0x3366d9\n");
         assert_eq!(p.selection[3], 1.0);
     }
 
@@ -675,7 +687,7 @@ blue: [0x0000ab, 0x5555ff]
     }
 
     #[test]
-    fn parse_max_colors_values() {
+    fn parse_max_colors_string_values() {
         let cases = [
             ("mono", ColorCap::Mono),
             ("monochrome", ColorCap::Mono),
@@ -686,8 +698,24 @@ blue: [0x0000ab, 0x5555ff]
             ("16m", ColorCap::Truecolor),
         ];
         for (literal, want) in cases {
-            let p = parse_yaml(&format!("max_colors: {}\n", literal));
+            let p = parse_toml(&format!("max_colors = \"{}\"\n", literal));
             assert_eq!(p.max_colors, want, "literal '{}'", literal);
+        }
+    }
+
+    #[test]
+    fn parse_max_colors_integer_values() {
+        // Bare integers are accepted too, since the depth names are mostly
+        // numbers: `max_colors = 16`.
+        let cases = [
+            (8, ColorCap::Ansi8),
+            (16, ColorCap::Ansi16),
+            (256, ColorCap::Xterm256),
+            (16_777_216, ColorCap::Truecolor),
+        ];
+        for (literal, want) in cases {
+            let p = parse_toml(&format!("max_colors = {}\n", literal));
+            assert_eq!(p.max_colors, want, "literal {}", literal);
         }
     }
 
@@ -695,7 +723,9 @@ blue: [0x0000ab, 0x5555ff]
     fn parse_max_colors_unknown_keeps_default() {
         // Typos shouldn't escalate into a full reset — same contract as
         // other invalid palette values.
-        let p = parse_yaml("max_colors: 42\n");
+        let p = parse_toml("max_colors = 42\n");
+        assert_eq!(p.max_colors, ColorCap::Truecolor);
+        let p = parse_toml("max_colors = \"lots\"\n");
         assert_eq!(p.max_colors, ColorCap::Truecolor);
     }
 
@@ -840,25 +870,25 @@ blue: [0x0000ab, 0x5555ff]
     }
 
     #[test]
-    fn empty_yaml_leaves_glow_overrides_none() {
+    fn empty_toml_leaves_glow_overrides_none() {
         // Sanity: the parser doesn't synthesise glow overrides out of
         // thin air. Schemes without any glow_ keys must round-trip to
         // `NONE`.
-        let p = parse_yaml("# only comments\nbackground: 0x000000\n");
+        let p = parse_toml("# only comments\nbackground = 0x000000\n");
         assert_eq!(p.glow, GlowOverrides::NONE);
     }
 
     #[test]
     fn parses_glow_bool_overrides() {
         let src = "\
-glow_match_brightness: true
-glow_match_bright_ansi: false
-glow_match_foreground: true
-glow_scanlines: true
-glow_scanlines_content: false
-glow_scanlines_skip_primary_bg: true
+glow_match_brightness = true
+glow_match_bright_ansi = false
+glow_match_foreground = true
+glow_scanlines = true
+glow_scanlines_content = false
+glow_scanlines_skip_primary_bg = true
 ";
-        let p = parse_yaml(src);
+        let p = parse_toml(src);
         assert_eq!(p.glow.match_brightness, Some(true));
         assert_eq!(p.glow.match_bright_ansi, Some(false));
         assert_eq!(p.glow.match_foreground, Some(true));
@@ -871,20 +901,22 @@ glow_scanlines_skip_primary_bg: true
     fn parses_glow_numeric_overrides_in_range() {
         // Each numeric override key writes its value verbatim when it
         // sits inside the slot's permitted range — no clamping should
-        // alter the result here.
+        // alter the result here. Note `glow_hue_tolerance_deg` and
+        // `glow_scanline_period` are written as bare integers to confirm
+        // the parser accepts integers where a float is expected.
         let src = "\
-glow_threshold: 0.7
-glow_intensity: 1.5
-glow_softness: 0.4
-glow_hue_tolerance_deg: 30
-glow_fg_tolerance: 0.5
-glow_iterations: 4
-glow_scanline_strength: 0.6
-glow_scanline_period: 5
-glow_scanlines_content_strength: 0.3
-glow_scanlines_content_attenuation: 0.8
+glow_threshold = 0.7
+glow_intensity = 1.5
+glow_softness = 0.4
+glow_hue_tolerance_deg = 30
+glow_fg_tolerance = 0.5
+glow_iterations = 4
+glow_scanline_strength = 0.6
+glow_scanline_period = 5
+glow_scanlines_content_strength = 0.3
+glow_scanlines_content_attenuation = 0.8
 ";
-        let p = parse_yaml(src);
+        let p = parse_toml(src);
         assert_eq!(p.glow.threshold, Some(0.7));
         assert_eq!(p.glow.intensity, Some(1.5));
         assert_eq!(p.glow.softness, Some(0.4));
@@ -899,10 +931,10 @@ glow_scanlines_content_attenuation: 0.8
 
     #[test]
     fn parses_glow_scanline_color_overrides() {
-        // Color overrides go through the same `rgba_from` path as
+        // Color overrides go through the same `rgb_from_value` path as
         // foreground/background, so the linear-space round-trip and
         // alpha == 1.0 contract apply.
-        let p = parse_yaml("glow_scanline_color_bright: 0xff00ff\nglow_scanline_color_dark: 0x112233\n");
+        let p = parse_toml("glow_scanline_color_bright = 0xff00ff\nglow_scanline_color_dark = 0x112233\n");
         let bright = p.glow.scanline_color_bright.expect("bright override");
         let dark = p.glow.scanline_color_dark.expect("dark override");
         assert_eq!(to_bytes(bright), [0xff, 0x00, 0xff]);
@@ -916,14 +948,14 @@ glow_scanlines_content_attenuation: 0.8
         // Threshold lives on [0, 1]; an out-of-range scheme value must
         // be clamped on parse so downstream consumers don't need to
         // sanitise the override themselves.
-        let p = parse_yaml("glow_threshold: 2.0\n");
+        let p = parse_toml("glow_threshold = 2.0\n");
         assert_eq!(p.glow.threshold, Some(1.0));
     }
 
     #[test]
     fn glow_softness_clamps_low() {
         // Softness lives on [0, 1]; negative values clamp up to 0.
-        let p = parse_yaml("glow_softness: -0.2\n");
+        let p = parse_toml("glow_softness = -0.2\n");
         assert_eq!(p.glow.softness, Some(0.0));
     }
 
@@ -931,7 +963,7 @@ glow_scanlines_content_attenuation: 0.8
     fn glow_scanline_period_clamps_to_one() {
         // Period < 1 would produce a sub-pixel scanline ridge that
         // aliases badly; the parser floors it at 1.0.
-        let p = parse_yaml("glow_scanline_period: 0.5\n");
+        let p = parse_toml("glow_scanline_period = 0.5\n");
         assert_eq!(p.glow.scanline_period, Some(1.0));
     }
 
@@ -940,7 +972,7 @@ glow_scanlines_content_attenuation: 0.8
         // Intensity is unbounded above but pinned at 0 below — a
         // negative scheme value would subtract light, which the
         // pipeline can't represent.
-        let p = parse_yaml("glow_intensity: -1.0\n");
+        let p = parse_toml("glow_intensity = -1.0\n");
         assert_eq!(p.glow.intensity, Some(0.0));
     }
 
@@ -948,7 +980,7 @@ glow_scanlines_content_attenuation: 0.8
     fn glow_hue_tolerance_clamps_high() {
         // Hue tolerance lives on [0, 180] degrees; values beyond 180
         // would match the entire colour wheel twice.
-        let p = parse_yaml("glow_hue_tolerance_deg: 500\n");
+        let p = parse_toml("glow_hue_tolerance_deg = 500\n");
         assert_eq!(p.glow.hue_tolerance_deg, Some(180.0));
     }
 
@@ -956,25 +988,78 @@ glow_scanlines_content_attenuation: 0.8
     fn glow_fg_tolerance_clamps_to_sqrt3() {
         // The fg-tolerance ceiling is sqrt(3), the max linear-RGB
         // Euclidean distance between black and white.
-        let p = parse_yaml("glow_fg_tolerance: 5.0\n");
+        let p = parse_toml("glow_fg_tolerance = 5.0\n");
         let got = p.glow.fg_tolerance.expect("fg_tolerance override");
         assert!((got - 3.0_f32.sqrt()).abs() < 1e-6, "got {}", got);
     }
 
     #[test]
-    fn invalid_glow_lines_dont_poison_good_ones() {
-        // Same forgiving contract as `bad_lines_dont_poison_good_ones`:
-        // a malformed glow value leaves its slot at `None` but sibling
-        // glow keys still parse.
+    fn rgb_from_value_accepts_black_and_white_boundaries() {
+        // The two ends of the legal 24-bit range must both decode: 0x000000
+        // is pure black and 0xFFFFFF is pure white. These are the boundary
+        // values the range check `0..=0xFFFFFF` admits, so a fencepost slip
+        // in that comparison would surface here.
+        let black = rgb_from_value(&toml::Value::Integer(0x000000)).expect("0x000000 in range");
+        assert_eq!(to_bytes(black), [0x00, 0x00, 0x00]);
+        assert_eq!(black[3], 1.0);
+        let white = rgb_from_value(&toml::Value::Integer(0xFF_FFFF)).expect("0xFFFFFF in range");
+        assert_eq!(to_bytes(white), [0xff, 0xff, 0xff]);
+        assert_eq!(white[3], 1.0);
+    }
+
+    #[test]
+    fn rgb_from_value_rejects_just_past_white() {
+        // 0x1000000 is one past the 24-bit ceiling — accepting it would
+        // wrap into the green/blue bytes and silently mis-colour the slot,
+        // so it must be an Err rather than a truncated success.
+        let r = rgb_from_value(&toml::Value::Integer(0x1_000000));
+        assert!(r.is_err(), "0x1000000 should be rejected, got {:?}", r);
+    }
+
+    #[test]
+    fn rgb_from_value_rejects_negative() {
+        // TOML integers are signed; a negative literal can't be a colour and
+        // must not be reinterpreted as a large unsigned value.
+        let r = rgb_from_value(&toml::Value::Integer(-1));
+        assert!(r.is_err(), "-1 should be rejected, got {:?}", r);
+    }
+
+    #[test]
+    fn rgb_from_value_rejects_non_integer_types() {
+        // Anything that isn't a bare integer (string, float, bool) can't be a
+        // 0xRRGGBB literal and must be refused so the per-key skip kicks in.
+        assert!(rgb_from_value(&toml::Value::String("0xffffff".into())).is_err());
+        assert!(rgb_from_value(&toml::Value::Float(1.0)).is_err());
+        assert!(rgb_from_value(&toml::Value::Boolean(true)).is_err());
+    }
+
+    #[test]
+    fn glow_numeric_overrides_accept_float_and_integer_alike() {
+        // `want_f32` must take both a TOML float and a bare integer for the
+        // same slot, so users needn't remember which keys demand a decimal
+        // point. Here `glow_threshold` is given as a float and again as an
+        // integer (0 and 1, the range endpoints) and both must land.
+        let pf = parse_toml("glow_threshold = 0.0\n");
+        assert_eq!(pf.glow.threshold, Some(0.0));
+        let pi = parse_toml("glow_threshold = 1\n");
+        assert_eq!(pi.glow.threshold, Some(1.0));
+    }
+
+    #[test]
+    fn invalid_glow_values_dont_poison_good_ones() {
+        // Same forgiving contract as `bad_values_dont_poison_good_ones`:
+        // a wrong-typed glow value leaves its slot at `None` but sibling
+        // glow keys still parse. Values must stay valid TOML (strings here)
+        // so the document parses at all.
         let src = "\
-glow_threshold: notanumber
-glow_intensity: 1.25
-glow_match_brightness: maybe
-glow_match_foreground: true
-glow_scanline_color_bright: nothex
-glow_scanline_period: 4
+glow_threshold = \"notanumber\"
+glow_intensity = 1.25
+glow_match_brightness = \"maybe\"
+glow_match_foreground = true
+glow_scanline_color_bright = \"nothex\"
+glow_scanline_period = 4
 ";
-        let p = parse_yaml(src);
+        let p = parse_toml(src);
         assert_eq!(p.glow.threshold, None);
         assert_eq!(p.glow.intensity, Some(1.25));
         assert_eq!(p.glow.match_brightness, None);
