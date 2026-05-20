@@ -85,9 +85,11 @@ pub fn fork_pty(fdm: i32) -> Result<Pty, String> {
 
 impl Pty {
     /// Blocks the calling thread reading from the PTY master, forwarding each
-    /// UTF-8 chunk to `on_output`. Returns when the child exits (EOF or EIO),
-    /// after reaping it with `waitpid`.
-    pub fn run<F: Fn(&str)>(&self, on_output: F) {
+    /// UTF-8 chunk to `on_output`. Returns the child's exit code when it
+    /// exits (EOF or EIO), after reaping it with `waitpid`. A normal exit
+    /// yields its status; a fatal signal yields `128 + signal` (shell
+    /// convention); an indeterminate state yields `-1`.
+    pub fn run<F: Fn(&str)>(&self, on_output: F) -> i32 {
         let mut input: [u8; 1500] = [0; 1500];
         let mut pending: Vec<u8> = Vec::with_capacity(4);
 
@@ -118,7 +120,21 @@ impl Pty {
 
             let mut status: c_int = 0;
             libc::waitpid(self.child, &mut status, 0);
+            exit_code(status)
         }
+    }
+}
+
+/// Translate a `waitpid` status word into a single exit code. Normal exit
+/// uses the status; a fatal signal maps to `128 + signal` as shells do;
+/// anything else (shouldn't happen for a reaped child) is `-1`.
+fn exit_code(status: c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
     }
 }
 
@@ -159,6 +175,7 @@ fn emit_utf8<F: Fn(&str)>(pending: &mut Vec<u8>, on_output: &F) {
 #[cfg(test)]
 mod tests {
     use super::emit_utf8;
+    use super::exit_code;
     use std::cell::RefCell;
 
     fn collector() -> (impl Fn(&str), std::rc::Rc<RefCell<String>>) {
@@ -210,5 +227,26 @@ mod tests {
         emit_utf8(&mut pending, &cb);
         assert_eq!(*out.borrow(), "ab");
         assert!(pending.is_empty());
+    }
+
+    // `waitpid` status words: a normal exit with code N has the code in the
+    // high byte (N << 8); a fatal signal S sets the low 7 bits to S.
+    #[test]
+    fn exit_code_normal_zero() {
+        assert_eq!(exit_code(0), 0);
+    }
+
+    #[test]
+    fn exit_code_normal_nonzero() {
+        // exit 1 → status word 0x100, exit 42 → 42 << 8.
+        assert_eq!(exit_code(1 << 8), 1);
+        assert_eq!(exit_code(42 << 8), 42);
+    }
+
+    #[test]
+    fn exit_code_signal_maps_to_128_plus_signal() {
+        // Killed by signal 9 (SIGKILL) → 137; signal 15 (SIGTERM) → 143.
+        assert_eq!(exit_code(9), 137);
+        assert_eq!(exit_code(15), 143);
     }
 }
