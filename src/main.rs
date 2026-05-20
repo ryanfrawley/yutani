@@ -4214,6 +4214,18 @@ impl State {
                 // selection or motion report once the pointer moves down.
                 if self.in_top_toolbar(self.mouse_y) {
                     self.held_button = None;
+                    // Kick off a native window drag immediately on left-press.
+                    // Our content view spans the title bar (fullsize_content_view)
+                    // and consumes this mouseDown, so without this AppKit falls
+                    // back to its slow drag path — the window only starts
+                    // following the cursor after a ~1s hesitation. Routing the
+                    // live mouseDown into performWindowDragWithEvent: makes the
+                    // drag begin on the first movement. Clicks on the traffic
+                    // lights don't reach us (they're system subviews on top), so
+                    // this only fires on the empty draggable strip.
+                    if *button == MouseButton::Left && *state == ElementState::Pressed {
+                        let _ = self.window.drag_window();
+                    }
                     return true;
                 }
                 let code = match button {
