@@ -1348,7 +1348,37 @@ impl Terminal {
         let (spill, refill) = if self.use_alternate {
             (0, 0)
         } else if rows < old_rows {
-            (old_rows - rows, 0)
+            // Spill only as many top rows as it takes to keep the live
+            // content on screen. "Content" is the bottom-most of: the cursor
+            // (the prompt's input row in a shell), the last non-blank cell
+            // row, and the lowest row any image placement covers. When there
+            // is blank space below that — a prompt sitting near the top of an
+            // otherwise empty grid — trim the blank rows instead of pushing
+            // real content into scrollback. Otherwise the prompt churns into
+            // scrollback on every shrink and, because the shell repaints on
+            // WINCH, reappears as stacked copies when the window grows back.
+            // A grid whose content reaches the bottom still spills the whole
+            // height delta, the previous behavior.
+            let mut content_bottom = self.cursor.row;
+            for r in (0..old_rows).rev() {
+                if self
+                    .primary
+                    .row(r)
+                    .iter()
+                    .any(|c| c.ch != ' ' || c.placeholder_image_id.is_some())
+                {
+                    content_bottom = content_bottom.max(r);
+                    break;
+                }
+            }
+            for p in &self.primary.placements {
+                if p.top_row >= 0 {
+                    let b = (p.bottom_row() - 1).clamp(0, old_rows as isize - 1) as usize;
+                    content_bottom = content_bottom.max(b);
+                }
+            }
+            let spill = (content_bottom + 1).saturating_sub(rows);
+            (spill, 0)
         } else if rows > old_rows {
             let extra = rows - old_rows;
             (0, extra.min(self.scrollback.len()))
@@ -5681,6 +5711,39 @@ mod tests {
     }
 
     #[test]
+    fn resize_shrink_keeps_top_content_when_grid_has_blank_rows_below() {
+        // Regression for the stacked-prompt bug: a prompt sitting at the top
+        // of an otherwise-empty grid must not churn into scrollback on
+        // shrink. The old reflow spilled `old_rows - rows` top rows
+        // unconditionally, so shrinking pushed the prompt into scrollback;
+        // the shell then repainted a fresh prompt, and growing back pulled
+        // the old copies in as stacked duplicates. With content-aware spill,
+        // the blank rows below the content are trimmed instead.
+        let mut t = Terminal::new(10, 10, 100);
+        t.feed("BAR\r\nPROMPT"); // rows 0..1 hold content; cursor on row 1
+        assert_eq!(t.cursor().row, 1);
+
+        // Shrink well below the original height. The two content rows still
+        // fit, so nothing spills and the prompt stays put.
+        t.resize(10, 4);
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(row_string(t.row(0)), "BAR");
+        assert_eq!(row_string(t.row(1)), "PROMPT");
+        assert_eq!(t.cursor().row, 1);
+
+        // Grow back: no scrollback to pull, so blank rows are added below and
+        // the prompt does not move or duplicate.
+        t.resize(10, 10);
+        assert_eq!(t.scrollback_len(), 0);
+        assert_eq!(row_string(t.row(0)), "BAR");
+        assert_eq!(row_string(t.row(1)), "PROMPT");
+        assert_eq!(t.cursor().row, 1);
+        for r in 2..10 {
+            assert_eq!(row_string(t.row(r)), "");
+        }
+    }
+
+    #[test]
     fn resize_on_alt_screen_does_not_touch_scrollback() {
         let mut t = Terminal::new(10, 5, 100);
         // Push two lines into primary scrollback before switching screens.
@@ -6262,6 +6325,9 @@ mod tests {
     fn resize_vertical_shrink_spills_placement_to_scrollback() {
         let mut t = Terminal::new(20, 10, 100);
         place(&mut t, 1, 2, 0, 2, 4); // anchored in rows 2..4
+        // Cursor on the last row: content reaches the bottom, so the shrink
+        // spills the full height delta (the bottom-anchored case).
+        t.feed("\x1b[10;1H");
         // Shrink rows 10 → 6. spill = 4 (rows 0..4). Placement at row 2 is
         // anchored in a spilled row, so it should land in scrollback.
         t.resize(20, 6);
@@ -6277,6 +6343,8 @@ mod tests {
     fn resize_vertical_shrink_keeps_low_placements_live() {
         let mut t = Terminal::new(20, 10, 100);
         place(&mut t, 1, 7, 0, 2, 4); // rows 7..9
+        // Cursor on the last row so the shrink spills the full height delta.
+        t.feed("\x1b[10;1H");
         // Shrink 10 → 6, spill = 4. Placement at row 7 stays live; shifts up
         // by 4 to row 3.
         t.resize(20, 6);
@@ -6288,6 +6356,9 @@ mod tests {
     fn resize_vertical_grow_promotes_scrollback_placement_back() {
         let mut t = Terminal::new(20, 6, 100);
         place(&mut t, 1, 0, 0, 2, 4);
+        // Cursor on the last row so the shrink spills the full height delta
+        // and the top-anchored placement is pushed into scrollback.
+        t.feed("\x1b[6;1H");
         // Force a single-row scroll so placement straddles, then another to
         // fully evict — but actually simplest: resize-shrink to push it into
         // scrollback, then resize-grow to pull it back.
@@ -9360,6 +9431,8 @@ mod tests {
         let mut t = Terminal::new(20, 10, 100);
         t.set_keep_placements_in_scrollback(false);
         place(&mut t, 1, 2, 0, 2, 4);
+        // Cursor on the last row so the shrink spills the full height delta.
+        t.feed("\x1b[10;1H");
         t.resize(20, 6); // spill = 4, placement at row 2 spills
         assert!(t.live_placements().is_empty());
         assert!(t.scrollback_placements_for_test().is_empty());
@@ -9636,6 +9709,8 @@ mod tests {
         // visible-but-wrong-position bug.
         let mut t = Terminal::new(20, 10, 100);
         place(&mut t, 1, 2, 0, 2, 4);
+        // Cursor on the last row so the shrink spills the full height delta.
+        t.feed("\x1b[10;1H");
         t.resize(20, 4); // spill = 6 — placement goes to scrollback.
         assert!(t.live_placements().is_empty());
         assert_eq!(t.scrollback_placements_for_test().len(), 1);
