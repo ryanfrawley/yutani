@@ -2015,7 +2015,6 @@ impl State {
             self.font.cell_width(),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
-        println!("w: {} h: {}", viewport.char_width, viewport.char_height);
         let (vbuf_bytes, ibuf_bytes) =
             grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
