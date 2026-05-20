@@ -865,6 +865,10 @@ struct State {
     // be within the threshold window).
     last_click: Option<(std::time::Instant, (isize, usize))>,
     click_count: u32,
+    // Time of the last left-press in the title-bar band, for double-click
+    // detection there. Separate from `last_click` (which keys on a grid cell)
+    // since toolbar clicks have no cell. A double-click toggles window zoom.
+    last_toolbar_click: Option<std::time::Instant>,
     /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
     /// the pointer isn't over a URL. Drives the underline overlay and the
     /// Cmd-click open behavior.
@@ -1845,6 +1849,7 @@ impl State {
             press_pixel: None,
             last_click: None,
             click_count: 0,
+            last_toolbar_click: None,
             hover_url: None,
             master,
             perf: PerfLog::new(),
@@ -4214,17 +4219,34 @@ impl State {
                 // selection or motion report once the pointer moves down.
                 if self.in_top_toolbar(self.mouse_y) {
                     self.held_button = None;
-                    // Kick off a native window drag immediately on left-press.
-                    // Our content view spans the title bar (fullsize_content_view)
-                    // and consumes this mouseDown, so without this AppKit falls
-                    // back to its slow drag path — the window only starts
-                    // following the cursor after a ~1s hesitation. Routing the
-                    // live mouseDown into performWindowDragWithEvent: makes the
-                    // drag begin on the first movement. Clicks on the traffic
-                    // lights don't reach us (they're system subviews on top), so
-                    // this only fires on the empty draggable strip.
                     if *button == MouseButton::Left && *state == ElementState::Pressed {
-                        let _ = self.window.drag_window();
+                        let now = std::time::Instant::now();
+                        let double = self
+                            .last_toolbar_click
+                            .map_or(false, |t| now.duration_since(t) < DOUBLE_CLICK_THRESHOLD);
+                        if double {
+                            // Double-click the title bar zooms the window, the
+                            // standard macOS gesture. We have to do this
+                            // ourselves: drag_window below consumes the first
+                            // click's mouseDown in a modal tracking loop, so the
+                            // OS never sees the pair as a double-click.
+                            self.last_toolbar_click = None;
+                            self.window.set_maximized(!self.window.is_maximized());
+                        } else {
+                            self.last_toolbar_click = Some(now);
+                            // Kick off a native window drag immediately. Our
+                            // content view spans the title bar
+                            // (fullsize_content_view) and consumes this
+                            // mouseDown, so without this AppKit falls back to its
+                            // slow drag path — the window only starts following
+                            // the cursor after a ~1s hesitation. Routing the live
+                            // mouseDown into performWindowDragWithEvent: makes the
+                            // drag begin on the first movement. Clicks on the
+                            // traffic lights don't reach us (system subviews on
+                            // top), so this only fires on the empty draggable
+                            // strip.
+                            let _ = self.window.drag_window();
+                        }
                     }
                     return true;
                 }
