@@ -45,9 +45,28 @@ pub fn fork_pty(fdm: i32) -> Result<Pty, String> {
                 setsid();
                 ioctl(0, TIOCSCTTY.into(), 1);
 
-                let default_shell = CString::new(std::env::var("SHELL").unwrap()).unwrap();
+                // Advertise our termcap so apps (and zle) pick the right key
+                // sequences. When the app is launched from Finder, $TERM is
+                // unset and the shell falls back to "dumb" — which leaves
+                // Backspace (0x7f) unmapped and reads as a printable glyph.
+                let term = CString::new("TERM").unwrap();
+                let term_val = CString::new("xterm-256color").unwrap();
+                setenv(term.as_ptr(), term_val.as_ptr(), 1);
+
+                let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                let shell_c = CString::new(shell_path.clone()).unwrap();
+                // Start the shell as a *login* shell (argv[0] = "-<basename>"),
+                // so /etc/zprofile and ~/.zprofile run. When launched from
+                // Finder we inherit only the launchd PATH, so brew shellenv —
+                // typically sourced from ~/.zprofile — is the thing that puts
+                // /opt/homebrew/bin (starship, etc.) on PATH.
+                let basename = std::path::Path::new(&shell_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("sh");
+                let argv0 = CString::new(format!("-{basename}")).unwrap();
                 // execvp replaces the process image; the Ok branch is unreachable.
-                match nix::unistd::execvp(default_shell.as_c_str(), &[&default_shell]) {
+                match nix::unistd::execvp(shell_c.as_c_str(), &[argv0.as_c_str()]) {
                     Ok(_) => std::process::exit(0),
                     Err(_) => std::process::exit(127),
                 }
