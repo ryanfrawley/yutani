@@ -638,6 +638,29 @@ struct PendingImagePlacement {
     preplaced_image_id: Option<images::ImageId>,
 }
 
+/// Whether `poll_pending_images` should re-arm a redraw so the render
+/// loop keeps ticking until every in-flight decode resolves.
+///
+/// Three independent reasons to keep going:
+///   - `pending_placements` still has deferred placements (Cmd-Shift-I
+///     paste, OSC 1337) waiting on their decode,
+///   - this poll produced `results` to act on, or
+///   - the store still holds undrained decodes (`store_pending > 0`).
+///
+/// The last one is load-bearing for the Kitty Unicode-placeholder path
+/// (`a=T,U=1`, what `icat` emits under tmux) and animation frames
+/// (`a=f`): those bump the store's queue without ever touching
+/// `pending_placements`. Omitting it lets a single-burst transmit whose
+/// decode lands after this frame's poll stall the loop, leaving the
+/// image blank until an unrelated event wakes it.
+fn should_rearm_image_poll(
+    pending_placements_empty: bool,
+    results_empty: bool,
+    store_pending: usize,
+) -> bool {
+    !pending_placements_empty || !results_empty || store_pending > 0
+}
+
 struct State {
     gpu: gpu::GpuContext,
 
@@ -3626,7 +3649,22 @@ impl State {
         // (mouse move, keystroke) wakes the loop. Symptom: decode "timeouts"
         // at multi-second elapsed times that don't match the configured
         // timeout. Has to happen before the early-return when no results.
-        if !self.pending_placements.is_empty() || !results.is_empty() {
+        //
+        // Check the store's own `pending_count` too, not just
+        // `pending_placements`: the Kitty Unicode-placeholder path
+        // (`a=T,U=1`, as `icat` emits under tmux) and animation frames
+        // (`a=f`) bump the store's queue WITHOUT registering a
+        // `pending_placement`. With only the `pending_placements` check,
+        // a single-burst transmit whose decode finishes after this frame's
+        // poll re-arms nothing — the loop sleeps and the image renders
+        // blank until the next unrelated event. (Release builds feed the
+        // whole `cat`/`icat` in one burst and reliably lose this race;
+        // slower debug builds spread ingest across events and win it.)
+        if should_rearm_image_poll(
+            self.pending_placements.is_empty(),
+            results.is_empty(),
+            self.image_store.pending_count(),
+        ) {
             self.window.request_redraw();
         }
         if results.is_empty() {
@@ -6969,5 +7007,45 @@ mod tests {
         // than silently break every existing user's config file.
         let parsed = Config::parse_str("theme_overrides_glow = true\n");
         assert!(parsed.theme_overrides_glow);
+    }
+
+    #[test]
+    fn should_rearm_image_poll_store_pending_alone_rearms() {
+        // Regression: the Kitty Unicode-placeholder path (`a=T,U=1`,
+        // what `icat` emits under tmux) and animation frames (`a=f`)
+        // bump the image store's pending queue WITHOUT registering a
+        // `pending_placements` entry. With no deferred placements and an
+        // empty result set, `store_pending > 0` is the only signal that a
+        // decode is still in flight — it must re-arm, or the loop parks at
+        // `ControlFlow::Wait` and the freshly-`cat`'d image renders blank.
+        assert!(should_rearm_image_poll(true, true, 1));
+    }
+
+    #[test]
+    fn should_rearm_image_poll_all_idle_does_not_rearm() {
+        // Nothing in flight on any of the three queues — let the loop go
+        // to sleep rather than spin redrawing forever.
+        assert!(!should_rearm_image_poll(true, true, 0));
+    }
+
+    #[test]
+    fn should_rearm_image_poll_pending_placements_alone_rearms() {
+        // A deferred placement (Cmd-Shift-I paste / OSC 1337) is still
+        // waiting on its decode.
+        assert!(should_rearm_image_poll(false, true, 0));
+    }
+
+    #[test]
+    fn should_rearm_image_poll_results_alone_rearms() {
+        // This poll produced results to act on, so the loop must tick again.
+        assert!(should_rearm_image_poll(true, false, 0));
+    }
+
+    #[test]
+    fn should_rearm_image_poll_combined_signals_rearm() {
+        // Any combination of the three live signals must re-arm.
+        assert!(should_rearm_image_poll(false, false, 3));
+        assert!(should_rearm_image_poll(false, true, 2));
+        assert!(should_rearm_image_poll(true, false, 5));
     }
 }
