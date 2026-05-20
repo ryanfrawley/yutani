@@ -104,6 +104,39 @@ fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
     (vertex_bytes, index_bytes)
 }
 
+/// What the window does when the child shell exits. Configured via the
+/// `shell_exit_mode` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellExitMode {
+    /// Quit the app whenever the shell exits, regardless of status.
+    Always,
+    /// Never quit automatically; print a status line and keep the window
+    /// open so the user can read the final output and dismiss it.
+    Never,
+    /// Quit on a clean (exit code 0) shell exit; otherwise keep the window
+    /// open with a status line so a crash isn't silently swallowed.
+    OnSuccess,
+}
+
+impl ShellExitMode {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            "on_success" => Some(Self::OnSuccess),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Never => "never",
+            Self::OnSuccess => "on_success",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     font_size: f32,
@@ -253,6 +286,10 @@ struct Config {
     /// decode case (which would flicker) is *never* covered; only the
     /// fully-disabled / fully-failed cases are.
     images_halfblock_for_missing: bool,
+    /// What happens to the window when the child shell exits. Defaults to
+    /// `OnSuccess`: a clean exit closes the window, a non-zero/abnormal
+    /// exit keeps it open with a status line. See `ShellExitMode`.
+    shell_exit_mode: ShellExitMode,
 }
 
 impl Config {
@@ -295,6 +332,7 @@ impl Config {
             images_in_scrollback: true,
             images_filter: "linear".to_string(),
             images_halfblock_for_missing: false,
+            shell_exit_mode: ShellExitMode::OnSuccess,
         }
     }
 
@@ -416,6 +454,13 @@ impl Config {
             "images_halfblock_for_missing" => if let Some(x) = v.as_bool() {
                 self.images_halfblock_for_missing = x;
             },
+            "shell_exit_mode" => if let Some(x) = v.as_str() {
+                if let Some(m) = ShellExitMode::from_str(x) {
+                    self.shell_exit_mode = m;
+                }
+                // Silently keep the default on an unknown value — same
+                // forgiving contract as `images_filter`.
+            },
             _ => (),
         }
     }
@@ -514,6 +559,12 @@ impl Config {
             self.images_in_scrollback,
             toml_str_lit(&self.images_filter),
             self.images_halfblock_for_missing,
+        ));
+        s.push_str(&format!(
+            "\n# Shell\n\
+             # shell_exit_mode: \"always\" | \"never\" | \"on_success\"\n\
+             shell_exit_mode = {}\n",
+            toml_str_lit(self.shell_exit_mode.as_str()),
         ));
         s
     }
@@ -5051,9 +5102,13 @@ async fn run() {
     // Fork before the window is created so we hold the master fd across setup.
     let pty = pty::fork_pty(fdm).expect("failed to fork pty");
     std::thread::spawn(move || {
-        pty.run(|data| {
+        let code = pty.run(|data| {
             let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
         });
+        // `run` returns once the shell has exited and been reaped. Wake the
+        // event loop so it can react instead of leaving a frozen window —
+        // queued after every PtyInput, so any final shell output lands first.
+        let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
     });
 
     let transparent = false; // needed because of a shadow bug
@@ -5270,6 +5325,28 @@ async fn run() {
                     // New / removed cells may have changed which URL (if any)
                     // sits under the pointer.
                     state.update_hover_url();
+                }
+                app_window::CustomEvent::PtyExit(code) => {
+                    let close = match state.config.shell_exit_mode {
+                        ShellExitMode::Always => true,
+                        ShellExitMode::Never => false,
+                        ShellExitMode::OnSuccess => code == 0,
+                    };
+                    if close {
+                        elwt.exit();
+                    } else {
+                        // Keep the window so the user can read the final
+                        // output / a crash's exit code, then dismiss it
+                        // themselves. The PTY master is closed, so typed
+                        // input now goes nowhere — selection and scrollback
+                        // still work. Render a dim status line via the normal
+                        // ANSI path.
+                        state.feed_terminal(&format!(
+                            "\r\n\x1b[2m[Process completed — exit {code}]\x1b[0m\r\n"
+                        ));
+                        state.invalidate();
+                        state.window.request_redraw();
+                    }
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
@@ -5907,6 +5984,68 @@ mod tests {
     fn config_image_invalid_bool_keeps_default() {
         let parsed = Config::parse_str("images_enabled = \"banana\"\n");
         assert!(parsed.images_enabled);
+    }
+
+    #[test]
+    fn shell_exit_mode_from_str_valid_values() {
+        assert_eq!(ShellExitMode::from_str("always"), Some(ShellExitMode::Always));
+        assert_eq!(ShellExitMode::from_str("never"), Some(ShellExitMode::Never));
+        assert_eq!(
+            ShellExitMode::from_str("on_success"),
+            Some(ShellExitMode::OnSuccess)
+        );
+    }
+
+    #[test]
+    fn shell_exit_mode_from_str_unknown_is_none() {
+        assert_eq!(ShellExitMode::from_str("bogus"), None);
+        assert_eq!(ShellExitMode::from_str(""), None);
+    }
+
+    #[test]
+    fn shell_exit_mode_round_trips_through_as_str() {
+        for m in [
+            ShellExitMode::Always,
+            ShellExitMode::Never,
+            ShellExitMode::OnSuccess,
+        ] {
+            assert_eq!(ShellExitMode::from_str(m.as_str()), Some(m));
+        }
+    }
+
+    #[test]
+    fn config_shell_exit_mode_default_is_on_success() {
+        assert_eq!(Config::defaults().shell_exit_mode, ShellExitMode::OnSuccess);
+    }
+
+    #[test]
+    fn config_shell_exit_mode_parses_explicit_values() {
+        let never = Config::parse_str("shell_exit_mode = \"never\"\n");
+        assert_eq!(never.shell_exit_mode, ShellExitMode::Never);
+
+        let always = Config::parse_str("shell_exit_mode = \"always\"\n");
+        assert_eq!(always.shell_exit_mode, ShellExitMode::Always);
+    }
+
+    #[test]
+    fn config_shell_exit_mode_unknown_keeps_default() {
+        let parsed = Config::parse_str("shell_exit_mode = \"bogus\"\n");
+        assert_eq!(parsed.shell_exit_mode, ShellExitMode::OnSuccess);
+    }
+
+    #[test]
+    fn config_shell_exit_mode_missing_key_defaults() {
+        // A config that doesn't mention the key keeps the default.
+        let parsed = Config::parse_str("font_size = 14.0\n");
+        assert_eq!(parsed.shell_exit_mode, ShellExitMode::OnSuccess);
+    }
+
+    #[test]
+    fn config_shell_exit_mode_round_trips_through_serialize() {
+        let mut c = Config::defaults();
+        c.shell_exit_mode = ShellExitMode::Never;
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.shell_exit_mode, ShellExitMode::Never);
     }
 
     #[test]
