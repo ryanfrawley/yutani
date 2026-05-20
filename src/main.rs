@@ -3440,6 +3440,7 @@ impl State {
         // reflect the new bg / fg.
         self.sync_theme_colors();
         self.window.set_theme(Some(theme_for_bg(p.background)));
+        set_native_window_bg(&self.window, p.background);
         self.invalidate();
     }
 
@@ -5259,6 +5260,7 @@ async fn run() {
     // draws over our transparent chrome reads against the actual bg —
     // otherwise dark schemes render black "Yutani" text on a dark fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
+    set_native_window_bg(&window, palette::get().background);
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
     // Build the rustybuzz shaper alongside the FreeType font. We keep one
@@ -5588,6 +5590,40 @@ fn format_hex_rgb(c: [f32; 4]) -> String {
 /// Pick a window NSAppearance to match a background color. Title-bar text is
 /// drawn by the OS using that appearance, so a dark scheme must report Dark
 /// or "Yutani" comes out black on near-black.
+/// Paint the native `NSWindow` background to match the terminal's bg color.
+/// The window is opaque, so during AppKit-driven frame changes — most visibly
+/// the title-bar double-click zoom animation — any area exposed before our
+/// Metal layer redraws is filled with the window's `backgroundColor`. Left
+/// unset that's the default system window color, which flashes against the
+/// real terminal background. `bg` is stored linear (the surface is sRGB), so
+/// re-encode each channel to sRGB for `NSColor`, which expects sRGB components.
+#[cfg(target_os = "macos")]
+fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return;
+    };
+    let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
+    unsafe {
+        let ns_view = handle.ns_view as *mut Object;
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        let color: *mut Object = msg_send![class!(NSColor),
+            colorWithSRGBRed: chan(bg[0])
+            green: chan(bg[1])
+            blue: chan(bg[2])
+            alpha: bg[3] as f64];
+        let _: () = msg_send![ns_window, setBackgroundColor: color];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_native_window_bg(_window: &Window, _bg: [f32; 4]) {}
+
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray
     // (sRGB 0.5). Below that, dark chrome reads better.
