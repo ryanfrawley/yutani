@@ -34,6 +34,10 @@ use wgpu::util::DeviceExt;
 
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
+/// Smallest grid height (in rows) we ever report to the PTY, regardless of how
+/// short the window is dragged. Sized to keep a typical multi-line shell prompt
+/// resident so resizing never spills it — see the floor in `get_viewport_size`.
+const MIN_GRID_ROWS: usize = 4;
 
 const DEFAULT_FONT_SIZE: f32 = 10.0;
 
@@ -1922,8 +1926,20 @@ impl State {
             // in `update_vertices`) never shoves the bottom row past the
             // window edge when the height isn't an integer multiple of
             // `line_height`.
+            //
+            // Floor at MIN_GRID_ROWS, well above 1. Multi-line shell prompts
+            // (a powerline/segment bar, sometimes a blank separator, then the
+            // input line — three rows is common) don't fit in a 1–2 row grid.
+            // When the window is dragged shorter than the prompt, the prompt
+            // spills into scrollback and the shell keeps repainting it in the
+            // cramped viewport, scrolling a line into scrollback on every
+            // WINCH; growing back then refills all that churn as stray blank /
+            // duplicate rows above the prompt. Keeping a few rows resident
+            // stops the prompt from ever spilling during a resize. A grid this
+            // short is unusable as a terminal anyway, so clipping the bottom of
+            // an even shorter window costs nothing real.
             char_height: usize::max(
-                1,
+                MIN_GRID_ROWS,
                 (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT) as usize / line_height,
             ),
         }
@@ -3193,8 +3209,21 @@ impl State {
             self.font.cell_width(),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
+        // Only touch the PTY winsize when the character grid actually
+        // changes. macOS raises SIGWINCH on any TIOCSWINSZ whose winsize
+        // differs from the old one (a full bcmp), and ws_xpixel/ws_ypixel
+        // shift on every pixel of a live drag. Notifying on pixel-only
+        // changes floods the foreground process with SIGWINCH; shells that
+        // repaint their prompt on WINCH (powerlevel10k &c.) then stack a
+        // fresh prompt per frame, so growing the window appears to push the
+        // prompt downward. Gating on rows/cols collapses a drag back to one
+        // signal per row boundary crossed.
+        let grid_changed = size.char_width != self.terminal.cols
+            || size.char_height != self.terminal.rows;
         self.terminal.resize(size.char_width, size.char_height);
-        self.notify_pty_size(size.char_width, size.char_height);
+        if grid_changed {
+            self.notify_pty_size(size.char_width, size.char_height);
+        }
         self.resize_buffers();
         self.cursor_anim = None;
         self.invalidate();
@@ -5518,6 +5547,21 @@ mod tests {
                  walk through `update_vertices`",
             );
         }
+    }
+
+    #[test]
+    fn get_viewport_size_floors_rows_at_min_grid_rows() {
+        // A window dragged shorter than the prompt would otherwise yield a
+        // 1–2 row grid, which spills the prompt into scrollback on resize.
+        // The row count must never drop below MIN_GRID_ROWS no matter how
+        // short the window. cell 8px wide, 18px line height.
+        let tiny = State::get_viewport_size(800.0, 0.0, 8, 18);
+        assert_eq!(tiny.char_height, MIN_GRID_ROWS);
+        let short = State::get_viewport_size(800.0, 60.0, 8, 18);
+        assert_eq!(short.char_height, MIN_GRID_ROWS);
+        // A normally-sized window is unaffected — the floor doesn't clamp it.
+        let normal = State::get_viewport_size(800.0, 600.0, 8, 18);
+        assert!(normal.char_height > MIN_GRID_ROWS);
     }
 
     #[test]
