@@ -7,6 +7,15 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[package.metadata.bundle]
+name = "Yutani"
+identifier = "co.frawley.yutani"
+category = "public.app-category.developer-tools"
+short_description = "Yutani terminal"
+# yutani.icns and Assets.car are produced from yutani.icon by
+# scripts/bundle-mac.sh; do not invoke `cargo bundle` directly on macOS.
+icon = ["target/macos-icon/yutani.icns"]
+
 [dependencies]
 bytemuck = { version = "1.14.0", features = ["derive"] }
 env_logger = "0.10.1"
