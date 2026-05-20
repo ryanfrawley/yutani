@@ -4214,7 +4214,7 @@ mod tests {
         // partial frame still blends rather than blanking the
         // surrounding region.
         let Some((d, q, pipeline, _)) = try_make_pipeline_and_image() else { return };
-        let mut store = Store::new(DEFAULT_CAP_BYTES);
+        let store = Store::new(DEFAULT_CAP_BYTES);
         // 4x4 parent so a 2x2 frame at (1,1) is genuinely partial.
         let mut s = Store::new(DEFAULT_CAP_BYTES);
         let Some((_d, _q, _p, parent)) = make_frame_test_image(&mut s, (4, 4)) else {
