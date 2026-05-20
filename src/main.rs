@@ -3342,6 +3342,19 @@ impl State {
         (c as u16 + 1, r as u16 + 1)
     }
 
+    /// True when a window-relative `py` falls inside the title bar / toolbar
+    /// band at the top of the window. The app draws with `fullsize_content_view`
+    /// so terminal content renders behind the translucent macOS title bar; the
+    /// renderer reserves `WINDOW_PADDING + DECORATOR_HEIGHT` here (see the top
+    /// fade strip). Cursor events landing in this band are the user driving the
+    /// window chrome — dragging the bar, hitting the traffic lights — and must
+    /// be swallowed rather than translated into mouse reports for the shell
+    /// below. The band is fixed (not the scroll-animated decorator offset)
+    /// because the native title bar doesn't move with scroll.
+    fn in_top_toolbar(&self, py: f64) -> bool {
+        py_in_top_toolbar(py)
+    }
+
     /// Forward a mouse event to the PTY in the host's preferred encoding,
     /// if any tracking mode is enabled. `motion` is set for drag/move events.
     fn report_mouse(&mut self, button: input::MouseButton, press: bool, motion: bool) {
@@ -4134,6 +4147,16 @@ impl State {
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_x = position.x;
                 self.mouse_y = position.y;
+                // Pointer over the title bar / toolbar: swallow it so motion
+                // never becomes a mouse report or extends a selection into the
+                // chrome. Drop any hovered-URL highlight too, since nothing
+                // hoverable is visible up there.
+                if self.in_top_toolbar(position.y) {
+                    if self.hover_url.take().is_some() {
+                        self.invalidate();
+                    }
+                    return true;
+                }
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.
                 let mouse_mode_active =
@@ -4152,6 +4175,14 @@ impl State {
                 self.update_hover_url();
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // Press/release over the title bar / toolbar drives the window
+                // chrome (drag, traffic lights), never the shell. Clear any
+                // held button so a press that began here can't seed a phantom
+                // selection or motion report once the pointer moves down.
+                if self.in_top_toolbar(self.mouse_y) {
+                    self.held_button = None;
+                    return true;
+                }
                 let code = match button {
                     MouseButton::Left => Some(input::MOUSE_LEFT),
                     MouseButton::Middle => Some(input::MOUSE_MIDDLE),
@@ -4199,6 +4230,12 @@ impl State {
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
+                // Wheel/scroll while the pointer sits over the title bar /
+                // toolbar shouldn't reach the shell's wheel reporting nor the
+                // local scrollback — swallow it like the other chrome events.
+                if self.in_top_toolbar(self.mouse_y) {
+                    return true;
+                }
                 let m = self.font.face().size_metrics().unwrap();
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // A `Started` after a real idle gap is the user putting fingers
@@ -5371,6 +5408,15 @@ fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     }
 }
 
+/// Window-relative `py` (physical pixels) falls inside the title bar / toolbar
+/// band at the top of the window. Free function so the boundary is unit-testable
+/// without standing up a full `State`; `State::in_top_toolbar` delegates here.
+/// The band matches the chrome the renderer reserves at the top — see
+/// `in_top_toolbar` for why it's fixed rather than the scroll-animated offset.
+fn py_in_top_toolbar(py: f64) -> bool {
+    py < (WINDOW_PADDING + DECORATOR_HEIGHT) as f64
+}
+
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;
     wgpu::Color {
@@ -5461,6 +5507,32 @@ mod tests {
         // perceptual midgray — must still trigger the dark chrome.
         let bg = [0.0, 0.05, 0.07, 1.0];
         assert_eq!(theme_for_bg(bg), winit::window::Theme::Dark);
+    }
+
+    #[test]
+    fn py_in_top_toolbar_true_inside_band() {
+        // The very top edge and a point comfortably within the 40px
+        // toolbar band both belong to the OS chrome.
+        assert!(py_in_top_toolbar(0.0));
+        assert!(py_in_top_toolbar(20.0));
+    }
+
+    #[test]
+    fn py_in_top_toolbar_false_below_band() {
+        // Well into the terminal grid: events here should reach the PTY.
+        assert!(!py_in_top_toolbar(100.0));
+    }
+
+    #[test]
+    fn py_in_top_toolbar_boundary_is_exclusive() {
+        // The band is a strict `<`, so the boundary pixel itself is *not*
+        // toolbar (it's the first row of the grid) but anything just above
+        // it still is.
+        let band = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
+        assert_eq!(band, 40.0);
+        assert!(!py_in_top_toolbar(band)); // exactly 40.0 → false
+        assert!(!py_in_top_toolbar(40.0));
+        assert!(py_in_top_toolbar(39.9)); // just under → true
     }
 
     /// Build a `CursorAnim` whose `started_at` is back-dated so that
