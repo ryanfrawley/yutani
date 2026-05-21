@@ -1,5 +1,18 @@
 # OSC 133 Semantic Prompt Marks — Implementation Plan
 
+## Status
+
+All planned slices are implemented (PRs #76–#80):
+
+- **K1 + K2 + K4** (#76) — parse A/B/C/D marks, store live, `command_regions`.
+- **K3** (#77) — marks survive scroll into scrollback, eviction, and resize.
+- **K5** (#78) — prompt navigation (Cmd-Shift-Up/Down).
+- **K6** (#79) — exit-status gutter indicator.
+- **K7** (#80) — select-last-command-output (Cmd-Shift-O).
+
+Deferred items below (autocomplete overlay, 32-bit params, status-filtered
+navigation) remain unbuilt — pick up if requested.
+
 ## Overview
 
 Add support for the FinalTerm / shell-integration **OSC 133** protocol
