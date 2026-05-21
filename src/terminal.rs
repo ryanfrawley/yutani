@@ -2350,9 +2350,8 @@ impl Terminal {
     /// A `PromptStart` opens a region; `InputStart` / `OutputStart` fill it;
     /// `CommandEnd` closes it. Missing marks are tolerated — an interrupted
     /// command leaves `command_end: None`, and a region needs only its
-    /// opening `PromptStart` to be emitted. Consumed by the (later)
-    /// prompt-navigation UI.
-    #[allow(dead_code)]
+    /// opening `PromptStart` to be emitted. Consumed by the prompt-navigation
+    /// keybinding (`scroll_to_prev_prompt` / `scroll_to_next_prompt`).
     pub fn command_regions(&self) -> Vec<CommandRegion> {
         // Live marks anchor below all scrollback rows; scrollback marks are
         // already absolute scrollback row indices.
@@ -2401,6 +2400,62 @@ impl Terminal {
             regions.push(r);
         }
         regions
+    }
+
+    /// Scroll the viewport so the nearest prompt *above* the current top
+    /// lands at the top of the viewport. Returns false (no-op) when there is
+    /// no such prompt or on the alt screen. Drives the prompt-navigation
+    /// keybinding (jump to previous prompt).
+    pub fn scroll_to_prev_prompt(&mut self) -> bool {
+        if self.use_alternate {
+            return false;
+        }
+        let top = self.visual_to_abs_line(0);
+        let target = self
+            .command_regions()
+            .into_iter()
+            .map(|r| r.prompt_start)
+            .filter(|&p| p < top)
+            .max();
+        match target {
+            Some(p) => self.scroll_to_abs_top(p),
+            None => false,
+        }
+    }
+
+    /// Scroll the viewport so the nearest prompt *below* the current top
+    /// lands at the top of the viewport. Returns false (no-op) when there is
+    /// no such prompt or on the alt screen. Drives the prompt-navigation
+    /// keybinding (jump to next prompt).
+    pub fn scroll_to_next_prompt(&mut self) -> bool {
+        if self.use_alternate {
+            return false;
+        }
+        let top = self.visual_to_abs_line(0);
+        let target = self
+            .command_regions()
+            .into_iter()
+            .map(|r| r.prompt_start)
+            .filter(|&p| p > top)
+            .min();
+        match target {
+            Some(p) => self.scroll_to_abs_top(p),
+            None => false,
+        }
+    }
+
+    /// Set `view_offset` so absolute line `abs` sits at the top of the
+    /// viewport, clamped into the scrollable range (a prompt already on the
+    /// live grid clamps to the bottom, `view_offset == 0`). Returns whether
+    /// the offset changed.
+    fn scroll_to_abs_top(&mut self, abs: isize) -> bool {
+        let sb = self.scrollback.len() as isize;
+        let new = (sb - abs).clamp(0, sb) as usize;
+        if new == self.view_offset {
+            return false;
+        }
+        self.view_offset = new;
+        true
     }
 
     /// `OSC 1337 ; <verb>=<args> [: <base64>] ST` — iTerm2's proprietary
@@ -7055,6 +7110,64 @@ mod tests {
         // The scrollback-anchored region is gone; the live one remains.
         let regions = t.command_regions();
         assert_eq!(regions.len(), 1);
+    }
+
+    //
+    // OSC 133 prompt navigation (K5).
+    //
+
+    #[test]
+    fn osc_133_prompt_navigation_jumps_between_prompts() {
+        let mut t = Terminal::new(10, 3, 100);
+        // Three prompts, each pushed up so they end at distinct absolute
+        // lines (some in scrollback).
+        t.feed("\x1b]133;A\x07one\r\n\r\n");
+        t.feed("\x1b]133;A\x07two\r\n\r\n");
+        t.feed("\x1b]133;A\x07three\r\n\r\n");
+
+        let mut prompts: Vec<isize> =
+            t.command_regions().iter().map(|r| r.prompt_start).collect();
+        prompts.sort();
+        assert_eq!(prompts.len(), 3);
+
+        t.scroll_to_bottom();
+        let top0 = t.visual_to_abs_line(0);
+
+        // Walk up through the prompts above the live top.
+        assert!(t.scroll_to_prev_prompt());
+        let t1 = t.visual_to_abs_line(0);
+        assert!(t1 < top0);
+        assert!(prompts.contains(&t1));
+
+        assert!(t.scroll_to_prev_prompt());
+        let t2 = t.visual_to_abs_line(0);
+        assert!(t2 < t1);
+        assert_eq!(t2, prompts[0]); // landed on the oldest prompt
+
+        // Nothing above the oldest prompt.
+        assert!(!t.scroll_to_prev_prompt());
+        assert_eq!(t.visual_to_abs_line(0), t2);
+
+        // Walking back down returns to the prompt we came from.
+        assert!(t.scroll_to_next_prompt());
+        assert_eq!(t.visual_to_abs_line(0), t1);
+    }
+
+    #[test]
+    fn osc_133_prompt_navigation_noop_without_marks() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("plain\r\noutput\r\nmore\r\nlines\r\n");
+        assert!(!t.scroll_to_prev_prompt());
+        assert!(!t.scroll_to_next_prompt());
+    }
+
+    #[test]
+    fn osc_133_prompt_navigation_noop_on_alt_screen() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b]133;A\x07one\r\n\r\n\x1b]133;A\x07two\r\n\r\n");
+        t.feed("\x1b[?1049h"); // alt screen has no scrollback to navigate
+        assert!(!t.scroll_to_prev_prompt());
+        assert!(!t.scroll_to_next_prompt());
     }
 
     //

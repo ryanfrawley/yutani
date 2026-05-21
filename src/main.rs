@@ -4517,6 +4517,30 @@ impl State {
                     // clipboard. Done before encode_key so the super_key
                     // check there doesn't drop them.
                     if self.modifiers.super_key() {
+                        // Cmd-Shift-Up / Cmd-Shift-Down: jump the viewport to
+                        // the previous / next shell prompt (OSC 133 marks).
+                        // No-op when the shell isn't emitting marks or on the
+                        // alt screen. Arrow keys arrive as Named, not
+                        // Character, so handle them before the Character match.
+                        if self.modifiers.shift_key() {
+                            use winit::keyboard::{Key, NamedKey};
+                            if event.logical_key == Key::Named(NamedKey::ArrowUp) {
+                                if self.terminal.scroll_to_prev_prompt() {
+                                    self.scroll_y = 0.0;
+                                    self.invalidate();
+                                    self.update_hover_url();
+                                }
+                                return true;
+                            }
+                            if event.logical_key == Key::Named(NamedKey::ArrowDown) {
+                                if self.terminal.scroll_to_next_prompt() {
+                                    self.scroll_y = 0.0;
+                                    self.invalidate();
+                                    self.update_hover_url();
+                                }
+                                return true;
+                            }
+                        }
                         if let winit::keyboard::Key::Character(s) = &event.logical_key {
                             if s.eq_ignore_ascii_case("c") {
                                 self.copy_selection();
