@@ -534,14 +534,27 @@ pub enum SemanticMarkKind {
     CommandEnd { exit: Option<i32> },
 }
 
-/// A semantic mark anchored to a live primary-grid position. Scroll /
-/// scrollback survival is handled in a later slice; for now marks track
-/// live grid rows and are dropped on a full-screen clear.
+/// Where a [`SemanticMark`] is anchored. A mark starts `Live` on a grid row;
+/// when that row scrolls off the top of the primary grid it converts to
+/// `Scrollback`, anchored to a scrollback row index the same way
+/// [`ScrollbackPlacement`] is. Both domains stay in one emission-ordered list
+/// (rather than two collections like placements) so `command_regions` can
+/// fold them in the order the shell emitted them without re-sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkAnchor {
+    /// Row on the live primary grid.
+    Live { row: usize },
+    /// Index into `scrollback` (0 = oldest), decremented on front eviction —
+    /// the same bookkeeping as `ScrollbackPlacement::scrollback_row`.
+    Scrollback { row: isize },
+}
+
+/// A semantic mark and its anchor. Marks live on the primary screen only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SemanticMark {
-    /// Primary-grid row the mark sits on.
-    row: usize,
-    /// Cursor column when the mark was emitted.
+    anchor: MarkAnchor,
+    /// Cursor column when the mark was emitted (anchor for column-aware
+    /// features like an autocomplete overlay; not read by region queries).
     col: usize,
     kind: SemanticMarkKind,
 }
@@ -1450,6 +1463,7 @@ impl Terminal {
                 if self.scrollback.len() == self.scrollback_limit {
                     self.scrollback.pop_front();
                     self.evict_scrollback_placement_front();
+                    self.evict_scrollback_mark_front();
                 }
                 self.scrollback.push_back(line);
             }
@@ -1498,6 +1512,9 @@ impl Terminal {
                 }
             }
             placements = keep;
+            // Marks follow the same spill migration as placements.
+            let sb_len_after_spill = self.scrollback.len() as isize;
+            self.spill_marks(spill, sb_len_after_spill);
         }
 
         let mut new_primary = Grid::new(rows, cols, blank);
@@ -1534,6 +1551,8 @@ impl Terminal {
                     i += 1;
                 }
             }
+            // Marks follow the same refill migration as placements.
+            self.refill_marks(refill, sb_post);
         }
         let src_start = spill;
         for old_r in src_start..old_rows {
@@ -1553,6 +1572,9 @@ impl Terminal {
         // extent and rely on the renderer's clipping.
         placements.retain(|p| !p.fully_off_grid(rows, cols));
         new_primary.placements = placements;
+        // Drop live marks that fell off the new grid and clamp mark columns
+        // into range (horizontal resize is clamp-only — no column reflow).
+        self.clamp_marks_after_resize(rows, cols);
 
         self.primary = new_primary;
         // Alternate is wiped wholesale on resize (matches the existing cell
@@ -1828,6 +1850,10 @@ impl Terminal {
             3 => {
                 self.scrollback.clear();
                 self.scrollback_placements.clear();
+                // Marks anchored into the cleared scrollback are gone; live
+                // marks on the on-screen content stay.
+                self.semantic_marks
+                    .retain(|m| matches!(m.anchor, MarkAnchor::Live { .. }));
                 self.view_offset = 0;
             }
             _ => {}
@@ -1861,6 +1887,7 @@ impl Terminal {
                 if self.scrollback.len() == self.scrollback_limit {
                     self.scrollback.pop_front();
                     self.evict_scrollback_placement_front();
+                    self.evict_scrollback_mark_front();
                 }
                 self.scrollback.push_back(line);
                 // Keep the user's view of historical content stable while
@@ -1900,6 +1927,114 @@ impl Terminal {
         }
         // If retention is off, `dropped` is simply discarded — same effect
         // as letting the placement fall off the bottom of `scroll_region_down`.
+
+        // Semantic marks follow the same promotion (they're cheap, so always
+        // retained regardless of the placement keep-flag). Existing scrollback
+        // marks were already decremented by the eviction calls above, so
+        // `scrollback.len()` is final here.
+        if !self.use_alternate && full_region {
+            self.scroll_marks_up(n);
+        }
+    }
+
+    /// Shift live marks up by `n` after a full-region primary scroll,
+    /// converting those that scrolled off the top into scrollback anchors.
+    /// Mirrors the placement promotion in `scroll_region_up_by`: a live row
+    /// `r` becomes `r - n`; once negative its scrollback index is
+    /// `scrollback.len() + (r - n)`, dropped if it underflowed the limit.
+    fn scroll_marks_up(&mut self, n: usize) {
+        let sb_len = self.scrollback.len() as isize;
+        let n = n as isize;
+        self.semantic_marks.retain_mut(|m| {
+            let MarkAnchor::Live { row } = m.anchor else {
+                return true; // scrollback marks handled by eviction
+            };
+            let new_row = row as isize - n;
+            if new_row >= 0 {
+                m.anchor = MarkAnchor::Live {
+                    row: new_row as usize,
+                };
+                true
+            } else {
+                let scrollback_row = sb_len + new_row;
+                if scrollback_row >= 0 {
+                    m.anchor = MarkAnchor::Scrollback { row: scrollback_row };
+                    true
+                } else {
+                    false
+                }
+            }
+        });
+    }
+
+    /// Scrollback popped its front row; drop marks anchored to it and
+    /// decrement the rest. Mirrors `evict_scrollback_placement_front`.
+    fn evict_scrollback_mark_front(&mut self) {
+        self.semantic_marks
+            .retain(|m| !matches!(m.anchor, MarkAnchor::Scrollback { row } if row == 0));
+        for m in &mut self.semantic_marks {
+            if let MarkAnchor::Scrollback { row } = &mut m.anchor {
+                *row -= 1;
+            }
+        }
+    }
+
+    /// Resize-shrink: migrate live marks through `spill` top rows pushed into
+    /// scrollback. Mirrors the placement spill migration in `resize` — a mark
+    /// in a spilled row (`row < spill`) anchors at
+    /// `sb_len_after_spill - spill + row` (dropped if that underflowed the
+    /// limit); a mark below the spill shifts up by `spill`.
+    fn spill_marks(&mut self, spill: usize, sb_len_after_spill: isize) {
+        self.semantic_marks.retain_mut(|m| {
+            let MarkAnchor::Live { row } = m.anchor else {
+                return true;
+            };
+            if row < spill {
+                let scrollback_row = sb_len_after_spill - spill as isize + row as isize;
+                if scrollback_row >= 0 {
+                    m.anchor = MarkAnchor::Scrollback { row: scrollback_row };
+                    true
+                } else {
+                    false
+                }
+            } else {
+                m.anchor = MarkAnchor::Live { row: row - spill };
+                true
+            }
+        });
+    }
+
+    /// Resize-grow: migrate marks through `refill` rows pulled from
+    /// scrollback's tail back onto the live grid. Mirrors the placement
+    /// refill migration — live marks shift down by `refill`; scrollback marks
+    /// in the drained tail (`row >= sb_post`) promote back to live rows.
+    fn refill_marks(&mut self, refill: usize, sb_post: isize) {
+        for m in &mut self.semantic_marks {
+            match &mut m.anchor {
+                MarkAnchor::Live { row } => *row += refill,
+                MarkAnchor::Scrollback { row } if *row >= sb_post => {
+                    m.anchor = MarkAnchor::Live {
+                        row: (*row - sb_post) as usize,
+                    };
+                }
+                MarkAnchor::Scrollback { .. } => {}
+            }
+        }
+    }
+
+    /// After a resize, drop live marks that fell off the new grid (rows the
+    /// shrink couldn't fit and the grow couldn't refill) and clamp mark
+    /// columns into the new width.
+    fn clamp_marks_after_resize(&mut self, rows: usize, cols: usize) {
+        self.semantic_marks.retain(|m| match m.anchor {
+            MarkAnchor::Live { row } => row < rows,
+            MarkAnchor::Scrollback { .. } => true,
+        });
+        for m in &mut self.semantic_marks {
+            if m.col >= cols {
+                m.col = cols.saturating_sub(1);
+            }
+        }
     }
 
     /// Decrement scrollback-placement indices because scrollback popped one
@@ -2199,7 +2334,9 @@ impl Terminal {
             _ => return,
         };
         self.semantic_marks.push(SemanticMark {
-            row: self.cursor.row,
+            anchor: MarkAnchor::Live {
+                row: self.cursor.row,
+            },
             col: self.cursor.col,
             kind,
         });
@@ -2217,9 +2354,13 @@ impl Terminal {
     /// prompt-navigation UI.
     #[allow(dead_code)]
     pub fn command_regions(&self) -> Vec<CommandRegion> {
-        // Live marks anchor below all scrollback rows.
+        // Live marks anchor below all scrollback rows; scrollback marks are
+        // already absolute scrollback row indices.
         let base = self.scrollback.len() as isize;
-        let abs = |m: &SemanticMark| base + m.row as isize;
+        let abs = |m: &SemanticMark| match m.anchor {
+            MarkAnchor::Live { row } => base + row as isize,
+            MarkAnchor::Scrollback { row } => row,
+        };
 
         let mut regions: Vec<CommandRegion> = Vec::new();
         let mut current: Option<CommandRegion> = None;
@@ -6800,6 +6941,120 @@ mod tests {
         assert_eq!(regions.len(), 1);
         // Cursor is on the last live row; abs = scrollback_len + cursor.row.
         assert_eq!(regions[0].prompt_start, sb + t.cursor.row as isize);
+    }
+
+    //
+    // OSC 133 mark lifecycle: scroll into scrollback, eviction, resize.
+    //
+
+    #[test]
+    fn osc_133_mark_follows_row_into_scrollback() {
+        let mut t = Terminal::new(10, 3, 100);
+        // Prompt mark on row 0 over "P1", then scroll it off the top.
+        t.feed("P1\x1b]133;A\x07");
+        t.feed("\r\nL2\r\nL3\r\nL4");
+        // "P1" has spilled into scrollback row 0.
+        assert_eq!(t.scrollback_len(), 1);
+        assert_eq!(row_string(t.line_at(0).unwrap()), "P1");
+        // The mark's absolute index tracked it: it now points at scrollback 0.
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].prompt_start, 0);
+    }
+
+    #[test]
+    fn osc_133_mark_evicted_when_its_scrollback_row_falls_off() {
+        // Scrollback limit 2: once the marked line is pushed past the limit
+        // its anchor row is evicted and the region disappears.
+        let mut t = Terminal::new(10, 2, 2);
+        t.feed("P1\x1b]133;A\x07");
+        // Each \r\n at the bottom row scrolls one line into scrollback.
+        t.feed("\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6");
+        assert_eq!(t.scrollback_len(), 2); // capped at the limit
+        // "P1" was pushed out the front; its mark went with it.
+        assert!(t.line_at(0).map(|c| row_string(c)) != Some("P1".to_string()));
+        assert!(t.command_regions().is_empty());
+    }
+
+    #[test]
+    fn osc_133_resize_shrink_spills_mark_into_scrollback() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("P1\x1b]133;A\x07\r\nL2\r\nL3\r\nL4\r\nL5");
+        // Mark sits live on row 0.
+        assert_eq!(t.command_regions()[0].prompt_start, 0);
+        // Shrink to 3 rows spills the top two (P1, L2) into scrollback.
+        t.resize(10, 3);
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(row_string(t.line_at(0).unwrap()), "P1");
+        // The mark followed P1 to scrollback row 0.
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].prompt_start, 0);
+    }
+
+    #[test]
+    fn osc_133_resize_grow_pulls_mark_back_to_live() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("P1\x1b]133;A\x07\r\nL2\r\nL3\r\nL4\r\nL5");
+        t.resize(10, 3); // mark spills to scrollback
+        assert_eq!(t.scrollback_len(), 2);
+        t.resize(10, 5); // grow pulls the rows (and the mark) back
+        assert_eq!(t.scrollback_len(), 0);
+        // Mark is live again on row 0; with empty scrollback abs == 0.
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].prompt_start, 0);
+        assert_eq!(row_string(t.row(0)), "P1");
+    }
+
+    #[test]
+    fn osc_133_shrink_grow_round_trip_preserves_region() {
+        let mut t = Terminal::new(10, 5, 100);
+        // A full command cycle on rows 0..2.
+        t.feed("P1\x1b]133;A\x07\x1b]133;B\x07ls\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+        let before = t.command_regions();
+        t.resize(10, 2);
+        t.resize(10, 5);
+        // Indices and exit code survive the round trip unchanged.
+        assert_eq!(t.command_regions(), before);
+    }
+
+    #[test]
+    fn osc_133_marks_survive_alt_screen_resize() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("P1\x1b]133;A\x07");
+        let before = t.command_regions();
+        t.feed("\x1b[?1049h"); // enter alt screen
+        t.resize(10, 3); // alt resize: clamp-only, no scrollback churn
+        t.feed("\x1b[?1049l"); // back to primary
+        assert_eq!(t.command_regions(), before);
+    }
+
+    #[test]
+    fn osc_133_viewport_scroll_does_not_move_marks() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("P1\x1b]133;A\x07\r\nL2\r\nL3\r\nL4");
+        let before = t.command_regions();
+        // Scrolling the viewport into history is purely a view change; the
+        // marks' absolute anchors must not move.
+        t.scroll_up(1);
+        assert_eq!(t.command_regions(), before);
+        t.scroll_down(1);
+        assert_eq!(t.command_regions(), before);
+    }
+
+    #[test]
+    fn osc_133_ed3_drops_scrollback_marks_keeps_live() {
+        let mut t = Terminal::new(10, 3, 100);
+        // One mark scrolled into scrollback, one live on the current screen.
+        t.feed("P1\x1b]133;A\x07\r\nL2\r\nL3\r\nL4");
+        assert_eq!(t.scrollback_len(), 1);
+        t.feed("\x1b]133;A\x07"); // a second prompt mark, live
+        assert_eq!(t.command_regions().len(), 2);
+        t.feed("\x1b[3J"); // ED 3 — drop scrollback
+        // The scrollback-anchored region is gone; the live one remains.
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
     }
 
     //
