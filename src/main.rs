@@ -5402,6 +5402,11 @@ async fn run() {
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
+                    // A shell that emits OSC 7 just told us its cwd; reflect
+                    // it in the window title (abbreviating $HOME to `~`).
+                    if let Some(cwd) = state.terminal.take_cwd_update() {
+                        state.window.set_title(&title_for_cwd(&cwd));
+                    }
                     state.perf.note_pty(bytes, t0.elapsed());
                     state.invalidate();
                     // New / removed cells may have changed which URL (if any)
@@ -5592,6 +5597,29 @@ fn format_hex_rgb(c: [f32; 4]) -> String {
 /// Paint the native `NSWindow` background to match the terminal's bg color.
 /// The window is opaque, so during AppKit-driven frame changes — most visibly
 /// the title-bar double-click zoom animation — any area exposed before our
+/// Window title for an OSC 7 working directory: the basename prefixed with
+/// "Yutani — ", with `$HOME` collapsed to `~`. An empty/`/` path falls back
+/// to the bare app name.
+fn title_for_cwd(cwd: &str) -> String {
+    let display = if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if cwd == home {
+            "~".to_string()
+        } else if let Some(rest) = cwd.strip_prefix(&format!("{home}/")) {
+            format!("~/{rest}")
+        } else {
+            cwd.to_string()
+        }
+    } else {
+        cwd.to_string()
+    };
+    if display.is_empty() {
+        "Yutani".to_string()
+    } else {
+        format!("Yutani — {display}")
+    }
+}
+
 /// Metal layer redraws is filled with the window's `backgroundColor`. Left
 /// unset that's the default system window color, which flashes against the
 /// real terminal background. `bg` is stored linear (the surface is sRGB), so
