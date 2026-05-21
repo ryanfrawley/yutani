@@ -518,6 +518,48 @@ impl Cursor {
     }
 }
 
+/// A semantic mark from the OSC 133 shell-integration protocol (FinalTerm).
+/// The shell's prompt hook emits these to delimit prompt, user-input, and
+/// command-output regions on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticMarkKind {
+    /// `OSC 133 ; A` — a fresh prompt is about to be drawn.
+    PromptStart,
+    /// `OSC 133 ; B` — end of prompt / start of the user-typed command.
+    InputStart,
+    /// `OSC 133 ; C` — the user pressed enter; command output follows.
+    OutputStart,
+    /// `OSC 133 ; D [; <exit>]` — the command finished, with its optional
+    /// exit code.
+    CommandEnd { exit: Option<i32> },
+}
+
+/// A semantic mark anchored to a live primary-grid position. Scroll /
+/// scrollback survival is handled in a later slice; for now marks track
+/// live grid rows and are dropped on a full-screen clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticMark {
+    /// Primary-grid row the mark sits on.
+    row: usize,
+    /// Cursor column when the mark was emitted.
+    col: usize,
+    kind: SemanticMarkKind,
+}
+
+/// One shell command's screen region, assembled from the A/B/C/D marks by
+/// [`Terminal::command_regions`]. Line fields are absolute line indices in
+/// the same space as [`Terminal::line_at`] (`0..scrollback_len` is
+/// scrollback, `scrollback_len + r` is live grid row `r`), computed at
+/// query time so they stay viewport-consistent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRegion {
+    pub prompt_start: isize,
+    pub input_start: Option<isize>,
+    pub output_start: Option<isize>,
+    pub command_end: Option<isize>,
+    pub exit_code: Option<i32>,
+}
+
 pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
@@ -580,6 +622,13 @@ pub struct Terminal {
     // Monotonic id source for new placements. Slice 2 doesn't yet allocate
     // these (test code does); slice 4 hooks it up via the debug keybind.
     next_placement_id: PlacementId,
+    // OSC 133 semantic prompt marks on the *primary* grid, in emission
+    // order, anchored to live grid rows. Surviving scroll into scrollback
+    // and resize lands in a later slice (see design/osc133-plan.md). Read
+    // by `command_regions`; the prompt-navigation UI that consumes that
+    // query is also a later slice, hence the allow.
+    #[allow(dead_code)]
+    semantic_marks: Vec<SemanticMark>,
     // Config-driven: when false, placements that fully scroll off the top
     // are dropped rather than promoted to `scrollback_placements`. Saves
     // memory in long-running shells with heavy image traffic. The trade-
@@ -731,6 +780,7 @@ impl Terminal {
             scrollback_limit,
             view_offset: 0,
             scrollback_placements: VecDeque::new(),
+            semantic_marks: Vec::new(),
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
@@ -1764,7 +1814,14 @@ impl Terminal {
                 }
                 grid.clear_row(row, 0, col + 1, blank);
             }
-            2 => self.active_grid_mut().clear(blank),
+            2 => {
+                self.active_grid_mut().clear(blank);
+                // The marks anchored to the rows we just blanked are stale.
+                // (Marks live on the primary grid only.)
+                if !self.use_alternate {
+                    self.semantic_marks.clear();
+                }
+            }
             // ED 3 — xterm "Erase Saved Lines": drop the scrollback buffer
             // (and snap the viewport back to the live grid) without touching
             // on-screen content. Used by `clear -x` / `tput E3`.
@@ -2053,6 +2110,8 @@ impl Terminal {
             // Shell working-directory report (used to seed new-tab cwd /
             // window titles). Payload is a `file://host/path` URL.
             7 => self.handle_osc_7(rest),
+            // FinalTerm / shell-integration semantic prompt marks.
+            133 => self.handle_osc_133(rest),
             // iTerm2 proprietary namespace. Only `File=...` (inline
             // images) is implemented; everything else is silently
             // dropped to match iTerm's "unknown verb is a no-op" contract.
@@ -2107,6 +2166,100 @@ impl Terminal {
         } else {
             None
         }
+    }
+
+    /// `OSC 133 ; <kind> [; params...] ST` — FinalTerm semantic prompt
+    /// marks. We record the four standard kinds (`A`/`B`/`C`/`D`) anchored
+    /// to the cursor position. Trailing `key=value` params (e.g. `A;aid=7`,
+    /// the exit code's siblings on `D`) are tolerated and ignored — only the
+    /// leading kind token and `D`'s first numeric field are read.
+    ///
+    /// Marks only make sense on the primary screen — full-screen apps that
+    /// take the alternate screen (vim, less) don't run prompts — so anything
+    /// emitted while the alt screen is active is dropped.
+    fn handle_osc_133(&mut self, payload: &str) {
+        if self.use_alternate {
+            return;
+        }
+        let mut fields = payload.split(';');
+        let kind = match fields.next() {
+            Some("A") => SemanticMarkKind::PromptStart,
+            Some("B") => SemanticMarkKind::InputStart,
+            Some("C") => SemanticMarkKind::OutputStart,
+            Some("D") => {
+                // The first field after `D` is the exit code when present and
+                // numeric. A `key=value` field (or non-numeric junk) means
+                // "no exit code reported".
+                let exit = fields
+                    .next()
+                    .filter(|f| !f.contains('='))
+                    .and_then(|f| f.parse::<i32>().ok());
+                SemanticMarkKind::CommandEnd { exit }
+            }
+            _ => return,
+        };
+        self.semantic_marks.push(SemanticMark {
+            row: self.cursor.row,
+            col: self.cursor.col,
+            kind,
+        });
+    }
+
+    /// Fold the recorded semantic marks into per-command regions, in
+    /// emission order. Line fields are absolute line indices (the
+    /// [`line_at`](Self::line_at) convention), computed from the current
+    /// scrollback length so they track the viewport.
+    ///
+    /// A `PromptStart` opens a region; `InputStart` / `OutputStart` fill it;
+    /// `CommandEnd` closes it. Missing marks are tolerated — an interrupted
+    /// command leaves `command_end: None`, and a region needs only its
+    /// opening `PromptStart` to be emitted. Consumed by the (later)
+    /// prompt-navigation UI.
+    #[allow(dead_code)]
+    pub fn command_regions(&self) -> Vec<CommandRegion> {
+        // Live marks anchor below all scrollback rows.
+        let base = self.scrollback.len() as isize;
+        let abs = |m: &SemanticMark| base + m.row as isize;
+
+        let mut regions: Vec<CommandRegion> = Vec::new();
+        let mut current: Option<CommandRegion> = None;
+        for m in &self.semantic_marks {
+            match m.kind {
+                SemanticMarkKind::PromptStart => {
+                    if let Some(r) = current.take() {
+                        regions.push(r);
+                    }
+                    current = Some(CommandRegion {
+                        prompt_start: abs(m),
+                        input_start: None,
+                        output_start: None,
+                        command_end: None,
+                        exit_code: None,
+                    });
+                }
+                SemanticMarkKind::InputStart => {
+                    if let Some(r) = current.as_mut() {
+                        r.input_start = Some(abs(m));
+                    }
+                }
+                SemanticMarkKind::OutputStart => {
+                    if let Some(r) = current.as_mut() {
+                        r.output_start = Some(abs(m));
+                    }
+                }
+                SemanticMarkKind::CommandEnd { exit } => {
+                    if let Some(mut r) = current.take() {
+                        r.command_end = Some(abs(m));
+                        r.exit_code = exit;
+                        regions.push(r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = current.take() {
+            regions.push(r);
+        }
+        regions
     }
 
     /// `OSC 1337 ; <verb>=<args> [: <base64>] ST` — iTerm2's proprietary
@@ -3358,6 +3511,7 @@ impl Terminal {
         // scrollback placements since the scrollback rows they anchor to are
         // about to be cleared.
         self.scrollback_placements.clear();
+        self.semantic_marks.clear();
         self.next_placement_id = 1;
     }
 }
@@ -6511,6 +6665,141 @@ mod tests {
         assert!(ids.contains(&10));
         assert!(ids.contains(&20));
         assert!(ids.contains(&30));
+    }
+
+    //
+    // OSC 133 semantic prompt marks.
+    //
+
+    #[test]
+    fn osc_133_full_command_cycle_builds_one_region() {
+        let mut t = Terminal::new(80, 24, 100);
+        // Prompt drawn on row 0, command typed, output on rows 1..2.
+        t.feed("\x1b]133;A\x07");
+        t.feed("$ \x1b]133;B\x07");
+        t.feed("ls\r\n\x1b]133;C\x07");
+        t.feed("file.txt\r\n\x1b]133;D;0\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        let r = regions[0];
+        assert_eq!(r.prompt_start, 0);
+        assert_eq!(r.input_start, Some(0));
+        assert_eq!(r.output_start, Some(1));
+        assert_eq!(r.command_end, Some(2));
+        assert_eq!(r.exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc_133_nonzero_exit_code_captured() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]133;A\x07\x1b]133;D;130\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].exit_code, Some(130));
+    }
+
+    #[test]
+    fn osc_133_command_end_without_code() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]133;A\x07\x1b]133;D\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].command_end, Some(0));
+        assert_eq!(regions[0].exit_code, None);
+    }
+
+    #[test]
+    fn osc_133_trailing_params_tolerated() {
+        let mut t = Terminal::new(80, 24, 100);
+        // `aid=` on A, an extra `key=value` sibling on D's exit field.
+        t.feed("\x1b]133;A;aid=foo\x07");
+        t.feed("\x1b]133;D;1;err=oops\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn osc_133_non_numeric_exit_field_is_no_code() {
+        let mut t = Terminal::new(80, 24, 100);
+        // A `key=value` first field means "no exit code".
+        t.feed("\x1b]133;A\x07\x1b]133;D;aid=7\x07");
+        assert_eq!(t.command_regions()[0].exit_code, None);
+    }
+
+    #[test]
+    fn osc_133_unknown_kind_ignored() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]133;Z\x07");
+        t.feed("\x1b]133;\x07");
+        assert!(t.command_regions().is_empty());
+    }
+
+    #[test]
+    fn osc_133_interrupted_command_has_no_end() {
+        let mut t = Terminal::new(80, 24, 100);
+        // Ctrl-C before the command finishes: A, B, C, but no D.
+        t.feed("\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].command_end, None);
+        assert_eq!(regions[0].output_start, Some(0));
+    }
+
+    #[test]
+    fn osc_133_back_to_back_prompts_make_two_regions() {
+        let mut t = Terminal::new(80, 24, 100);
+        // A bare prompt (no command), then another prompt. The second A
+        // closes the first (still-open) region.
+        t.feed("\x1b]133;A\x07\x1b]133;B\x07");
+        t.feed("\r\n\x1b]133;A\x07\x1b]133;B\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].prompt_start, 0);
+        assert_eq!(regions[1].prompt_start, 1);
+    }
+
+    #[test]
+    fn osc_133_marks_ignored_on_alt_screen() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[?1049h"); // enter alt screen
+        t.feed("\x1b]133;A\x07\x1b]133;D;0\x07");
+        t.feed("\x1b[?1049l"); // leave alt screen
+        assert!(t.command_regions().is_empty());
+    }
+
+    #[test]
+    fn osc_133_ed2_clears_marks() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]133;A\x07\x1b]133;D;0\x07");
+        assert_eq!(t.command_regions().len(), 1);
+        t.feed("\x1b[2J"); // ED 2 — full-screen clear
+        assert!(t.command_regions().is_empty());
+    }
+
+    #[test]
+    fn osc_133_st_terminator_accepted() {
+        let mut t = Terminal::new(80, 24, 100);
+        // String Terminator (ESC \) instead of BEL.
+        t.feed("\x1b]133;A\x1b\\\x1b]133;D;0\x1b\\");
+        assert_eq!(t.command_regions().len(), 1);
+        assert_eq!(t.command_regions()[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc_133_absolute_indices_include_scrollback() {
+        // Marks anchor below scrollback. Push a few lines into scrollback
+        // first, then a mark on the live grid: its absolute index must be
+        // offset by the scrollback length.
+        let mut t = Terminal::new(80, 2, 100);
+        t.feed("a\r\nb\r\nc\r\nd"); // scrolls rows into scrollback
+        let sb = t.scrollback.len() as isize;
+        assert!(sb > 0);
+        t.feed("\x1b]133;A\x07");
+        let regions = t.command_regions();
+        assert_eq!(regions.len(), 1);
+        // Cursor is on the last live row; abs = scrollback_len + cursor.row.
+        assert_eq!(regions[0].prompt_start, sb + t.cursor.row as isize);
     }
 
     //
