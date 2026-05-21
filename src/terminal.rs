@@ -559,6 +559,12 @@ pub struct Terminal {
     // Bytes the host has asked us to send back (DSR replies, etc.). Caller
     // drains via `take_response()` after each `feed`.
     pending_response: Vec<u8>,
+    // Shell's reported working directory (OSC 7). `None` until a shell
+    // integration emits one. `cwd_dirty` is set when it changes so the
+    // front end can pull the update via `take_cwd_update()` (e.g. to retitle
+    // the window or seed a new tab's cwd) without polling on every feed.
+    cwd: Option<String>,
+    cwd_dirty: bool,
     parser: ansi::Parser,
     scrollback: VecDeque<Vec<Cell>>,
     scrollback_limit: usize,
@@ -718,6 +724,8 @@ impl Terminal {
             default_bg_rgb: [0x00, 0x00, 0x00],
             default_cursor_rgb: [0xcc, 0xcc, 0xcc],
             pending_response: Vec::new(),
+            cwd: None,
+            cwd_dirty: false,
             parser: ansi::Parser::new(),
             scrollback: VecDeque::new(),
             scrollback_limit,
@@ -2042,11 +2050,62 @@ impl Terminal {
             10 if rest == "?" => self.reply_color(10, self.default_fg_rgb),
             11 if rest == "?" => self.reply_color(11, self.default_bg_rgb),
             12 if rest == "?" => self.reply_color(12, self.default_cursor_rgb),
+            // Shell working-directory report (used to seed new-tab cwd /
+            // window titles). Payload is a `file://host/path` URL.
+            7 => self.handle_osc_7(rest),
             // iTerm2 proprietary namespace. Only `File=...` (inline
             // images) is implemented; everything else is silently
             // dropped to match iTerm's "unknown verb is a no-op" contract.
             1337 => self.handle_osc_1337(rest),
             _ => {}
+        }
+    }
+
+    /// `OSC 7 ; file://<host>/<path> ST` — the shell reports its current
+    /// working directory. Emitted from the prompt hook (`precmd` in zsh,
+    /// `PROMPT_COMMAND` in bash) on every prompt. The host name is advisory
+    /// (we ignore it; remote dirs over ssh aren't reachable locally anyway)
+    /// and the path is percent-encoded.
+    ///
+    /// We accept the canonical `file://host/path` form and also a bare
+    /// absolute path (`/some/dir`) some minimal integrations emit. Anything
+    /// else — relative paths, unknown schemes, empty payloads — is dropped.
+    /// An unchanged value doesn't mark the cwd dirty, so re-emitting the
+    /// same directory on every prompt is free for the front end.
+    fn handle_osc_7(&mut self, payload: &str) {
+        let path = if let Some(after_scheme) = payload.strip_prefix("file://") {
+            // Strip the authority (host) component: everything up to the
+            // first '/'. `file:///path` (empty host) and `file://host/path`
+            // both leave `after_scheme` pointing at the leading '/'.
+            match after_scheme.find('/') {
+                Some(slash) => &after_scheme[slash..],
+                None => return, // host with no path — nothing usable
+            }
+        } else if payload.starts_with('/') {
+            payload
+        } else {
+            return;
+        };
+
+        let decoded = percent_decode_path(path);
+        if decoded.is_empty() {
+            return;
+        }
+        if self.cwd.as_deref() != Some(decoded.as_str()) {
+            self.cwd = Some(decoded);
+            self.cwd_dirty = true;
+        }
+    }
+
+    /// Returns the working directory once if it changed since the last call,
+    /// clearing the dirty flag. The front end calls this after each `feed`
+    /// to retitle the window / seed a new tab without diffing strings itself.
+    pub fn take_cwd_update(&mut self) -> Option<String> {
+        if self.cwd_dirty {
+            self.cwd_dirty = false;
+            self.cwd.clone()
+        } else {
+            None
         }
     }
 
@@ -3399,6 +3458,31 @@ fn compute_cell_extent(
         rows.min(u16::MAX as u32) as u16,
         cols.min(u16::MAX as u32) as u16,
     )
+}
+
+/// Percent-decode an OSC 7 path. `%XX` (two hex digits) becomes the byte it
+/// names; a `%` not followed by two hex digits is passed through literally.
+/// The resulting bytes are interpreted as UTF-8, lossily — a malformed
+/// sequence yields replacement chars rather than dropping the directory,
+/// since a partly-garbled path is more useful to show than none.
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parse an iTerm2 OSC 1337 size token. Accepts:
@@ -6448,6 +6532,92 @@ mod tests {
             .unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
         format!("\x1b]1337;File=inline=1{}:{}\x07", extra, b64)
+    }
+
+    //
+    // OSC 7 working-directory reporting.
+    //
+
+    #[test]
+    fn osc_7_file_url_sets_cwd() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]7;file://myhost/Users/ry/projects\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/Users/ry/projects"));
+    }
+
+    #[test]
+    fn osc_7_empty_host_triple_slash() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]7;file:///var/log\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/var/log"));
+    }
+
+    #[test]
+    fn osc_7_percent_decodes_path() {
+        let mut t = Terminal::new(80, 24, 100);
+        // "%20" -> space, "%C3%A9" -> é
+        t.feed("\x1b]7;file://h/Users/ry/My%20Code/caf%C3%A9\x07");
+        assert_eq!(
+            t.take_cwd_update().as_deref(),
+            Some("/Users/ry/My Code/café")
+        );
+    }
+
+    #[test]
+    fn osc_7_bare_absolute_path_accepted() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]7;/tmp/work\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn osc_7_take_update_clears_dirty() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]7;file://h/a/b\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/a/b"));
+        // Second take with no new report yields nothing.
+        assert_eq!(t.take_cwd_update(), None);
+    }
+
+    #[test]
+    fn osc_7_unchanged_dir_does_not_redirty() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]7;file://h/a/b\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/a/b"));
+        // Re-emitting the identical directory (every prompt does this) must
+        // not mark the cwd dirty again.
+        t.feed("\x1b]7;file://h/a/b\x07");
+        assert_eq!(t.take_cwd_update(), None);
+        // A genuine change does dirty it.
+        t.feed("\x1b]7;file://h/a/c\x07");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/a/c"));
+    }
+
+    #[test]
+    fn osc_7_malformed_payloads_ignored() {
+        let mut t = Terminal::new(80, 24, 100);
+        // Relative path, unknown scheme, host-only file URL, and empty body.
+        t.feed("\x1b]7;relative/path\x07");
+        t.feed("\x1b]7;http://example.com/x\x07");
+        t.feed("\x1b]7;file://hostonly\x07");
+        t.feed("\x1b]7;\x07");
+        assert_eq!(t.take_cwd_update(), None);
+    }
+
+    #[test]
+    fn percent_decode_passes_through_lone_percent() {
+        // A trailing or malformed '%' is kept verbatim, not dropped.
+        assert_eq!(percent_decode_path("/a%"), "/a%");
+        assert_eq!(percent_decode_path("/a%zz/b"), "/a%zz/b");
+        assert_eq!(percent_decode_path("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn osc_7_st_terminator_accepted() {
+        let mut t = Terminal::new(80, 24, 100);
+        // String Terminator (ESC \) instead of BEL.
+        t.feed("\x1b]7;file://h/a/b\x1b\\");
+        assert_eq!(t.take_cwd_update().as_deref(), Some("/a/b"));
     }
 
     #[test]
