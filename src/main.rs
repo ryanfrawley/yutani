@@ -35,6 +35,9 @@ use wgpu::util::DeviceExt;
 
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
+/// Maximum rows the completion popup shows at once; longer lists scroll. Shared
+/// by the draw block and the keyboard-nav handler so the two can't drift.
+const COMPLETION_MAX_VISIBLE: usize = 10;
 /// Smallest grid height (in rows) we ever report to the PTY, regardless of how
 /// short the window is dragged. Sized to keep a typical multi-line shell prompt
 /// resident so resizing never spills it — see the floor in `get_viewport_size`.
@@ -1054,6 +1057,13 @@ struct State {
     /// The (buffer, cursor) the cached `completions` were computed from, so we
     /// can skip the recompute (and the `read_dir`) when nothing changed.
     completions_input: Option<(String, usize)>,
+    /// Highlighted row in the completion popup (index into `completions`). Reset
+    /// to 0 whenever the list is recomputed. Only meaningful while `completions`
+    /// is non-empty.
+    selected_completion: usize,
+    /// First visible row when `completions` exceeds the popup's MAX_VISIBLE
+    /// rows; scrolls to keep `selected_completion` on screen.
+    completion_scroll: usize,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -2056,6 +2066,8 @@ impl State {
             cursor_ghosts: Vec::new(),
             completions: Vec::new(),
             completions_input: None,
+            selected_completion: 0,
+            completion_scroll: 0,
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -3208,12 +3220,17 @@ impl State {
         // glow is on; acceptable for K10.
         let popup_visible = !self.completions.is_empty() && self.terminal.view_offset() == 0;
         if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
-            const MAX_VISIBLE: usize = 10;
-            let n = self.completions.len().min(MAX_VISIBLE);
+            let len = self.completions.len();
+            // The visible window: `COMPLETION_MAX_VISIBLE` rows starting at the
+            // scroll offset, clamped to the list. `n` is how many rows render.
+            let start = self.completion_scroll.min(len);
+            let end = (start + COMPLETION_MAX_VISIBLE).min(len);
+            let visible = &self.completions[start..end];
+            let n = visible.len();
             let item_h = line_height;
             // Box width: longest visible suggestion (chars) plus a little
             // horizontal padding, capped, so it's deterministic and testable.
-            let longest = self.completions[..n]
+            let longest = visible
                 .iter()
                 .map(|s| s.text.chars().count())
                 .max()
@@ -3270,26 +3287,35 @@ impl State {
                 [radius; 4],
             );
 
-            // Row 0 highlight. K11 will make the selected index movable.
-            push_quad(
-                &mut vertices,
-                &mut indices,
-                layout.x,
-                layout.y,
-                layout.w,
-                item_h,
-                [bg_u, bg_v],
-                [bg_u, bg_v],
-                hl_color,
-                [radius, 0.0, radius, 0.0],
-            );
+            // Highlight the selected row at its on-screen offset within the
+            // visible window. Round the highlight's top corners only when it's
+            // the box's first visible row, and its bottom corners only when it's
+            // the last — so the highlight's rounding tracks the box's edges.
+            let hl_row = self.selected_completion.saturating_sub(start);
+            if hl_row < n {
+                let hl_y = layout.y + hl_row as f32 * item_h;
+                let round_top = if hl_row == 0 { radius } else { 0.0 };
+                let round_bot = if hl_row + 1 == n { radius } else { 0.0 };
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    layout.x,
+                    hl_y,
+                    layout.w,
+                    item_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    hl_color,
+                    [round_top, round_bot, round_top, round_bot],
+                );
+            }
 
             // Suggestion text rows. Baseline within each row mirrors the grid:
             // strip_top + ascent (ascent above baseline = bg_h + descender,
             // descender being negative) + the centering pad.
             let text_x = layout.x + text_pad;
             let max_text_x = layout.x + layout.w - text_pad;
-            for (i, sug) in self.completions[..n].iter().enumerate() {
+            for (i, sug) in visible.iter().enumerate() {
                 let row_top = layout.y + i as f32 * item_h;
                 let baseline = row_top + bg_h + descender + strip_pad;
                 emit_text_run(
@@ -4440,7 +4466,39 @@ impl State {
             }
             _ => Vec::new(),
         };
+        // The cache was replaced: restart selection at the top and reset the
+        // scroll window so navigation state never points past a shorter list.
+        self.selected_completion = 0;
+        self.completion_scroll = 0;
         true
+    }
+
+    /// Accept the highlighted suggestion: write the bytes that extend the typed
+    /// token into the chosen path, straight to the PTY (the shell's line editor
+    /// inserts them at the cursor). Computes the suffix against the LIVE buffer
+    /// (not the cached one) and bails if they no longer agree, so a stale cache
+    /// can't inject wrong bytes. Closes the popup afterward; if the shell
+    /// re-reports its input (OSC 2122), a fresh popup may open — e.g. accepting
+    /// `src/` then shows that directory's contents.
+    fn accept_selected_completion(&mut self) {
+        let Some(sug) = self.completions.get(self.selected_completion) else {
+            return;
+        };
+        let text = sug.text.clone();
+        if let Some(c) = self.terminal.current_input() {
+            if let Some(suffix) = completion::accept_suffix(&c.buffer, c.cursor, &text) {
+                // Clone to a Vec before write_pty: `current_input()` borrows
+                // `self.terminal` immutably while `write_pty(&self)` borrows
+                // `self`, so the suffix can't stay borrowed across the call.
+                let bytes = suffix.as_bytes().to_vec();
+                self.write_pty(&bytes);
+            }
+        }
+        self.completions.clear();
+        self.completions_input = None; // force a fresh recompute on the next report
+        self.selected_completion = 0;
+        self.completion_scroll = 0;
+        self.invalidate();
     }
 
     /// Pull every iTerm2 OSC-1337 (and future protocol) payload off the
@@ -5011,6 +5069,77 @@ impl State {
                                 self.window.request_redraw();
                                 return true;
                             }
+                        }
+                    }
+                    // Completion popup keyboard interaction (autocomplete slice
+                    // K11). Only acts when the popup is genuinely active (cached
+                    // suggestions + live view) and no Ctrl/Alt/Super is held;
+                    // Shift is allowed so Shift-Tab can navigate up. Intercepting
+                    // here — after the Cmd shortcuts, before the encode_key path —
+                    // means these keys reach the shell normally when no popup is
+                    // open, and only steer the popup while it is.
+                    let popup_active =
+                        !self.completions.is_empty() && self.terminal.view_offset() == 0;
+                    let plain = !self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key();
+                    if popup_active && plain {
+                        use winit::keyboard::{Key, NamedKey};
+                        let len = self.completions.len();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::ArrowDown) => {
+                                self.selected_completion =
+                                    (self.selected_completion + 1).min(len - 1);
+                                self.completion_scroll = completion::visible_window_start(
+                                    self.selected_completion,
+                                    self.completion_scroll,
+                                    COMPLETION_MAX_VISIBLE,
+                                );
+                                self.invalidate();
+                                return true;
+                            }
+                            // ArrowUp, and Shift-Tab, move the selection up.
+                            Key::Named(NamedKey::ArrowUp) => {
+                                self.selected_completion =
+                                    self.selected_completion.saturating_sub(1);
+                                self.completion_scroll = completion::visible_window_start(
+                                    self.selected_completion,
+                                    self.completion_scroll,
+                                    COMPLETION_MAX_VISIBLE,
+                                );
+                                self.invalidate();
+                                return true;
+                            }
+                            Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
+                                self.selected_completion =
+                                    self.selected_completion.saturating_sub(1);
+                                self.completion_scroll = completion::visible_window_start(
+                                    self.selected_completion,
+                                    self.completion_scroll,
+                                    COMPLETION_MAX_VISIBLE,
+                                );
+                                self.invalidate();
+                                return true;
+                            }
+                            // Tab is the primary accept; Enter is a convenience.
+                            // Enter here DOES hijack command submission while a
+                            // path popup is open — that's intended: accept the
+                            // completion, don't run the command.
+                            Key::Named(NamedKey::Tab) | Key::Named(NamedKey::Enter) => {
+                                self.accept_selected_completion();
+                                return true;
+                            }
+                            Key::Named(NamedKey::Escape) => {
+                                // Dismiss by clearing the cached list. Because
+                                // `completions_input` is left intact,
+                                // `recompute_completions` won't repopulate until
+                                // the buffer actually changes — so it stays closed
+                                // until the user types more.
+                                self.completions.clear();
+                                self.invalidate();
+                                return true;
+                            }
+                            _ => {}
                         }
                     }
                     // macOS Option-as-Meta: with Option held, winit reports the

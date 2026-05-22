@@ -193,6 +193,30 @@ fn token_under_cursor(buffer: &str, cursor: usize) -> (usize, &str) {
     (token_start, &buffer[token_start..cursor_byte])
 }
 
+/// The bytes to append to the shell's input to accept `suggestion_text` for the
+/// path token under the cursor: the part of the suggestion beyond what the user
+/// already typed. Returns `None` when the suggestion doesn't extend the current
+/// token — a guard against writing garbage if the cached suggestion is stale
+/// relative to the live buffer. Assumes the cursor sits at the end of the token
+/// (v1; mid-token accept is a later refinement).
+pub fn accept_suffix<'a>(buffer: &str, cursor: usize, suggestion_text: &'a str) -> Option<&'a str> {
+    let (_start, token) = token_under_cursor(buffer, cursor);
+    suggestion_text.strip_prefix(token)
+}
+
+/// New scroll-window start so row `selected` stays within a `max_visible`-row
+/// viewport that currently starts at `current_start`. Scrolls just enough to
+/// bring `selected` into view (no centering).
+pub fn visible_window_start(selected: usize, current_start: usize, max_visible: usize) -> usize {
+    if selected < current_start {
+        selected
+    } else if max_visible > 0 && selected >= current_start + max_visible {
+        selected + 1 - max_visible
+    } else {
+        current_start
+    }
+}
+
 /// Split a token into the directory to scan, the filename prefix to match, and
 /// the directory portion of the token (the part up to and including the last
 /// `/`, or empty) used to rebuild [`Suggestion::text`] so the replacement
@@ -513,5 +537,58 @@ mod tests {
         }
         let s = complete_path("ls file_", 8, Some(tmp.path.as_path()));
         assert_eq!(s.len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn accept_suffix_extends_partial_token() {
+        // Token `sr` (cursor at end), suggestion `src/`: suffix is `c/`.
+        assert_eq!(accept_suffix("sr", 2, "src/"), Some("c/"));
+    }
+
+    #[test]
+    fn accept_suffix_completed_dir_token() {
+        // Token `src/` fully matched; suffix is the entry name.
+        assert_eq!(accept_suffix("src/", 4, "src/main.rs"), Some("main.rs"));
+    }
+
+    #[test]
+    fn accept_suffix_mismatch_returns_none() {
+        // Suggestion doesn't extend the typed token: no bytes to write.
+        assert_eq!(accept_suffix("x", 1, "src/"), None);
+    }
+
+    #[test]
+    fn accept_suffix_multibyte_round_trip() {
+        // A multibyte token followed by an entry name; suffix math must hold.
+        // Token is `café` (cursor after the accented char run).
+        let buffer = "ls café";
+        let cursor = 7; // chars: l s ' ' c a f é -> 7 code points
+        assert_eq!(accept_suffix(buffer, cursor, "café_dir/"), Some("_dir/"));
+    }
+
+    #[test]
+    fn visible_window_already_visible_unchanged() {
+        // selected in [start, start+max): no scroll.
+        assert_eq!(visible_window_start(3, 2, 10), 2);
+        assert_eq!(visible_window_start(2, 2, 10), 2);
+    }
+
+    #[test]
+    fn visible_window_scrolls_up_to_selected() {
+        // selected above the window: start moves to selected.
+        assert_eq!(visible_window_start(1, 5, 10), 1);
+    }
+
+    #[test]
+    fn visible_window_scrolls_down_to_last_row() {
+        // selected at/below start+max: scroll so selected is the last visible row.
+        // start=0, max=10, selected=10 -> start = 10 + 1 - 10 = 1.
+        assert_eq!(visible_window_start(10, 0, 10), 1);
+        assert_eq!(visible_window_start(12, 0, 10), 3);
+    }
+
+    #[test]
+    fn visible_window_zero_max_is_noop() {
+        assert_eq!(visible_window_start(5, 2, 0), 2);
     }
 }
