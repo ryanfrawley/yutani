@@ -2782,6 +2782,53 @@ impl State {
             }
         }
 
+        // 1c. OSC 133 prompt-status gutter. A short rounded vertical bar in
+        //     the left window padding at each prompt's row, colored by the
+        //     command's exit status — green for success, red for failure, and
+        //     a dim foreground tint while a command is still running (or the
+        //     shell reported no code). Drawn in the padding so it never
+        //     overlaps cell content.
+        let status_markers = self.terminal.prompt_status_markers();
+        if !status_markers.is_empty() {
+            let pal = palette::get();
+            let bar_w = (cell_w * 0.16).clamp(2.0, 4.0);
+            let bar_x = (WINDOW_PADDING - bar_w) * 0.5; // centered in the padding
+            let strip_pad = (line_height - bg_h) * 0.5;
+            let bar_radius = bar_w * 0.5;
+            for r in r_lo..r_hi {
+                let abs_line = self.terminal.visual_to_abs_line(r);
+                let Some((_, status)) = status_markers.iter().find(|(l, _)| *l == abs_line)
+                else {
+                    continue;
+                };
+                let color = match status {
+                    terminal::PromptStatus::Success => pal.ansi[2], // green
+                    terminal::PromptStatus::Failure => pal.ansi[1], // red
+                    terminal::PromptStatus::Pending => {
+                        let fg = pal.foreground;
+                        [fg[0], fg[1], fg[2], fg[3] * 0.35]
+                    }
+                };
+                // Inset a little from the row's top/bottom so the bar reads as
+                // a marker rather than filling the line.
+                let inset = line_height * 0.18;
+                let sy = row_y(r) - bg_h - descender - strip_pad + scroll_y + inset;
+                let sh = (line_height - 2.0 * inset).max(2.0);
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    bar_x,
+                    sy,
+                    bar_w,
+                    sh,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    color,
+                    [bar_radius; 4],
+                );
+            }
+        }
+
         // 2. Cursor box, only when the live cursor row is actually visible on
         //    screen (scrollback may have pushed it off the bottom). Shape
         //    follows DECSCUSR — block, underline, or bar. The displayed

@@ -573,6 +573,19 @@ pub struct CommandRegion {
     pub exit_code: Option<i32>,
 }
 
+/// Status shown in the prompt gutter for a command region, derived from its
+/// reported exit code. Drives the gutter-bar color in the renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptStatus {
+    /// Command finished with exit code 0.
+    Success,
+    /// Command finished with a non-zero exit code.
+    Failure,
+    /// No completed-with-code command for this prompt yet — still running,
+    /// interrupted, or the shell reported `D` without an exit code.
+    Pending,
+}
+
 pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
@@ -2456,6 +2469,24 @@ impl Terminal {
         }
         self.view_offset = new;
         true
+    }
+
+    /// One `(absolute_line, status)` per command region, anchored at the
+    /// region's prompt-start line. The renderer maps each absolute line to a
+    /// visible row (via [`visual_to_abs_line`](Self::visual_to_abs_line)) and
+    /// draws a status-colored gutter bar. Empty when no marks are present.
+    pub fn prompt_status_markers(&self) -> Vec<(isize, PromptStatus)> {
+        self.command_regions()
+            .into_iter()
+            .map(|r| {
+                let status = match r.exit_code {
+                    Some(0) => PromptStatus::Success,
+                    Some(_) => PromptStatus::Failure,
+                    None => PromptStatus::Pending,
+                };
+                (r.prompt_start, status)
+            })
+            .collect()
     }
 
     /// `OSC 1337 ; <verb>=<args> [: <base64>] ST` — iTerm2's proprietary
@@ -7168,6 +7199,69 @@ mod tests {
         t.feed("\x1b[?1049h"); // alt screen has no scrollback to navigate
         assert!(!t.scroll_to_prev_prompt());
         assert!(!t.scroll_to_next_prompt());
+    }
+
+    //
+    // OSC 133 prompt-status gutter markers (K6).
+    //
+
+    #[test]
+    fn osc_133_status_marker_success() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b]133;A\x07\x1b]133;D;0\x07");
+        assert_eq!(
+            t.prompt_status_markers(),
+            vec![(0, PromptStatus::Success)]
+        );
+    }
+
+    #[test]
+    fn osc_133_status_marker_failure() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b]133;A\x07\x1b]133;D;1\x07");
+        assert_eq!(
+            t.prompt_status_markers(),
+            vec![(0, PromptStatus::Failure)]
+        );
+    }
+
+    #[test]
+    fn osc_133_status_marker_pending_until_command_ends() {
+        let mut t = Terminal::new(10, 3, 100);
+        // Prompt drawn, command still running (no D, or D without a code).
+        t.feed("\x1b]133;A\x07\x1b]133;B\x07");
+        assert_eq!(
+            t.prompt_status_markers(),
+            vec![(0, PromptStatus::Pending)]
+        );
+        t.feed("\x1b]133;D\x07"); // ended, but no exit code reported
+        assert_eq!(
+            t.prompt_status_markers(),
+            vec![(0, PromptStatus::Pending)]
+        );
+    }
+
+    #[test]
+    fn osc_133_status_markers_track_each_prompt() {
+        let mut t = Terminal::new(10, 3, 100);
+        // Two completed commands (success then failure) on distinct rows.
+        t.feed("\x1b]133;A\x07ok\r\n\x1b]133;D;0\x07");
+        t.feed("\x1b]133;A\x07bad\r\n\x1b]133;D;1\x07");
+        let markers = t.prompt_status_markers();
+        assert_eq!(markers.len(), 2);
+        // Each marker's line equals its region's prompt_start.
+        let regions = t.command_regions();
+        assert_eq!(markers[0].0, regions[0].prompt_start);
+        assert_eq!(markers[0].1, PromptStatus::Success);
+        assert_eq!(markers[1].0, regions[1].prompt_start);
+        assert_eq!(markers[1].1, PromptStatus::Failure);
+    }
+
+    #[test]
+    fn osc_133_status_markers_empty_without_marks() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("just some output\r\n");
+        assert!(t.prompt_status_markers().is_empty());
     }
 
     //
