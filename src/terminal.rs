@@ -2346,6 +2346,14 @@ impl Terminal {
         }
     }
 
+    /// The shell's reported working directory (OSC 7), if known. Borrowed for
+    /// read access (e.g. seeding the path completer); `take_cwd_update` remains
+    /// the change-notification path.
+    #[allow(dead_code)]
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
     /// The shell's current interactive input line, if the shell is reporting
     /// one via `OSC 2122`. `None` when no edit line is active (no shell
     /// integration, a command is running, or the alternate screen is up).

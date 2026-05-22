@@ -1,5 +1,6 @@
 mod app_window;
 mod box_drawing;
+mod completion;
 mod font;
 mod font_loader;
 mod renderer;
