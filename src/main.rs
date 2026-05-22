@@ -1064,6 +1064,11 @@ struct State {
     /// First visible row when `completions` exceeds the popup's MAX_VISIBLE
     /// rows; scrolls to keep `selected_completion` on screen.
     completion_scroll: usize,
+    /// When true, the popup stays closed even as the shell re-reports input —
+    /// set by Enter (finish) and Esc (dismiss), cleared by the next real
+    /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
+    /// close the menu.
+    completion_dismissed: bool,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -2068,6 +2073,7 @@ impl State {
             completions_input: None,
             selected_completion: 0,
             completion_scroll: 0,
+            completion_dismissed: false,
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -4459,12 +4465,19 @@ impl State {
             return false;
         }
         self.completions_input = key;
-        self.completions = match &cur {
-            Some(c) if completion::has_path_token(&c.buffer, c.cursor) => {
-                let cwd = self.terminal.cwd().map(std::path::Path::new);
-                completion::complete_path(&c.buffer, c.cursor, cwd)
+        // A dismissed popup (Enter/Esc) must not reopen when the shell re-emits
+        // OSC 2122 after an accepted suffix — keep it empty until a real
+        // keystroke clears the flag.
+        self.completions = if self.completion_dismissed {
+            Vec::new()
+        } else {
+            match &cur {
+                Some(c) if completion::has_path_token(&c.buffer, c.cursor) => {
+                    let cwd = self.terminal.cwd().map(std::path::Path::new);
+                    completion::complete_path(&c.buffer, c.cursor, cwd)
+                }
+                _ => Vec::new(),
             }
-            _ => Vec::new(),
         };
         // The cache was replaced: restart selection at the top and reset the
         // scroll window so navigation state never points past a shorter list.
@@ -4477,25 +4490,61 @@ impl State {
     /// token into the chosen path, straight to the PTY (the shell's line editor
     /// inserts them at the cursor). Computes the suffix against the LIVE buffer
     /// (not the cached one) and bails if they no longer agree, so a stale cache
-    /// can't inject wrong bytes. Closes the popup afterward; if the shell
-    /// re-reports its input (OSC 2122), a fresh popup may open — e.g. accepting
-    /// `src/` then shows that directory's contents.
-    fn accept_selected_completion(&mut self) {
+    /// can't inject wrong bytes.
+    ///
+    /// `keep_open` distinguishes drilling into a directory (Tab on a dir) from
+    /// finishing (Enter, or Tab on a file): when set, the popup is left alone so
+    /// the shell's round-trip (echoed suffix → new `$BUFFER` → OSC 2122) can
+    /// refilter the list to the subdirectory's contents; otherwise the popup is
+    /// closed and kept closed via `completion_dismissed`.
+    ///
+    /// `submit` runs the command in the same keystroke (Shift+Enter): the
+    /// accept-suffix (if any) is written followed by a carriage return, so the
+    /// line executes even when the suggestion didn't extend it (the buffer
+    /// submits as-typed). `submit` implies not-keep-open and always closes the
+    /// popup (the command is running, so the popup must go).
+    fn accept_selected_completion(&mut self, keep_open: bool, submit: bool) {
         let Some(sug) = self.completions.get(self.selected_completion) else {
             return;
         };
         let text = sug.text.clone();
-        if let Some(c) = self.terminal.current_input() {
-            if let Some(suffix) = completion::accept_suffix(&c.buffer, c.cursor, &text) {
-                // Clone to a Vec before write_pty: `current_input()` borrows
-                // `self.terminal` immutably while `write_pty(&self)` borrows
-                // `self`, so the suffix can't stay borrowed across the call.
-                let bytes = suffix.as_bytes().to_vec();
+        // Build the byte payload (cloning the suffix) while holding the
+        // immutable `self.terminal` borrow, then drop it before the &self
+        // `write_pty` call below.
+        let bytes: Option<Vec<u8>> = self.terminal.current_input().map(|c| {
+            let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &text) {
+                Some(suffix) => suffix.as_bytes().to_vec(),
+                // A stale / non-extending suggestion: no suffix to insert, but
+                // we may still submit the line as-typed below.
+                None => Vec::new(),
+            };
+            if submit {
+                bytes.push(b'\r');
+            }
+            bytes
+        });
+        if let Some(bytes) = bytes {
+            if !bytes.is_empty() {
                 self.write_pty(&bytes);
             }
         }
-        self.completions.clear();
-        self.completions_input = None; // force a fresh recompute on the next report
+        if submit {
+            // Submitting: the command is running, so the popup must close and
+            // stay closed until the user types again.
+            self.completions.clear();
+            self.completions_input = None;
+            self.completion_dismissed = true;
+        } else if keep_open {
+            // Drilling into a directory: force a fresh recompute on the next
+            // OSC 2122 report, but leave the popup open and undismissed so the
+            // round-trip refilters to the subdirectory's contents.
+            self.completions_input = None;
+        } else {
+            // Finishing: close and keep closed until the user types.
+            self.completions.clear();
+            self.completions_input = None;
+            self.completion_dismissed = true;
+        }
         self.selected_completion = 0;
         self.completion_scroll = 0;
         self.invalidate();
@@ -5121,21 +5170,42 @@ impl State {
                                 self.invalidate();
                                 return true;
                             }
-                            // Tab is the primary accept; Enter is a convenience.
-                            // Enter here DOES hijack command submission while a
-                            // path popup is open — that's intended: accept the
-                            // completion, don't run the command.
-                            Key::Named(NamedKey::Tab) | Key::Named(NamedKey::Enter) => {
-                                self.accept_selected_completion();
+                            // Tab accepts the suffix and, on a directory, drills
+                            // in (popup stays open and refilters to the dir's
+                            // contents); on a file it accepts and closes.
+                            Key::Named(NamedKey::Tab) => {
+                                let keep = self
+                                    .completions
+                                    .get(self.selected_completion)
+                                    .map(|s| s.is_dir)
+                                    .unwrap_or(false);
+                                self.accept_selected_completion(keep, false);
+                                return true;
+                            }
+                            // Shift+Enter: accept the highlighted completion AND
+                            // run the command in one keystroke (writes the
+                            // accept-suffix + a carriage return, then closes the
+                            // popup). Must precede the plain Enter arm.
+                            Key::Named(NamedKey::Enter) if self.modifiers.shift_key() => {
+                                self.accept_selected_completion(false, true);
+                                return true;
+                            }
+                            // Enter accepts + closes + suppresses reopen. It
+                            // intentionally does NOT submit the command — a
+                            // second Enter (popup now empty, so not intercepted)
+                            // submits normally.
+                            Key::Named(NamedKey::Enter) => {
+                                self.accept_selected_completion(false, false);
                                 return true;
                             }
                             Key::Named(NamedKey::Escape) => {
-                                // Dismiss by clearing the cached list. Because
-                                // `completions_input` is left intact,
-                                // `recompute_completions` won't repopulate until
-                                // the buffer actually changes — so it stays closed
+                                // Dismiss without accepting: clear the list and
+                                // set the dismissed flag so the popup stays
+                                // closed even when the shell re-reports input,
                                 // until the user types more.
                                 self.completions.clear();
+                                self.completions_input = None;
+                                self.completion_dismissed = true;
                                 self.invalidate();
                                 return true;
                             }
@@ -5175,6 +5245,11 @@ impl State {
                         self.scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
+                        // A genuine keystroke re-enables the popup after a
+                        // finish/dismiss. The auto-inserted accept suffix goes
+                        // through `write_pty` directly (not this path), so
+                        // accepting never clears the flag — only real input does.
+                        self.completion_dismissed = false;
                         self.write_pty(&bytes);
                         self.invalidate();
                         return true;
