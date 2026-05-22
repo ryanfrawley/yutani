@@ -51,15 +51,20 @@ autocomplete slice consumes `current_input()` every frame.
 
 ## zsh hook
 
-Copy-pasteable into `~/.zshrc` (alongside your existing OSC 133 / OSC 7
-integration):
+The canonical emitter is the shipped integration script
+[`shell-integration/yutani.zsh`](../shell-integration/yutani.zsh) — source that
+from `~/.zshrc` (it also emits OSC 133 and OSC 7, composes with existing hooks
+via `add-zle-hook-widget`, and dedups redundant redraws). The minimal core of
+the OSC 2122 emission is:
 
 ```zsh
 _yutani_report_input() {
   printf '\e]2122;%d;%s\a' "$CURSOR" "$(print -rn -- "$BUFFER" | base64 | tr -d '\n')"
 }
-zle -N zle-line-pre-redraw _yutani_report_input
 ```
+
+The script registers it on the `line-pre-redraw` zle hook (via
+`add-zle-hook-widget`, not a bare `zle -N`, so it coexists with other hooks).
 
 Notes:
 
