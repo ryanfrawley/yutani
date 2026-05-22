@@ -141,6 +141,35 @@ impl ShellExitMode {
     }
 }
 
+/// How the OSC 133 prompt-status indicator is drawn in the left margin.
+/// Configured via the `prompt_gutter` key; off by default since not every
+/// shell emits OSC 133 marks and the indicator is otherwise just noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptGutter {
+    /// No indicator (default).
+    None,
+    /// A short vertical bar per prompt — green on success, red on failure,
+    /// dim while a command is still running.
+    Bar,
+}
+
+impl PromptGutter {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "bar" => Some(Self::Bar),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bar => "bar",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     font_size: f32,
@@ -294,6 +323,8 @@ struct Config {
     /// `OnSuccess`: a clean exit closes the window, a non-zero/abnormal
     /// exit keeps it open with a status line. See `ShellExitMode`.
     shell_exit_mode: ShellExitMode,
+    /// OSC 133 prompt-status gutter indicator. Off by default.
+    prompt_gutter: PromptGutter,
 }
 
 impl Config {
@@ -337,6 +368,7 @@ impl Config {
             images_filter: "linear".to_string(),
             images_halfblock_for_missing: false,
             shell_exit_mode: ShellExitMode::OnSuccess,
+            prompt_gutter: PromptGutter::None,
         }
     }
 
@@ -465,6 +497,11 @@ impl Config {
                 // Silently keep the default on an unknown value — same
                 // forgiving contract as `images_filter`.
             },
+            "prompt_gutter" => if let Some(x) = v.as_str() {
+                if let Some(g) = PromptGutter::from_str(x) {
+                    self.prompt_gutter = g;
+                }
+            },
             _ => (),
         }
     }
@@ -569,6 +606,12 @@ impl Config {
              # shell_exit_mode: \"always\" | \"never\" | \"on_success\"\n\
              shell_exit_mode = {}\n",
             toml_str_lit(self.shell_exit_mode.as_str()),
+        ));
+        s.push_str(&format!(
+            "\n# Shell integration (OSC 133)\n\
+             # prompt_gutter: \"none\" | \"bar\"\n\
+             prompt_gutter = {}\n",
+            toml_str_lit(self.prompt_gutter.as_str()),
         ));
         s
     }
@@ -2787,8 +2830,12 @@ impl State {
         //     command's exit status — green for success, red for failure, and
         //     a dim foreground tint while a command is still running (or the
         //     shell reported no code). Drawn in the padding so it never
-        //     overlaps cell content.
-        let status_markers = self.terminal.prompt_status_markers();
+        //     overlaps cell content. Off unless `prompt_gutter` opts in.
+        let status_markers = if self.config.prompt_gutter == PromptGutter::None {
+            Vec::new()
+        } else {
+            self.terminal.prompt_status_markers()
+        };
         if !status_markers.is_empty() {
             let pal = palette::get();
             let bar_w = (cell_w * 0.16).clamp(2.0, 4.0);
@@ -6300,6 +6347,56 @@ mod tests {
         c.shell_exit_mode = ShellExitMode::Never;
         let parsed = Config::parse_str(&c.serialize());
         assert_eq!(parsed.shell_exit_mode, ShellExitMode::Never);
+    }
+
+    #[test]
+    fn prompt_gutter_from_str_valid_values() {
+        assert_eq!(PromptGutter::from_str("none"), Some(PromptGutter::None));
+        assert_eq!(PromptGutter::from_str("bar"), Some(PromptGutter::Bar));
+    }
+
+    #[test]
+    fn prompt_gutter_from_str_unknown_is_none() {
+        assert_eq!(PromptGutter::from_str("bogus"), None);
+        assert_eq!(PromptGutter::from_str(""), None);
+    }
+
+    #[test]
+    fn prompt_gutter_round_trips_through_as_str() {
+        for g in [PromptGutter::None, PromptGutter::Bar] {
+            assert_eq!(PromptGutter::from_str(g.as_str()), Some(g));
+        }
+    }
+
+    #[test]
+    fn config_prompt_gutter_default_is_none() {
+        assert_eq!(Config::defaults().prompt_gutter, PromptGutter::None);
+    }
+
+    #[test]
+    fn config_prompt_gutter_parses_explicit_value() {
+        let bar = Config::parse_str("prompt_gutter = \"bar\"\n");
+        assert_eq!(bar.prompt_gutter, PromptGutter::Bar);
+    }
+
+    #[test]
+    fn config_prompt_gutter_unknown_keeps_default() {
+        let parsed = Config::parse_str("prompt_gutter = \"squiggle\"\n");
+        assert_eq!(parsed.prompt_gutter, PromptGutter::None);
+    }
+
+    #[test]
+    fn config_prompt_gutter_missing_key_defaults() {
+        let parsed = Config::parse_str("font_size = 14.0\n");
+        assert_eq!(parsed.prompt_gutter, PromptGutter::None);
+    }
+
+    #[test]
+    fn config_prompt_gutter_round_trips_through_serialize() {
+        let mut c = Config::defaults();
+        c.prompt_gutter = PromptGutter::Bar;
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.prompt_gutter, PromptGutter::Bar);
     }
 
     #[test]
