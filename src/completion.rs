@@ -86,6 +86,84 @@ pub fn complete_path(buffer: &str, cursor: usize, cwd: Option<&Path>) -> Vec<Sug
     suggestions
 }
 
+/// True when there is a non-empty token (a run of non-whitespace ending at the
+/// cursor) under the cursor. The completion UI gates the popup on this so an
+/// empty token — cursor at the start of the line or right after whitespace —
+/// does NOT dump the entire cwd. A trailing-slash token like `sub/` is
+/// non-empty and so still shows (it lists the directory's contents).
+pub(crate) fn has_path_token(buffer: &str, cursor: usize) -> bool {
+    !token_under_cursor(buffer, cursor).1.is_empty()
+}
+
+/// Computed on-screen rectangle for the completion popup, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PopupLayout {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// True when the popup was flipped to sit *above* the cursor row because it
+    /// would have overflowed the bottom of the screen below the cursor.
+    pub flipped_above: bool,
+}
+
+/// Place an `n_items`-row popup anchored to the cell below the cursor.
+///
+/// `anchor_x` is the popup's left edge (the left of the cursor column);
+/// `anchor_below_y` is the y of the top of the line *below* the cursor row
+/// (where the popup normally hangs); `cursor_top_y` is the top of the cursor's
+/// own row, used as the popup's bottom edge when it flips above.
+///
+/// The box height is `n_items * item_h`. When the popup would overflow the
+/// bottom of the screen (minus `pad`), it flips to sit above the cursor row.
+/// `x` is clamped so the right edge stays `pad` inside `screen_w` and never
+/// goes left of `pad`; `y` is clamped to never go above `pad`.
+#[allow(clippy::too_many_arguments)]
+pub fn popup_layout(
+    anchor_x: f32,
+    anchor_below_y: f32,
+    cursor_top_y: f32,
+    n_items: usize,
+    item_h: f32,
+    box_w: f32,
+    screen_w: f32,
+    screen_h: f32,
+    pad: f32,
+) -> PopupLayout {
+    let h = n_items as f32 * item_h;
+
+    // Vertical: prefer below the cursor; flip above if it would overflow the
+    // bottom margin and there's more room above than the overflow forces.
+    let overflows_below = anchor_below_y + h > screen_h - pad;
+    let (mut y, flipped_above) = if overflows_below {
+        // Sit above: bottom edge at the cursor row's top, growing upward.
+        (cursor_top_y - h, true)
+    } else {
+        (anchor_below_y, false)
+    };
+    // Clamp to the top margin (covers a popup too tall to fit either way).
+    if y < pad {
+        y = pad;
+    }
+
+    // Horizontal: keep the right edge on screen, but never push left of `pad`.
+    let mut x = anchor_x;
+    if x + box_w > screen_w - pad {
+        x = screen_w - pad - box_w;
+    }
+    if x < pad {
+        x = pad;
+    }
+
+    PopupLayout {
+        x,
+        y,
+        w: box_w,
+        h,
+        flipped_above,
+    }
+}
+
 /// Extract the token under the cursor: the run of non-whitespace characters
 /// ending at the cursor. We scan left from the cursor to the previous
 /// whitespace (space or tab) or the start of the buffer. Everything to the
@@ -376,6 +454,55 @@ mod tests {
         // Scan a subdirectory that does not exist; must not panic.
         let s = complete_path("cat does_not_exist/x", 20, Some(tmp.path.as_path()));
         assert!(s.is_empty());
+    }
+
+    #[test]
+    fn has_path_token_gating() {
+        // Empty / whitespace-trailing tokens must not trigger the popup.
+        assert!(!has_path_token("", 0));
+        assert!(!has_path_token("ls ", 3));
+        assert!(!has_path_token("ls", 0));
+        // Non-empty tokens (including a trailing-slash dir token) do.
+        assert!(has_path_token("cat ap", 6));
+        assert!(has_path_token("ls sub/", 7));
+        assert!(has_path_token("vim sub/m", 9));
+    }
+
+    #[test]
+    fn popup_below_normal_placement() {
+        // Plenty of room below: no flip, sits at the anchor.
+        let l = popup_layout(100.0, 220.0, 200.0, 5, 20.0, 300.0, 1000.0, 800.0, 8.0);
+        assert_eq!(l.x, 100.0);
+        assert_eq!(l.y, 220.0);
+        assert_eq!(l.w, 300.0);
+        assert_eq!(l.h, 100.0);
+        assert!(!l.flipped_above);
+    }
+
+    #[test]
+    fn popup_flips_above_on_bottom_overflow() {
+        // anchor_below_y + h (760 + 100) overflows screen_h - pad (792), so it
+        // flips to sit above: bottom at cursor_top_y (740), top at 740 - 100.
+        let l = popup_layout(100.0, 760.0, 740.0, 5, 20.0, 300.0, 1000.0, 800.0, 8.0);
+        assert!(l.flipped_above);
+        assert_eq!(l.y, 640.0);
+    }
+
+    #[test]
+    fn popup_clamps_right_edge() {
+        // anchor_x + box_w (900 + 300) overflows; x clamps so right edge sits
+        // pad inside the screen: 1000 - 8 - 300 = 692.
+        let l = popup_layout(900.0, 220.0, 200.0, 3, 20.0, 300.0, 1000.0, 800.0, 8.0);
+        assert_eq!(l.x, 692.0);
+    }
+
+    #[test]
+    fn popup_clamps_to_left_and_top() {
+        // A negative anchor_x clamps to the left pad; a huge popup that can't
+        // fit above clamps its top to the top pad.
+        let l = popup_layout(-50.0, 760.0, 100.0, 20, 20.0, 300.0, 1000.0, 800.0, 8.0);
+        assert_eq!(l.x, 8.0);
+        assert_eq!(l.y, 8.0);
     }
 
     #[test]

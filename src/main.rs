@@ -109,6 +109,106 @@ fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
     (vertex_bytes, index_bytes)
 }
 
+/// Emit quads for `text` as a left-to-right monospace run starting at pixel
+/// (`x`, `baseline_y`), advancing by `cell_w` per character. Pushes into the
+/// same `vertices`/`indices` the grid uses, so it must be called within the FG
+/// portion of `update_vertices` (after `num_bg_indices` is recorded) to draw on
+/// top. Returns the final x advance.
+///
+/// Reuses the glyph-atlas lookup + bearing math from `emit_fg_for_cell`'s
+/// ordinary (non-cell-filling) glyph path. We deliberately *duplicate* that
+/// minimal math here rather than refactor the grid closure: the closure
+/// captures `&self.atlas`/`scroll_y` and folds in box-drawing UV-clipping and
+/// ligature substitution that don't apply to plain popup text, so factoring it
+/// into a shared free fn would be a larger, riskier change. Callers must have
+/// rasterized the glyphs into `atlas` beforehand (via `ensure_char`) so the
+/// lookups hit.
+///
+/// Characters whose advance would push the glyph past `max_x` are skipped
+/// (truncation); the run stops there.
+#[allow(clippy::too_many_arguments)]
+fn emit_text_run(
+    atlas: &font::Atlas,
+    vertices: &mut Vec<renderer::vertex::Vertex>,
+    indices: &mut Vec<u16>,
+    mut x: f32,
+    baseline_y: f32,
+    text: &str,
+    color: [f32; 4],
+    atlas_w: f32,
+    atlas_h: f32,
+    cell_w: f32,
+    max_x: f32,
+) -> f32 {
+    for ch in text.chars() {
+        // Truncate once the next cell would overflow the box.
+        if x + cell_w > max_x {
+            break;
+        }
+        if ch != ' ' {
+            let g = atlas.lookup(ch, font::FaceVariant::Regular);
+            if g.width > 0 && g.height > 0 {
+                let bx = g.bearing_x as f32;
+                let by = g.bearing_y as f32;
+                let gx = x + bx;
+                let gy = baseline_y - by;
+                let gw = g.width as f32;
+                let gh = g.height as f32;
+                let u0 = g.x as f32 / atlas_w;
+                let u1 = (g.x as f32 + gw) / atlas_w;
+                let v0 = g.y as f32 / atlas_h;
+                let v1 = (g.y as f32 + gh) / atlas_h;
+                let start = vertices.len() as u16;
+                let hx = gw * 0.5;
+                let hy = gh * 0.5;
+                let half_size = [hx, hy];
+                vertices.push(renderer::vertex::Vertex {
+                    position: [gx, gy, 0.0],
+                    tex_coords: [u0, v0],
+                    color,
+                    local_pos: [-hx, -hy],
+                    half_size,
+                    radii: [0.0; 4],
+                });
+                vertices.push(renderer::vertex::Vertex {
+                    position: [gx, gy + gh, 0.0],
+                    tex_coords: [u0, v1],
+                    color,
+                    local_pos: [-hx, hy],
+                    half_size,
+                    radii: [0.0; 4],
+                });
+                vertices.push(renderer::vertex::Vertex {
+                    position: [gx + gw, gy, 0.0],
+                    tex_coords: [u1, v0],
+                    color,
+                    local_pos: [hx, -hy],
+                    half_size,
+                    radii: [0.0; 4],
+                });
+                vertices.push(renderer::vertex::Vertex {
+                    position: [gx + gw, gy + gh, 0.0],
+                    tex_coords: [u1, v1],
+                    color,
+                    local_pos: [hx, hy],
+                    half_size,
+                    radii: [0.0; 4],
+                });
+                indices.extend_from_slice(&[
+                    start,
+                    start + 1,
+                    start + 2,
+                    start + 1,
+                    start + 2,
+                    start + 3,
+                ]);
+            }
+        }
+        x += cell_w;
+    }
+    x
+}
+
 /// What the window does when the child shell exits. Configured via the
 /// `shell_exit_mode` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -946,6 +1046,14 @@ struct State {
     /// alpha 0 over `cursor_anim_secs`; the entry is dropped early if the
     /// underlying cell becomes non-blank again (a follow-up keystroke).
     cursor_ghosts: Vec<CursorGhost>,
+    /// Suggestions for the completion popup, recomputed only when the shell's
+    /// reported input changes (path completion does disk I/O — never recompute
+    /// per frame). Drawn by `update_vertices`; display-only in K10 (K11 adds
+    /// keyboard nav + accept).
+    completions: Vec<completion::Suggestion>,
+    /// The (buffer, cursor) the cached `completions` were computed from, so we
+    /// can skip the recompute (and the `read_dir`) when nothing changed.
+    completions_input: Option<(String, usize)>,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -1946,6 +2054,8 @@ impl State {
             cursor_anim: None,
             prev_visible: None,
             cursor_ghosts: Vec::new(),
+            completions: Vec::new(),
+            completions_input: None,
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -2306,6 +2416,24 @@ impl State {
             }
             if let Some(over) = row_override {
                 row_overrides.insert(r, over);
+            }
+        }
+
+        // Rasterize any glyphs the completion popup will draw that the grid
+        // didn't already pack this frame, so the immutable-`atlas` lookup in
+        // `emit_text_run` below is a hit (and the dirty flag triggers the
+        // re-upload right after). Done here, before the `&self.atlas` borrow,
+        // because `ensure_char` needs `&mut self.atlas`/`&mut self.font`.
+        if !self.completions.is_empty() {
+            let chars: Vec<char> = self
+                .completions
+                .iter()
+                .flat_map(|s| s.text.chars())
+                .chain(std::iter::once('…'))
+                .collect();
+            for ch in chars {
+                self.atlas
+                    .ensure_char(&mut self.font, font::FaceVariant::Regular, ch);
             }
         }
 
@@ -2918,6 +3046,9 @@ impl State {
         };
         let live_grid_offset = live_grid_offset_i as f32;
 
+        // Cursor anchor for the completion popup, captured while the cursor is
+        // drawn (same row/col→pixel mapping). `(anchor_x, cursor_row_top)`.
+        let mut popup_anchor: Option<(f32, f32)> = None;
         if let Some(_cur_visual_row) = self.terminal.cursor_visual_row() {
             let cur = self.terminal.cursor();
             let cur_col = cur.col.min(cols.saturating_sub(1));
@@ -3032,6 +3163,9 @@ impl State {
                     WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
                 let block_y =
                     cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5 + scroll_y;
+                // Anchor the completion popup to this cell's strip: left edge at
+                // the cursor column, with `block_y` the top of the cursor row.
+                popup_anchor = Some((block_x, block_y));
                 let cursor_color = palette::get().cursor;
                 // Underline / bar use a 2-px stripe; block fills the full cell.
                 let stripe = 2.0_f32;
@@ -3061,6 +3195,117 @@ impl State {
             // a stale one. Ghosts are tied to the cursor's motion so go with it.
             self.cursor_anim = None;
             self.cursor_ghosts.clear();
+        }
+
+        // Completion popup overlay (autocomplete slice K10). Drawn AFTER the
+        // cursor/selection FG quads so it sits on top, and only when there are
+        // cached suggestions, the cursor is on-screen (we have an anchor), and
+        // the user hasn't scrolled into history (the cursor isn't where they're
+        // looking then). Display-only: K11 adds keyboard nav + accept.
+        //
+        // TODO(K11+): consider excluding the popup from bloom. Appending into
+        // the FG index range means it participates in the glow/bloom pass when
+        // glow is on; acceptable for K10.
+        let popup_visible = !self.completions.is_empty() && self.terminal.view_offset() == 0;
+        if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
+            const MAX_VISIBLE: usize = 10;
+            let n = self.completions.len().min(MAX_VISIBLE);
+            let item_h = line_height;
+            // Box width: longest visible suggestion (chars) plus a little
+            // horizontal padding, capped, so it's deterministic and testable.
+            let longest = self.completions[..n]
+                .iter()
+                .map(|s| s.text.chars().count())
+                .max()
+                .unwrap_or(0);
+            let text_pad = cell_w; // half a cell each side
+            let box_w = (longest as f32 * cell_w + text_pad * 2.0).min(cell_w * 48.0);
+
+            let anchor_below_y = cursor_row_top + line_height;
+            let screen_w = self.gpu.config.width as f32;
+            let screen_h = self.gpu.config.height as f32;
+            let layout = completion::popup_layout(
+                anchor_x,
+                anchor_below_y,
+                cursor_row_top,
+                n,
+                item_h,
+                box_w,
+                screen_w,
+                screen_h,
+                WINDOW_PADDING,
+            );
+
+            // Colors derived from the active palette so themes are respected.
+            // The pipeline expects premultiplied alpha (RGB pre-scaled by A),
+            // matching how selection/cursor colors are built above.
+            let premul = |rgb: [f32; 4], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+            // Dark, semi-opaque box from a darkened background.
+            let bg = pal.background;
+            let box_rgb = [bg[0] * 0.6, bg[1] * 0.6, bg[2] * 0.6, 1.0];
+            let box_color = premul(box_rgb, 0.92);
+            // Highlight (selected row) — blend background toward foreground.
+            let fgc = pal.foreground;
+            let hl_rgb = [
+                bg[0] * 0.5 + fgc[0] * 0.5,
+                bg[1] * 0.5 + fgc[1] * 0.5,
+                bg[2] * 0.5 + fgc[2] * 0.5,
+                1.0,
+            ];
+            let hl_color = premul(hl_rgb, 0.85);
+            let text_color = pal.foreground;
+            let radius = 5.0_f32;
+
+            // Box background (rounded corners, all four equal).
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                layout.x,
+                layout.y,
+                layout.w,
+                layout.h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                box_color,
+                [radius; 4],
+            );
+
+            // Row 0 highlight. K11 will make the selected index movable.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                layout.x,
+                layout.y,
+                layout.w,
+                item_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                hl_color,
+                [radius, 0.0, radius, 0.0],
+            );
+
+            // Suggestion text rows. Baseline within each row mirrors the grid:
+            // strip_top + ascent (ascent above baseline = bg_h + descender,
+            // descender being negative) + the centering pad.
+            let text_x = layout.x + text_pad;
+            let max_text_x = layout.x + layout.w - text_pad;
+            for (i, sug) in self.completions[..n].iter().enumerate() {
+                let row_top = layout.y + i as f32 * item_h;
+                let baseline = row_top + bg_h + descender + strip_pad;
+                emit_text_run(
+                    atlas,
+                    &mut vertices,
+                    &mut indices,
+                    text_x,
+                    baseline,
+                    &sug.text,
+                    text_color,
+                    atlas_w,
+                    atlas_h,
+                    cell_w,
+                    max_text_x,
+                );
+            }
         }
 
         // Refresh the visible-grid snapshot with the current frame's cells
@@ -4173,6 +4418,29 @@ impl State {
     fn feed_terminal(&mut self, bytes: &str) {
         self.terminal.feed(bytes);
         self.drain_pending_image_uploads();
+    }
+
+    /// Refresh the cached completion-popup suggestions, but only when the
+    /// shell's reported input (`OSC 2122`) actually changed since last time —
+    /// `completion::complete_path` does a `read_dir`, so it must never run per
+    /// frame. The popup is gated on a non-empty path token so an empty prompt
+    /// doesn't dump the whole cwd. Returns true if the cache changed (so the
+    /// caller can request a redraw).
+    fn recompute_completions(&mut self) -> bool {
+        let cur = self.terminal.current_input().cloned();
+        let key = cur.as_ref().map(|c| (c.buffer.clone(), c.cursor));
+        if key == self.completions_input {
+            return false;
+        }
+        self.completions_input = key;
+        self.completions = match &cur {
+            Some(c) if completion::has_path_token(&c.buffer, c.cursor) => {
+                let cwd = self.terminal.cwd().map(std::path::Path::new);
+                completion::complete_path(&c.buffer, c.cursor, cwd)
+            }
+            _ => Vec::new(),
+        };
+        true
     }
 
     /// Pull every iTerm2 OSC-1337 (and future protocol) payload off the
@@ -5550,6 +5818,11 @@ async fn run() {
                     if let Some(cwd) = state.terminal.take_cwd_update() {
                         state.window.set_title(&title_for_cwd(&cwd));
                     }
+                    // The chunk may have carried an OSC 2122 input report;
+                    // refresh the completion popup's cached suggestions (only
+                    // recomputes — and only touches disk — when the input
+                    // actually changed). `invalidate()` below redraws.
+                    state.recompute_completions();
                     state.perf.note_pty(bytes, t0.elapsed());
                     state.invalidate();
                     // New / removed cells may have changed which URL (if any)
