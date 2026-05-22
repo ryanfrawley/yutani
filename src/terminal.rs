@@ -586,6 +586,25 @@ pub enum PromptStatus {
     Pending,
 }
 
+/// The shell's live interactive input line, reported via the yutani-private
+/// `OSC 2122` extension (see [`Terminal::handle_osc_2122`]). Populated only
+/// while the shell's line editor is active and cleared when a command is
+/// submitted, so `Some` means "the user is editing a command line right now".
+/// This is the foundation the autocomplete UI builds on: it gives the live
+/// buffer + cursor without reconstructing them from the grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentInput {
+    /// The full edit buffer (zsh `$BUFFER`), decoded from the base64 payload.
+    /// May be empty (the user cleared the line) — that is distinct from no
+    /// active edit line at all, which is represented by `None` on the field.
+    pub buffer: String,
+    /// Cursor position as a *character* (code point) offset into `buffer`, as
+    /// reported by the shell (zsh `$CURSOR`), clamped to `buffer.chars().count()`.
+    /// Character-, not byte-, indexed because that is what the shell reports;
+    /// consumers that need a byte offset convert via `buffer.char_indices()`.
+    pub cursor: usize,
+}
+
 pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
@@ -655,6 +674,14 @@ pub struct Terminal {
     // query is also a later slice, hence the allow.
     #[allow(dead_code)]
     semantic_marks: Vec<SemanticMark>,
+    // Shell's live interactive input line, reported via the yutani-private
+    // OSC 2122 extension. `Some` while the shell's line editor is active;
+    // set on every edit by `handle_osc_2122`, cleared when a command is
+    // submitted (OSC 133 `C` / OutputStart) and when the terminal switches
+    // to the alternate screen (no prompt line editing happens there). Read
+    // via `current_input()` by a later autocomplete slice, hence the allow.
+    #[allow(dead_code)]
+    current_input: Option<CurrentInput>,
     // Config-driven: when false, placements that fully scroll off the top
     // are dropped rather than promoted to `scrollback_placements`. Saves
     // memory in long-running shells with heavy image traffic. The trade-
@@ -807,6 +834,7 @@ impl Terminal {
             view_offset: 0,
             scrollback_placements: VecDeque::new(),
             semantic_marks: Vec::new(),
+            current_input: None,
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
@@ -2260,6 +2288,8 @@ impl Terminal {
             7 => self.handle_osc_7(rest),
             // FinalTerm / shell-integration semantic prompt marks.
             133 => self.handle_osc_133(rest),
+            // yutani-private current-input report (autocomplete foundation).
+            2122 => self.handle_osc_2122(rest),
             // iTerm2 proprietary namespace. Only `File=...` (inline
             // images) is implemented; everything else is silently
             // dropped to match iTerm's "unknown verb is a no-op" contract.
@@ -2316,6 +2346,16 @@ impl Terminal {
         }
     }
 
+    /// The shell's current interactive input line, if the shell is reporting
+    /// one via `OSC 2122`. `None` when no edit line is active (no shell
+    /// integration, a command is running, or the alternate screen is up).
+    /// Borrowed because the autocomplete layer reads it every frame.
+    // Consumed by a later autocomplete slice; tests exercise it now.
+    #[allow(dead_code)]
+    pub fn current_input(&self) -> Option<&CurrentInput> {
+        self.current_input.as_ref()
+    }
+
     /// `OSC 133 ; <kind> [; params...] ST` — FinalTerm semantic prompt
     /// marks. We record the four standard kinds (`A`/`B`/`C`/`D`) anchored
     /// to the cursor position. Trailing `key=value` params (e.g. `A;aid=7`,
@@ -2333,7 +2373,12 @@ impl Terminal {
         let kind = match fields.next() {
             Some("A") => SemanticMarkKind::PromptStart,
             Some("B") => SemanticMarkKind::InputStart,
-            Some("C") => SemanticMarkKind::OutputStart,
+            Some("C") => {
+                // Command submitted: the edit line is gone, so the live
+                // input report (OSC 2122) no longer describes anything.
+                self.current_input = None;
+                SemanticMarkKind::OutputStart
+            }
             Some("D") => {
                 // The first field after `D` is the exit code when present and
                 // numeric. A `key=value` field (or non-numeric junk) means
@@ -2353,6 +2398,45 @@ impl Terminal {
             col: self.cursor.col,
             kind,
         });
+    }
+
+    /// `OSC 2122 ; <cursor> ; <base64(buffer)> ST` — the yutani-private
+    /// current-input report. The shell's line-editor hook emits this on every
+    /// edit/cursor move so the terminal can track the live edit buffer without
+    /// reconstructing it from the grid; it is the data foundation autocomplete
+    /// builds on. A no-op in other terminals (private-use OSC number).
+    ///
+    /// `<cursor>` is a decimal *character* (code-point) offset into the buffer
+    /// (zsh `$CURSOR`). The buffer is STANDARD base64 of its UTF-8 bytes so it
+    /// can contain `;`, control chars, and other OSC-hostile bytes safely; an
+    /// empty buffer encodes to the empty string, so `OSC 2122 ; 0 ; ST` is a
+    /// valid "empty active line" report and yields `Some` with an empty buffer.
+    ///
+    /// Like OSC 133, line editing only happens on the primary screen, so a
+    /// report received while the alternate screen is active is dropped. Any
+    /// malformed payload (missing `;`, non-numeric cursor, invalid base64 or
+    /// UTF-8) is ignored, leaving the previous state untouched.
+    fn handle_osc_2122(&mut self, payload: &str) {
+        if self.use_alternate {
+            return;
+        }
+        let Some((cursor_str, b64)) = payload.split_once(';') else {
+            return;
+        };
+        let Ok(cursor) = cursor_str.parse::<usize>() else {
+            return;
+        };
+        use base64::Engine;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) else {
+            return;
+        };
+        let Ok(buffer) = String::from_utf8(bytes) else {
+            return;
+        };
+        // `$CURSOR` is a character offset; clamp defensively so consumers can
+        // index by char without bounds checks (e.g. an off-by-one past EOL).
+        let cursor = cursor.min(buffer.chars().count());
+        self.current_input = Some(CurrentInput { buffer, cursor });
     }
 
     /// Fold the recorded semantic marks into per-command regions, in
@@ -3692,6 +3776,9 @@ impl Terminal {
             let blank = Cell::new(' ', Style::new());
             self.alternate.clear(blank);
             self.use_alternate = true;
+            // No prompt line editing on the alt screen — drop any stale
+            // current-input report so it can't leak across the switch.
+            self.current_input = None;
             if clear_and_save {
                 self.cursor = Cursor::new();
             }
@@ -7277,6 +7364,112 @@ mod tests {
         let mut t = Terminal::new(10, 3, 100);
         t.feed("just some output\r\n");
         assert!(t.prompt_status_markers().is_empty());
+    }
+
+    //
+    // OSC 2122 yutani-private current-input report (K8).
+    //
+
+    #[test]
+    fn osc_2122_basic_report_sets_buffer_and_cursor() {
+        let mut t = Terminal::new(80, 24, 100);
+        // base64("git ") == "Z2l0IA==", cursor at end (4 chars).
+        t.feed("\x1b]2122;4;Z2l0IA==\x07");
+        let ci = t.current_input().expect("current input set");
+        assert_eq!(ci.buffer, "git ");
+        assert_eq!(ci.cursor, 4);
+    }
+
+    #[test]
+    fn osc_2122_cursor_clamped_to_char_count() {
+        let mut t = Terminal::new(80, 24, 100);
+        // "git " is 4 chars; a cursor of 99 clamps to 4.
+        t.feed("\x1b]2122;99;Z2l0IA==\x07");
+        let ci = t.current_input().expect("current input set");
+        assert_eq!(ci.buffer, "git ");
+        assert_eq!(ci.cursor, 4);
+    }
+
+    #[test]
+    fn osc_2122_empty_buffer_is_some_not_none() {
+        let mut t = Terminal::new(80, 24, 100);
+        // Empty edit line: cursor 0, empty base64 payload.
+        t.feed("\x1b]2122;0;\x07");
+        let ci = t.current_input().expect("empty line is still Some");
+        assert_eq!(ci.buffer, "");
+        assert_eq!(ci.cursor, 0);
+    }
+
+    #[test]
+    fn osc_2122_multibyte_roundtrip_preserves_char_cursor() {
+        let mut t = Terminal::new(80, 24, 100);
+        // base64("café 🚀") == "Y2Fmw6kg8J+agA==". 6 code points
+        // (c a f é space 🚀); place the cursor on char 5 (before the emoji).
+        t.feed("\x1b]2122;5;Y2Fmw6kg8J+agA==\x07");
+        let ci = t.current_input().expect("current input set");
+        assert_eq!(ci.buffer, "café 🚀");
+        assert_eq!(ci.buffer.chars().count(), 6);
+        assert_eq!(ci.cursor, 5);
+    }
+
+    #[test]
+    fn osc_2122_invalid_base64_is_ignored() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]2122;2;not valid base64!!!\x07");
+        assert!(t.current_input().is_none());
+    }
+
+    #[test]
+    fn osc_2122_non_numeric_cursor_is_ignored() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]2122;abc;Z2l0IA==\x07");
+        assert!(t.current_input().is_none());
+    }
+
+    #[test]
+    fn osc_2122_missing_semicolon_is_ignored() {
+        let mut t = Terminal::new(80, 24, 100);
+        // No `;` separating cursor from buffer at all.
+        t.feed("\x1b]2122;4\x07");
+        assert!(t.current_input().is_none());
+    }
+
+    #[test]
+    fn osc_2122_malformed_leaves_prior_state_untouched() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]2122;4;Z2l0IA==\x07"); // valid: "git "
+        t.feed("\x1b]2122;abc;Z2l0IA==\x07"); // bad cursor: ignored
+        let ci = t.current_input().expect("prior state retained");
+        assert_eq!(ci.buffer, "git ");
+        assert_eq!(ci.cursor, 4);
+    }
+
+    #[test]
+    fn osc_2122_ignored_on_alternate_screen() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b[?1049h"); // enter alternate screen
+        t.feed("\x1b]2122;4;Z2l0IA==\x07");
+        assert!(t.current_input().is_none());
+    }
+
+    #[test]
+    fn osc_2122_cleared_by_osc_133_command_submit() {
+        let mut t = Terminal::new(80, 24, 100);
+        // base64("echo") == "ZWNobw==".
+        t.feed("\x1b]2122;4;ZWNobw==\x07");
+        assert!(t.current_input().is_some());
+        // OSC 133 `C` = command submitted -> clears the live input.
+        t.feed("\x1b]133;C\x07");
+        assert!(t.current_input().is_none());
+    }
+
+    #[test]
+    fn osc_2122_cleared_when_entering_alternate_screen() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]2122;4;ZWNobw==\x07");
+        assert!(t.current_input().is_some());
+        t.feed("\x1b[?1049h"); // enter alternate screen clears the report
+        assert!(t.current_input().is_none());
     }
 
     //
