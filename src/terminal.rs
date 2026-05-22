@@ -2489,6 +2489,21 @@ impl Terminal {
             .collect()
     }
 
+    /// Absolute line span `[start, end]` (inclusive) of the most recent
+    /// *completed* command's output: from its `OutputStart` line up to the
+    /// line just above its `CommandEnd` (the `D` mark sits on the next
+    /// prompt's line). Returns `None` when no completed command produced any
+    /// output. Drives the select-last-command-output keybinding.
+    pub fn last_command_output_span(&self) -> Option<(isize, isize)> {
+        self.command_regions()
+            .into_iter()
+            .rev()
+            .find_map(|r| match (r.output_start, r.command_end) {
+                (Some(out), Some(end)) if end - 1 >= out => Some((out, end - 1)),
+                _ => None,
+            })
+    }
+
     /// `OSC 1337 ; <verb>=<args> [: <base64>] ST` — iTerm2's proprietary
     /// channel. The one verb we care about is `File=key=val,...:<base64>`
     /// for inline images.
@@ -7262,6 +7277,56 @@ mod tests {
         let mut t = Terminal::new(10, 3, 100);
         t.feed("just some output\r\n");
         assert!(t.prompt_status_markers().is_empty());
+    }
+
+    //
+    // OSC 133 select-last-command-output span (K7).
+    //
+
+    #[test]
+    fn osc_133_last_output_span_basic() {
+        let mut t = Terminal::new(10, 5, 100);
+        // Prompt row 0; output "file1"/"file2" on rows 1..2; D on row 3.
+        t.feed("\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n");
+        t.feed("\x1b]133;C\x07file1\r\nfile2\r\n\x1b]133;D;0\x07");
+        // Output span is OutputStart (1) .. CommandEnd-1 (2), inclusive.
+        assert_eq!(t.last_command_output_span(), Some((1, 2)));
+    }
+
+    #[test]
+    fn osc_133_last_output_span_none_when_no_output() {
+        let mut t = Terminal::new(10, 5, 100);
+        // C and D land on the same row — the command produced nothing.
+        t.feed("\x1b]133;A\x07\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output_span(), None);
+    }
+
+    #[test]
+    fn osc_133_last_output_span_picks_most_recent_completed() {
+        let mut t = Terminal::new(10, 10, 100);
+        // First command: one line of output.
+        t.feed("\x1b]133;A\x07\x1b]133;C\x07a\r\n\x1b]133;D;0\x07");
+        // Second command: two lines of output (rows 1..2, D on row 3).
+        t.feed("\x1b]133;A\x07\x1b]133;C\x07b\r\nc\r\n\x1b]133;D;0\x07");
+        assert_eq!(t.last_command_output_span(), Some((1, 2)));
+    }
+
+    #[test]
+    fn osc_133_last_output_span_skips_running_command() {
+        let mut t = Terminal::new(10, 10, 100);
+        // A completed command (output on row 0, D on row 1)...
+        t.feed("\x1b]133;A\x07\x1b]133;C\x07done\r\n\x1b]133;D;0\x07");
+        // ...then a still-running one (no D). The span falls back to the
+        // last *completed* command.
+        t.feed("\x1b]133;A\x07\x1b]133;C\x07running\r\n");
+        assert_eq!(t.last_command_output_span(), Some((0, 0)));
+    }
+
+    #[test]
+    fn osc_133_last_output_span_none_without_marks() {
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("plain output\r\n");
+        assert_eq!(t.last_command_output_span(), None);
     }
 
     //

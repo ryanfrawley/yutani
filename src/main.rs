@@ -3762,6 +3762,24 @@ impl State {
         }
     }
 
+    /// Select and copy the most recent completed command's output (OSC 133
+    /// `OutputStart`..`CommandEnd`). Returns false (no-op) when no completed
+    /// command has any output. Drives the Cmd-Shift-O keybinding.
+    fn select_last_command_output(&mut self) -> bool {
+        let Some((start_line, end_line)) = self.terminal.last_command_output_span() else {
+            return false;
+        };
+        let last_col = self.terminal.cols.saturating_sub(1);
+        self.selection = Some(Selection {
+            anchor: (start_line, 0),
+            head: (end_line, last_col),
+        });
+        self.selection_mode = SelectionMode::Cell;
+        self.copy_selection();
+        self.invalidate();
+        true
+    }
+
     /// Read the system clipboard and write it to the PTY, wrapped in
     /// bracketed-paste markers if the host has enabled them.
     /// Read `path` from disk and fire a decode job. The placement on the
@@ -4649,6 +4667,12 @@ impl State {
                                         "debug image (Cmd-Shift-I)",
                                     );
                                 }
+                                return true;
+                            }
+                            // Cmd-Shift-O: select and copy the last completed
+                            // command's output (OSC 133 shell integration).
+                            if self.modifiers.shift_key() && s.eq_ignore_ascii_case("o") {
+                                self.select_last_command_output();
                                 return true;
                             }
                             // Cmd-[ / Cmd-] tune the dual-Kawase iteration
