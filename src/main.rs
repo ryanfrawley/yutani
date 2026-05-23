@@ -4212,9 +4212,9 @@ impl State {
         use winit::keyboard::{Key, NamedKey};
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => {
+                // Close but leave the viewport where it is, so the match the
+                // user found stays in view.
                 self.search.close();
-                self.terminal.scroll_to_bottom();
-                self.scroll_y = 0.0;
             }
             Key::Named(NamedKey::Enter) => {
                 if self.modifiers.shift_key() {
@@ -6064,7 +6064,8 @@ impl State {
                     // first (and gated on !shift so it never fires for a
                     // Cmd-Shift chord) so it both opens the overlay and, while
                     // open, closes it before the overlay's key handler below
-                    // swallows the keystroke. Closing returns to the bottom.
+                    // swallows the keystroke. Closing leaves the viewport where
+                    // it is so the found match stays in view.
                     if self.modifiers.super_key()
                         && !self.modifiers.shift_key()
                         && !self.command_palette.open
@@ -6072,10 +6073,6 @@ impl State {
                         if let winit::keyboard::Key::Character(s) = &event.logical_key {
                             if s.eq_ignore_ascii_case("f") {
                                 self.search.toggle();
-                                if !self.search.open {
-                                    self.terminal.scroll_to_bottom();
-                                    self.scroll_y = 0.0;
-                                }
                                 self.invalidate();
                                 return true;
                             }
