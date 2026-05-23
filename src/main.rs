@@ -1779,14 +1779,27 @@ fn open_url(url: &str) {
 #[cfg(not(target_os = "macos"))]
 fn open_url(_url: &str) {}
 
+/// Logical-point offset applied to each cascaded window, matching the macOS
+/// convention of stepping a new window down-and-right from its parent. Roughly
+/// a title-bar height so successive windows stack like a fanned deck.
+const WINDOW_CASCADE_STEP: f64 = 28.0;
+
+/// Env var carrying the parent window's top-left, in logical points, to a
+/// freshly spawned child (`"x,y"`). The child reads it in `run()` and places
+/// its window one `WINDOW_CASCADE_STEP` down-and-right so new windows cascade
+/// instead of landing exactly atop the one that spawned them. Absent for the
+/// first window (launched from Finder/CLI), which keeps the OS default spot.
+const CASCADE_ENV: &str = "YUTANI_CASCADE_FROM";
+
 /// Launch a fresh Yutani window. Each window is its own process (the app is
 /// single-window per process), so a new window is just another instance of our
 /// own executable. `cwd` — the running shell's working directory from OSC 7 —
 /// becomes the child's working directory so the new window opens where the
-/// current one is, falling back to inheriting ours when it's unknown. Failures
-/// are logged rather than fatal: a missing exe path shouldn't kill the window
-/// the user is already in.
-fn spawn_new_window(cwd: Option<&str>) {
+/// current one is, falling back to inheriting ours when it's unknown.
+/// `origin` is the spawning window's top-left in logical points; when present
+/// it's forwarded so the child can cascade off it. Failures are logged rather
+/// than fatal: a missing exe path shouldn't kill the window the user is in.
+fn spawn_new_window(cwd: Option<&str>, origin: Option<(f64, f64)>) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -1800,9 +1813,27 @@ fn spawn_new_window(cwd: Option<&str>) {
             cmd.current_dir(dir);
         }
     }
+    if let Some((x, y)) = origin {
+        cmd.env(CASCADE_ENV, format!("{x},{y}"));
+    }
     if let Err(e) = cmd.spawn() {
         eprintln!("new window: failed to spawn: {e}");
     }
+}
+
+/// Parse the cascade hint set by a parent window (see [`CASCADE_ENV`]) into the
+/// child's target top-left, stepped one [`WINDOW_CASCADE_STEP`] down-and-right.
+/// Returns `None` when the var is absent or malformed so the window falls back
+/// to the OS-chosen position.
+fn cascade_position() -> Option<winit::dpi::LogicalPosition<f64>> {
+    let raw = std::env::var(CASCADE_ENV).ok()?;
+    let (x, y) = raw.split_once(',')?;
+    let x: f64 = x.trim().parse().ok()?;
+    let y: f64 = y.trim().parse().ok()?;
+    Some(winit::dpi::LogicalPosition::new(
+        x + WINDOW_CASCADE_STEP,
+        y + WINDOW_CASCADE_STEP,
+    ))
 }
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -4505,6 +4536,16 @@ impl State {
         self.invalidate();
     }
 
+    /// This window's top-left in logical points, for handing to a child window
+    /// to cascade off (see [`spawn_new_window`]). `None` if the platform can't
+    /// report the position — the child then keeps the OS default spot.
+    fn window_origin(&self) -> Option<(f64, f64)> {
+        let phys = self.window.outer_position().ok()?;
+        let logical: winit::dpi::LogicalPosition<f64> =
+            phys.to_logical(self.window.scale_factor());
+        Some((logical.x, logical.y))
+    }
+
     /// Execute a command chosen in the palette. Every arm reuses behaviour that
     /// already exists elsewhere — the palette is a discoverable front end, not
     /// new functionality.
@@ -4563,7 +4604,7 @@ impl State {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
-            A::NewWindow => spawn_new_window(self.terminal.cwd()),
+            A::NewWindow => spawn_new_window(self.terminal.cwd(), self.window_origin()),
         }
         self.invalidate();
     }
@@ -6390,7 +6431,7 @@ impl State {
                             // !shift so Cmd-Shift-N stays free for a future
                             // binding.
                             if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
-                                spawn_new_window(self.terminal.cwd());
+                                spawn_new_window(self.terminal.cwd(), self.window_origin());
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -7354,16 +7395,20 @@ async fn run() {
     let initial_title = effective_title(None, initial_cwd.as_deref());
 
     let transparent = false; // needed because of a shadow bug
-    let window = WindowBuilder::new()
+    let mut window_builder = WindowBuilder::new()
         .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
         .with_decorations(true)
-        .with_blur(transparent)
-        .build(&event_loop)
-        .unwrap();
+        .with_blur(transparent);
+    // When spawned via Cmd-N the parent forwards its position; cascade off it
+    // so the new window steps down-and-right instead of stacking exactly atop.
+    if let Some(pos) = cascade_position() {
+        window_builder = window_builder.with_position(pos);
+    }
+    let window = window_builder.build(&event_loop).unwrap();
     lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);

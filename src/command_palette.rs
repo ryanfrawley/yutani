@@ -147,6 +147,7 @@ pub const COMMANDS: &[Command] = &[
         title: "New window",
         action: PaletteAction::NewWindow,
         arg_prompt: None,
+        choose: false,
     },
 ];
 
