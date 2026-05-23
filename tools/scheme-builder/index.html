@@ -227,8 +227,9 @@
     border-radius: 4px; padding: 3px 6px; font: 12px var(--mono); outline: none;
   }
   .pv-bar input:focus { border-color: var(--accent); }
-  .pv-bar input.font { width: 200px; }
+  .pv-bar select.font { max-width: 220px; padding: 3px 6px; font: 12px var(--mono); }
   .pv-bar input.size { width: 56px; }
+  .pv-bar #pv-font-all { font: 11px var(--mono); padding: 3px 7px; }
   .pv-bar .pv-note { margin-left: auto; font-style: italic; }
   .terminal {
     border-radius: 8px;
@@ -612,22 +613,8 @@
     <div class="preview-wrap">
       <div class="pv-bar">
         <label for="pv-font">Font</label>
-        <input class="font" id="pv-font" list="pv-fonts" spellcheck="false" autocomplete="off"
-               placeholder="font family">
-        <datalist id="pv-fonts">
-          <option value="ui-monospace, &quot;SF Mono&quot;, Menlo, Consolas, monospace">System mono (default)</option>
-          <option value="Menlo"></option>
-          <option value="Monaco"></option>
-          <option value="SF Mono"></option>
-          <option value="Consolas"></option>
-          <option value="Cascadia Code"></option>
-          <option value="JetBrains Mono"></option>
-          <option value="Fira Code"></option>
-          <option value="Hack"></option>
-          <option value="Source Code Pro"></option>
-          <option value="IBM Plex Mono"></option>
-          <option value="Courier New"></option>
-        </datalist>
+        <select class="font" id="pv-font"></select>
+        <button id="pv-font-all" title="List every monospace font installed on your system (asks permission)">All system fonts</button>
         <label for="pv-size">Size</label>
         <input class="size" type="number" id="pv-size" min="8" max="32" step="1">
         <span class="pv-note">preview only — not saved to the scheme</span>
@@ -985,6 +972,54 @@ function fontStack(name) {
   name = (name || '').trim();
   if (!name) return PREVIEW_DEFAULTS.fontFamily;
   return name.includes(',') ? name : `"${name}", ui-monospace, monospace`;
+}
+
+/* ---- System monospace font detection ----------------------------------
+ * The font dropdown lists monospace faces actually present on the machine.
+ * On load we probe a curated list (no permission needed); the "All system
+ * fonts" button uses the Local Font Access API to enumerate everything the
+ * OS has installed and keeps the monospace ones. */
+const CURATED_MONO = [
+  'SF Mono', 'Menlo', 'Monaco', 'Andale Mono', 'PT Mono', 'Courier New', 'Courier',
+  'Consolas', 'Cascadia Code', 'Cascadia Mono', 'Lucida Console',
+  'JetBrains Mono', 'Fira Code', 'Fira Mono', 'Hack', 'Source Code Pro',
+  'IBM Plex Mono', 'Roboto Mono', 'Inconsolata', 'Space Mono', 'Ubuntu Mono',
+  'DejaVu Sans Mono', 'Liberation Mono', 'Anonymous Pro', 'Iosevka', 'Victor Mono',
+];
+const _fontProbe = document.createElement('canvas').getContext('2d');
+// Installed? Render a probe string in the family over each generic fallback;
+// if the width differs from the bare generic, the family rendered (so it's
+// present rather than silently falling back).
+function fontInstalled(family) {
+  const s = 'mmmmmwwwwwiiiii0O';
+  return ['monospace', 'serif', 'sans-serif'].some(base => {
+    _fontProbe.font = `72px ${base}`;
+    const w0 = _fontProbe.measureText(s).width;
+    _fontProbe.font = `72px "${family}", ${base}`;
+    return _fontProbe.measureText(s).width !== w0;
+  });
+}
+// Monospace? Every glyph advances the same, so a narrow and a wide run match.
+function fontIsMono(family) {
+  _fontProbe.font = `72px "${family}", monospace`;
+  return _fontProbe.measureText('iiiiiiiiii').width === _fontProbe.measureText('WWWWWWWWWW').width;
+}
+function dedupeSort(names) {
+  const seen = new Set(), out = [];
+  for (const n of names) { const k = n.toLowerCase(); if (!seen.has(k)) { seen.add(k); out.push(n); } }
+  return out.sort((a, b) => a.localeCompare(b));
+}
+// Curated families that are both installed and monospace (no permission).
+function curatedMonoFonts() {
+  return dedupeSort(CURATED_MONO.filter(f => fontInstalled(f) && fontIsMono(f)));
+}
+// Every installed monospace family, via the Local Font Access API. Requires a
+// user gesture + permission; rejects/returns null if unavailable or denied.
+async function systemMonoFonts() {
+  if (!('queryLocalFonts' in window)) return null;
+  const fonts = await window.queryLocalFonts();           // may throw if denied
+  const fams = dedupeSort(fonts.map(f => f.family));
+  return fams.filter(fontIsMono);
 }
 
 /* ============================================================
@@ -2609,13 +2644,58 @@ function init() {
     renderAll();
   });
 
-  // Preview-only font controls. Seed from saved prefs, then re-render the
-  // preview (DOM + glow raster) on change. These never touch the scheme.
+  // Preview-only font controls. The font dropdown lists installed monospace
+  // faces; choosing one re-renders the preview. These never touch the scheme.
   const pvFont = document.getElementById('pv-font');
+  const pvFontAll = document.getElementById('pv-font-all');
   const pvSize = document.getElementById('pv-size');
-  pvFont.value = preview.fontFamily;
+
+  // (Re)fill the dropdown: a "default" entry mapping to the system mono stack,
+  // then each detected family (its option rendered in that font as a preview).
+  // The current selection is always present even if not in the detected set.
+  function fillFontSelect(families) {
+    pvFont.innerHTML = '';
+    const add = (value, label, font) => {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      if (font) o.style.fontFamily = font;
+      pvFont.append(o);
+    };
+    add(PREVIEW_DEFAULTS.fontFamily, 'System mono (default)', PREVIEW_DEFAULTS.fontFamily);
+    for (const f of families) add(f, f, fontStack(f));
+    // Preserve a custom / persisted family that isn't in the list.
+    const cur = preview.fontFamily;
+    if (cur && cur !== PREVIEW_DEFAULTS.fontFamily && !families.some(f => f === cur)) {
+      add(cur, cur + ' (current)', fontStack(cur));
+    }
+    pvFont.value = preview.fontFamily;
+  }
+
+  fillFontSelect(curatedMonoFonts());
+  pvFont.addEventListener('change', () => { preview.fontFamily = pvFont.value; savePreview(); renderPreview(); });
+
+  // "All system fonts" — enumerate every installed monospace family. Needs the
+  // user gesture this click provides; hidden when the API isn't available.
+  if (!('queryLocalFonts' in window)) {
+    pvFontAll.style.display = 'none';
+  } else {
+    pvFontAll.addEventListener('click', async () => {
+      pvFontAll.disabled = true;
+      const prev = pvFontAll.textContent;
+      pvFontAll.textContent = 'Loading…';
+      try {
+        const mono = await systemMonoFonts();
+        if (mono && mono.length) { fillFontSelect(mono); pvFontAll.style.display = 'none'; }
+        else { pvFontAll.textContent = prev; pvFontAll.disabled = false; }
+      } catch {
+        // Permission denied or no access — keep the curated list.
+        pvFontAll.textContent = 'Permission denied';
+        setTimeout(() => { pvFontAll.textContent = prev; pvFontAll.disabled = false; }, 1500);
+      }
+    });
+  }
+
   pvSize.value = preview.fontSize;
-  pvFont.addEventListener('input', () => { preview.fontFamily = pvFont.value; savePreview(); renderPreview(); });
   pvSize.addEventListener('input', () => {
     const n = parseInt(pvSize.value, 10);
     if (Number.isFinite(n)) { preview.fontSize = Math.max(8, Math.min(32, n)); savePreview(); renderPreview(); }
