@@ -108,7 +108,7 @@ fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
     let extra_quads = 4 * cols + 5;
     let quads = 2 * area + 2 * extra_quads;
     let vertex_bytes = quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
-    let index_bytes = quads * std::mem::size_of::<u16>() * 6;
+    let index_bytes = quads * std::mem::size_of::<u32>() * 6;
     (vertex_bytes, index_bytes)
 }
 
@@ -133,7 +133,7 @@ fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
 fn emit_text_run(
     atlas: &font::Atlas,
     vertices: &mut Vec<renderer::vertex::Vertex>,
-    indices: &mut Vec<u16>,
+    indices: &mut Vec<u32>,
     mut x: f32,
     baseline_y: f32,
     text: &str,
@@ -161,7 +161,7 @@ fn emit_text_run(
                 let u1 = (g.x as f32 + gw) / atlas_w;
                 let v0 = g.y as f32 / atlas_h;
                 let v1 = (g.y as f32 + gh) / atlas_h;
-                let start = vertices.len() as u16;
+                let start = vertices.len() as u32;
                 let hx = gw * 0.5;
                 let hy = gh * 0.5;
                 let half_size = [hx, hy];
@@ -2234,7 +2234,7 @@ impl State {
         let rows = self.terminal.rows;
         let area = cols * rows;
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
-        let mut indices: Vec<u16> = Vec::with_capacity(12 * (area + 1));
+        let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
         let face = self.font.face();
@@ -2285,7 +2285,7 @@ impl State {
 
         let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
-             idxs: &mut Vec<u16>,
+             idxs: &mut Vec<u32>,
              x: f32,
              y: f32,
              w: f32,
@@ -2294,7 +2294,7 @@ impl State {
              uv1: [f32; 2],
              color: [f32; 4],
              radii: [f32; 4]| {
-                let start = verts.len() as u16;
+                let start = verts.len() as u32;
                 let hx = w * 0.5;
                 let hy = h * 0.5;
                 let half_size = [hx, hy];
@@ -2517,7 +2517,7 @@ impl State {
         // bloom each layer independently.
         let strip_pad = (line_height - bg_h) * 0.5;
         let emit_bg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
-                                idxs: &mut Vec<u16>,
+                                idxs: &mut Vec<u32>,
                                 r: isize,
                                 c: usize,
                                 bg: [f32; 4]| {
@@ -2547,7 +2547,7 @@ impl State {
         // FG quad only — glyph for the cell. See `emit_bg_for_cell` above
         // for why bg/fg are split.
         let emit_fg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
-                                idxs: &mut Vec<u16>,
+                                idxs: &mut Vec<u32>,
                                 fg_source: GlyphSource,
                                 variant: font::FaceVariant,
                                 r: isize,
@@ -2924,7 +2924,7 @@ impl State {
                 // strip's concave corner).
                 let cr = concave_radius;
                 let push_fillet = |vertices: &mut Vec<renderer::vertex::Vertex>,
-                                   indices: &mut Vec<u16>,
+                                   indices: &mut Vec<u32>,
                                    fx: f32,
                                    fy: f32,
                                    bite: [f32; 4]| {
@@ -5596,7 +5596,7 @@ impl State {
             pass.set_bind_group(1, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.fade_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             if range.start < range.end {
                 pass.draw_indexed(range, 0, 0..1);
             }
@@ -6463,7 +6463,34 @@ mod tests {
         let quads = 2 * area + 2 * extra_quads;
         let v = std::mem::size_of::<renderer::vertex::Vertex>();
         assert_eq!(vbuf, quads * v * 4);
-        assert_eq!(ibuf, quads * std::mem::size_of::<u16>() * 6);
+        assert_eq!(ibuf, quads * std::mem::size_of::<u32>() * 6);
+    }
+
+    #[test]
+    fn grid_index_buffer_addresses_beyond_u16() {
+        // Regression: the grid's index buffer was `Uint16`, but
+        // `update_vertices` emits 8 vertices per cell (bg + fg quad,
+        // 4 verts each) into one shared vertex vector. Once a frame
+        // crosses 65_536 vertices — only ~8_192 cells — `verts.len()
+        // as u16` wrapped and the wrapped indices referenced the
+        // wrong vertices, so cells rendered as garbage or vanished
+        // (large windows, fullscreen, tmux splits). The index buffer
+        // must be wide enough to address every vertex a realistic
+        // grid can emit, so its element type has to be u32, not u16.
+        let cols = 240usize;
+        let rows = 80usize; // a routine fullscreen grid
+        let verts_per_cell = 8; // bg quad + fg quad, 4 verts each
+        let max_vertex_index = cols * rows * verts_per_cell;
+        assert!(
+            max_vertex_index > u16::MAX as usize,
+            "this grid emits {max_vertex_index} vertices, which fits in u16 — \
+             pick a bigger grid so the test actually guards the overflow",
+        );
+
+        // The buffer sizing must reserve 4 bytes per index (u32), not 2.
+        let (_, ibuf) = grid_buffer_byte_sizes(cols, rows);
+        let quads = 2 * (cols * rows) + 2 * (4 * cols + 5);
+        assert_eq!(ibuf, quads * 4 * 6, "index buffer must be sized for u32 indices");
     }
 
     #[test]
