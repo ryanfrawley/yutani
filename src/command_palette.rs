@@ -50,6 +50,9 @@ pub enum PaletteAction {
     CopyLastOutput,
     /// Open a new Yutani window (a fresh process) in the current working dir.
     NewWindow,
+    /// Re-run the first-time setup: re-arm the onboarding marker and relaunch
+    /// Yutani so it boots into onboarding-in-PTY exactly like a real first run.
+    RunOnboarding,
 }
 
 /// One entry in the palette's command list.
@@ -146,6 +149,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         title: "New window",
         action: PaletteAction::NewWindow,
+        arg_prompt: None,
+        choose: false,
+    },
+    Command {
+        title: "Run first-time setup…",
+        action: PaletteAction::RunOnboarding,
         arg_prompt: None,
         choose: false,
     },

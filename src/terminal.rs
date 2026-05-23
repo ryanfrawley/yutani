@@ -636,6 +636,28 @@ pub struct CurrentInput {
     pub cursor: usize,
 }
 
+/// A live-preview action requested over the yutani-private `OSC 2125` extension
+/// (see [`Terminal::handle_osc_2125`]). Emitted by the first-run onboarding to
+/// drive the real renderer as the user chooses; the front end applies each
+/// transiently, persisting nothing until the onboarding writes config and sends
+/// [`PreviewRequest::Reload`]. (Not `Eq`: `FontSize` carries an `f32`.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreviewRequest {
+    /// Preview a color scheme by name; `None` = the built-in default palette.
+    Scheme(Option<String>),
+    /// Preview a CRT-glow preset.
+    Glow(crate::GlowLevel),
+    /// Toggle the scanline overlay.
+    Scanlines(bool),
+    /// Preview a combined CRT effect (bloom + scanlines together).
+    Crt(crate::CrtLevel),
+    /// Preview an absolute font size in points.
+    FontSize(f32),
+    /// Re-read config + scheme from disk — the commit step once the onboarding
+    /// has saved the chosen settings.
+    Reload,
+}
+
 pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
@@ -755,6 +777,12 @@ pub struct Terminal {
     // live when OSC 133 `C` (OutputStart) fired. Drained once via
     // `take_submitted_command()` and folded into the in-session command history.
     last_submitted_command: Option<String>,
+    // Live-preview requests from the yutani-private OSC 2125 extension, used by
+    // the first-run onboarding (which runs as the PTY child) to drive the real
+    // renderer as the user picks a scheme / glow level. A FIFO because one feed
+    // chunk can carry several; the front end drains it via
+    // `take_preview_requests()` after each feed and applies each transiently.
+    preview_requests: Vec<PreviewRequest>,
     // Config-driven: when false, placements that fully scroll off the top
     // are dropped rather than promoted to `scrollback_placements`. Saves
     // memory in long-running shells with heavy image traffic. The trade-
@@ -981,6 +1009,7 @@ impl Terminal {
             histfile: None,
             histfile_dirty: false,
             last_submitted_command: None,
+            preview_requests: Vec::new(),
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
@@ -2619,6 +2648,9 @@ impl Terminal {
             2122 => self.handle_osc_2122(rest),
             // yutani-private history-file path report (autocomplete history).
             2124 => self.handle_osc_2124(rest),
+            // yutani-private live-preview control, emitted by the first-run
+            // onboarding to drive the renderer as the user chooses.
+            2125 => self.handle_osc_2125(rest),
             // iTerm2 proprietary namespace. Only `File=...` (inline
             // images) is implemented; everything else is silently
             // dropped to match iTerm's "unknown verb is a no-op" contract.
@@ -2891,6 +2923,62 @@ impl Terminal {
         } else {
             None
         }
+    }
+
+    /// `OSC 2125 ; <verb> [; <arg>] \a` — yutani-private live-preview control,
+    /// emitted by the first-run onboarding (which runs as the PTY child) so the
+    /// user sees their choice on the real window before it's saved. Recognized
+    /// verbs:
+    ///
+    /// - `scheme;<name>` — preview a color scheme by name; empty / `-` /
+    ///   `default` reverts to the built-in palette.
+    /// - `glow;off|subtle|full` — preview a CRT-glow preset.
+    /// - `scanlines;on|off` — toggle the scanline overlay.
+    /// - `crt;off|low|high` — preview a combined CRT effect (bloom + scanlines).
+    /// - `font;<points>` — preview an absolute font size (rebuilds the grid).
+    /// - `reload` — re-read config + scheme from disk (the final commit step,
+    ///   after the onboarding has written the chosen settings).
+    ///
+    /// Unknown verbs / args are dropped, matching the terminal's general
+    /// "unknown OSC is a no-op" contract. Parsed requests are queued for the
+    /// front end to apply via [`take_preview_requests`](Self::take_preview_requests).
+    fn handle_osc_2125(&mut self, payload: &str) {
+        let (verb, arg) = payload.split_once(';').unwrap_or((payload, ""));
+        let req = match verb {
+            "scheme" => {
+                let name = match arg {
+                    "" | "-" | "default" => None,
+                    other => Some(other.to_string()),
+                };
+                PreviewRequest::Scheme(name)
+            }
+            "glow" => match crate::GlowLevel::from_str(arg) {
+                Some(level) => PreviewRequest::Glow(level),
+                None => return,
+            },
+            "scanlines" => match arg {
+                "on" => PreviewRequest::Scanlines(true),
+                "off" => PreviewRequest::Scanlines(false),
+                _ => return,
+            },
+            "crt" => match crate::CrtLevel::from_str(arg) {
+                Some(level) => PreviewRequest::Crt(level),
+                None => return,
+            },
+            "font" => match arg.parse::<f32>() {
+                Ok(pt) if pt.is_finite() => PreviewRequest::FontSize(pt),
+                _ => return,
+            },
+            "reload" => PreviewRequest::Reload,
+            _ => return,
+        };
+        self.preview_requests.push(req);
+    }
+
+    /// Drain any live-preview requests queued since the last call. The front end
+    /// calls this after each `feed` and applies each to the running renderer.
+    pub fn take_preview_requests(&mut self) -> Vec<PreviewRequest> {
+        std::mem::take(&mut self.preview_requests)
     }
 
     /// Returns the last command submitted at a prompt (the OSC 2122 buffer that
@@ -12925,5 +13013,191 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- OSC 2125: onboarding live-preview channel -----------------------
+
+    /// Feed a single BEL-terminated OSC 2125 payload and drain the requests
+    /// it produced. Drives the real `feed` -> parser -> `handle_osc_2125`
+    /// path end-to-end so the tests pin the wire contract, not the helper.
+    fn preview_after_2125(payload: &str) -> Vec<PreviewRequest> {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed(&format!("\x1b]2125;{}\x07", payload));
+        t.take_preview_requests()
+    }
+
+    #[test]
+    fn osc_2125_scheme_by_name() {
+        assert_eq!(
+            preview_after_2125("scheme;Solarized"),
+            vec![PreviewRequest::Scheme(Some("Solarized".into()))],
+        );
+    }
+
+    #[test]
+    fn osc_2125_scheme_empty_is_default() {
+        // Empty arg, the literal `-`, and the word `default` all mean
+        // "the built-in palette", encoded as `Scheme(None)`.
+        assert_eq!(
+            preview_after_2125("scheme;"),
+            vec![PreviewRequest::Scheme(None)],
+        );
+        assert_eq!(
+            preview_after_2125("scheme;-"),
+            vec![PreviewRequest::Scheme(None)],
+        );
+        assert_eq!(
+            preview_after_2125("scheme;default"),
+            vec![PreviewRequest::Scheme(None)],
+        );
+    }
+
+    #[test]
+    fn osc_2125_glow_presets() {
+        assert_eq!(
+            preview_after_2125("glow;off"),
+            vec![PreviewRequest::Glow(crate::GlowLevel::Off)],
+        );
+        assert_eq!(
+            preview_after_2125("glow;subtle"),
+            vec![PreviewRequest::Glow(crate::GlowLevel::Subtle)],
+        );
+        assert_eq!(
+            preview_after_2125("glow;full"),
+            vec![PreviewRequest::Glow(crate::GlowLevel::Full)],
+        );
+    }
+
+    #[test]
+    fn osc_2125_glow_unknown_preset_dropped() {
+        // An unparseable glow level is a no-op, matching the terminal's
+        // "unknown OSC is silent" contract — nothing queued.
+        assert!(preview_after_2125("glow;bogus").is_empty());
+        assert!(preview_after_2125("glow;").is_empty());
+    }
+
+    #[test]
+    fn osc_2125_scanlines_on_off() {
+        assert_eq!(
+            preview_after_2125("scanlines;on"),
+            vec![PreviewRequest::Scanlines(true)],
+        );
+        assert_eq!(
+            preview_after_2125("scanlines;off"),
+            vec![PreviewRequest::Scanlines(false)],
+        );
+    }
+
+    #[test]
+    fn osc_2125_scanlines_unknown_arg_dropped() {
+        assert!(preview_after_2125("scanlines;maybe").is_empty());
+        assert!(preview_after_2125("scanlines;").is_empty());
+    }
+
+    #[test]
+    fn osc_2125_reload() {
+        assert_eq!(
+            preview_after_2125("reload"),
+            vec![PreviewRequest::Reload],
+        );
+    }
+
+    #[test]
+    fn osc_2125_crt_presets() {
+        assert_eq!(
+            preview_after_2125("crt;off"),
+            vec![PreviewRequest::Crt(crate::CrtLevel::Off)],
+        );
+        assert_eq!(
+            preview_after_2125("crt;low"),
+            vec![PreviewRequest::Crt(crate::CrtLevel::Low)],
+        );
+        assert_eq!(
+            preview_after_2125("crt;high"),
+            vec![PreviewRequest::Crt(crate::CrtLevel::High)],
+        );
+    }
+
+    #[test]
+    fn osc_2125_crt_unknown_preset_dropped() {
+        assert!(preview_after_2125("crt;medium").is_empty());
+        assert!(preview_after_2125("crt;").is_empty());
+    }
+
+    #[test]
+    fn osc_2125_font_size() {
+        assert_eq!(
+            preview_after_2125("font;12"),
+            vec![PreviewRequest::FontSize(12.0)],
+        );
+        assert_eq!(
+            preview_after_2125("font;9.5"),
+            vec![PreviewRequest::FontSize(9.5)],
+        );
+    }
+
+    #[test]
+    fn osc_2125_font_size_garbage_dropped() {
+        assert!(preview_after_2125("font;big").is_empty());
+        assert!(preview_after_2125("font;").is_empty());
+        // Non-finite values are rejected too.
+        assert!(preview_after_2125("font;inf").is_empty());
+    }
+
+    #[test]
+    fn osc_2125_unknown_verb_dropped() {
+        assert!(preview_after_2125("wat").is_empty());
+        assert!(preview_after_2125("wat;arg").is_empty());
+    }
+
+    #[test]
+    fn osc_2125_multiple_requests_queue_in_order() {
+        // Several 2125 sequences in one feed must all land, in arrival
+        // order, so the front end can replay the user's choices faithfully.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed(
+            "\x1b]2125;scheme;Solarized\x07\
+             \x1b]2125;glow;full\x07\
+             \x1b]2125;scanlines;on\x07\
+             \x1b]2125;reload\x07",
+        );
+        assert_eq!(
+            t.take_preview_requests(),
+            vec![
+                PreviewRequest::Scheme(Some("Solarized".into())),
+                PreviewRequest::Glow(crate::GlowLevel::Full),
+                PreviewRequest::Scanlines(true),
+                PreviewRequest::Reload,
+            ],
+        );
+    }
+
+    #[test]
+    fn osc_2125_dropped_requests_do_not_break_the_queue() {
+        // A dropped (unknown) request mid-stream must not eat the valid
+        // ones around it — the queue keeps exactly the parseable verbs.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed(
+            "\x1b]2125;glow;bogus\x07\
+             \x1b]2125;reload\x07\
+             \x1b]2125;scanlines;nope\x07\
+             \x1b]2125;scheme;Nord\x07",
+        );
+        assert_eq!(
+            t.take_preview_requests(),
+            vec![
+                PreviewRequest::Reload,
+                PreviewRequest::Scheme(Some("Nord".into())),
+            ],
+        );
+    }
+
+    #[test]
+    fn osc_2125_take_drains_the_queue() {
+        // The accessor moves the queue out; a second drain sees nothing.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b]2125;reload\x07");
+        assert_eq!(t.take_preview_requests(), vec![PreviewRequest::Reload]);
+        assert!(t.take_preview_requests().is_empty());
     }
 }
