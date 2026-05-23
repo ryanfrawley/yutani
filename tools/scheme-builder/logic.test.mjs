@@ -171,11 +171,26 @@ function done() {
     assert.deepEqual(out.ansi.green, ['#00ab00', '#55ff55']);
   });
 
+  test('parseToml reads a single ANSI hex into both slots', () => {
+    // 8-color / mono shorthand: `black = 0x000000` fills normal AND bright.
+    const { out, errors } = parseToml('black = 0x000000\nred = 0xab0000');
+    assert.deepEqual(errors, []);
+    assert.deepEqual(out.ansi.black, ['#000000', '#000000']);
+    assert.deepEqual(out.ansi.red, ['#ab0000', '#ab0000']);
+  });
+
+  test('parseToml rejects a bad single ANSI hex', () => {
+    const { out, errors } = parseToml('blue = nothex');
+    assert.equal(out.ansi.blue, undefined);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /invalid hex/);
+  });
+
   test('parseToml rejects malformed pairs without throwing', () => {
     const { out, errors } = parseToml('blue = [0x0000ab]');
     assert.equal(out.ansi.blue, undefined);
     assert.equal(errors.length, 1);
-    assert.match(errors[0], /expected \[normal, bright\]/);
+    assert.match(errors[0], /expected a hex color or \[normal, bright\]/);
   });
 
   test('parseToml rejects bad hex inside a pair', () => {
@@ -335,6 +350,34 @@ function done() {
     const toml = sb.toToml();
     assert.equal(/selection_fg/.test(toml), false);
     assert.equal(/max_colors/.test(toml), false);
+  });
+
+  test('toToml emits single-hex ANSI in 8-color mode', () => {
+    const s = freshState();
+    s.max_colors = '8';
+    sb.__setState(s);
+    const toml = sb.toToml();
+    // Single hex per slot, no [normal, bright] arrays.
+    assert.match(toml, /^black\s+= 0x000000$/m);
+    assert.equal(/\[0x/.test(toml), false, 'no array form in 8-color mode');
+    // Round-trips: both slots come back as the normal color.
+    const { out, errors } = parser.parseToml(toml);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(out.ansi.black, ['#000000', '#000000']);
+    assert.deepEqual(out.ansi.red, ['#ab0000', '#ab0000']);
+  });
+
+  test('toToml omits the ANSI palette entirely in mono mode', () => {
+    const s = freshState();
+    s.max_colors = 'mono';
+    sb.__setState(s);
+    const toml = sb.toToml();
+    for (const hue of ['black','red','green','yellow','blue','magenta','cyan','white']) {
+      assert.equal(new RegExp('^' + hue + '\\b', 'm').test(toml), false, `${hue} should be omitted`);
+    }
+    // Window colors and the cap are still written.
+    assert.match(toml, /^background = /m);
+    assert.match(toml, /^max_colors = "mono"$/m);
   });
 }
 
@@ -538,7 +581,15 @@ function done() {
         assert.equal(out[k], s[k], `${name}.${k}`);
       }
       for (const hue of HUES) {
-        assert.deepEqual(out.ansi[hue], s.ansi[hue], `${name}.${hue}`);
+        if (s.max_colors === 'mono') {
+          // Mono omits the ANSI palette from the file entirely.
+          assert.equal(out.ansi[hue], undefined, `${name}.${hue} omitted in mono`);
+        } else if (s.max_colors === '8') {
+          // 8-color emits one hex per slot; both slots round-trip to the normal.
+          assert.deepEqual(out.ansi[hue], [s.ansi[hue][0], s.ansi[hue][0]], `${name}.${hue}`);
+        } else {
+          assert.deepEqual(out.ansi[hue], s.ansi[hue], `${name}.${hue}`);
+        }
       }
       assert.equal(out.max_colors, s.max_colors || '', `${name}.max_colors`);
       // Glow keys only emit when enabled; whatever lands must match state.

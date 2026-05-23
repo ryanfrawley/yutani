@@ -2984,8 +2984,11 @@ impl State {
                 // Ansi16). Identity for the common Truecolor cap. Done
                 // after reverse so reverse-video respects the cap too;
                 // applied only to cell colors — cursor, selection, and
-                // chrome remain at scheme-author fidelity.
-                let (fg, bg) = (pal.project(fg), pal.project(bg));
+                // chrome remain at scheme-author fidelity. `project_cell` also
+                // handles the Mono special case where a cell with an explicit
+                // background is flipped to fg-ink-on-bg-text so it stays
+                // distinct from an empty cell (see palette::Palette).
+                let (fg, bg) = pal.project_cell(fg, bg);
                 // Scheme-provided selection_fg wins over the cell's own fg
                 // (including the post-reverse swap). Applied after projection
                 // so it stays at scheme-author fidelity, matching how

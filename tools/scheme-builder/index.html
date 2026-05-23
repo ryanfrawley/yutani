@@ -585,10 +585,10 @@
         </div>
         <div id="cap-note" style="font: 11px var(--mono); color: var(--muted); padding: 4px 0 0 94px;"></div>
       </div>
-      <div class="group">
+      <div class="group" id="ansi-group">
         <h3>ANSI palette</h3>
-        <div class="row header-row">
-          <span></span><span>Normal</span><span>Bright</span>
+        <div class="row header-row" id="ansi-header">
+          <span></span><span>Normal</span><span id="ansi-bright-head">Bright</span>
         </div>
         <div id="ansi-fields"></div>
       </div>
@@ -1443,19 +1443,29 @@ function buildPane1() {
   sfgRow.append(sfgChk, sfgLabel, sfgSwatch);
   win.append(sfgRow);
 
+  const cap = state.max_colors || '';
+  // Mono ignores the ANSI palette entirely (every cell snaps to fg/bg), so
+  // hide the whole group. 8-color uses the normals but folds bright onto
+  // them, so hide the Bright column (header + each bright swatch) rather
+  // than just dimming it. 16/256/truecolor show everything.
+  const ansiUsed = normalAnsiEnabled();      // false only for mono
+  const showBright = brightEnabled();        // false for mono and 8
+  document.getElementById('ansi-group').style.display = ansiUsed ? '' : 'none';
+  document.getElementById('ansi-bright-head').style.display = showBright ? '' : 'none';
+
   const ansi = document.getElementById('ansi-fields');
   ansi.innerHTML = '';
-  const normalOn = normalAnsiEnabled();
-  const brightOn = brightEnabled();
   for (const hue of HUES) {
     const [normal, bright] = state.ansi[hue];
     const row = document.createElement('div');
-    row.className = 'row' + (normalOn ? '' : ' disabled');
+    row.className = 'row';
     row.innerHTML = `<label>${hue}</label>`;
     const nSwatch = makeSwatch(hue+'-n', normal, v => { state.ansi[hue][0] = v; renderAll(); });
-    const bSwatch = makeSwatch(hue+'-b', bright, v => { state.ansi[hue][1] = v; renderAll(); });
-    if (!brightOn) bSwatch.style.opacity = '0.35', bSwatch.style.pointerEvents = 'none';
-    row.append(nSwatch, bSwatch);
+    row.append(nSwatch);
+    if (showBright) {
+      const bSwatch = makeSwatch(hue+'-b', bright, v => { state.ansi[hue][1] = v; renderAll(); });
+      row.append(bSwatch);
+    }
     ansi.append(row);
   }
 
@@ -1464,9 +1474,8 @@ function buildPane1() {
   maxSel.onchange = e => { state.max_colors = e.target.value; renderAll(); };
 
   const note = document.getElementById('cap-note');
-  const cap = state.max_colors || '';
-  if (cap === 'mono') note.textContent = 'ANSI palette unused — every cell snaps to fg/bg.';
-  else if (cap === '8') note.textContent = 'Bright variants disabled — they fold onto the nearest normal.';
+  if (cap === 'mono') note.textContent = 'ANSI palette unused — a cell with a background paints as fg ink, its text as bg; empty cells stay bg.';
+  else if (cap === '8') note.textContent = 'Bright variants hidden — one color per slot; brights fold onto normals.';
   else if (cap === '16') note.textContent = 'Truecolor cells snap to nearest of the 16 ANSI entries.';
   else if (cap === '256') note.textContent = 'Truecolor cells snap to the 256-entry xterm cube.';
   else note.textContent = 'No cap — colors pass through unchanged.';
@@ -2123,13 +2132,23 @@ function toToml() {
   const lines = [];
   for (const k of SINGLES) lines.push(`${k} = ${toTomlHex(state[k])}`);
   if (state.selection_fg) lines.push(`selection_fg = ${toTomlHex(state.selection_fg)}`);
-  lines.push('');
-  // pad keys to a column so values align visually
-  const pad = 'magenta'.length;
-  for (const hue of HUES) {
-    const [n, b] = state.ansi[hue];
-    const key = hue.padEnd(pad, ' ');
-    lines.push(`${key} = [${toTomlHex(n)}, ${toTomlHex(b)}]`);
+  // Mono ignores the ANSI palette (every cell snaps to fg/bg), so leave it
+  // out of the file entirely. 8-color folds bright onto normal, so emit a
+  // single hex per slot (`black = 0x000000`) — palette.rs set_pair fills
+  // both slots from it. Other caps keep the explicit [normal, bright] pair.
+  const cap = state.max_colors || '';
+  if (cap !== 'mono') {
+    lines.push('');
+    // pad keys to a column so values align visually
+    const pad = 'magenta'.length;
+    const singleAnsi = cap === '8';
+    for (const hue of HUES) {
+      const [n, b] = state.ansi[hue];
+      const key = hue.padEnd(pad, ' ');
+      lines.push(singleAnsi
+        ? `${key} = ${toTomlHex(n)}`
+        : `${key} = [${toTomlHex(n)}, ${toTomlHex(b)}]`);
+    }
   }
   if (state.max_colors) {
     lines.push('');
@@ -2218,12 +2237,20 @@ function parseToml(src) {
       if (e) { errors.push(`line ${i+1}: ${e}`); continue; }
       out.glowSeen = true;
     } else if (HUES.includes(key)) {
-      // Allow an optional trailing comma — TOML permits it inside arrays.
-      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*,?\s*\]$/);
-      if (!m) { errors.push(`line ${i+1}: expected [normal, bright]`); continue; }
-      const n = normHex(m[1]), b = normHex(m[2]);
-      if (!n || !b) { errors.push(`line ${i+1}: invalid hex in pair`); continue; }
-      out.ansi[key] = [n, b];
+      // Two accepted forms, mirroring palette.rs set_pair: a bare hex sets
+      // both normal and bright to the same color (the 8-color / mono
+      // shorthand), or a `[normal, bright]` pair (optional trailing comma).
+      if (value[0] !== '[') {
+        const c = normHex(value);
+        if (!c) { errors.push(`line ${i+1}: invalid hex '${value}'`); continue; }
+        out.ansi[key] = [c, c];
+      } else {
+        const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*,?\s*\]$/);
+        if (!m) { errors.push(`line ${i+1}: expected a hex color or [normal, bright]`); continue; }
+        const n = normHex(m[1]), b = normHex(m[2]);
+        if (!n || !b) { errors.push(`line ${i+1}: invalid hex in pair`); continue; }
+        out.ansi[key] = [n, b];
+      }
     } else if (key === 'max_colors') {
       // Accept the value bare or quoted (TOML strings) — strip one layer of
       // matching quotes before validating.

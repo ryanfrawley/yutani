@@ -187,6 +187,47 @@ impl Palette {
         }
     }
 
+    /// Resolve a cell's `(foreground, background)` colors down to what this
+    /// palette's [`ColorCap`] permits, returning the pair to actually draw.
+    ///
+    /// For every cap except [`ColorCap::Mono`] this is just [`project`] on
+    /// each color independently. Mono is special: with only two ink levels,
+    /// glyphs must never be quantised by nearest-color — a dim or grey text
+    /// color (e.g. the 256-color greys Claude Code uses for secondary text)
+    /// can land closer to the [`background`] and collapse onto it, which on a
+    /// transparent cell means the window background shows through and the
+    /// glyph vanishes. So in Mono the glyph is always drawn as ink, picked
+    /// purely by whether the cell carries a *distinct* background:
+    ///
+    /// - **a background that differs from the window [`background`]** → the
+    ///   block paints in the [`foreground`] "ink" color and the glyph flips to
+    ///   [`background`], so the text reads against its own block.
+    /// - **otherwise** (transparent, or a background equal to the window
+    ///   background) → the cell reads as blank: the bg projects normally
+    ///   (transparent passes through; a window-bg color stays the window bg),
+    ///   and the glyph paints in [`foreground`] ink. An app explicitly
+    ///   painting the scheme's own bg color means "blank", so it must not
+    ///   become a filled ink block.
+    ///
+    /// This keeps three states mutually distinct — an empty/blank cell (window
+    /// bg), a filled cell (fg ink), and text (bg or fg ink) — and guarantees
+    /// text is always visible regardless of the requested color.
+    ///
+    /// [`project`]: Palette::project
+    /// [`foreground`]: Palette::foreground
+    /// [`background`]: Palette::background
+    pub fn project_cell(&self, fg: [f32; 4], bg: [f32; 4]) -> ([f32; 4], [f32; 4]) {
+        if self.max_colors == ColorCap::Mono {
+            if bg[3] != 0.0 && !rgb_eq(bg, self.background) {
+                (self.background, self.foreground)
+            } else {
+                (self.foreground, self.project(bg))
+            }
+        } else {
+            (self.project(fg), self.project(bg))
+        }
+    }
+
     pub fn ansi(&self, n: u8, bright: bool) -> [f32; 4] {
         let idx = (n & 7) as usize + if bright { 8 } else { 0 };
         self.ansi[idx]
@@ -274,6 +315,14 @@ fn luma_dist_sq(a: [f32; 4], b: [f32; 4]) -> f32 {
     let dg = a[1] - b[1];
     let db = a[2] - b[2];
     0.299 * dr * dr + 0.587 * dg * dg + 0.114 * db * db
+}
+
+/// RGB equality within a small epsilon, ignoring alpha. Used to detect a
+/// cell background that matches the window background despite float rounding
+/// from sRGB/linear conversion or palette indexing.
+fn rgb_eq(a: [f32; 4], b: [f32; 4]) -> bool {
+    const EPS: f32 = 1.0 / 512.0;
+    (a[0] - b[0]).abs() < EPS && (a[1] - b[1]).abs() < EPS && (a[2] - b[2]).abs() < EPS
 }
 
 fn nearest(c: [f32; 4], candidates: &[[f32; 4]]) -> [f32; 4] {
@@ -386,9 +435,22 @@ fn parse_color_cap(value: &toml::Value) -> Result<ColorCap, String> {
 }
 
 fn set_pair(ansi: &mut [[f32; 4]; 16], hue: usize, value: &toml::Value) -> Result<(), String> {
-    let arr = value
-        .as_array()
-        .ok_or_else(|| format!("expected [normal, bright] array, got {}", value.type_str()))?;
+    // A bare hex int sets the normal AND bright slots to the same color.
+    // This is the natural shorthand for caps that fold bright onto normal
+    // (Mono / Ansi8): a single-color scheme writes `black = 0x000000`
+    // instead of repeating the value in a `[normal, bright]` array.
+    if value.as_integer().is_some() {
+        let c = rgb_from_value(value)?;
+        ansi[hue] = c;
+        ansi[hue + 8] = c;
+        return Ok(());
+    }
+    let arr = value.as_array().ok_or_else(|| {
+        format!(
+            "expected a hex color or [normal, bright] array, got {}",
+            value.type_str()
+        )
+    })?;
     if arr.len() != 2 {
         return Err(format!("expected exactly 2 values, got {}", arr.len()));
     }
@@ -530,6 +592,19 @@ mod tests {
         // defaults rather than guessing.
         let p = parse_toml("background = 0x111111\nnonsense\n");
         assert_eq!(p, Palette::defaults());
+    }
+
+    #[test]
+    fn single_hex_sets_both_normal_and_bright() {
+        // Shorthand for caps that fold bright onto normal: a bare hex int
+        // fills both slots with the same color.
+        let p = parse_toml("black = 0x000000
+red = 0xab0000
+");
+        assert_eq!(to_bytes(p.ansi[0]), [0x00, 0x00, 0x00]);
+        assert_eq!(to_bytes(p.ansi[8]), [0x00, 0x00, 0x00]);
+        assert_eq!(to_bytes(p.ansi[1]), [0xab, 0x00, 0x00]);
+        assert_eq!(to_bytes(p.ansi[9]), [0xab, 0x00, 0x00]);
     }
 
     #[test]
@@ -812,6 +887,82 @@ blue = [0x0000ab, 0x5555ff]
         p.max_colors = ColorCap::Xterm256;
         let c196 = p.xterm_256(196);
         assert_eq!(p.project(c196), c196);
+    }
+
+    #[test]
+    fn project_cell_mono_explicit_bg_becomes_fg_ink() {
+        // A cell with any explicit (non-transparent) background must paint as
+        // the fg "ink" color, and its glyph flips to the bg color — so a
+        // filled cell stays distinct from an empty cell and the text stays
+        // readable against the block.
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        // Original cell: near-white glyph on a mid-grey explicit background.
+        let (fg, bg) = p.project_cell([0.9, 0.9, 0.9, 1.0], [0.4, 0.4, 0.4, 1.0]);
+        assert_eq!(bg, p.foreground, "filled bg should become fg ink");
+        assert_eq!(fg, p.background, "glyph should flip to bg color");
+    }
+
+    #[test]
+    fn project_cell_mono_transparent_bg_keeps_window_through() {
+        // No explicit background: the bg stays the transparent sentinel so the
+        // window shows through, and the glyph projects normally to fg ink.
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        let (fg, bg) = p.project_cell([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(bg, [0.0, 0.0, 0.0, 0.0], "transparent bg must pass through");
+        assert_eq!(fg, p.foreground, "glyph on empty cell stays fg ink");
+    }
+
+    #[test]
+    fn project_cell_mono_dim_glyph_stays_ink_not_invisible() {
+        // Regression: a glyph color closer to the window background (e.g. a
+        // 256-color grey used for secondary text) must NOT collapse onto the
+        // background and vanish — in mono the glyph is always ink.
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        // Dim grey is perceptually nearer black (the bg) than white (the fg).
+        let dim = [0.15, 0.15, 0.15, 1.0];
+        let (fg, bg) = p.project_cell(dim, [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(fg, p.foreground, "dim glyph on empty cell must stay ink");
+        assert_eq!(bg, [0.0, 0.0, 0.0, 0.0], "transparent bg must pass through");
+    }
+
+    #[test]
+    fn project_cell_mono_bg_matching_window_reads_blank() {
+        // A cell explicitly painted with the scheme's own background color
+        // means "blank": it must NOT flip to a filled fg-ink block. The bg
+        // projects to the window background and the glyph stays ink — visually
+        // identical to an empty cell.
+        let mut p = Palette::defaults();
+        p.background = [0.05, 0.05, 0.05, 1.0];
+        p.foreground = [0.95, 0.95, 0.95, 1.0];
+        p.max_colors = ColorCap::Mono;
+        let (fg, bg) = p.project_cell([0.95, 0.95, 0.95, 1.0], [0.05, 0.05, 0.05, 1.0]);
+        assert_eq!(bg, p.background, "window-bg-colored cell stays blank, no flip");
+        assert_eq!(fg, p.foreground, "glyph stays ink");
+        // A rounding wobble within epsilon must still count as a match.
+        let (_fg, bg) = p.project_cell([0.95, 0.95, 0.95, 1.0], [0.051, 0.049, 0.05, 1.0]);
+        assert_eq!(bg, p.background, "near-equal bg within epsilon stays blank");
+    }
+
+    #[test]
+    fn project_cell_non_mono_is_independent_projection() {
+        // Outside Mono there's no inversion: each color projects on its own.
+        // Truecolor is identity, so the pair round-trips unchanged.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Truecolor;
+        let fg_in = [0.2, 0.5, 0.7, 1.0];
+        let bg_in = [0.1, 0.1, 0.1, 1.0];
+        let (fg, bg) = p.project_cell(fg_in, bg_in);
+        assert_eq!(fg, fg_in);
+        assert_eq!(bg, bg_in);
     }
 
     #[test]
