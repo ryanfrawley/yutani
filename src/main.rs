@@ -1,5 +1,6 @@
 mod app_window;
 mod box_drawing;
+mod command_palette;
 mod completion;
 mod font;
 mod font_loader;
@@ -1085,6 +1086,11 @@ struct State {
     /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
     /// close the menu.
     completion_dismissed: bool,
+    /// The command palette overlay (Cmd-Shift-P). While `open`, it owns the
+    /// keyboard: keystrokes filter/drive it instead of reaching the PTY. Holds
+    /// its own search/argument text field and selection state; see
+    /// `command_palette.rs`.
+    command_palette: command_palette::CommandPalette,
     /// Past command lines for history-based completion suggestions, most-recent-
     /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
     /// 2124) and grown with this session's submitted commands (captured at OSC
@@ -1371,19 +1377,43 @@ fn is_word_char(ch: char) -> bool {
 /// Cmd modifier is held so the renderer can underline the span and the
 /// click handler can open it. URLs that wrap at the right edge span
 /// multiple rows; the start/end pair is inclusive on both ends.
+/// One underline strip on a single (scroll-stable) line; columns inclusive.
 #[derive(Clone, Debug, PartialEq)]
-struct HoverUrl {
-    /// Absolute (scroll-stable) line indices. `start_abs_line == end_abs_line`
-    /// for the common single-row case.
-    start_abs_line: isize,
-    end_abs_line: isize,
-    /// Inclusive cell columns. For wrapped URLs, the underline strip on each
-    /// intermediate row spans the full row width — only the first and last
-    /// rows use these column positions.
+struct HoverSegment {
+    abs_line: isize,
     start_col: usize,
     end_col: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HoverUrl {
+    /// Every strip to underline. A heuristic match or a contiguous OSC 8 link
+    /// is one segment (or a few, when it wraps across rows); an OSC 8 link
+    /// whose `id=` is shared by non-contiguous spans contributes a segment per
+    /// visible run, so all siblings underline together. Ordered by line then
+    /// column for stable equality (so hover repaint de-dup works).
+    segments: Vec<HoverSegment>,
     /// The URL text itself, ready to hand to `open(1)`.
     url: String,
+}
+
+#[cfg(test)]
+impl HoverUrl {
+    /// First/last segment edges — convenient for the single-run (heuristic or
+    /// contiguous OSC 8) cases the tests assert on. Segments are ordered by
+    /// line then column.
+    fn start_abs_line(&self) -> isize {
+        self.segments.first().unwrap().abs_line
+    }
+    fn end_abs_line(&self) -> isize {
+        self.segments.last().unwrap().abs_line
+    }
+    fn start_col(&self) -> usize {
+        self.segments.first().unwrap().start_col
+    }
+    fn end_col(&self) -> usize {
+        self.segments.last().unwrap().end_col
+    }
 }
 
 /// Locate an http/https URL within a row of cells that covers `col`. The
@@ -1514,11 +1544,89 @@ fn build_wrapped_line(
 /// Locate the URL under `(abs_line, col)`, joining wrap-continued rows so a
 /// link that spilled past the right edge still resolves as a single span.
 /// Falls back to a same-row search when no wrap continuation is in play.
+/// Inclusive column runs of cells whose hyperlink id equals `id`, in one row.
+fn hyperlink_runs(
+    cells: &[style::Cell],
+    id: std::num::NonZeroU32,
+) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < cells.len() {
+        if cells[i].hyperlink == Some(id) {
+            let start = i;
+            while i + 1 < cells.len() && cells[i + 1].hyperlink == Some(id) {
+                i += 1;
+            }
+            runs.push((start, i));
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)`. The link id is
+/// taken from the cell; every visible cell sharing that id is part of the same
+/// logical link (the OSC 8 `id=` contract), so we collect a [`HoverSegment`]
+/// for every run of it across the visible rows — including non-contiguous
+/// siblings, which then underline together. We scan only what's on screen
+/// because that's all the overlay can draw; siblings scrolled off don't need a
+/// strip. Takes precedence over the heuristic: the extent and target are
+/// exactly what the app declared.
+fn find_osc8_link_at(
+    terminal: &terminal::Terminal,
+    abs_line: isize,
+    col: usize,
+) -> Option<HoverUrl> {
+    let row = terminal.line_at(abs_line)?;
+    if col >= row.len() {
+        return None;
+    }
+    let id = row[col].hyperlink?;
+    let uri = terminal.hyperlink_uri(id)?.to_string();
+
+    let mut segments = Vec::new();
+    for v in 0..terminal.rows as isize {
+        let line = terminal.visual_to_abs_line(v);
+        let Some(cells) = terminal.line_at(line) else {
+            continue;
+        };
+        for (start_col, end_col) in hyperlink_runs(cells, id) {
+            segments.push(HoverSegment {
+                abs_line: line,
+                start_col,
+                end_col,
+            });
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    Some(HoverUrl {
+        segments,
+        url: uri,
+    })
+}
+
+/// Scheme allowlist for opening a clicked link. The heuristic only ever
+/// produces http/https, but OSC 8 lets an app declare an arbitrary target, so
+/// we refuse anything outside a small safe set (no `javascript:`, `data:`,
+/// `vbscript:`, etc.) before handing it to the OS opener.
+fn is_safe_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    const SAFE: [&str; 6] = ["http://", "https://", "mailto:", "ftp://", "file://", "ssh://"];
+    SAFE.iter().any(|p| lower.starts_with(p))
+}
+
 fn find_url_at(
     terminal: &terminal::Terminal,
     abs_line: isize,
     col: usize,
 ) -> Option<HoverUrl> {
+    // App-declared OSC 8 links win over the heuristic: exact bounds, and they
+    // may carry non-http schemes the heuristic can't express.
+    if let Some(hu) = find_osc8_link_at(terminal, abs_line, col) {
+        return Some(hu);
+    }
     let (start_abs, cols, flat) = build_wrapped_line(terminal, abs_line)?;
     if cols == 0 || col >= cols {
         return None;
@@ -1526,13 +1634,26 @@ fn find_url_at(
     let row_offset = (abs_line - start_abs) as usize;
     let virtual_col = row_offset * cols + col;
     let (s, e, url) = find_url_in_cells(&flat, virtual_col)?;
-    Some(HoverUrl {
-        start_abs_line: start_abs + (s / cols) as isize,
-        start_col: s % cols,
-        end_abs_line: start_abs + (e / cols) as isize,
-        end_col: e % cols,
-        url,
-    })
+    // A heuristic match is one contiguous (possibly wrapped) run: first row
+    // from `start_col` to the edge, full-width middle rows, last row to
+    // `end_col`. Express it as the same per-line segments OSC 8 uses.
+    let start_line = start_abs + (s / cols) as isize;
+    let start_col = s % cols;
+    let end_line = start_abs + (e / cols) as isize;
+    let end_col = e % cols;
+    let mut segments = Vec::new();
+    let mut line = start_line;
+    while line <= end_line {
+        let from = if line == start_line { start_col } else { 0 };
+        let to = if line == end_line { end_col } else { cols - 1 };
+        segments.push(HoverSegment {
+            abs_line: line,
+            start_col: from,
+            end_col: to,
+        });
+        line += 1;
+    }
+    Some(HoverUrl { segments, url })
 }
 
 #[cfg(target_os = "macos")]
@@ -2115,6 +2236,7 @@ impl State {
             selected_completion: 0,
             completion_scroll: 0,
             completion_dismissed: false,
+            command_palette: command_palette::CommandPalette::default(),
             command_history: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
@@ -2896,61 +3018,59 @@ impl State {
         if let Some(hu) = &self.hover_url {
             for r in r_lo..r_hi {
                 let abs_line = self.terminal.visual_to_abs_line(r);
-                if abs_line < hu.start_abs_line || abs_line > hu.end_abs_line {
-                    continue;
+                // Underline every segment that lands on this line. Most links
+                // have one per line; an OSC 8 link with an `id=` shared across
+                // non-contiguous spans can have several, so don't stop early.
+                for seg in hu.segments.iter().filter(|seg| seg.abs_line == abs_line) {
+                    let from = seg.start_col;
+                    if from >= cols {
+                        continue;
+                    }
+                    let last = seg.end_col.min(cols - 1);
+                    if last < from {
+                        continue;
+                    }
+                    let ux = col_x(from);
+                    let uw = (last - from + 1) as f32 * cell_w;
+                    // Honor the font's own underline_position / underline_thickness
+                    // so the line lands where the type designer intended and scales
+                    // with point size. `underline_pos_px` is the (signed) offset of
+                    // the stem center from the baseline — negative means below, so
+                    // adding `-pos` walks downward in screen coords. Subtracting
+                    // half the thickness then gives the top edge of the stripe.
+                    let uh = underline_thickness_px;
+                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + row_scroll(r);
+                    // Drop a moving row's underline once it crosses the region's
+                    // bottom edge so it can't streak across the static status line.
+                    if row_moving(r) && uy >= clip_bottom_px {
+                        continue;
+                    }
+                    // Match the cell's foreground color so the underline tracks
+                    // theme overrides; fall back to the default fg.
+                    let fg = self
+                        .terminal
+                        .extended_cell(r, from)
+                        .map(|cell| {
+                            if cell.style.reverse {
+                                cell.style.color_bg.unwrap_or(default_bg_solid)
+                            } else {
+                                cell.style.color_fg.unwrap_or(default_fg)
+                            }
+                        })
+                        .unwrap_or(default_fg);
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        ux,
+                        uy,
+                        uw,
+                        uh,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        fg,
+                        [0.0; 4],
+                    );
                 }
-                // Span on this row: first row honors start_col, last row
-                // honors end_col, every middle row covers the full width
-                // (the URL ran edge-to-edge to wrap).
-                let from = if abs_line == hu.start_abs_line { hu.start_col } else { 0 };
-                let to = if abs_line == hu.end_abs_line { hu.end_col } else { cols - 1 };
-                if from >= cols {
-                    continue;
-                }
-                let last = to.min(cols - 1);
-                if last < from {
-                    continue;
-                }
-                let ux = col_x(from);
-                let uw = (last - from + 1) as f32 * cell_w;
-                // Honor the font's own underline_position / underline_thickness
-                // so the line lands where the type designer intended and scales
-                // with point size. `underline_pos_px` is the (signed) offset of
-                // the stem center from the baseline — negative means below, so
-                // adding `-pos` walks downward in screen coords. Subtracting
-                // half the thickness then gives the top edge of the stripe.
-                let uh = underline_thickness_px;
-                let uy = row_y(r) - underline_pos_px - uh * 0.5 + row_scroll(r);
-                // Drop a moving row's underline once it crosses the region's
-                // bottom edge so it can't streak across the static status line.
-                if row_moving(r) && uy >= clip_bottom_px {
-                    continue;
-                }
-                // Match the cell's foreground color so the underline tracks
-                // theme overrides; fall back to the default fg.
-                let fg = self
-                    .terminal
-                    .extended_cell(r, from)
-                    .map(|cell| {
-                        if cell.style.reverse {
-                            cell.style.color_bg.unwrap_or(default_bg_solid)
-                        } else {
-                            cell.style.color_fg.unwrap_or(default_fg)
-                        }
-                    })
-                    .unwrap_or(default_fg);
-                push_quad(
-                    &mut vertices,
-                    &mut indices,
-                    ux,
-                    uy,
-                    uw,
-                    uh,
-                    [bg_u, bg_v],
-                    [bg_u, bg_v],
-                    fg,
-                    [0.0; 4],
-                );
             }
         }
 
@@ -3459,6 +3579,180 @@ impl State {
             }
         }
 
+        // Command palette overlay (Cmd-Shift-P). Drawn last so it sits above
+        // everything, anchored top-center rather than at the cursor. Reuses the
+        // popup's quad/glyph helpers and palette-derived colors. Layout: a dim
+        // backdrop, a rounded box, an input line with a caret, then (in command
+        // mode) a separator and the filtered, scrollable command rows.
+        if self.command_palette.open {
+            use command_palette::{Mode, COMMANDS, PALETTE_MAX_VISIBLE};
+            let cp = &self.command_palette;
+            let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+            let screen_w = self.gpu.config.width as f32;
+            let screen_h = self.gpu.config.height as f32;
+
+            // Dim the terminal behind the palette to pull focus.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                0.0,
+                0.0,
+                screen_w,
+                screen_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                premul([0.0, 0.0, 0.0], 0.45),
+                [0.0; 4],
+            );
+
+            // Box geometry: a fixed-ish width centered horizontally, parked near
+            // the top of the window.
+            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - WINDOW_PADDING * 2.0);
+            let box_x = ((screen_w - box_w) * 0.5).round();
+            let box_y = (screen_h * 0.12).round();
+            let pad_v = (line_height * 0.45).round();
+            let row_h = line_height;
+            let sep_h = 1.0_f32;
+
+            // Visible slice of the filtered command list (command mode only).
+            let list_mode = matches!(cp.mode, Mode::Commands);
+            let start = cp.scroll.min(cp.filtered.len());
+            let end = (start + PALETTE_MAX_VISIBLE).min(cp.filtered.len());
+            let n = if list_mode { end - start } else { 0 };
+            let has_list = n > 0;
+
+            let total_h = pad_v * 2.0
+                + row_h
+                + if has_list { sep_h + n as f32 * row_h } else { 0.0 };
+
+            // Colors, mirroring the completion popup so themes apply.
+            let bg = pal.background;
+            let box_color = premul([bg[0] * 0.55, bg[1] * 0.55, bg[2] * 0.55], 0.96);
+            let fgc = pal.foreground;
+            let hl_color = premul(
+                [
+                    bg[0] * 0.4 + fgc[0] * 0.6,
+                    bg[1] * 0.4 + fgc[1] * 0.6,
+                    bg[2] * 0.4 + fgc[2] * 0.6,
+                ],
+                0.9,
+            );
+            let text_color = pal.foreground;
+            let caret_color = premul([fgc[0], fgc[1], fgc[2]], 0.9);
+            let radius = 8.0_f32;
+
+            // Box background.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                box_x,
+                box_y,
+                box_w,
+                total_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                box_color,
+                [radius; 4],
+            );
+
+            let text_x = box_x + cell_w;
+            let max_text_x = box_x + box_w - cell_w;
+
+            // Input line: a prompt prefix, then the typed text. In argument mode
+            // the prefix names what's being entered (e.g. "Title: ").
+            let prefix = match cp.mode {
+                Mode::Commands => "> ".to_string(),
+                Mode::Argument { prompt, .. } => format!("{prompt}: "),
+            };
+            let input_top = box_y + pad_v;
+            let input_text = format!("{prefix}{}", cp.input.value);
+            let baseline = input_top + bg_h + descender + strip_pad;
+            emit_text_run(
+                atlas,
+                &mut vertices,
+                &mut indices,
+                text_x,
+                baseline,
+                &input_text,
+                text_color,
+                atlas_w,
+                atlas_h,
+                cell_w,
+                max_text_x,
+            );
+
+            // Caret: a thin bar after the prefix + the chars left of the cursor.
+            let caret_col = prefix.chars().count() + cp.input.cursor_col();
+            let caret_x = text_x + caret_col as f32 * cell_w;
+            if caret_x + 2.0 <= max_text_x {
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    caret_x,
+                    input_top + strip_pad,
+                    2.0,
+                    bg_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    caret_color,
+                    [0.0; 4],
+                );
+            }
+
+            if has_list {
+                let list_top = input_top + row_h + sep_h;
+                // Separator between the input and the results.
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    box_x,
+                    input_top + row_h,
+                    box_w,
+                    sep_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    premul([fgc[0], fgc[1], fgc[2]], 0.18),
+                    [0.0; 4],
+                );
+
+                // Highlight the selected row within the visible window.
+                let hl_row = cp.selected.saturating_sub(start);
+                if hl_row < n {
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        box_x,
+                        list_top + hl_row as f32 * row_h,
+                        box_w,
+                        row_h,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        hl_color,
+                        [0.0; 4],
+                    );
+                }
+
+                // Command titles.
+                for (i, &cmd_idx) in cp.filtered[start..end].iter().enumerate() {
+                    let row_top = list_top + i as f32 * row_h;
+                    let baseline = row_top + bg_h + descender + strip_pad;
+                    emit_text_run(
+                        atlas,
+                        &mut vertices,
+                        &mut indices,
+                        text_x,
+                        baseline,
+                        COMMANDS[cmd_idx].title,
+                        text_color,
+                        atlas_w,
+                        atlas_h,
+                        cell_w,
+                        max_text_x,
+                    );
+                }
+            }
+        }
+
         // Refresh the visible-grid snapshot with the current frame's cells
         // so the next retarget can spot what just got cleared. Keyed by
         // viewport so a resize / scrollback / alt-screen flip flushes the
@@ -3635,6 +3929,90 @@ impl State {
             0,
             bytemuck::cast_slice(&fade_data),
         );
+    }
+
+    /// Drive the command palette from a key press while it's open. Always
+    /// consumes the event (returns `true`): the palette owns the keyboard, so
+    /// nothing here reaches the PTY. Cmd-Shift-P (open/close) is handled by the
+    /// caller before this; everything else — navigation, text editing, accept,
+    /// dismiss — is handled here.
+    fn command_palette_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use command_palette::Outcome;
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                if self.command_palette.escape() == Outcome::Close {
+                    self.command_palette.close();
+                }
+            }
+            Key::Named(NamedKey::Enter) => match self.command_palette.accept() {
+                Outcome::Run { action, arg } => {
+                    self.command_palette.close();
+                    self.run_palette_action(action, arg);
+                }
+                Outcome::Close => self.command_palette.close(),
+                Outcome::Stay => {}
+            },
+            Key::Named(NamedKey::ArrowDown) => self.command_palette.move_down(),
+            Key::Named(NamedKey::ArrowUp) => self.command_palette.move_up(),
+            Key::Named(NamedKey::Backspace) => self.command_palette.backspace(),
+            Key::Named(NamedKey::Delete) => self.command_palette.input.delete(),
+            Key::Named(NamedKey::ArrowLeft) => self.command_palette.input.left(),
+            Key::Named(NamedKey::ArrowRight) => self.command_palette.input.right(),
+            Key::Named(NamedKey::Home) => self.command_palette.input.home(),
+            Key::Named(NamedKey::End) => self.command_palette.input.end(),
+            _ => {
+                // Printable text: insert it, unless a Cmd/Ctrl/Alt chord is
+                // held (those aren't text input). winit hands us the composed
+                // text in `event.text`.
+                let plain = !self.modifiers.super_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key();
+                if plain {
+                    if let Some(text) = &event.text {
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                self.command_palette.type_char(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Execute a command chosen in the palette. Every arm reuses behaviour that
+    /// already exists elsewhere — the palette is a discoverable front end, not
+    /// new functionality.
+    fn run_palette_action(
+        &mut self,
+        action: command_palette::PaletteAction,
+        arg: Option<String>,
+    ) {
+        use command_palette::PaletteAction as A;
+        match action {
+            // Route through the OSC-0/2 path so the existing title plumbing
+            // (take_title_update -> effective_title) applies uniformly; the
+            // event loop picks the change up after this returns.
+            A::SetTitle => self
+                .terminal
+                .set_window_title(arg.as_deref().unwrap_or("")),
+            A::ClearTitle => self.terminal.set_window_title(""),
+            A::ReloadConfig => self.reload_config(),
+            A::ZoomIn => self.change_font_size(1.0),
+            A::ZoomOut => self.change_font_size(-1.0),
+            A::ToggleWireframe => {
+                if self.wireframe_pipeline.is_some() {
+                    self.wireframe = !self.wireframe;
+                }
+            }
+            A::CopyLastOutput => {
+                self.select_last_command_output();
+            }
+        }
+        self.invalidate();
     }
 
     /// Bump (or shrink) the font by `delta_pt` points and rebuild everything
@@ -5134,7 +5512,11 @@ impl State {
                         && self.modifiers.super_key()
                     {
                         if let Some(hu) = self.hover_url.clone() {
-                            open_url(&hu.url);
+                            if is_safe_url(&hu.url) {
+                                open_url(&hu.url);
+                            }
+                            // Consume the click either way: a Cmd-click on a
+                            // link shouldn't also fall through to selection.
                             return true;
                         }
                     }
@@ -5307,6 +5689,24 @@ impl State {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
+                    // Cmd-Shift-P toggles the command palette. Checked before
+                    // everything else so it both opens the palette and, while
+                    // it's open, closes it (the palette's own key handler below
+                    // otherwise swallows the keystroke).
+                    if self.modifiers.super_key() && self.modifiers.shift_key() {
+                        if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                            if s.eq_ignore_ascii_case("p") {
+                                self.command_palette.toggle();
+                                self.invalidate();
+                                return true;
+                            }
+                        }
+                    }
+                    // While the palette is open it owns the keyboard: every
+                    // keystroke filters/drives it and nothing reaches the PTY.
+                    if self.command_palette.open {
+                        return self.command_palette_key(&event);
+                    }
                     // Cmd+C / Cmd+V: copy / paste through the system
                     // clipboard. Done before encode_key so the super_key
                     // check there doesn't drop them.
@@ -6432,7 +6832,19 @@ async fn run() {
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
-                if !state.input(&event, elwt) {
+                let consumed = state.input(&event, elwt);
+                // The palette's Set/Clear title actions set the title through
+                // the same terminal path OSC 0/2 uses, but a keystroke isn't
+                // followed by PtyInput, so poll the title update here too.
+                // Mirrors the OSC-driven poll in the PtyInput arm above.
+                if let Some(t) = state.terminal.take_title_update() {
+                    manual_title = t;
+                    state.window.set_title(&effective_title(
+                        manual_title.as_deref(),
+                        state.terminal.cwd(),
+                    ));
+                }
+                if !consumed {
                     match event {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
@@ -8016,6 +8428,178 @@ mod tests {
     }
 
     #[test]
+    fn is_safe_url_allows_known_schemes() {
+        for u in [
+            "https://x/",
+            "http://x/",
+            "mailto:a@b.com",
+            "file:///etc/hosts",
+            "ftp://host/f",
+            "ssh://host",
+            "  HTTPS://Upper/  ",
+        ] {
+            assert!(is_safe_url(u), "{u} should be safe");
+        }
+    }
+
+    #[test]
+    fn is_safe_url_rejects_dangerous_or_bare() {
+        for u in [
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "vbscript:x",
+            "not a url",
+            "example.com",
+        ] {
+            assert!(!is_safe_url(u), "{u} should be rejected");
+        }
+    }
+
+    #[test]
+    fn osc8_link_preferred_over_heuristic_anchor_text() {
+        // Anchor text "click here" links to a different target via OSC 8.
+        // find_url_at must return the OSC 8 target, not parse the visible text.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://real.example/path\x07click here\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_url_at(&t, abs, 2).expect("link under 'click'");
+        assert_eq!(hu.url, "https://real.example/path");
+        assert_eq!(hu.start_col(), 0);
+        assert_eq!(hu.end_col(), "click here".len() - 1);
+    }
+
+    #[test]
+    fn osc8_link_span_stops_at_unlinked_cells() {
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        // "pre " unlinked, "LINK" linked, " post" unlinked.
+        t.feed("pre \x1b]8;;https://x/\x07LINK\x1b]8;;\x07 post");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_osc8_link_at(&t, abs, 5).expect("link under LINK");
+        assert_eq!(hu.start_col(), 4);
+        assert_eq!(hu.end_col(), 7);
+        assert_eq!(hu.url, "https://x/");
+        // A cell in "pre " has no OSC 8 link.
+        assert!(find_osc8_link_at(&t, abs, 1).is_none());
+    }
+
+    #[test]
+    fn osc8_id_siblings_cohighlight() {
+        // Two non-contiguous spans share `id=grp` + URI: hovering either must
+        // return segments covering BOTH runs so they underline together.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=grp;https://x/\x07AB\x1b]8;;\x07 mid \x1b]8;id=grp;https://x/\x07CD\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        // "AB" at cols 0..1; " mid " at 2..6; "CD" at cols 7..8.
+        let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
+        assert_eq!(hu.url, "https://x/");
+        let mut spans: Vec<(usize, usize)> =
+            hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![(0, 1), (7, 8)], "both id=grp spans co-highlight");
+        // Hovering the second span resolves to the identical set.
+        let hu2 = find_osc8_link_at(&t, abs, 7).expect("link under second span");
+        assert_eq!(hu, hu2);
+    }
+
+    #[test]
+    fn osc8_id_three_siblings_all_cohighlight() {
+        // Three non-contiguous spans share one id: hovering any of them must
+        // return all three segments.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=g;https://x/\x07A\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07B\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07C\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        // "A" col 0, "B" col 2, "C" col 4.
+        let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
+        let mut spans: Vec<(usize, usize)> =
+            hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![(0, 0), (2, 2), (4, 4)], "all three spans co-highlight");
+        // Hovering the middle and last spans yields the identical set.
+        assert_eq!(find_osc8_link_at(&t, abs, 2).unwrap(), hu);
+        assert_eq!(find_osc8_link_at(&t, abs, 4).unwrap(), hu);
+    }
+
+    #[test]
+    fn osc8_id_siblings_on_different_rows_cohighlight() {
+        // Two spans share one id but land on different visible rows (a newline
+        // separates them). Hovering either must return one segment per row.
+        let mut t = make_terminal(5, 20);
+        t.feed("\x1b]8;id=g;https://x/\x07AB\x1b]8;;\x07\r\n\x1b]8;id=g;https://x/\x07CD\x1b]8;;\x07");
+        let abs0 = t.visual_to_abs_line(0);
+        let abs1 = t.visual_to_abs_line(1);
+        let hu = find_osc8_link_at(&t, abs0, 0).expect("hover first row span");
+        assert_eq!(hu.url, "https://x/");
+        let mut segs: Vec<(isize, usize, usize)> = hu
+            .segments
+            .iter()
+            .map(|s| (s.abs_line, s.start_col, s.end_col))
+            .collect();
+        segs.sort();
+        assert_eq!(segs, vec![(abs0, 0, 1), (abs1, 0, 1)], "siblings on two rows co-highlight");
+        // Hovering the second-row span resolves to the same set.
+        assert_eq!(find_osc8_link_at(&t, abs1, 0).unwrap(), hu);
+    }
+
+    #[test]
+    fn osc8_anonymous_spans_do_not_cohighlight() {
+        // No `id=`: each open is a distinct link, so hovering the first span
+        // highlights only its own contiguous run, not the later same-URI span.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://x/\x07AB\x1b]8;;\x07 \x1b]8;;https://x/\x07CD\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_osc8_link_at(&t, abs, 0).expect("first span");
+        assert_eq!(hu.segments.len(), 1, "anonymous links don't group");
+        assert_eq!(hu.segments[0].start_col, 0);
+        assert_eq!(hu.segments[0].end_col, 1);
+    }
+
+    #[test]
+    fn heuristic_still_works_without_osc8() {
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("see https://example.com today");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_url_at(&t, abs, 12).expect("heuristic url");
+        assert_eq!(hu.url, "https://example.com");
+    }
+
+    #[test]
+    fn find_osc8_link_at_none_on_unlinked_cell() {
+        // A grid with no OSC 8 link anywhere yields None for every cell.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("just plain text");
+        let abs = t.visual_to_abs_line(0);
+        assert!(find_osc8_link_at(&t, abs, 0).is_none());
+        assert!(find_osc8_link_at(&t, abs, 5).is_none());
+    }
+
+    #[test]
+    fn find_osc8_link_at_out_of_bounds_col_is_none() {
+        // A col past the row width must not panic and must return None.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://x/\x07AB\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        assert!(find_osc8_link_at(&t, abs, 10_000).is_none());
+    }
+
+    #[test]
+    fn find_osc8_link_at_extends_across_wrapped_rows() {
+        // A single OSC 8 link whose anchor text wraps across rows must resolve
+        // to one span covering both rows, whether hovered on the first or the
+        // continuation row. Grid is 10 cols; 14 linked glyphs wrap to row 1.
+        let mut t = make_terminal(5, 10);
+        t.feed("\x1b]8;;https://wrap/target\x07ABCDEFGHIJKLMN\x1b]8;;\x07");
+        // Row 0 is full (cols 0..9), row 1 holds the remaining 4 (cols 0..3).
+        let from_first = find_osc8_link_at(&t, 0, 2).expect("hover first row");
+        let from_tail = find_osc8_link_at(&t, 1, 1).expect("hover continuation row");
+        assert_eq!(from_first, from_tail, "both hovers resolve to one span");
+        assert_eq!(from_first.start_abs_line(), 0);
+        assert_eq!(from_first.start_col(), 0);
+        assert_eq!(from_first.end_abs_line(), 1);
+        assert_eq!(from_first.end_col(), 3, "14 glyphs over 10 cols end at col 3 of row 1");
+        assert_eq!(from_first.url, "https://wrap/target");
+    }
+
+    #[test]
     fn url_only_in_punctuation_run_rejected() {
         // A `).` after the prefix would leave an empty host. Make sure we
         // don't return a URL that's just the scheme.
@@ -8257,10 +8841,10 @@ mod tests {
         t.feed(url);
 
         let hover = find_url_at(&t, 0, 5).expect("URL should be found from first row");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 1);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18, "39 chars over 20 cols ends at col 18 of row 1");
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 1);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18, "39 chars over 20 cols ends at col 18 of row 1");
         assert_eq!(hover.url, url);
     }
 
@@ -8288,10 +8872,10 @@ mod tests {
         t.feed("https://example.com extra-text");
 
         let hover = find_url_at(&t, 0, 5).expect("URL on row 0");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 0);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 0);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18);
         assert_eq!(hover.url, "https://example.com");
         assert!(
             !hover.url.contains("extra-text"),
@@ -8333,7 +8917,7 @@ mod tests {
         let start_abs = start_abs.expect("URL start row should exist");
 
         let hover = find_url_at(&t, start_abs, 0).expect("should resolve to some URL");
-        assert_eq!(hover.start_abs_line, start_abs);
+        assert_eq!(hover.start_abs_line(), start_abs);
         assert!(hover.url.starts_with("https://example.com/"));
         // Cap is URL_WRAP_MAX_ROWS rows past the start; bound length
         // generously to confirm we didn't walk all 50 rows.
@@ -8354,10 +8938,10 @@ mod tests {
         t.feed("https://example.com more text here");
 
         let hover = find_url_at(&t, 0, 10).expect("single-row URL");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 0);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 0);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18);
         assert_eq!(hover.url, "https://example.com");
     }
 

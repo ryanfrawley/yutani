@@ -184,8 +184,53 @@
     width: 100%;
   }
 
+  /* ---------- Glow & scanline controls ---------- */
+  .chk-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+    font: 12px var(--mono);
+    color: var(--text);
+  }
+  .chk-row input[type=checkbox] { margin: 0; accent-color: var(--accent); cursor: pointer; }
+  .chk-row label { cursor: pointer; }
+  .ctl-row {
+    display: grid;
+    grid-template-columns: 132px 1fr 46px;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+  }
+  .ctl-row > label { font: 12px var(--mono); color: var(--text); }
+  .ctl-row input[type=range] { width: 100%; accent-color: var(--accent); }
+  .ctl-row .val { font: 11px var(--mono); color: var(--muted); text-align: right; }
+  .glow-note { font: 10px var(--mono); color: var(--muted); padding: 2px 0 8px; line-height: 1.5; }
+  .glow-note code { background: #0c0c0c; padding: 1px 4px; border-radius: 3px; color: #c5c8c6; }
+  .glow-body.disabled { opacity: 0.4; pointer-events: none; filter: grayscale(0.4); }
+  .subhead {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 12px 0 4px; font-weight: 600;
+  }
+  .opt-row { display: grid; grid-template-columns: 88px auto 1fr; align-items: center; gap: 6px; padding: 4px 0; }
+  .opt-row > label { font: 12px var(--mono); color: var(--text); }
+  .opt-row .swatch.off { opacity: 0.35; pointer-events: none; }
+
   /* ---------- Pane 2: preview ---------- */
   .preview-wrap { padding: 14px; display: flex; flex-direction: column; gap: 14px; align-items: stretch; flex: 1; }
+  /* Preview-only helpers (font face + size). These tune the rendering so it
+   * resembles the user's real terminal; they're never written to the scheme. */
+  .pv-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font: 11px var(--mono); color: var(--muted); }
+  .pv-bar label { color: var(--text); }
+  .pv-bar input {
+    background: #141414; color: var(--text); border: 1px solid #2a2a2a;
+    border-radius: 4px; padding: 3px 6px; font: 12px var(--mono); outline: none;
+  }
+  .pv-bar input:focus { border-color: var(--accent); }
+  .pv-bar select.font { max-width: 220px; padding: 3px 6px; font: 12px var(--mono); }
+  .pv-bar input.size { width: 56px; }
+  .pv-bar #pv-font-all { font: 11px var(--mono); padding: 3px 7px; }
+  .pv-bar .pv-note { margin-left: auto; font-style: italic; }
   .terminal {
     border-radius: 8px;
     box-shadow: 0 10px 30px rgba(0,0,0,0.4);
@@ -224,6 +269,15 @@
   .term-body .line { display: block; }
   .term-body .seg { white-space: pre; }
   .term-body .sel { padding: 0 1px; }
+  /* The WebGL glow canvas. It renders the full scene (bg + text + bloom +
+   * scanlines) and sits opaque over the DOM text it was built from, so the
+   * compositing it does internally matches the renderer's framebuffer. */
+  .term-fx {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+  }
   .term-body .cursor {
     display: inline-block;
     width: 0.6em;
@@ -249,9 +303,27 @@
     text-shadow: 0 0 2px rgba(255,255,255,0.5);
   }
 
-  /* ---------- Pane 3: YAML output ---------- */
-  .yaml-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-  textarea.yaml {
+  /* ---------- Contrast / readability panel ---------- */
+  .contrast h4 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .contrast-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 12px; }
+  .cpair { display: flex; align-items: center; gap: 7px; font: 11px var(--mono); }
+  .cpair .chip {
+    width: 30px; height: 18px; border-radius: 3px; flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    font: 10px var(--mono); border: 1px solid rgba(128,128,128,0.4);
+  }
+  .cpair .ratio { color: var(--text); }
+  .cpair .grade { margin-left: auto; font-size: 10px; padding: 1px 5px; border-radius: 3px; }
+  .grade.pass { background: #1d3a24; color: #82d6a3; }
+  .grade.aa   { background: #3a361d; color: #e6cf6a; }
+  .grade.fail { background: #3a1d1d; color: #ff8e8e; }
+
+  /* ---------- Pane 3: TOML output ---------- */
+  .toml-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  textarea.toml {
     flex: 1;
     width: 100%;
     background: #0c0c0c;
@@ -264,8 +336,8 @@
     border-top: 1px solid var(--pane-border);
     tab-size: 2;
   }
-  textarea.yaml.invalid { color: #ff8e8e; }
-  .yaml-status {
+  textarea.toml.invalid { color: #ff8e8e; }
+  .toml-status {
     padding: 6px 14px;
     font-size: 11px;
     color: var(--muted);
@@ -273,7 +345,7 @@
     border-top: 1px solid var(--pane-border);
     min-height: 26px;
   }
-  .yaml-status.error { color: #ff8e8e; }
+  .toml-status.error { color: #ff8e8e; }
   /* ---------- Import modal ---------- */
   .modal-backdrop {
     position: fixed;
@@ -520,6 +592,18 @@
         </div>
         <div id="ansi-fields"></div>
       </div>
+      <div class="group">
+        <h3>Glow &amp; scanlines</h3>
+        <div class="chk-row">
+          <input type="checkbox" id="glow-enabled">
+          <label for="glow-enabled">Enable glow / scanline overrides</label>
+        </div>
+        <div class="glow-note">
+          Written into the scheme as <code>glow_*</code> keys. They only take effect when
+          <code>theme_overrides_glow = true</code> is set in your <code>config.toml</code>.
+        </div>
+        <div class="glow-body" id="glow-fields"></div>
+      </div>
     </div>
   </section>
 
@@ -527,10 +611,18 @@
   <section class="pane">
     <header><span>Live preview</span></header>
     <div class="preview-wrap">
+      <div class="pv-bar">
+        <label for="pv-font">Font</label>
+        <select class="font" id="pv-font"></select>
+        <button id="pv-font-all" title="List every monospace font installed on your system (asks permission)">All system fonts</button>
+        <label for="pv-size">Size</label>
+        <input class="size" type="number" id="pv-size" min="8" max="32" step="1">
+        <span class="pv-note">preview only — not saved to the scheme</span>
+      </div>
       <div class="terminal" id="term">
         <div class="titlebar">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-          <span class="title">yutani — ~/projects/yutani</span>
+          <span class="title">~/projects/yutani</span>
         </div>
         <div class="term-body" id="term-body"></div>
       </div>
@@ -538,21 +630,25 @@
         <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
         <div class="swatch-grid" id="ansi-grid"></div>
       </div>
+      <div class="contrast">
+        <h4>Contrast vs background (WCAG)</h4>
+        <div class="contrast-grid" id="contrast-grid"></div>
+      </div>
     </div>
   </section>
 
   <!-- =========================== PANE 3 =========================== -->
   <section class="pane">
     <header>
-      <span>scheme.yaml</span>
+      <span>scheme.toml</span>
       <div class="actions">
         <button id="downloadBtn">Download</button>
         <button id="copyBtn" class="primary">Copy</button>
       </div>
     </header>
-    <div class="yaml-wrap">
-      <textarea class="yaml" id="yaml" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
-      <div class="yaml-status" id="yaml-status">Edits flow back to the pickers.</div>
+    <div class="toml-wrap">
+      <textarea class="toml" id="toml" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
+      <div class="toml-status" id="toml-status">Edits flow back to the pickers.</div>
     </div>
   </section>
 </div>
@@ -626,6 +722,40 @@
 const SINGLES = ['background', 'foreground', 'cursor', 'selection'];
 const HUES = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
 
+/* Per-scheme glow + scanline overrides. Field names and defaults mirror
+ * the runtime exactly: GlowOverrides in palette.rs, the glow_* config slots
+ * in main.rs, and the DEFAULT_* constants in renderer/glow.rs. `enabled` is
+ * a builder-only master switch — when off, no glow_* keys are emitted and
+ * the scheme defers entirely to the user's config. The match-mode booleans
+ * all default off, so even with overrides enabled nothing blooms until one
+ * is turned on (matching the runtime, where glow is opt-in). MIN_PALETTE_SAT
+ * isn't a scheme key — it's a fixed renderer constant (0.25) used by the
+ * bright-ANSI match, reproduced here so the preview agrees. */
+const MIN_PALETTE_SAT = 0.25;
+const GLOW_DEFAULTS = {
+  enabled: false,
+  match_brightness: false,
+  match_bright_ansi: false,
+  match_foreground: false,
+  threshold: 0.6,
+  intensity: 0.8,
+  softness: 0.15,
+  hue_tolerance_deg: 18.0,
+  fg_tolerance: 0.12,
+  iterations: 2,
+  scanlines: false,
+  scanline_strength: 1.0,
+  scanline_period: 4.0,
+  scanlines_content: false,
+  scanlines_content_strength: 1.0,
+  scanline_color_bright: '#ffffff',
+  scanline_color_dark: '#000000',
+  scanlines_skip_primary_bg: false,
+  scanlines_content_attenuation: 0.5,
+};
+// glow_* keys that carry an RGB color rather than a scalar/bool.
+const GLOW_COLOR_KEYS = ['scanline_color_bright', 'scanline_color_dark'];
+
 const DEFAULTS = {
   // Yutani's hardcoded fallback (white bg, black fg). See palette.rs::defaults.
   background: '#fbfaf7',
@@ -647,6 +777,72 @@ const DEFAULTS = {
 
 const PRESETS = {
   'Yutani default (light)': structuredClone(DEFAULTS),
+  // The schemes currently shipping in ~/.config/yutani/schemes. Spacedust and
+  // Yutani carry glow overrides (match_brightness + halo scanlines); Nostromo
+  // caps at 8 colors. selection_fg is unset on all three.
+  'Nostromo': {
+    background: '#1d1f21', foreground: '#c5c8c6',
+    cursor: '#c5c8c6',    selection: '#373b41',
+    ansi: {
+      black:   ['#1d1f21', '#969896'],
+      red:     ['#cc6666', '#cc6666'],
+      green:   ['#b5bd68', '#b5bd68'],
+      yellow:  ['#f0c674', '#f0c674'],
+      blue:    ['#81a2be', '#81a2be'],
+      magenta: ['#b294bb', '#b294bb'],
+      cyan:    ['#8abeb7', '#8abeb7'],
+      white:   ['#c5c8c6', '#ffffff'],
+    },
+    max_colors: '8',
+  },
+  'Spacedust': {
+    background: '#0a1e24', foreground: '#ecefc1',
+    cursor: '#ffffff',    selection: '#0a385c',
+    ansi: {
+      black:   ['#6e5246', '#674c31'],
+      red:     ['#e35a00', '#ff8a39'],
+      green:   ['#5cab96', '#adcab8'],
+      yellow:  ['#e3cd7b', '#ffc777'],
+      blue:    ['#0e548b', '#67a0cd'],
+      magenta: ['#e35a00', '#ff8a39'],
+      cyan:    ['#06afc7', '#83a6b3'],
+      white:   ['#f0f1ce', '#fefff0'],
+    },
+    max_colors: '16',
+    glow: {
+      enabled: true,
+      match_brightness: true, match_bright_ansi: false, match_foreground: false,
+      threshold: 0, intensity: 0.6, softness: 1, hue_tolerance_deg: 18, fg_tolerance: 0,
+      iterations: 4, scanlines: true, scanline_strength: 1, scanline_period: 8,
+      scanlines_content: false, scanlines_content_strength: 1,
+      scanline_color_bright: '#ffffff', scanline_color_dark: '#000000',
+      scanlines_skip_primary_bg: false, scanlines_content_attenuation: 0,
+    },
+  },
+  'Yutani': {
+    background: '#fbfaf7', foreground: '#1a150e',
+    cursor: '#1a00cc',    selection: '#3366d9',
+    ansi: {
+      black:   ['#000000', '#808080'],
+      red:     ['#ab0000', '#ff5555'],
+      green:   ['#00ab00', '#55ff55'],
+      yellow:  ['#abab00', '#ffff55'],
+      blue:    ['#0000ab', '#5555ff'],
+      magenta: ['#ab00ab', '#ff55ff'],
+      cyan:    ['#00abab', '#55ffff'],
+      white:   ['#ababab', '#ffffff'],
+    },
+    max_colors: '16',
+    glow: {
+      enabled: true,
+      match_brightness: true, match_bright_ansi: false, match_foreground: false,
+      threshold: 0, intensity: 0.6, softness: 1, hue_tolerance_deg: 18, fg_tolerance: 0,
+      iterations: 4, scanlines: true, scanline_strength: 1, scanline_period: 8,
+      scanlines_content: false, scanlines_content_strength: 1,
+      scanline_color_bright: '#ffffff', scanline_color_dark: '#000000',
+      scanlines_skip_primary_bg: false, scanlines_content_attenuation: 0,
+    },
+  },
   'Solarized Dark': {
     background: '#002b36', foreground: '#839496',
     cursor: '#93a1a1',   selection: '#073642',
@@ -739,12 +935,95 @@ const PRESETS = {
   },
 };
 
-let state = clone(PRESETS['Yutani default (light)']);
-let editingYaml = false;     // suppress YAML→model write while typing
-let editingPickers = false;  // suppress picker→YAML loop while regenerating
+/* Ensure a scheme object carries the optional pieces the presets and
+ * importers don't bother to specify — the glow override block and the
+ * nullable selection_fg slot. Mutates and returns `s`. Called wherever
+ * `state` is (re)assigned so the rest of the code can assume they exist. */
+function normalizeState(s) {
+  if (!s.glow) s.glow = clone(GLOW_DEFAULTS);
+  else for (const k of Object.keys(GLOW_DEFAULTS)) {
+    if (!(k in s.glow)) s.glow[k] = GLOW_DEFAULTS[k];
+  }
+  if (!('selection_fg' in s)) s.selection_fg = null;  // null = unset (defer to fg)
+  return s;
+}
+
+let state = normalizeState(clone(PRESETS['Yutani default (light)']));
+let editingToml = false;     // suppress TOML→model write while typing
+let editingPickers = false;  // suppress picker→TOML loop while regenerating
+
+/* Preview-only settings. These tune how the preview is drawn so it can
+ * resemble the user's real terminal; they are NOT part of the scheme model
+ * (`state`) and never reach toToml. Persisted to localStorage so the choice
+ * survives reloads. */
+const PREVIEW_DEFAULTS = { fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace', fontSize: 13 };
+let preview = loadPreview();
+function loadPreview() {
+  try { return { ...PREVIEW_DEFAULTS, ...(JSON.parse(localStorage.getItem('yutani-sb-preview')) || {}) }; }
+  catch { return { ...PREVIEW_DEFAULTS }; }
+}
+function savePreview() {
+  try { localStorage.setItem('yutani-sb-preview', JSON.stringify(preview)); } catch { /* private mode */ }
+}
+// Resolve a user-entered font into a usable CSS font-family stack: a bare name
+// (e.g. "Fira Code") is quoted and given monospace fallbacks; a value that
+// already contains a comma is treated as a complete stack and used verbatim.
+function fontStack(name) {
+  name = (name || '').trim();
+  if (!name) return PREVIEW_DEFAULTS.fontFamily;
+  return name.includes(',') ? name : `"${name}", ui-monospace, monospace`;
+}
+
+/* ---- System monospace font detection ----------------------------------
+ * The font dropdown lists monospace faces actually present on the machine.
+ * On load we probe a curated list (no permission needed); the "All system
+ * fonts" button uses the Local Font Access API to enumerate everything the
+ * OS has installed and keeps the monospace ones. */
+const CURATED_MONO = [
+  'SF Mono', 'Menlo', 'Monaco', 'Andale Mono', 'PT Mono', 'Courier New', 'Courier',
+  'Consolas', 'Cascadia Code', 'Cascadia Mono', 'Lucida Console',
+  'JetBrains Mono', 'Fira Code', 'Fira Mono', 'Hack', 'Source Code Pro',
+  'IBM Plex Mono', 'Roboto Mono', 'Inconsolata', 'Space Mono', 'Ubuntu Mono',
+  'DejaVu Sans Mono', 'Liberation Mono', 'Anonymous Pro', 'Iosevka', 'Victor Mono',
+];
+const _fontProbe = document.createElement('canvas').getContext('2d');
+// Installed? Render a probe string in the family over each generic fallback;
+// if the width differs from the bare generic, the family rendered (so it's
+// present rather than silently falling back).
+function fontInstalled(family) {
+  const s = 'mmmmmwwwwwiiiii0O';
+  return ['monospace', 'serif', 'sans-serif'].some(base => {
+    _fontProbe.font = `72px ${base}`;
+    const w0 = _fontProbe.measureText(s).width;
+    _fontProbe.font = `72px "${family}", ${base}`;
+    return _fontProbe.measureText(s).width !== w0;
+  });
+}
+// Monospace? Every glyph advances the same, so a narrow and a wide run match.
+function fontIsMono(family) {
+  _fontProbe.font = `72px "${family}", monospace`;
+  return _fontProbe.measureText('iiiiiiiiii').width === _fontProbe.measureText('WWWWWWWWWW').width;
+}
+function dedupeSort(names) {
+  const seen = new Set(), out = [];
+  for (const n of names) { const k = n.toLowerCase(); if (!seen.has(k)) { seen.add(k); out.push(n); } }
+  return out.sort((a, b) => a.localeCompare(b));
+}
+// Curated families that are both installed and monospace (no permission).
+function curatedMonoFonts() {
+  return dedupeSort(CURATED_MONO.filter(f => fontInstalled(f) && fontIsMono(f)));
+}
+// Every installed monospace family, via the Local Font Access API. Requires a
+// user gesture + permission; rejects/returns null if unavailable or denied.
+async function systemMonoFonts() {
+  if (!('queryLocalFonts' in window)) return null;
+  const fonts = await window.queryLocalFonts();           // may throw if denied
+  const fams = dedupeSort(fonts.map(f => f.family));
+  return fams.filter(fontIsMono);
+}
 
 /* ============================================================
- * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (YAML).
+ * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (TOML).
  * ============================================================ */
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 function normHex(s) {
@@ -756,8 +1035,8 @@ function normHex(s) {
   if (v.length !== 6 || !/^[0-9a-f]{6}$/.test(v)) return null;
   return '#' + v;
 }
-function toYamlHex(hex) {
-  // hex is '#rrggbb' — emit as 0xrrggbb to match palette.rs::parse_hex.
+function toTomlHex(hex) {
+  // hex is '#rrggbb' — emit as 0xrrggbb to match palette.rs::rgb_from_value.
   return '0x' + hex.slice(1);
 }
 function luma(hex) {
@@ -1144,6 +1423,26 @@ function buildPane1() {
     win.append(row);
   }
 
+  // selection_fg is an optional override (palette.rs: `Option<[f32;4]>`):
+  // a checkbox gates it, and the swatch only edits a value when enabled.
+  const sfgRow = document.createElement('div');
+  sfgRow.className = 'opt-row';
+  const sfgOn = state.selection_fg != null;
+  const sfgChk = document.createElement('input');
+  sfgChk.type = 'checkbox'; sfgChk.checked = sfgOn; sfgChk.id = 'sel-fg-on';
+  const sfgLabel = document.createElement('label');
+  sfgLabel.textContent = 'selection_fg'; sfgLabel.htmlFor = 'sel-fg-on';
+  const sfgSwatch = makeSwatch('selection_fg', state.selection_fg || state.foreground,
+    v => { state.selection_fg = v; renderAll(); });
+  if (!sfgOn) sfgSwatch.classList.add('off');
+  sfgChk.addEventListener('change', () => {
+    // Enabling seeds from the current foreground; disabling clears the key.
+    state.selection_fg = sfgChk.checked ? (state.selection_fg || state.foreground) : null;
+    renderAll();
+  });
+  sfgRow.append(sfgChk, sfgLabel, sfgSwatch);
+  win.append(sfgRow);
+
   const ansi = document.getElementById('ansi-fields');
   ansi.innerHTML = '';
   const normalOn = normalAnsiEnabled();
@@ -1171,6 +1470,74 @@ function buildPane1() {
   else if (cap === '16') note.textContent = 'Truecolor cells snap to nearest of the 16 ANSI entries.';
   else if (cap === '256') note.textContent = 'Truecolor cells snap to the 256-entry xterm cube.';
   else note.textContent = 'No cap — colors pass through unchanged.';
+
+  buildGlowControls();
+}
+
+/* Build the glow + scanline control panel from state.glow. Sliders and
+ * checkboxes write straight into state.glow and re-render. The master
+ * `enabled` toggle (wired in init) dims this whole body when off. */
+function buildGlowControls() {
+  const host = document.getElementById('glow-fields');
+  host.innerHTML = '';
+  host.classList.toggle('disabled', !state.glow.enabled);
+  document.getElementById('glow-enabled').checked = state.glow.enabled;
+
+  const g = state.glow;
+  const chk = (key, label) => {
+    const row = document.createElement('div'); row.className = 'chk-row';
+    const box = document.createElement('input'); box.type = 'checkbox'; box.checked = !!g[key];
+    box.id = 'g-' + key;
+    box.addEventListener('change', () => { g[key] = box.checked; renderAll(); });
+    const lab = document.createElement('label'); lab.textContent = label; lab.htmlFor = 'g-' + key;
+    row.append(box, lab); host.append(row);
+  };
+  const slider = (key, label, min, max, step, fmt) => {
+    const row = document.createElement('div'); row.className = 'ctl-row';
+    const lab = document.createElement('label'); lab.textContent = label;
+    const rng = document.createElement('input'); rng.type = 'range';
+    rng.min = min; rng.max = max; rng.step = step; rng.value = g[key];
+    const val = document.createElement('span'); val.className = 'val';
+    const show = () => { val.textContent = (fmt || (x => x))(Number(g[key])); };
+    show();
+    rng.addEventListener('input', () => {
+      g[key] = (step === 1) ? parseInt(rng.value, 10) : parseFloat(rng.value);
+      show(); renderAll();
+    });
+    row.append(lab, rng, val); host.append(row);
+  };
+  const sub = txt => { const d = document.createElement('div'); d.className = 'subhead'; d.textContent = txt; host.append(d); };
+
+  sub('Match modes — what glows');
+  chk('match_brightness', 'Brightness (HSV value > threshold)');
+  chk('match_bright_ansi', 'Bright ANSI hue');
+  chk('match_foreground', 'Foreground colour');
+
+  sub('Bloom');
+  slider('threshold', 'threshold', 0, 1, 0.01, x => x.toFixed(2));
+  slider('intensity', 'intensity', 0, 3, 0.05, x => x.toFixed(2));
+  slider('softness', 'softness', 0, 1, 0.01, x => x.toFixed(2));
+  slider('hue_tolerance_deg', 'hue tol°', 0, 180, 1, x => x + '°');
+  slider('fg_tolerance', 'fg tol', 0, 1.73, 0.01, x => x.toFixed(2));
+  slider('iterations', 'blur iters', 1, 12, 1, x => String(x));
+
+  sub('Scanlines');
+  chk('scanlines', 'Halo scanlines');
+  slider('scanline_strength', 'halo strength', 0, 1, 0.01, x => x.toFixed(2));
+  slider('scanline_period', 'period (px)', 1, 12, 0.5, x => x.toFixed(1));
+  chk('scanlines_content', 'Content scanlines');
+  slider('scanlines_content_strength', 'content str', 0, 1, 0.01, x => x.toFixed(2));
+
+  // Two stripe colors for the content overlay.
+  for (const [key, label] of [['scanline_color_bright', 'bright row'], ['scanline_color_dark', 'dark row']]) {
+    const row = document.createElement('div'); row.className = 'opt-row';
+    const lab = document.createElement('label'); lab.textContent = label; lab.style.width = '90px';
+    const sw = makeSwatch('g-' + key, g[key], v => { g[key] = v; renderAll(); });
+    sw.style.gridColumn = '2 / span 2';
+    row.append(lab, sw); host.append(row);
+  }
+  chk('scanlines_skip_primary_bg', 'Skip empty background');
+  slider('scanlines_content_attenuation', 'content atten', 0, 1, 0.01, x => x.toFixed(2));
 }
 
 /* ============================================================
@@ -1185,12 +1552,12 @@ const PREVIEW_LINES = [
     {fg:'blue', bold:true, text:'target/'}, '    ',
     {fg:'foreground', text:'Cargo.toml '},
     {fg:'green', text:'README.md '},
-    {fg:'cyan', text:'scheme.yaml'},
+    {fg:'cyan', text:'scheme.toml'},
   ],
   [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'cat src/palette.rs | head'}],
-  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_yaml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
+  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_toml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
   [{fg:'foreground', text:'    '}, {fg:'magenta', text:'let mut '}, {fg:'foreground', text:'p = '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:'::'}, {fg:'blue', text:'defaults'}, {fg:'foreground', text:'();'}],
-  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key: value'}],
+  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key = value'}],
   [{fg:'foreground', text:'    '}, {fg:'magenta', text:'for'}, {fg:'foreground', text:' (lineno, raw) '}, {fg:'magenta', text:'in'}, {fg:'foreground', text:' src.'}, {fg:'blue', text:'lines'}, {fg:'foreground', text:'().'}, {fg:'blue', text:'enumerate'}, {fg:'foreground', text:'() {'}],
   [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'git status'}],
   [{fg:'foreground', text:'On branch '}, {fg:'green', text:'main'}],
@@ -1221,6 +1588,10 @@ function renderPreview() {
   body.style.background = state.background;
   body.style.color = state.foreground;
   body.style.caretColor = state.cursor;
+  // Preview-only font face + size (kept out of the scheme).
+  body.style.fontFamily = fontStack(preview.fontFamily);
+  body.style.fontSize = preview.fontSize + 'px';
+  body.style.lineHeight = '1.5';
   body.innerHTML = '';
 
   for (const segs of PREVIEW_LINES) {
@@ -1284,34 +1655,543 @@ function renderPreview() {
     c.title = `${label} — ${all[i]}${note}`;
     grid.append(c);
   }
+
+  renderContrast();
+
+  // Glow + scanline overlays. Deferred a frame so the rebuilt DOM has laid
+  // out and term-body reports its final size before we rasterise it.
+  requestAnimationFrame(renderGlowPreview);
 }
 
 /* ============================================================
- * Pane 3: serialise model → YAML, and parse it back on edit.
+ * Contrast / readability panel. WCAG 2.x relative-luminance
+ * contrast ratio of the foreground and each ANSI colour against
+ * the background, so an author can spot unreadable pairs. ANSI
+ * colours are shown post-projection (through max_colors) to match
+ * what actually renders.
  * ============================================================ */
-function toYaml() {
+function relLuminance(hex) {
+  const h = hex.slice(1);
+  const ch = i => {
+    const c = parseInt(h.slice(i, i + 2), 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * ch(0) + 0.7152 * ch(2) + 0.0722 * ch(4);
+}
+function contrastRatio(a, b) {
+  const la = relLuminance(a), lb = relLuminance(b);
+  const hi = Math.max(la, lb), lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+function gradeOf(r) {
+  if (r >= 7) return ['AAA', 'pass'];
+  if (r >= 4.5) return ['AA', 'pass'];
+  if (r >= 3) return ['AA·lg', 'aa'];
+  return ['fail', 'fail'];
+}
+function renderContrast() {
+  const grid = document.getElementById('contrast-grid');
+  grid.innerHTML = '';
+  const bg = state.background;
+  const pairs = [['foreground', state.foreground]];
+  for (const hue of HUES) pairs.push([hue, projectHex(state.ansi[hue][0])]);
+  for (const [label, fg] of pairs) {
+    const r = contrastRatio(fg, bg);
+    const [gradeText, gradeClass] = gradeOf(r);
+    const cell = document.createElement('div');
+    cell.className = 'cpair';
+    cell.innerHTML =
+      `<span class="chip" style="background:${bg};color:${fg}">Ag</span>` +
+      `<span class="ratio">${label}: ${r.toFixed(1)}:1</span>` +
+      `<span class="grade ${gradeClass}">${gradeText}</span>`;
+    grid.append(cell);
+  }
+}
+
+/* ============================================================
+ * Glow + scanline preview — a WebGL2 port of src/renderer/glow.wgsl.
+ * The terminal scene is rasterised to a canvas and uploaded as an
+ * sRGB texture, so sampling yields LINEAR light exactly like the
+ * renderer's framebuffer. The pipeline then matches the GPU:
+ *   1. Bright pass (fs_bright): per-pixel weight from the three match
+ *      modes (brightness / bright-ANSI hue / foreground distance);
+ *      output = sceneLinear·weight, alpha = weight (premultiplied).
+ *   2. Dual-Kawase blur: `iterations` of fs_down / fs_up between a
+ *      half-res and quarter-res RGBA16F target — the same chain, in
+ *      linear light, so the halo spreads and brightens like the real
+ *      bloom (a Gaussian blur in sRGB does not).
+ *   3. Composite (fs_composite): halo premultiplied-over the linear
+ *      scene with intensity and the halo scanline_factor, then
+ *      sRGB-encoded.
+ *   4. Content scanlines: a multiply on the encoded result, masked
+ *      off empty background when skip_primary_bg is set.
+ * Everything bloom-related runs in linear light. If WebGL2 with
+ * float render targets is unavailable, the preview falls back to the
+ * plain DOM text (no glow) and logs once.
+ * ============================================================ */
+// Work resolution as a multiple of CSS pixels. Rendering at the device pixel
+// ratio (not 1) keeps scanlines crisp — a CSS-resolution canvas shown on a
+// HiDPI screen gets bilinearly upscaled, smearing the 1px stripes — and lines
+// `scanline_period` up with the renderer's framebuffer pixels. Capped at 2 to
+// bound fill cost on 3x displays.
+let GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
+
+let glowCanvas = null, rasterCanvas = null, glowGL = null, glowGLFailed = false;
+function ensureGlowCanvases() {
+  if (glowCanvas) return;
+  glowCanvas = document.createElement('canvas'); glowCanvas.className = 'term-fx';
+  rasterCanvas = document.createElement('canvas');  // offscreen sRGB scene
+}
+
+function smoothstep(e0, e1, x) {
+  const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0 || 1e-6)));
+  return t * t * (3 - 2 * t);
+}
+// HSV of a linear-RGB triple. Returns hue in degrees (or -1 when achromatic),
+// saturation, and value (max channel) — the same quantities fs_bright derives.
+function hsvLin(lin) {
+  const mx = Math.max(lin[0], lin[1], lin[2]);
+  const mn = Math.min(lin[0], lin[1], lin[2]);
+  const d = mx - mn;
+  let h = -1;
+  if (d > 0) {
+    if (mx === lin[0]) h = (lin[1] - lin[2]) / d;
+    else if (mx === lin[1]) h = 2 + (lin[2] - lin[0]) / d;
+    else h = 4 + (lin[0] - lin[1]) / d;
+    h *= 60; if (h < 0) h += 360;
+  }
+  return { h, s: mx <= 0 ? 0 : d / mx, v: mx };
+}
+function hueDist(a, b) { const d = Math.abs(a - b); return Math.min(d, 360 - d); }
+// Per-slot (hue, sat, active) for the 8 bright ANSI variants — mirrors
+// glow.rs::set_bright_palette. Achromatic slots (sat < MIN_PALETTE_SAT) are
+// inactive so they don't drag greys into the bright-ANSI match.
+function brightSlots() {
+  return HUES.map(hue => {
+    const { h, s } = hsvLin(hexToLin(state.ansi[hue][1]));
+    return { h, s, active: h >= 0 && s >= MIN_PALETTE_SAT };
+  });
+}
+
+// Draw the terminal scene (bg + glyphs + selection + cursor) into ctx at the
+// given scale. Geometry matches the .term-body CSS (13px/1.5 mono, 14/16 pad)
+// so the rasterised scene lines up with the DOM text it replaces under glow.
+function rasterizeScene(ctx, scale, w, h) {
+  const padL = 16 * scale, padT = 14 * scale;
+  const fontPx = preview.fontSize * scale, lineH = preview.fontSize * 1.5 * scale;
+  const stack = fontStack(preview.fontFamily);
+  const fontFor = bold => `${bold ? '600 ' : ''}${fontPx}px ${stack}`;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = state.background; ctx.fillRect(0, 0, w, h);
+  // Glyphs are vertically centred in their line cell so the full-cell block
+  // cursor and selection rects wrap the text symmetrically (a top-aligned
+  // baseline left the cursor hanging below the glyphs).
+  ctx.textBaseline = 'middle';
+  let y = padT;
+  for (const segs of PREVIEW_LINES) {
+    let x = padL;
+    const cy = y + lineH / 2;
+    for (const s of segs) {
+      if (typeof s === 'string') { ctx.font = fontFor(false); x += ctx.measureText(s).width; continue; }
+      const text = s.text || '';
+      ctx.font = fontFor(s.bold);
+      const tw = ctx.measureText(text).width;
+      if (s.sel) { ctx.fillStyle = state.selection; ctx.fillRect(x, y, tw, lineH); }
+      ctx.fillStyle = (s.sel && state.selection_fg) ? state.selection_fg : resolveFg(s.fg || 'foreground', s.bold);
+      ctx.fillText(text, x, cy);
+      x += tw;
+      if (s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
+    }
+    y += lineH;
+  }
+}
+
+// sRGB '#rrggbb' → [r,g,b] in 0..1 (gamma-encoded; used for the content
+// scanline multiplier, which the renderer applies on the encoded framebuffer).
+function hexToRgb01(hex) {
+  const h = hex.slice(1);
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255];
+}
+
+/* ---- WebGL2 glow pipeline ---------------------------------------------- */
+const GLOW_VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;                                  // 0..1 across the visible quad
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// Bright pass — direct port of fs_bright (operates in linear light).
+const GLOW_FS_BRIGHT = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_scene;            // sRGB texture → sampling returns linear
+uniform float u_threshold, u_softness, u_hueTol, u_minSat, u_fgTol;
+uniform float u_useBri, u_useAnsi, u_useFg;
+uniform vec3 u_fg;                    // foreground, linear
+uniform vec4 u_hues[8];               // (hueDeg, sat, _, active)
+float vmax(vec3 c){ return max(max(c.r,c.g),c.b); }
+float vsat(vec3 c){ float mx=vmax(c), mn=min(min(c.r,c.g),c.b); return mx<=0.0?0.0:(mx-mn)/mx; }
+float vhue(vec3 c){ float mx=vmax(c), mn=min(min(c.r,c.g),c.b), d=mx-mn; if(d<=0.0) return -1.0;
+  float h; if(mx==c.r)h=(c.g-c.b)/d; else if(mx==c.g)h=2.0+(c.b-c.r)/d; else h=4.0+(c.r-c.g)/d;
+  h*=60.0; if(h<0.0)h+=360.0; return h; }
+float hdist(float a,float b){ float d=abs(a-b); return min(d,360.0-d); }
+void main(){
+  vec3 c = texture(u_scene, v_uv).rgb;
+  float w = 0.0;
+  if(u_useBri>0.5){ float lo=u_threshold, hi=min(lo+max(u_softness,1e-4),1.0); w=max(w, smoothstep(lo,hi,vmax(c))); }
+  if(u_useAnsi>0.5){ float s=vsat(c);
+    if(s>=u_minSat){ float h=vhue(c);
+      if(h>=0.0){ float tol=max(u_hueTol,0.0), edge=max(u_softness,1e-4)*180.0, best=0.0;
+        for(int i=0;i<8;i++){ if(u_hues[i].w<0.5) continue;
+          float ww=1.0-smoothstep(tol,tol+edge,hdist(h,u_hues[i].x)); best=max(best, ww*min(s,u_hues[i].y)); }
+        w=max(w,best); } } }
+  if(u_useFg>0.5){ float d=distance(c,u_fg); float lo=max(u_fgTol,0.0), hi=lo+max(u_softness,1e-4); w=max(w, 1.0-smoothstep(lo,hi,d)); }
+  o = vec4(c*w, w);                   // premultiplied by weight
+}`;
+
+// Dual-Kawase down (fs_down) and up (fs_up). texel = 1/sourceDims.
+const GLOW_FS_DOWN = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_src; uniform vec2 u_texel;
+void main(){ vec2 o2=u_texel;
+  vec4 s = texture(u_src,v_uv)*4.0;
+  s += texture(u_src,v_uv+vec2(-o2.x,-o2.y));
+  s += texture(u_src,v_uv+vec2( o2.x,-o2.y));
+  s += texture(u_src,v_uv+vec2(-o2.x, o2.y));
+  s += texture(u_src,v_uv+vec2( o2.x, o2.y));
+  o = s/8.0; }`;
+const GLOW_FS_UP = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_src; uniform vec2 u_texel;
+void main(){ vec2 o2=u_texel;
+  vec4 s = texture(u_src,v_uv+vec2(-o2.x*2.0,0.0));
+  s += texture(u_src,v_uv+vec2( o2.x*2.0,0.0));
+  s += texture(u_src,v_uv+vec2(0.0,-o2.y*2.0));
+  s += texture(u_src,v_uv+vec2(0.0, o2.y*2.0));
+  s += texture(u_src,v_uv+vec2(-o2.x, o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2( o2.x, o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2(-o2.x,-o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2( o2.x,-o2.y))*2.0;
+  o = s/12.0; }`;
+
+// Composite (fs_composite) + content scanline overlay, to the canvas.
+const GLOW_FS_COMP = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_scene, u_halo;
+uniform float u_intensity, u_scanPeriod;
+uniform float u_haloScan, u_haloStrength;
+uniform float u_content, u_contentStrength, u_contentAtten, u_contentMasked;
+uniform vec3 u_stripeBright, u_stripeDark, u_bg;
+float l2s(float c){ return c<=0.0031308 ? c*12.92 : 1.055*pow(c,1.0/2.4)-0.055; }
+void main(){
+  vec3 scene = texture(u_scene, v_uv).rgb;          // linear
+  vec4 halo  = texture(u_halo, v_uv);               // linear, premultiplied
+  float y = gl_FragCoord.y;
+  float phase = fract(y / max(u_scanPeriod, 1.0));
+  float isBright = step(0.5, phase);
+  float hs = (u_haloScan>0.5) ? mix(1.0, isBright, u_haloStrength) : 1.0;
+  float k = u_intensity * hs;
+  vec3 lin = halo.rgb*k + scene*(1.0 - clamp(halo.a*k, 0.0, 1.0));   // premult-over
+  vec3 srgb = vec3(l2s(lin.r), l2s(lin.g), l2s(lin.b));
+  if(u_content>0.5){
+    vec3 stripe = mix(u_stripeDark, u_stripeBright, isBright);
+    stripe = mix(vec3(1.0), stripe, u_contentStrength);
+    float lerp = 0.0;
+    if(u_contentMasked>0.5){
+      float content = smoothstep(0.02, 0.08, distance(scene, u_bg));
+      lerp = max(1.0 - content, content * u_contentAtten);
+    }
+    srgb *= mix(stripe, vec3(1.0), lerp);
+  }
+  o = vec4(srgb, 1.0);
+}`;
+
+function createGlowGL(canvas) {
+  const gl = canvas.getContext('webgl2', { alpha: false, premultipliedAlpha: false, antialias: false });
+  if (!gl) return null;
+  if (!gl.getExtension('EXT_color_buffer_float')) return null;  // RGBA16F render targets
+  gl.getExtension('OES_texture_float_linear');
+
+  const compile = (type, src) => {
+    const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  };
+  const program = fs => {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, GLOW_VS));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  };
+  let progs;
+  try { progs = { bright: program(GLOW_FS_BRIGHT), down: program(GLOW_FS_DOWN), up: program(GLOW_FS_UP), comp: program(GLOW_FS_COMP) }; }
+  catch (e) { console.warn('scheme-builder: glow shader compile failed:', e.message); return null; }
+
+  const vao = gl.createVertexArray();           // empty VAO (vertices from gl_VertexID)
+  const sceneTex = gl.createTexture();
+  // Half- and quarter-resolution ping/pong targets, (re)sized on demand.
+  let half = null, quarter = null, dims = { w: 0, h: 0 };
+  const mkTarget = (w, h) => {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return { tex, fbo, w, h };
+  };
+  const resize = (sw, sh) => {
+    const hw = Math.max(1, sw >> 1), hh = Math.max(1, sh >> 1);
+    const qw = Math.max(1, hw >> 1), qh = Math.max(1, hh >> 1);
+    if (dims.w === sw && dims.h === sh) return;
+    half = mkTarget(hw, hh); quarter = mkTarget(qw, qh); dims = { w: sw, h: sh };
+  };
+  const setU = (p, name, set) => { const loc = gl.getUniformLocation(p, name); set(loc); };
+  const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  function render(raster, g, slots) {
+    const sw = canvas.width, sh = canvas.height;
+    resize(sw, sh);
+    gl.bindVertexArray(vao);
+
+    // Upload the scene as an sRGB texture (flip Y so the texture is upright).
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, raster);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+
+    const wantHalo = g.match_brightness || g.match_bright_ansi || g.match_foreground;
+    const fg = hexToLin(state.foreground), bg = hexToLin(state.background);
+
+    // 1. Bright pass → half.
+    gl.useProgram(progs.bright);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, half.fbo);
+    gl.viewport(0, 0, half.w, half.h);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    setU(progs.bright, 'u_scene', l => gl.uniform1i(l, 0));
+    setU(progs.bright, 'u_threshold', l => gl.uniform1f(l, g.threshold));
+    setU(progs.bright, 'u_softness', l => gl.uniform1f(l, g.softness));
+    setU(progs.bright, 'u_hueTol', l => gl.uniform1f(l, g.hue_tolerance_deg));
+    setU(progs.bright, 'u_minSat', l => gl.uniform1f(l, MIN_PALETTE_SAT));
+    setU(progs.bright, 'u_fgTol', l => gl.uniform1f(l, g.fg_tolerance));
+    setU(progs.bright, 'u_useBri', l => gl.uniform1f(l, g.match_brightness ? 1 : 0));
+    setU(progs.bright, 'u_useAnsi', l => gl.uniform1f(l, g.match_bright_ansi ? 1 : 0));
+    setU(progs.bright, 'u_useFg', l => gl.uniform1f(l, g.match_foreground ? 1 : 0));
+    setU(progs.bright, 'u_fg', l => gl.uniform3f(l, fg[0], fg[1], fg[2]));
+    const hues = new Float32Array(32);
+    slots.forEach((s, i) => { hues[i*4] = s.h < 0 ? 0 : s.h; hues[i*4+1] = s.s; hues[i*4+3] = s.active ? 1 : 0; });
+    setU(progs.bright, 'u_hues[0]', l => gl.uniform4fv(l, hues));
+    draw();
+
+    // 2. Dual-Kawase blur: iterations of down (half→quarter) then up (quarter→half).
+    if (wantHalo) {
+      const iters = Math.max(1, Math.min(12, g.iterations | 0));
+      for (let i = 0; i < iters; i++) {
+        gl.useProgram(progs.down);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, quarter.fbo);
+        gl.viewport(0, 0, quarter.w, quarter.h);
+        gl.bindTexture(gl.TEXTURE_2D, half.tex);
+        setU(progs.down, 'u_src', l => gl.uniform1i(l, 0));
+        setU(progs.down, 'u_texel', l => gl.uniform2f(l, 1 / half.w, 1 / half.h));
+        draw();
+        gl.useProgram(progs.up);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, half.fbo);
+        gl.viewport(0, 0, half.w, half.h);
+        gl.bindTexture(gl.TEXTURE_2D, quarter.tex);
+        setU(progs.up, 'u_src', l => gl.uniform1i(l, 0));
+        setU(progs.up, 'u_texel', l => gl.uniform2f(l, 1 / quarter.w, 1 / quarter.h));
+        draw();
+      }
+    }
+
+    // 3 + 4. Composite halo over the linear scene, then content scanlines, to canvas.
+    gl.useProgram(progs.comp);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, sw, sh);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, half.tex);
+    const sb = hexToRgb01(g.scanline_color_bright), sd = hexToRgb01(g.scanline_color_dark);
+    setU(progs.comp, 'u_scene', l => gl.uniform1i(l, 0));
+    setU(progs.comp, 'u_halo', l => gl.uniform1i(l, 1));
+    setU(progs.comp, 'u_intensity', l => gl.uniform1f(l, wantHalo ? g.intensity : 0));
+    setU(progs.comp, 'u_scanPeriod', l => gl.uniform1f(l, g.scanline_period));
+    setU(progs.comp, 'u_haloScan', l => gl.uniform1f(l, (wantHalo && g.scanlines) ? 1 : 0));
+    setU(progs.comp, 'u_haloStrength', l => gl.uniform1f(l, g.scanline_strength));
+    setU(progs.comp, 'u_content', l => gl.uniform1f(l, g.scanlines_content ? 1 : 0));
+    setU(progs.comp, 'u_contentStrength', l => gl.uniform1f(l, g.scanlines_content_strength));
+    setU(progs.comp, 'u_contentAtten', l => gl.uniform1f(l, g.scanlines_content_attenuation));
+    setU(progs.comp, 'u_contentMasked', l => gl.uniform1f(l, g.scanlines_skip_primary_bg ? 1 : 0));
+    setU(progs.comp, 'u_stripeBright', l => gl.uniform3f(l, sb[0], sb[1], sb[2]));
+    setU(progs.comp, 'u_stripeDark', l => gl.uniform3f(l, sd[0], sd[1], sd[2]));
+    setU(progs.comp, 'u_bg', l => gl.uniform3f(l, bg[0], bg[1], bg[2]));
+    draw();
+    gl.bindVertexArray(null);
+  }
+
+  return { render };
+}
+
+function renderGlowPreview() {
+  ensureGlowCanvases();
+  const body = document.getElementById('term-body');
+  const g = state.glow;
+  const W = body.clientWidth, H = body.clientHeight;
+  if (W < 2 || H < 2) return;
+
+  const wantHalo = g.enabled && (g.match_brightness || g.match_bright_ansi || g.match_foreground);
+  const wantGL = g.enabled && (wantHalo || g.scanlines_content);
+  glowCanvas.style.display = wantGL ? '' : 'none';
+  if (!wantGL) return;
+
+  // Track the live device pixel ratio so the work resolution stays 1:1 with
+  // device pixels (keeps scanlines crisp; matches framebuffer-pixel period).
+  GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
+  const sw = Math.round(W * GLOW_SCALE), sh = Math.round(H * GLOW_SCALE);
+  glowCanvas.style.width = W + 'px'; glowCanvas.style.height = H + 'px';
+  if (glowCanvas.width !== sw) glowCanvas.width = sw;
+  if (glowCanvas.height !== sh) glowCanvas.height = sh;
+  if (rasterCanvas.width !== sw) rasterCanvas.width = sw;
+  if (rasterCanvas.height !== sh) rasterCanvas.height = sh;
+  rasterizeScene(rasterCanvas.getContext('2d'), GLOW_SCALE, sw, sh);
+
+  if (!glowGL && !glowGLFailed) {
+    glowGL = createGlowGL(glowCanvas);
+    if (!glowGL) {
+      glowGLFailed = true;
+      console.warn('scheme-builder: WebGL2 + float render targets unavailable; glow preview disabled.');
+    }
+  }
+  if (!glowGL) { glowCanvas.style.display = 'none'; return; }
+
+  glowGL.render(rasterCanvas, g, brightSlots());
+  // The opaque WebGL canvas sits over (and hides) the DOM text it was built
+  // from. Re-attach after the DOM rebuild in renderPreview.
+  body.append(glowCanvas);
+}
+
+/* ============================================================
+ * Pane 3: serialise model → TOML, and parse it back on edit.
+ * ============================================================ */
+// Which glow_* fields are booleans / colors; everything else is numeric.
+const GLOW_BOOL_KEYS = [
+  'match_brightness', 'match_bright_ansi', 'match_foreground',
+  'scanlines', 'scanlines_content', 'scanlines_skip_primary_bg',
+];
+
+// Format a TOML number: emit integers without a trailing `.0` (the runtime's
+// want_f32/want_usize accept both, and integers read cleaner for iterations).
+function tomlNum(n) {
+  return Number.isInteger(n) ? String(n) : String(n);
+}
+
+/* Serialize the enabled glow override block. Only keys that differ from the
+ * renderer default are emitted, so a scheme that just flips on one match
+ * mode stays a one-liner instead of dumping all 18 knobs. Returns [] when
+ * the master toggle is off. */
+function toGlowLines() {
+  if (!state.glow.enabled) return [];
+  const g = state.glow;
+  const lines = ['', '# Glow + scanline overrides (need theme_overrides_glow = true in config).'];
+  for (const field of Object.keys(GLOW_DEFAULTS)) {
+    if (field === 'enabled') continue;
+    const val = g[field];
+    if (val === GLOW_DEFAULTS[field]) continue;  // default → omit
+    const key = 'glow_' + field;
+    if (GLOW_COLOR_KEYS.includes(field)) lines.push(`${key} = ${toTomlHex(val)}`);
+    else if (GLOW_BOOL_KEYS.includes(field)) lines.push(`${key} = ${val ? 'true' : 'false'}`);
+    else lines.push(`${key} = ${tomlNum(val)}`);
+  }
+  // If every value was at its default, only the comment header remains —
+  // drop the block entirely rather than emit a lone comment.
+  return lines.length > 2 ? lines : [];
+}
+
+function toToml() {
   const lines = [];
-  for (const k of SINGLES) lines.push(`${k}: ${toYamlHex(state[k])}`);
+  for (const k of SINGLES) lines.push(`${k} = ${toTomlHex(state[k])}`);
+  if (state.selection_fg) lines.push(`selection_fg = ${toTomlHex(state.selection_fg)}`);
   lines.push('');
   // pad keys to a column so values align visually
-  const pad = 'magenta:'.length;
+  const pad = 'magenta'.length;
   for (const hue of HUES) {
     const [n, b] = state.ansi[hue];
-    const key = (hue + ':').padEnd(pad + 1, ' ');
-    lines.push(`${key}[${toYamlHex(n)}, ${toYamlHex(b)}]`);
+    const key = hue.padEnd(pad, ' ');
+    lines.push(`${key} = [${toTomlHex(n)}, ${toTomlHex(b)}]`);
   }
   if (state.max_colors) {
     lines.push('');
-    lines.push(`max_colors: ${state.max_colors}`);
+    // Quoted: "mono"/"truecolor" require it, and the parser accepts the
+    // numeric depths as strings too, so one form covers every value.
+    lines.push(`max_colors = "${state.max_colors}"`);
   }
+  lines.push(...toGlowLines());
   return lines.join('\n') + '\n';
 }
 
-// Tiny parser that matches palette.rs::parse_yaml (strict subset of YAML).
-function parseYaml(src) {
+/* Parse one `glow_<field> = <value>` into the partial `g`. `field` is the
+ * key with the `glow_` prefix already stripped. Returns null on success or
+ * an error string. Mirrors palette.rs apply()'s glow arm: unknown fields and
+ * type mismatches are rejected, but the caller logs and skips rather than
+ * aborting the whole document. Clamps match the runtime so the round-trip
+ * agrees with what yutani would actually use. */
+function parseGlowKey(g, field, value) {
+  if (!(field in GLOW_DEFAULTS) || field === 'enabled') {
+    return `unknown key 'glow_${field}'`;
+  }
+  if (GLOW_COLOR_KEYS.includes(field)) {
+    const h = normHex(value);
+    if (!h) return `glow_${field}: invalid hex '${value}'`;
+    g[field] = h;
+  } else if (GLOW_BOOL_KEYS.includes(field)) {
+    if (value !== 'true' && value !== 'false') return `glow_${field}: expected true/false`;
+    g[field] = value === 'true';
+  } else if (field === 'iterations') {
+    const n = parseInt(value, 10);
+    if (!Number.isFinite(n) || String(n) !== value) return `glow_${field}: expected an integer`;
+    g[field] = Math.max(1, Math.min(12, n));
+  } else {
+    const n = parseFloat(value);
+    if (!Number.isFinite(n)) return `glow_${field}: expected a number`;
+    g[field] = clampGlowNum(field, n);
+  }
+  return null;
+}
+
+// Range clamps for the numeric glow knobs, matching main.rs Config::apply.
+function clampGlowNum(field, n) {
+  switch (field) {
+    case 'threshold': case 'softness': case 'scanline_strength':
+    case 'scanlines_content_strength': case 'scanlines_content_attenuation':
+      return Math.max(0, Math.min(1, n));
+    case 'intensity':            return Math.max(0, n);
+    case 'hue_tolerance_deg':    return Math.max(0, Math.min(180, n));
+    case 'fg_tolerance':         return Math.max(0, Math.min(Math.sqrt(3), n));
+    case 'scanline_period':      return Math.max(1, n);
+    default:                     return n;
+  }
+}
+
+// Tiny parser that matches palette.rs::parse_toml (strict subset of TOML:
+// flat `key = value` pairs, `#` line comments, hex-int colors, 2-element
+// arrays, string/int max_colors, optional selection_fg, and glow_* keys).
+function parseToml(src) {
   const out = {
     background: null, foreground: null, cursor: null, selection: null,
-    ansi: {}, max_colors: '',
+    selection_fg: null, ansi: {}, max_colors: '',
+    glow: {}, glowSeen: false,
   };
   const errors = [];
   const lines = src.split(/\r?\n/);
@@ -1321,30 +2201,42 @@ function parseYaml(src) {
     if (hash >= 0) raw = raw.slice(0, hash);
     const line = raw.trim();
     if (!line) continue;
-    const idx = line.indexOf(':');
-    if (idx < 0) { errors.push(`line ${i+1}: missing ':'`); continue; }
+    const idx = line.indexOf('=');
+    if (idx < 0) { errors.push(`line ${i+1}: missing '='`); continue; }
     const key = line.slice(0, idx).trim();
     const value = line.slice(idx + 1).trim();
     if (SINGLES.includes(key)) {
       const h = normHex(value);
       if (!h) { errors.push(`line ${i+1}: invalid hex '${value}'`); continue; }
       out[key] = h;
+    } else if (key === 'selection_fg' || key === 'selection_foreground') {
+      const h = normHex(value);
+      if (!h) { errors.push(`line ${i+1}: invalid hex '${value}'`); continue; }
+      out.selection_fg = h;
+    } else if (key.startsWith('glow_')) {
+      const e = parseGlowKey(out.glow, key.slice(5), value);
+      if (e) { errors.push(`line ${i+1}: ${e}`); continue; }
+      out.glowSeen = true;
     } else if (HUES.includes(key)) {
-      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*\]$/);
+      // Allow an optional trailing comma — TOML permits it inside arrays.
+      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*,?\s*\]$/);
       if (!m) { errors.push(`line ${i+1}: expected [normal, bright]`); continue; }
       const n = normHex(m[1]), b = normHex(m[2]);
       if (!n || !b) { errors.push(`line ${i+1}: invalid hex in pair`); continue; }
       out.ansi[key] = [n, b];
     } else if (key === 'max_colors') {
-      const ok = ['mono','monochrome','8','16','256','truecolor','16m'];
-      if (!ok.includes(value)) {
+      // Accept the value bare or quoted (TOML strings) — strip one layer of
+      // matching quotes before validating.
+      const v = value.replace(/^(['"])(.*)\1$/, '$2');
+      const ok = ['mono','monochrome','8','16','256','truecolor','16m','16777216'];
+      if (!ok.includes(v)) {
         errors.push(`line ${i+1}: max_colors must be one of mono|8|16|256|truecolor`);
         continue;
       }
       // Normalize aliases
-      out.max_colors = (value === 'monochrome') ? 'mono'
-                      : (value === '16m') ? 'truecolor'
-                      : value;
+      out.max_colors = (v === 'monochrome') ? 'mono'
+                      : (v === '16m' || v === '16777216') ? 'truecolor'
+                      : v;
     } else {
       errors.push(`line ${i+1}: unknown key '${key}'`);
     }
@@ -1352,21 +2244,21 @@ function parseYaml(src) {
   return { out, errors };
 }
 
-function renderYaml() {
-  if (editingYaml) return;
-  const ta = document.getElementById('yaml');
+function renderToml() {
+  if (editingToml) return;
+  const ta = document.getElementById('toml');
   editingPickers = true;
-  ta.value = toYaml();
+  ta.value = toToml();
   ta.classList.remove('invalid');
-  document.getElementById('yaml-status').textContent = 'In sync.';
-  document.getElementById('yaml-status').classList.remove('error');
+  document.getElementById('toml-status').textContent = 'In sync.';
+  document.getElementById('toml-status').classList.remove('error');
   editingPickers = false;
 }
 
-function applyYamlEdit() {
-  const ta = document.getElementById('yaml');
-  const { out, errors } = parseYaml(ta.value);
-  const status = document.getElementById('yaml-status');
+function applyTomlEdit() {
+  const ta = document.getElementById('toml');
+  const { out, errors } = parseToml(ta.value);
+  const status = document.getElementById('toml-status');
   if (errors.length) {
     ta.classList.add('invalid');
     status.classList.add('error');
@@ -1381,9 +2273,17 @@ function applyYamlEdit() {
   for (const k of SINGLES) if (out[k]) state[k] = out[k];
   for (const hue of HUES) if (out.ansi[hue]) state.ansi[hue] = out.ansi[hue];
   state.max_colors = out.max_colors || '';
+  // selection_fg is explicit: present in the doc → set it, absent → clear it,
+  // so deleting the line in the textarea removes the override.
+  state.selection_fg = out.selection_fg || null;
+  // Glow: a fresh default block, overlaid with whatever keys appeared. The
+  // master toggle follows whether the document carried any glow_* key at all.
+  state.glow = clone(GLOW_DEFAULTS);
+  state.glow.enabled = out.glowSeen;
+  Object.assign(state.glow, out.glow);
   status.textContent = 'In sync.';
   // Rebuild pickers (values changed) and preview, but DON'T regenerate the
-  // YAML — the textarea already has the source of truth.
+  // TOML — the textarea already has the source of truth.
   buildPane1();
   renderPreview();
 }
@@ -1715,7 +2615,7 @@ function mergePartial(partial) {
 function renderAll() {
   buildPane1();
   renderPreview();
-  renderYaml();
+  renderToml();
 }
 
 function init() {
@@ -1728,27 +2628,90 @@ function init() {
   }
   sel.addEventListener('change', e => {
     if (!e.target.value) return;
-    state = clone(PRESETS[e.target.value]);
+    state = normalizeState(clone(PRESETS[e.target.value]));
     renderAll();
     e.target.value = '';
   });
 
   document.getElementById('resetBtn').addEventListener('click', () => {
-    state = clone(PRESETS['Yutani default (light)']);
+    state = normalizeState(clone(PRESETS['Yutani default (light)']));
     renderAll();
   });
 
-  // YAML textarea — debounce edits back into the model so the pickers
+  // Glow master toggle — enables/disables the whole override block.
+  document.getElementById('glow-enabled').addEventListener('change', e => {
+    state.glow.enabled = e.target.checked;
+    renderAll();
+  });
+
+  // Preview-only font controls. The font dropdown lists installed monospace
+  // faces; choosing one re-renders the preview. These never touch the scheme.
+  const pvFont = document.getElementById('pv-font');
+  const pvFontAll = document.getElementById('pv-font-all');
+  const pvSize = document.getElementById('pv-size');
+
+  // (Re)fill the dropdown: a "default" entry mapping to the system mono stack,
+  // then each detected family (its option rendered in that font as a preview).
+  // The current selection is always present even if not in the detected set.
+  function fillFontSelect(families) {
+    pvFont.innerHTML = '';
+    const add = (value, label, font) => {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = label;
+      if (font) o.style.fontFamily = font;
+      pvFont.append(o);
+    };
+    add(PREVIEW_DEFAULTS.fontFamily, 'System mono (default)', PREVIEW_DEFAULTS.fontFamily);
+    for (const f of families) add(f, f, fontStack(f));
+    // Preserve a custom / persisted family that isn't in the list.
+    const cur = preview.fontFamily;
+    if (cur && cur !== PREVIEW_DEFAULTS.fontFamily && !families.some(f => f === cur)) {
+      add(cur, cur + ' (current)', fontStack(cur));
+    }
+    pvFont.value = preview.fontFamily;
+  }
+
+  fillFontSelect(curatedMonoFonts());
+  pvFont.addEventListener('change', () => { preview.fontFamily = pvFont.value; savePreview(); renderPreview(); });
+
+  // "All system fonts" — enumerate every installed monospace family. Needs the
+  // user gesture this click provides; hidden when the API isn't available.
+  if (!('queryLocalFonts' in window)) {
+    pvFontAll.style.display = 'none';
+  } else {
+    pvFontAll.addEventListener('click', async () => {
+      pvFontAll.disabled = true;
+      const prev = pvFontAll.textContent;
+      pvFontAll.textContent = 'Loading…';
+      try {
+        const mono = await systemMonoFonts();
+        if (mono && mono.length) { fillFontSelect(mono); pvFontAll.style.display = 'none'; }
+        else { pvFontAll.textContent = prev; pvFontAll.disabled = false; }
+      } catch {
+        // Permission denied or no access — keep the curated list.
+        pvFontAll.textContent = 'Permission denied';
+        setTimeout(() => { pvFontAll.textContent = prev; pvFontAll.disabled = false; }, 1500);
+      }
+    });
+  }
+
+  pvSize.value = preview.fontSize;
+  pvSize.addEventListener('input', () => {
+    const n = parseInt(pvSize.value, 10);
+    if (Number.isFinite(n)) { preview.fontSize = Math.max(8, Math.min(32, n)); savePreview(); renderPreview(); }
+  });
+
+  // TOML textarea — debounce edits back into the model so the pickers
   // don't fight every keystroke.
-  const ta = document.getElementById('yaml');
+  const ta = document.getElementById('toml');
   let timer = null;
   ta.addEventListener('input', () => {
     if (editingPickers) return;
-    editingYaml = true;
+    editingToml = true;
     clearTimeout(timer);
     timer = setTimeout(() => {
-      applyYamlEdit();
-      editingYaml = false;
+      applyTomlEdit();
+      editingToml = false;
     }, 200);
   });
 
@@ -1830,11 +2793,11 @@ function init() {
   });
 
   document.getElementById('downloadBtn').addEventListener('click', () => {
-    const blob = new Blob([ta.value], { type: 'text/yaml' });
+    const blob = new Blob([ta.value], { type: 'application/toml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'scheme.yaml';
+    a.download = 'scheme.toml';
     a.click();
     URL.revokeObjectURL(url);
   });
