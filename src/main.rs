@@ -1366,19 +1366,43 @@ fn is_word_char(ch: char) -> bool {
 /// Cmd modifier is held so the renderer can underline the span and the
 /// click handler can open it. URLs that wrap at the right edge span
 /// multiple rows; the start/end pair is inclusive on both ends.
+/// One underline strip on a single (scroll-stable) line; columns inclusive.
 #[derive(Clone, Debug, PartialEq)]
-struct HoverUrl {
-    /// Absolute (scroll-stable) line indices. `start_abs_line == end_abs_line`
-    /// for the common single-row case.
-    start_abs_line: isize,
-    end_abs_line: isize,
-    /// Inclusive cell columns. For wrapped URLs, the underline strip on each
-    /// intermediate row spans the full row width — only the first and last
-    /// rows use these column positions.
+struct HoverSegment {
+    abs_line: isize,
     start_col: usize,
     end_col: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct HoverUrl {
+    /// Every strip to underline. A heuristic match or a contiguous OSC 8 link
+    /// is one segment (or a few, when it wraps across rows); an OSC 8 link
+    /// whose `id=` is shared by non-contiguous spans contributes a segment per
+    /// visible run, so all siblings underline together. Ordered by line then
+    /// column for stable equality (so hover repaint de-dup works).
+    segments: Vec<HoverSegment>,
     /// The URL text itself, ready to hand to `open(1)`.
     url: String,
+}
+
+#[cfg(test)]
+impl HoverUrl {
+    /// First/last segment edges — convenient for the single-run (heuristic or
+    /// contiguous OSC 8) cases the tests assert on. Segments are ordered by
+    /// line then column.
+    fn start_abs_line(&self) -> isize {
+        self.segments.first().unwrap().abs_line
+    }
+    fn end_abs_line(&self) -> isize {
+        self.segments.last().unwrap().abs_line
+    }
+    fn start_col(&self) -> usize {
+        self.segments.first().unwrap().start_col
+    }
+    fn end_col(&self) -> usize {
+        self.segments.last().unwrap().end_col
+    }
 }
 
 /// Locate an http/https URL within a row of cells that covers `col`. The
@@ -1509,11 +1533,34 @@ fn build_wrapped_line(
 /// Locate the URL under `(abs_line, col)`, joining wrap-continued rows so a
 /// link that spilled past the right edge still resolves as a single span.
 /// Falls back to a same-row search when no wrap continuation is in play.
-/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)`. Returns the
-/// contiguous run of cells sharing the cell's interned link id — extended
-/// across autowrapped rows — as a [`HoverUrl`]. Unlike the heuristic this is
-/// exact: the link's extent is whatever the app marked, and the target can be
-/// any scheme (filtered for safety only at click time).
+/// Inclusive column runs of cells whose hyperlink id equals `id`, in one row.
+fn hyperlink_runs(
+    cells: &[style::Cell],
+    id: std::num::NonZeroU32,
+) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < cells.len() {
+        if cells[i].hyperlink == Some(id) {
+            let start = i;
+            while i + 1 < cells.len() && cells[i + 1].hyperlink == Some(id) {
+                i += 1;
+            }
+            runs.push((start, i));
+        }
+        i += 1;
+    }
+    runs
+}
+
+/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)`. The link id is
+/// taken from the cell; every visible cell sharing that id is part of the same
+/// logical link (the OSC 8 `id=` contract), so we collect a [`HoverSegment`]
+/// for every run of it across the visible rows — including non-contiguous
+/// siblings, which then underline together. We scan only what's on screen
+/// because that's all the overlay can draw; siblings scrolled off don't need a
+/// strip. Takes precedence over the heuristic: the extent and target are
+/// exactly what the app declared.
 fn find_osc8_link_at(
     terminal: &terminal::Terminal,
     abs_line: isize,
@@ -1526,62 +1573,25 @@ fn find_osc8_link_at(
     let id = row[col].hyperlink?;
     let uri = terminal.hyperlink_uri(id)?.to_string();
 
-    // Contiguous run of the same id on the starting row.
-    let mut start_col = col;
-    while start_col > 0 && row[start_col - 1].hyperlink == Some(id) {
-        start_col -= 1;
-    }
-    let mut end_col = col;
-    while end_col + 1 < row.len() && row[end_col + 1].hyperlink == Some(id) {
-        end_col += 1;
-    }
-
-    // Extend upward: while this row's run starts at column 0 and the row above
-    // ends with the same link, the link wrapped down from there. Bounded by
-    // URL_WRAP_MAX_ROWS like the heuristic.
-    let mut start_abs_line = abs_line;
-    let mut steps = 0;
-    while steps < URL_WRAP_MAX_ROWS && start_col == 0 {
-        let above = match terminal.line_at(start_abs_line - 1) {
-            Some(a) if a.last().and_then(|c| c.hyperlink) == Some(id) => a,
-            _ => break,
+    let mut segments = Vec::new();
+    for v in 0..terminal.rows as isize {
+        let line = terminal.visual_to_abs_line(v);
+        let Some(cells) = terminal.line_at(line) else {
+            continue;
         };
-        start_abs_line -= 1;
-        let mut s = above.len() - 1;
-        while s > 0 && above[s - 1].hyperlink == Some(id) {
-            s -= 1;
+        for (start_col, end_col) in hyperlink_runs(cells, id) {
+            segments.push(HoverSegment {
+                abs_line: line,
+                start_col,
+                end_col,
+            });
         }
-        start_col = s;
-        steps += 1;
     }
-
-    // Extend downward: while this row's run reaches the right edge and the row
-    // below begins with the same link.
-    let mut end_abs_line = abs_line;
-    let mut steps = 0;
-    while steps < URL_WRAP_MAX_ROWS {
-        let cur_len = terminal.line_at(end_abs_line).map(|r| r.len()).unwrap_or(0);
-        if end_col + 1 != cur_len {
-            break;
-        }
-        let below = match terminal.line_at(end_abs_line + 1) {
-            Some(b) if b.first().and_then(|c| c.hyperlink) == Some(id) => b,
-            _ => break,
-        };
-        end_abs_line += 1;
-        let mut e = 0;
-        while e + 1 < below.len() && below[e + 1].hyperlink == Some(id) {
-            e += 1;
-        }
-        end_col = e;
-        steps += 1;
+    if segments.is_empty() {
+        return None;
     }
-
     Some(HoverUrl {
-        start_abs_line,
-        start_col,
-        end_abs_line,
-        end_col,
+        segments,
         url: uri,
     })
 }
@@ -1613,13 +1623,26 @@ fn find_url_at(
     let row_offset = (abs_line - start_abs) as usize;
     let virtual_col = row_offset * cols + col;
     let (s, e, url) = find_url_in_cells(&flat, virtual_col)?;
-    Some(HoverUrl {
-        start_abs_line: start_abs + (s / cols) as isize,
-        start_col: s % cols,
-        end_abs_line: start_abs + (e / cols) as isize,
-        end_col: e % cols,
-        url,
-    })
+    // A heuristic match is one contiguous (possibly wrapped) run: first row
+    // from `start_col` to the edge, full-width middle rows, last row to
+    // `end_col`. Express it as the same per-line segments OSC 8 uses.
+    let start_line = start_abs + (s / cols) as isize;
+    let start_col = s % cols;
+    let end_line = start_abs + (e / cols) as isize;
+    let end_col = e % cols;
+    let mut segments = Vec::new();
+    let mut line = start_line;
+    while line <= end_line {
+        let from = if line == start_line { start_col } else { 0 };
+        let to = if line == end_line { end_col } else { cols - 1 };
+        segments.push(HoverSegment {
+            abs_line: line,
+            start_col: from,
+            end_col: to,
+        });
+        line += 1;
+    }
+    Some(HoverUrl { segments, url })
 }
 
 #[cfg(target_os = "macos")]
@@ -2891,56 +2914,54 @@ impl State {
         if let Some(hu) = &self.hover_url {
             for r in r_lo..r_hi {
                 let abs_line = self.terminal.visual_to_abs_line(r);
-                if abs_line < hu.start_abs_line || abs_line > hu.end_abs_line {
-                    continue;
+                // Underline every segment that lands on this line. Most links
+                // have one per line; an OSC 8 link with an `id=` shared across
+                // non-contiguous spans can have several, so don't stop early.
+                for seg in hu.segments.iter().filter(|seg| seg.abs_line == abs_line) {
+                    let from = seg.start_col;
+                    if from >= cols {
+                        continue;
+                    }
+                    let last = seg.end_col.min(cols - 1);
+                    if last < from {
+                        continue;
+                    }
+                    let ux = col_x(from);
+                    let uw = (last - from + 1) as f32 * cell_w;
+                    // Honor the font's own underline_position / underline_thickness
+                    // so the line lands where the type designer intended and scales
+                    // with point size. `underline_pos_px` is the (signed) offset of
+                    // the stem center from the baseline — negative means below, so
+                    // adding `-pos` walks downward in screen coords. Subtracting
+                    // half the thickness then gives the top edge of the stripe.
+                    let uh = underline_thickness_px;
+                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + scroll_y;
+                    // Match the cell's foreground color so the underline tracks
+                    // theme overrides; fall back to the default fg.
+                    let fg = self
+                        .terminal
+                        .extended_cell(r, from)
+                        .map(|cell| {
+                            if cell.style.reverse {
+                                cell.style.color_bg.unwrap_or(default_bg_solid)
+                            } else {
+                                cell.style.color_fg.unwrap_or(default_fg)
+                            }
+                        })
+                        .unwrap_or(default_fg);
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        ux,
+                        uy,
+                        uw,
+                        uh,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        fg,
+                        [0.0; 4],
+                    );
                 }
-                // Span on this row: first row honors start_col, last row
-                // honors end_col, every middle row covers the full width
-                // (the URL ran edge-to-edge to wrap).
-                let from = if abs_line == hu.start_abs_line { hu.start_col } else { 0 };
-                let to = if abs_line == hu.end_abs_line { hu.end_col } else { cols - 1 };
-                if from >= cols {
-                    continue;
-                }
-                let last = to.min(cols - 1);
-                if last < from {
-                    continue;
-                }
-                let ux = col_x(from);
-                let uw = (last - from + 1) as f32 * cell_w;
-                // Honor the font's own underline_position / underline_thickness
-                // so the line lands where the type designer intended and scales
-                // with point size. `underline_pos_px` is the (signed) offset of
-                // the stem center from the baseline — negative means below, so
-                // adding `-pos` walks downward in screen coords. Subtracting
-                // half the thickness then gives the top edge of the stripe.
-                let uh = underline_thickness_px;
-                let uy = row_y(r) - underline_pos_px - uh * 0.5 + scroll_y;
-                // Match the cell's foreground color so the underline tracks
-                // theme overrides; fall back to the default fg.
-                let fg = self
-                    .terminal
-                    .extended_cell(r, from)
-                    .map(|cell| {
-                        if cell.style.reverse {
-                            cell.style.color_bg.unwrap_or(default_bg_solid)
-                        } else {
-                            cell.style.color_fg.unwrap_or(default_fg)
-                        }
-                    })
-                    .unwrap_or(default_fg);
-                push_quad(
-                    &mut vertices,
-                    &mut indices,
-                    ux,
-                    uy,
-                    uw,
-                    uh,
-                    [bg_u, bg_v],
-                    [bg_u, bg_v],
-                    fg,
-                    [0.0; 4],
-                );
             }
         }
 
@@ -7911,8 +7932,8 @@ mod tests {
         let abs = t.visual_to_abs_line(0);
         let hu = find_url_at(&t, abs, 2).expect("link under 'click'");
         assert_eq!(hu.url, "https://real.example/path");
-        assert_eq!(hu.start_col, 0);
-        assert_eq!(hu.end_col, "click here".len() - 1);
+        assert_eq!(hu.start_col(), 0);
+        assert_eq!(hu.end_col(), "click here".len() - 1);
     }
 
     #[test]
@@ -7922,11 +7943,82 @@ mod tests {
         t.feed("pre \x1b]8;;https://x/\x07LINK\x1b]8;;\x07 post");
         let abs = t.visual_to_abs_line(0);
         let hu = find_osc8_link_at(&t, abs, 5).expect("link under LINK");
-        assert_eq!(hu.start_col, 4);
-        assert_eq!(hu.end_col, 7);
+        assert_eq!(hu.start_col(), 4);
+        assert_eq!(hu.end_col(), 7);
         assert_eq!(hu.url, "https://x/");
         // A cell in "pre " has no OSC 8 link.
         assert!(find_osc8_link_at(&t, abs, 1).is_none());
+    }
+
+    #[test]
+    fn osc8_id_siblings_cohighlight() {
+        // Two non-contiguous spans share `id=grp` + URI: hovering either must
+        // return segments covering BOTH runs so they underline together.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=grp;https://x/\x07AB\x1b]8;;\x07 mid \x1b]8;id=grp;https://x/\x07CD\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        // "AB" at cols 0..1; " mid " at 2..6; "CD" at cols 7..8.
+        let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
+        assert_eq!(hu.url, "https://x/");
+        let mut spans: Vec<(usize, usize)> =
+            hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![(0, 1), (7, 8)], "both id=grp spans co-highlight");
+        // Hovering the second span resolves to the identical set.
+        let hu2 = find_osc8_link_at(&t, abs, 7).expect("link under second span");
+        assert_eq!(hu, hu2);
+    }
+
+    #[test]
+    fn osc8_id_three_siblings_all_cohighlight() {
+        // Three non-contiguous spans share one id: hovering any of them must
+        // return all three segments.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=g;https://x/\x07A\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07B\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07C\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        // "A" col 0, "B" col 2, "C" col 4.
+        let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
+        let mut spans: Vec<(usize, usize)> =
+            hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+        spans.sort();
+        assert_eq!(spans, vec![(0, 0), (2, 2), (4, 4)], "all three spans co-highlight");
+        // Hovering the middle and last spans yields the identical set.
+        assert_eq!(find_osc8_link_at(&t, abs, 2).unwrap(), hu);
+        assert_eq!(find_osc8_link_at(&t, abs, 4).unwrap(), hu);
+    }
+
+    #[test]
+    fn osc8_id_siblings_on_different_rows_cohighlight() {
+        // Two spans share one id but land on different visible rows (a newline
+        // separates them). Hovering either must return one segment per row.
+        let mut t = make_terminal(5, 20);
+        t.feed("\x1b]8;id=g;https://x/\x07AB\x1b]8;;\x07\r\n\x1b]8;id=g;https://x/\x07CD\x1b]8;;\x07");
+        let abs0 = t.visual_to_abs_line(0);
+        let abs1 = t.visual_to_abs_line(1);
+        let hu = find_osc8_link_at(&t, abs0, 0).expect("hover first row span");
+        assert_eq!(hu.url, "https://x/");
+        let mut segs: Vec<(isize, usize, usize)> = hu
+            .segments
+            .iter()
+            .map(|s| (s.abs_line, s.start_col, s.end_col))
+            .collect();
+        segs.sort();
+        assert_eq!(segs, vec![(abs0, 0, 1), (abs1, 0, 1)], "siblings on two rows co-highlight");
+        // Hovering the second-row span resolves to the same set.
+        assert_eq!(find_osc8_link_at(&t, abs1, 0).unwrap(), hu);
+    }
+
+    #[test]
+    fn osc8_anonymous_spans_do_not_cohighlight() {
+        // No `id=`: each open is a distinct link, so hovering the first span
+        // highlights only its own contiguous run, not the later same-URI span.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://x/\x07AB\x1b]8;;\x07 \x1b]8;;https://x/\x07CD\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_osc8_link_at(&t, abs, 0).expect("first span");
+        assert_eq!(hu.segments.len(), 1, "anonymous links don't group");
+        assert_eq!(hu.segments[0].start_col, 0);
+        assert_eq!(hu.segments[0].end_col, 1);
     }
 
     #[test]
@@ -7968,10 +8060,10 @@ mod tests {
         let from_first = find_osc8_link_at(&t, 0, 2).expect("hover first row");
         let from_tail = find_osc8_link_at(&t, 1, 1).expect("hover continuation row");
         assert_eq!(from_first, from_tail, "both hovers resolve to one span");
-        assert_eq!(from_first.start_abs_line, 0);
-        assert_eq!(from_first.start_col, 0);
-        assert_eq!(from_first.end_abs_line, 1);
-        assert_eq!(from_first.end_col, 3, "14 glyphs over 10 cols end at col 3 of row 1");
+        assert_eq!(from_first.start_abs_line(), 0);
+        assert_eq!(from_first.start_col(), 0);
+        assert_eq!(from_first.end_abs_line(), 1);
+        assert_eq!(from_first.end_col(), 3, "14 glyphs over 10 cols end at col 3 of row 1");
         assert_eq!(from_first.url, "https://wrap/target");
     }
 
@@ -8217,10 +8309,10 @@ mod tests {
         t.feed(url);
 
         let hover = find_url_at(&t, 0, 5).expect("URL should be found from first row");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 1);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18, "39 chars over 20 cols ends at col 18 of row 1");
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 1);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18, "39 chars over 20 cols ends at col 18 of row 1");
         assert_eq!(hover.url, url);
     }
 
@@ -8248,10 +8340,10 @@ mod tests {
         t.feed("https://example.com extra-text");
 
         let hover = find_url_at(&t, 0, 5).expect("URL on row 0");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 0);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 0);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18);
         assert_eq!(hover.url, "https://example.com");
         assert!(
             !hover.url.contains("extra-text"),
@@ -8293,7 +8385,7 @@ mod tests {
         let start_abs = start_abs.expect("URL start row should exist");
 
         let hover = find_url_at(&t, start_abs, 0).expect("should resolve to some URL");
-        assert_eq!(hover.start_abs_line, start_abs);
+        assert_eq!(hover.start_abs_line(), start_abs);
         assert!(hover.url.starts_with("https://example.com/"));
         // Cap is URL_WRAP_MAX_ROWS rows past the start; bound length
         // generously to confirm we didn't walk all 50 rows.
@@ -8314,10 +8406,10 @@ mod tests {
         t.feed("https://example.com more text here");
 
         let hover = find_url_at(&t, 0, 10).expect("single-row URL");
-        assert_eq!(hover.start_abs_line, 0);
-        assert_eq!(hover.end_abs_line, 0);
-        assert_eq!(hover.start_col, 0);
-        assert_eq!(hover.end_col, 18);
+        assert_eq!(hover.start_abs_line(), 0);
+        assert_eq!(hover.end_abs_line(), 0);
+        assert_eq!(hover.start_col(), 0);
+        assert_eq!(hover.end_col(), 18);
         assert_eq!(hover.url, "https://example.com");
     }
 

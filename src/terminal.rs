@@ -824,30 +824,52 @@ struct ScrollbackPlacement {
 /// store with an unbounded string.
 const MAX_HYPERLINK_URI_LEN: usize = 4096;
 
-/// Interns OSC 8 hyperlink target URIs so each `Cell` references one by a
-/// compact id instead of owning the string. Identical URIs dedupe to the same
-/// id, so the cells of one link — and repeats of the same link elsewhere —
-/// share an id and group together on hover. The table only grows: distinct
-/// URIs per session are few, and dropping entries would orphan ids still held
-/// by scrollback cells.
+/// Interns OSC 8 hyperlink targets so each `Cell` references one by a compact
+/// id instead of owning the string. The id also drives hover co-highlighting:
+/// every cell sharing an id is one logical link.
+///
+/// Grouping follows the OSC 8 `id=` parameter. A link opened with an explicit
+/// `id=` is keyed by `(id, uri)`, so the *same* `(id, uri)` reused anywhere —
+/// even in a non-contiguous region elsewhere on screen — interns to the same
+/// id and co-highlights. A link opened *without* an id is anonymous: each open
+/// gets a fresh id, so two anonymous spans never merge (only the contiguous
+/// cells of one open share an id). The table only grows; distinct links per
+/// session are few, and dropping entries would orphan ids still held by
+/// scrollback cells.
 #[derive(Default)]
 pub struct HyperlinkStore {
+    /// id (1-based) -> target URI.
     uris: Vec<String>,
-    index: std::collections::HashMap<String, std::num::NonZeroU32>,
+    /// `(id_param, uri)` -> interned id, for explicit-`id=` dedup/grouping.
+    keyed: std::collections::HashMap<(String, String), std::num::NonZeroU32>,
 }
 
 impl HyperlinkStore {
-    /// Intern `uri`, returning its (stable, 1-based) id. Idempotent for a
-    /// given URI string.
-    fn intern(&mut self, uri: &str) -> std::num::NonZeroU32 {
-        if let Some(&id) = self.index.get(uri) {
-            return id;
-        }
+    /// Append a fresh entry for `uri`, returning its (1-based) id.
+    fn push(&mut self, uri: &str) -> std::num::NonZeroU32 {
         self.uris.push(uri.to_string());
         // 1-based so the id is never zero — lets `Cell` carry it as a niche
         // `Option<NonZeroU32>` with no extra storage.
-        let id = std::num::NonZeroU32::new(self.uris.len() as u32).expect("len >= 1");
-        self.index.insert(uri.to_string(), id);
+        std::num::NonZeroU32::new(self.uris.len() as u32).expect("len >= 1")
+    }
+
+    /// Intern an anonymous link (no `id=`): always a fresh id, so separate
+    /// opens of the same URI stay distinct logical links.
+    fn intern_anon(&mut self, uri: &str) -> std::num::NonZeroU32 {
+        self.push(uri)
+    }
+
+    /// Intern a link carrying an explicit `id=`: `(id, uri)` dedupes to one id
+    /// so every span sharing them is the same logical link and co-highlights.
+    /// The id is scoped to the URI — the same `id=` with a different URI is a
+    /// different link.
+    fn intern_keyed(&mut self, id_param: &str, uri: &str) -> std::num::NonZeroU32 {
+        let key = (id_param.to_string(), uri.to_string());
+        if let Some(&id) = self.keyed.get(&key) {
+            return id;
+        }
+        let id = self.push(uri);
+        self.keyed.insert(key, id);
         id
     }
 
@@ -2396,13 +2418,24 @@ impl Terminal {
         // may contain ';' (query strings), so split exactly once and keep the
         // remainder verbatim. A `rest` with no ';' is malformed — treat the
         // whole thing as the URI rather than dropping it.
-        let (_params, uri) = rest.split_once(';').unwrap_or(("", rest));
+        let (params, uri) = rest.split_once(';').unwrap_or(("", rest));
         let uri = uri.trim();
         if uri.is_empty() || uri.len() > MAX_HYPERLINK_URI_LEN {
             self.cursor.hyperlink = None;
             return;
         }
-        self.cursor.hyperlink = Some(self.hyperlinks.intern(uri));
+        // `params` is a colon-separated `key=value` list. Only `id=` is
+        // defined: it groups (possibly non-contiguous) spans of one logical
+        // link. With an id, intern by `(id, uri)` so siblings co-highlight;
+        // without one the link is anonymous (a fresh id per open).
+        let id_param = params
+            .split(':')
+            .find_map(|kv| kv.strip_prefix("id="))
+            .filter(|v| !v.is_empty());
+        self.cursor.hyperlink = Some(match id_param {
+            Some(id) => self.hyperlinks.intern_keyed(id, uri),
+            None => self.hyperlinks.intern_anon(uri),
+        });
     }
 
     /// `OSC 7 ; file://<host>/<path> ST` — the shell reports its current
@@ -7931,12 +7964,86 @@ mod tests {
     }
 
     #[test]
-    fn osc_8_dedupes_identical_uris() {
+    fn osc_8_anonymous_same_uri_does_not_merge() {
+        // Two separate anonymous opens of the same URI are distinct logical
+        // links per the OSC 8 spec (only an explicit `id=` groups spans), so
+        // they must intern to different ids and not co-highlight.
         let mut t = Terminal::new(80, 24, 100);
         t.feed("\x1b]8;;https://dup/\x07A\x1b]8;;\x07 \x1b]8;;https://dup/\x07B\x1b]8;;\x07");
         let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
         let b = t.visible_cell(0, 2).hyperlink.expect("B linked");
-        assert_eq!(a, b, "same URI interns to the same id");
+        assert_ne!(a, b, "anonymous opens of the same URI stay distinct");
+        // ...but both still resolve to that URI.
+        assert_eq!(t.hyperlink_uri(a).as_deref(), Some("https://dup/"));
+        assert_eq!(t.hyperlink_uri(b).as_deref(), Some("https://dup/"));
+    }
+
+    #[test]
+    fn osc_8_explicit_id_groups_noncontiguous_spans() {
+        // Two spans sharing `id=grp` and the same URI are one logical link:
+        // they must intern to the same id even though unlinked text (and a
+        // close) separates them.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=grp;https://x/\x07A\x1b]8;;\x07 mid \x1b]8;id=grp;https://x/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 6).hyperlink.expect("B linked");
+        assert_eq!(a, b, "same (id, uri) groups the spans");
+    }
+
+    #[test]
+    fn osc_8_same_id_different_uri_is_distinct() {
+        // The id is scoped to the URI: the same `id=` with a different target
+        // is a different link.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=g;https://a/\x07A\x1b]8;;\x07\x1b]8;id=g;https://b/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 1).hyperlink.expect("B linked");
+        assert_ne!(a, b, "same id but different uri => different links");
+    }
+
+    #[test]
+    fn osc_8_different_ids_same_uri_are_distinct() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=one;https://x/\x07A\x1b]8;;\x07\x1b]8;id=two;https://x/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 1).hyperlink.expect("B linked");
+        assert_ne!(a, b, "different ids => different links");
+    }
+
+    #[test]
+    fn osc_8_id_not_first_param_still_groups() {
+        // The params field is a colon-separated key=value list and `id=` need
+        // not be first. Two spans with `foo=bar:id=grp` (id second) and the
+        // same URI are one logical link.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;foo=bar:id=grp;https://x/\x07A\x1b]8;;\x07 \x1b]8;baz=qux:id=grp;https://x/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 2).hyperlink.expect("B linked");
+        assert_eq!(a, b, "id= grouped regardless of param position");
+        assert_eq!(t.hyperlink_uri(a).as_deref(), Some("https://x/"));
+    }
+
+    #[test]
+    fn osc_8_empty_id_value_falls_back_to_anonymous() {
+        // `id=` with an empty value is not a real id (filtered out), so each
+        // open is anonymous and same-URI spans stay distinct.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=;https://x/\x07A\x1b]8;;\x07 \x1b]8;id=;https://x/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 2).hyperlink.expect("B linked");
+        assert_ne!(a, b, "empty id= is anonymous, spans stay distinct");
+    }
+
+    #[test]
+    fn osc_8_explicit_id_and_anonymous_same_uri_stay_separate() {
+        // A keyed (id=grp) span and a separate anonymous span sharing the URI
+        // are different logical links: the anon open must not adopt the keyed
+        // id, so they intern distinctly.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;id=grp;https://x/\x07A\x1b]8;;\x07 \x1b]8;;https://x/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 2).hyperlink.expect("B linked");
+        assert_ne!(a, b, "keyed and anonymous same-URI spans are distinct");
     }
 
     #[test]
