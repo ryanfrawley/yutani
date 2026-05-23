@@ -628,4 +628,206 @@ function done() {
   });
 }
 
+/* ============================================================
+ * resolveFg — what color a preview cell glyph actually paints.
+ *
+ * resolveFg closes over the module `state`, brightEnabled(), and the
+ * whole projectHex color chain (hex<->linear conversion + nearest-
+ * color snapping). We grab that chain and inject HUES via buildSandbox.
+ *
+ * The mono case mirrors palette.rs::project_cell: with only two ink
+ * levels every glyph paints as the foreground ink, so a dim color that
+ * would nearest-snap to the background must NOT vanish into it.
+ * ============================================================ */
+{
+  const sb = buildSandbox([
+    'resolveFg', 'brightEnabled', 'projectHex',
+    'srgbToLinear', 'linearToSrgbU8', 'hexToLin', 'linToHex',
+    'lumaDistSq', 'nearestLin', 'ansiLinPalette', 'xterm256Lin',
+  ]);
+  const { resolveFg, __setState } = sb;
+
+  function freshState(max_colors = '') {
+    return {
+      background: '#000000', foreground: '#e0e0e0',
+      cursor: '#1a00cc', selection: '#3366d9',
+      ansi: {
+        black:   ['#000000', '#808080'],
+        red:     ['#ab0000', '#ff5555'],
+        // A dim green that nearest-snaps to the background, not the fg.
+        green:   ['#003300', '#55ff55'],
+        yellow:  ['#abab00', '#ffff55'],
+        blue:    ['#0000ab', '#5555ff'],
+        magenta: ['#ab00ab', '#ff55ff'],
+        cyan:    ['#00abab', '#55ffff'],
+        white:   ['#ababab', '#ffffff'],
+      },
+      max_colors,
+    };
+  }
+
+  test('resolveFg: truecolor returns the scheme normal/bright ANSI hex', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('red', false), '#ab0000');
+    assert.equal(resolveFg('red', true), '#ff5555');
+  });
+
+  test('resolveFg: truecolor leaves colors unprojected (no snapping)', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('green', false), '#003300');
+    assert.equal(resolveFg('cyan', true), '#55ffff');
+  });
+
+  test('resolveFg: mono paints every ANSI glyph as foreground ink', () => {
+    __setState(freshState('mono'));
+    for (const hue of ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white']) {
+      assert.equal(resolveFg(hue, false), '#e0e0e0', `${hue} normal`);
+      assert.equal(resolveFg(hue, true), '#e0e0e0', `${hue} bold`);
+    }
+  });
+
+  test('resolveFg: mono does NOT let a bg-snapping color vanish (regression)', () => {
+    const s = freshState('mono');
+    __setState(s);
+    // Sanity: under projectHex, this dim green WOULD snap to the background.
+    assert.equal(sb.projectHex(s.ansi.green[0]), s.background);
+    // But resolveFg must paint it as foreground ink, not the background.
+    assert.equal(resolveFg('green', false), s.foreground);
+    assert.equal(resolveFg('green', true), s.foreground);
+    assert.notEqual(resolveFg('green', false), s.background);
+  });
+
+  test('resolveFg: window colors return their window hex in truecolor', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('foreground', false), '#e0e0e0');
+    assert.equal(resolveFg('background', false), '#000000');
+    assert.equal(resolveFg('cursor', false), '#1a00cc');
+  });
+
+  test('resolveFg: window colors return their window hex in mono too', () => {
+    __setState(freshState('mono'));
+    assert.equal(resolveFg('foreground', true), '#e0e0e0');
+    assert.equal(resolveFg('background', true), '#000000');
+    assert.equal(resolveFg('cursor', true), '#1a00cc');
+  });
+}
+
+/* ============================================================
+ * buildPreviewLines — builds the first section of `msgcat --color=test`:
+ * a prompt + title + a 9×9 fg/bg color grid. It closes over the `S`
+ * row helper (top-level in index.html), takes no args and reads no
+ * `state`. Each grid column is 7 wide (`|` + " Words "), behind a
+ * 7-wide label column → 7 + 9*8 = 79 columns per grid row.
+ * ============================================================ */
+{
+  // S is a `const` arrow (not a `function` decl), so grab() can't slice it —
+  // lift it verbatim as extra const source; seglen likewise for measuring.
+  const S_SRC = html.match(/const S = [^\n]+/)[0];
+  const SEGLEN_SRC = html.match(/const seglen = segs =>[\s\S]*?;/)[0];
+  const { buildPreviewLines } = buildSandbox(['buildPreviewLines'], S_SRC);
+  const seglen = new Function(SEGLEN_SRC + '\nreturn seglen;')();
+  const GRID_W = 7 + 9 * (1 + 7); // 79
+  const cellsOf = row => row.filter(s => typeof s !== 'string' && s.text === ' Words ');
+
+  test('buildPreviewLines returns the msgcat first section (13 rows)', () => {
+    assert.equal(buildPreviewLines().length, 13);
+  });
+
+  test('buildPreviewLines: row 2 is the section title', () => {
+    const texts = buildPreviewLines()[2].map(s => (typeof s === 'string' ? s : s.text));
+    assert.ok(texts.join('').includes('Colors (foreground/background):'));
+  });
+
+  test('buildPreviewLines: the header + 9 data rows are 79 columns wide', () => {
+    const rows = buildPreviewLines();
+    for (let i = 3; i < rows.length; i++) assert.equal(seglen(rows[i]), GRID_W, `row ${i} width`);
+  });
+
+  test('buildPreviewLines: data cells carry a bg per column, except default', () => {
+    const cells = cellsOf(buildPreviewLines()[4]); // first data row ("black")
+    assert.equal(cells.length, 9);
+    assert.equal(cells[0].bg, 'black');     // black column → normal slot
+    assert.ok(!cells[0].bgBold);
+    assert.equal(cells[1].bg, 'blue');      // blue column → bright slot
+    assert.ok(cells[1].bgBold);
+    assert.equal(cells[8].bg, undefined);   // default column → no bg
+  });
+
+  test('buildPreviewLines: the default row paints glyphs in the window foreground', () => {
+    const cells = cellsOf(buildPreviewLines()[12]); // last data row ("default")
+    assert.ok(cells.every(c => c.fg === 'foreground'));
+  });
+}
+
+/* ============================================================
+ * resolveSeg — resolves a preview segment to the {fg, bg} the
+ * renderers draw. Selection is chrome; an explicit cell background
+ * invokes palette.rs project_cell (mono fg-ink flip / blank). It
+ * closes over `state`, resolveFg, resolveBg, brightEnabled and the
+ * projectHex color chain (mirrored from the resolveFg block).
+ * ============================================================ */
+{
+  const sb = buildSandbox([
+    'resolveSeg', 'resolveFg', 'resolveBg', 'brightEnabled', 'projectHex',
+    'srgbToLinear', 'linearToSrgbU8', 'hexToLin', 'linToHex',
+    'lumaDistSq', 'nearestLin', 'ansiLinPalette', 'xterm256Lin',
+  ]);
+  const { resolveSeg, resolveFg, __setState } = sb;
+
+  function freshState(max_colors = '') {
+    return {
+      background: '#000000', foreground: '#e0e0e0',
+      cursor: '#1a00cc', selection: '#3366d9', selection_fg: null,
+      ansi: {
+        black:   ['#000000', '#808080'],
+        red:     ['#ab0000', '#ff5555'],
+        green:   ['#00ab00', '#55ff55'],
+        yellow:  ['#abab00', '#ffff55'],
+        blue:    ['#0000ab', '#5555ff'],
+        magenta: ['#ab00ab', '#ff55ff'],
+        cyan:    ['#00abab', '#55ffff'],
+        white:   ['#ababab', '#ffffff'],
+      },
+      max_colors,
+    };
+  }
+
+  test('resolveSeg: non-mono projects fg and bg independently', () => {
+    __setState(freshState(''));
+    const got = resolveSeg({ fg: 'green', bg: 'blue' });
+    assert.equal(got.fg, resolveFg('green', false));
+    assert.equal(got.bg, '#0000ab'); // projected blue (truecolor: no snapping)
+  });
+
+  test('resolveSeg: bgBold picks the bright bg slot independently of the glyph', () => {
+    __setState(freshState(''));
+    // msgcat's grid puts normal-black ink on a bright-blue block.
+    const got = resolveSeg({ fg: 'black', bg: 'blue', bgBold: true });
+    assert.equal(got.fg, '#000000'); // normal black (glyph not bold)
+    assert.equal(got.bg, '#5555ff'); // bright blue (bgBold)
+  });
+
+  test('resolveSeg: mono flips a distinct bg to fg-ink block / bg-color glyph', () => {
+    // The bg must resolve to a color distinct from the window background;
+    // in mono, ANSI hues nearest-snap to bg/fg, so use a window-color bg
+    // (mirrors the vim status segments, which carry `bg: 'blue'` etc.).
+    __setState(freshState('mono'));
+    const got = resolveSeg({ fg: 'red', bg: 'foreground' });
+    assert.deepEqual(got, { fg: '#000000', bg: '#e0e0e0' }); // {bg, fg} flip
+  });
+
+  test('resolveSeg: mono reads a window-background bg as blank (no flip)', () => {
+    __setState(freshState('mono'));
+    const got = resolveSeg({ fg: 'foreground', bg: 'background' });
+    assert.deepEqual(got, { fg: '#e0e0e0', bg: null });
+  });
+
+  test('resolveSeg: a selection segment paints bg === state.selection in either cap', () => {
+    __setState(freshState(''));
+    assert.equal(resolveSeg({ sel: true, fg: 'red' }).bg, '#3366d9');
+    __setState(freshState('mono'));
+    assert.equal(resolveSeg({ sel: true, fg: 'red' }).bg, '#3366d9');
+  });
+}
+
 done();

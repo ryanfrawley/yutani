@@ -2,6 +2,7 @@ mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
+mod search;
 mod font;
 mod font_loader;
 mod renderer;
@@ -199,6 +200,69 @@ impl CrtLevel {
             "high" => Some(Self::High),
             _ => None,
         }
+    }
+}
+
+/// The names of every color scheme available under `~/.config/yutani/schemes/`,
+/// i.e. the file stems of the `.toml` files there, sorted alphabetically. These
+/// are exactly the names `scheme_path` / `install_color_scheme` accept, so the
+/// command palette's theme picker can only offer schemes that actually load.
+/// A missing or unreadable directory yields an empty list.
+fn list_scheme_names() -> Vec<String> {
+    let mut dir = match config_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    dir.push("schemes");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+                return None;
+            }
+            path.file_stem()?.to_str().map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Label for the synthetic theme-picker entry that reverts to the built-in
+/// defaults (i.e. clears `color_scheme`). It carries spaces and parens so it
+/// can't collide with a real `.toml` file stem; any on-disk scheme that somehow
+/// matched it is filtered out (see [`theme_picker_choices`]).
+const DEFAULT_THEME_LABEL: &str = "Default (built-in)";
+
+/// The theme picker's full candidate list: the synthetic "Default (built-in)"
+/// entry first, then the real schemes (with any collision against the label
+/// dropped so the entry is unambiguous).
+fn theme_picker_choices(scheme_names: Vec<String>) -> Vec<String> {
+    let mut v = Vec::with_capacity(scheme_names.len() + 1);
+    v.push(DEFAULT_THEME_LABEL.to_string());
+    v.extend(scheme_names.into_iter().filter(|n| n != DEFAULT_THEME_LABEL));
+    v
+}
+
+/// Resolve a theme-picker selection to the scheme name to install: `None` for
+/// the synthetic default entry (revert to built-in defaults), otherwise the
+/// label *is* the scheme name.
+fn scheme_for_pick(label: &str) -> Option<&str> {
+    (label != DEFAULT_THEME_LABEL).then_some(label)
+}
+
+/// Convert a theme-picker selection into the value to store in a config scheme
+/// slot (`color_scheme` / `light_scheme` / `dark_scheme`). The synthetic
+/// "Default (built-in)" entry and an empty/whitespace pick both map to `None`
+/// (revert to defaults); any other label becomes the scheme name.
+fn scheme_value_from_pick(arg: Option<String>) -> Option<String> {
+    let arg = arg.unwrap_or_default();
+    match scheme_for_pick(arg.trim()) {
+        Some(name) if !name.is_empty() => Some(name.to_string()),
+        _ => None,
     }
 }
 
@@ -410,8 +474,20 @@ struct Config {
     blur_iterations: usize,
     /// Name of a TOML scheme under ~/.config/yutani/schemes/. `None` keeps
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
-    /// back to defaults.
+    /// back to defaults. Used as the active scheme when `auto_theme` is off,
+    /// and as the fallback when an `auto_theme` slot below is unset.
     color_scheme: Option<String>,
+    /// When true, follow the system light/dark appearance: install
+    /// `light_scheme` in light mode and `dark_scheme` in dark mode, swapping
+    /// live when the OS appearance changes. When false, `color_scheme` is used
+    /// regardless of system appearance.
+    auto_theme: bool,
+    /// Scheme to use in system light mode while `auto_theme` is on. `None`
+    /// falls back to `color_scheme`, then the built-in defaults.
+    light_scheme: Option<String>,
+    /// Scheme to use in system dark mode while `auto_theme` is on. `None`
+    /// falls back to `color_scheme`, then the built-in defaults.
+    dark_scheme: Option<String>,
     /// Preferred font family name. `None` (or empty) falls back to the
     /// built-in preference list (Iosevka Term → Iosevka → Fira Code → Menlo).
     /// Matched by exact family name first; failing that, by substring (so
@@ -563,6 +639,9 @@ impl Config {
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
+            auto_theme: false,
+            light_scheme: None,
+            dark_scheme: None,
             font_family: None,
             glow_match_brightness: false,
             glow_match_bright_ansi: false,
@@ -638,6 +717,13 @@ impl Config {
             },
             "color_scheme" => if let Some(x) = v.as_str() {
                 self.color_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "auto_theme" => if let Some(x) = v.as_bool() { self.auto_theme = x; },
+            "light_scheme" => if let Some(x) = v.as_str() {
+                self.light_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "dark_scheme" => if let Some(x) = v.as_str() {
+                self.dark_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
             },
             "font_family" => if let Some(x) = v.as_str() {
                 self.font_family = if x.is_empty() { None } else { Some(x.to_string()) };
@@ -739,6 +825,19 @@ impl Config {
         let _ = std::fs::write(p, self.serialize());
     }
 
+    /// The scheme name to install for the current system appearance, or `None`
+    /// to use the built-in defaults. When `auto_theme` is off this is just
+    /// `color_scheme`. When on, it's the `dark_scheme` / `light_scheme` slot for
+    /// `dark`, falling back to `color_scheme` if that slot is unset — so a user
+    /// can configure only one slot and keep their existing scheme for the other.
+    fn active_scheme(&self, dark: bool) -> Option<&str> {
+        if !self.auto_theme {
+            return self.color_scheme.as_deref();
+        }
+        let slot = if dark { &self.dark_scheme } else { &self.light_scheme };
+        slot.as_deref().or(self.color_scheme.as_deref())
+    }
+
     fn serialize(&self) -> String {
         let mut s = String::from("# Yutani configuration\n\n");
         s.push_str(&format!(
@@ -764,6 +863,13 @@ impl Config {
         ));
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", toml_str_lit(name)));
+        }
+        s.push_str(&format!("auto_theme = {}\n", self.auto_theme));
+        if let Some(name) = &self.light_scheme {
+            s.push_str(&format!("light_scheme = {}\n", toml_str_lit(name)));
+        }
+        if let Some(name) = &self.dark_scheme {
+            s.push_str(&format!("dark_scheme = {}\n", toml_str_lit(name)));
         }
         if let Some(name) = &self.font_family {
             s.push_str(&format!("font_family = {}\n", toml_str_lit(name)));
@@ -1296,6 +1402,10 @@ struct State {
     /// its own search/argument text field and selection state; see
     /// `command_palette.rs`.
     command_palette: command_palette::CommandPalette,
+    /// The find-in-scrollback overlay (Cmd-F). While `open`, it owns the
+    /// keyboard like the command palette; holds the query field and the
+    /// list of matches across the buffer. See `search.rs`.
+    search: search::Search,
     /// Past command lines for history-based completion suggestions, most-recent-
     /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
     /// 2124) and grown with this session's submitted commands (captured at OSC
@@ -1874,6 +1984,63 @@ fn open_url(url: &str) {
 #[cfg(not(target_os = "macos"))]
 fn open_url(_url: &str) {}
 
+/// Logical-point offset applied to each cascaded window, matching the macOS
+/// convention of stepping a new window down-and-right from its parent. Roughly
+/// a title-bar height so successive windows stack like a fanned deck.
+const WINDOW_CASCADE_STEP: f64 = 28.0;
+
+/// Env var carrying the parent window's top-left, in logical points, to a
+/// freshly spawned child (`"x,y"`). The child reads it in `run()` and places
+/// its window one `WINDOW_CASCADE_STEP` down-and-right so new windows cascade
+/// instead of landing exactly atop the one that spawned them. Absent for the
+/// first window (launched from Finder/CLI), which keeps the OS default spot.
+const CASCADE_ENV: &str = "YUTANI_CASCADE_FROM";
+
+/// Launch a fresh Yutani window. Each window is its own process (the app is
+/// single-window per process), so a new window is just another instance of our
+/// own executable. `cwd` — the running shell's working directory from OSC 7 —
+/// becomes the child's working directory so the new window opens where the
+/// current one is, falling back to inheriting ours when it's unknown.
+/// `origin` is the spawning window's top-left in logical points; when present
+/// it's forwarded so the child can cascade off it. Failures are logged rather
+/// than fatal: a missing exe path shouldn't kill the window the user is in.
+fn spawn_new_window(cwd: Option<&str>, origin: Option<(f64, f64)>) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("new window: cannot resolve current exe: {e}");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(dir) = cwd {
+        if !dir.is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
+    if let Some((x, y)) = origin {
+        cmd.env(CASCADE_ENV, format!("{x},{y}"));
+    }
+    if let Err(e) = cmd.spawn() {
+        eprintln!("new window: failed to spawn: {e}");
+    }
+}
+
+/// Parse the cascade hint set by a parent window (see [`CASCADE_ENV`]) into the
+/// child's target top-left, stepped one [`WINDOW_CASCADE_STEP`] down-and-right.
+/// Returns `None` when the var is absent or malformed so the window falls back
+/// to the OS-chosen position.
+fn cascade_position() -> Option<winit::dpi::LogicalPosition<f64>> {
+    let raw = std::env::var(CASCADE_ENV).ok()?;
+    let (x, y) = raw.split_once(',')?;
+    let x: f64 = x.trim().parse().ok()?;
+    let y: f64 = y.trim().parse().ok()?;
+    Some(winit::dpi::LogicalPosition::new(
+        x + WINDOW_CASCADE_STEP,
+        y + WINDOW_CASCADE_STEP,
+    ))
+}
+
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// Duration of the smooth-scroll slide for an explicit alt-screen scroll
@@ -2017,16 +2184,21 @@ impl State {
     async fn new(
         master: i32,
         window: Window,
+        gpu: gpu::GpuContext,
         mut font: font::Font,
         shaper: shaper::Shaper,
         config: Config,
         dpi: u32,
     ) -> Self {
+        let _sw = std::time::Instant::now();
+        let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
+        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         let pt_size = config.font_size;
-        let gpu = gpu::GpuContext::new(&window).await;
+        sub!("GpuContext (passed in, built concurrently)");
 
         // Font texture setup
         let atlas = font.build_atlas();
+        sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
             &gpu.device,
@@ -2233,6 +2405,7 @@ impl State {
         } else {
             None
         };
+        sub!("main render + wireframe pipelines");
 
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
@@ -2291,6 +2464,7 @@ impl State {
         );
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
+        sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
             &gpu.device,
@@ -2321,6 +2495,7 @@ impl State {
             gpu.config.height,
             &scene_fg.view,
         );
+        sub!("Glow::new x2 + scene_fg");
         let initial_overrides = palette::get().glow;
         for g in [&mut glow, &mut glow_fg] {
             apply_glow_config(g, &config, &initial_overrides);
@@ -2379,6 +2554,7 @@ impl State {
             &camera_bind_group_layout,
         );
         let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
+        sub!("ImagePipeline::new + Store");
 
         Self {
             window,
@@ -2448,6 +2624,7 @@ impl State {
             completion_scroll: 0,
             completion_dismissed: false,
             command_palette: command_palette::CommandPalette::default(),
+            search: search::Search::default(),
             command_history: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
@@ -3429,6 +3606,71 @@ impl State {
             }
         }
 
+        // 1b. Find-in-scrollback match highlights. Translucent rounded quads
+        //     over each matched run; the current (stepped-to) match gets a
+        //     stronger fill drawn last so it reads as emphasised. Mapped from a
+        //     match's absolute line to a visible row the same way the selection
+        //     strip is, and only drawn for matches inside the phantom range.
+        if self.search.open && !self.search.matches.is_empty() {
+            let pal = palette::get();
+            let strip_pad = (line_height - bg_h) * 0.5;
+            let yellow = pal.ansi[3];
+            let hl_radius = (cell_w * 0.18).min(line_height * 0.25);
+            let all_a = 0.32_f32;
+            let all_color = [
+                yellow[0] * all_a,
+                yellow[1] * all_a,
+                yellow[2] * all_a,
+                all_a,
+            ];
+            let cur_a = 0.62_f32;
+            let cur_color = [
+                yellow[0] * cur_a,
+                yellow[1] * cur_a,
+                yellow[2] * cur_a,
+                cur_a,
+            ];
+            let top_abs = self.terminal.visual_to_abs_line(0);
+            let emit_match = |vertices: &mut Vec<renderer::vertex::Vertex>,
+                              indices: &mut Vec<u32>,
+                              m: &search::Match,
+                              color: [f32; 4]| {
+                let r = m.line - top_abs;
+                if r < r_lo || r >= r_hi {
+                    return;
+                }
+                let from = m.start_col.min(cols.saturating_sub(1));
+                let to = m.end_col.min(cols.saturating_sub(1));
+                if from > to {
+                    return;
+                }
+                let sx = col_x(from);
+                let sw = (to - from + 1) as f32 * cell_w;
+                let sy = row_y(r) - bg_h - descender - strip_pad + row_scroll(r);
+                push_quad(
+                    vertices,
+                    indices,
+                    sx,
+                    sy,
+                    sw,
+                    line_height,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    color,
+                    [hl_radius; 4],
+                );
+            };
+            for (i, m) in self.search.matches.iter().enumerate() {
+                if i == self.search.current {
+                    continue; // drawn last, on top
+                }
+                emit_match(&mut vertices, &mut indices, m, all_color);
+            }
+            if let Some(cur) = self.search.current_match() {
+                emit_match(&mut vertices, &mut indices, &cur, cur_color);
+            }
+        }
+
         // 1c. OSC 133 prompt-status gutter. A short rounded vertical bar in
         //     the left window padding at each prompt's row, colored by the
         //     command's exit status — green for success, red for failure, and
@@ -3803,7 +4045,7 @@ impl State {
         // backdrop, a rounded box, an input line with a caret, then (in command
         // mode) a separator and the filtered, scrollable command rows.
         if self.command_palette.open {
-            use command_palette::{Mode, COMMANDS, PALETTE_MAX_VISIBLE};
+            use command_palette::{Mode, PALETTE_MAX_VISIBLE};
             let cp = &self.command_palette;
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
             let screen_w = self.gpu.config.width as f32;
@@ -3832,8 +4074,10 @@ impl State {
             let row_h = line_height;
             let sep_h = 1.0_f32;
 
-            // Visible slice of the filtered command list (command mode only).
-            let list_mode = matches!(cp.mode, Mode::Commands);
+            // Visible slice of the filtered list. Both command mode and the
+            // choose-a-value mode (e.g. the theme picker) show a list; only
+            // free-text argument mode hides it.
+            let list_mode = cp.has_list();
             let start = cp.scroll.min(cp.filtered.len());
             let end = (start + PALETTE_MAX_VISIBLE).min(cp.filtered.len());
             let n = if list_mode { end - start } else { 0 };
@@ -3876,11 +4120,14 @@ impl State {
             let text_x = box_x + cell_w;
             let max_text_x = box_x + box_w - cell_w;
 
-            // Input line: a prompt prefix, then the typed text. In argument mode
-            // the prefix names what's being entered (e.g. "Title: ").
+            // Input line: a prompt prefix, then the typed text. In argument /
+            // choose mode the prefix names what's being entered (e.g. "Title: ",
+            // "Theme: ").
             let prefix = match cp.mode {
                 Mode::Commands => "> ".to_string(),
-                Mode::Argument { prompt, .. } => format!("{prompt}: "),
+                Mode::Argument { prompt, .. } | Mode::Choose { prompt, .. } => {
+                    format!("{prompt}: ")
+                }
             };
             let input_top = box_y + pad_v;
             let input_text = format!("{prefix}{}", cp.input.value);
@@ -3950,8 +4197,12 @@ impl State {
                     );
                 }
 
-                // Command titles.
-                for (i, &cmd_idx) in cp.filtered[start..end].iter().enumerate() {
+                // Row labels: command titles in command mode, candidate values
+                // (e.g. theme names) in choose mode — `row_label` hides which.
+                for i in 0..n {
+                    let Some(label) = cp.row_label(start + i) else {
+                        continue;
+                    };
                     let row_top = list_top + i as f32 * row_h;
                     let baseline = row_top + bg_h + descender + strip_pad;
                     emit_text_run(
@@ -3960,7 +4211,7 @@ impl State {
                         &mut indices,
                         text_x,
                         baseline,
-                        COMMANDS[cmd_idx].title,
+                        label,
                         text_color,
                         atlas_w,
                         atlas_h,
@@ -3968,6 +4219,142 @@ impl State {
                         max_text_x,
                     );
                 }
+            }
+        }
+
+        // Find-in-scrollback overlay (Cmd-F). Same centered, palette-styled box:
+        // a dim backdrop, a rounded box, the "Find:" input line with a caret,
+        // and — once there's a query — a separator and a result counter
+        // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
+        if self.search.open {
+            let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+            let screen_w = self.gpu.config.width as f32;
+            let screen_h = self.gpu.config.height as f32;
+
+            // Dim the terminal behind the box.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                0.0,
+                0.0,
+                screen_w,
+                screen_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                premul([0.0, 0.0, 0.0], 0.45),
+                [0.0; 4],
+            );
+
+            let box_w = (screen_w * 0.6)
+                .clamp(cell_w * 24.0, cell_w * 72.0)
+                .min(screen_w - WINDOW_PADDING * 2.0);
+            let box_x = ((screen_w - box_w) * 0.5).round();
+            let box_y = (screen_h * 0.12).round();
+            let pad_v = (line_height * 0.45).round();
+            let row_h = line_height;
+            let sep_h = 1.0_f32;
+
+            let query = self.search.input.value.clone();
+            let status = if query.is_empty() {
+                String::new()
+            } else if self.search.matches.is_empty() {
+                "No results".to_string()
+            } else {
+                format!("{} / {}", self.search.current + 1, self.search.matches.len())
+            };
+            let has_status = !status.is_empty();
+
+            let total_h = pad_v * 2.0 + row_h + if has_status { sep_h + row_h } else { 0.0 };
+
+            let bg = pal.background;
+            let box_color = premul([bg[0] * 0.55, bg[1] * 0.55, bg[2] * 0.55], 0.96);
+            let fgc = pal.foreground;
+            let text_color = pal.foreground;
+            let caret_color = premul([fgc[0], fgc[1], fgc[2]], 0.9);
+            let radius = 8.0_f32;
+
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                box_x,
+                box_y,
+                box_w,
+                total_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                box_color,
+                [radius; 4],
+            );
+
+            let text_x = box_x + cell_w;
+            let max_text_x = box_x + box_w - cell_w;
+
+            // Input line: "Find: " prefix then the query.
+            let prefix = "Find: ";
+            let input_top = box_y + pad_v;
+            let input_text = format!("{prefix}{query}");
+            let baseline = input_top + bg_h + descender + strip_pad;
+            emit_text_run(
+                atlas,
+                &mut vertices,
+                &mut indices,
+                text_x,
+                baseline,
+                &input_text,
+                text_color,
+                atlas_w,
+                atlas_h,
+                cell_w,
+                max_text_x,
+            );
+
+            // Caret after the prefix + chars left of the cursor.
+            let caret_col = prefix.chars().count() + self.search.input.cursor_col();
+            let caret_x = text_x + caret_col as f32 * cell_w;
+            if caret_x + 2.0 <= max_text_x {
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    caret_x,
+                    input_top + strip_pad,
+                    2.0,
+                    bg_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    caret_color,
+                    [0.0; 4],
+                );
+            }
+
+            if has_status {
+                // Separator between the input and the counter.
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    box_x,
+                    input_top + row_h,
+                    box_w,
+                    sep_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    premul([fgc[0], fgc[1], fgc[2]], 0.18),
+                    [0.0; 4],
+                );
+                let status_top = input_top + row_h + sep_h;
+                let baseline = status_top + bg_h + descender + strip_pad;
+                emit_text_run(
+                    atlas,
+                    &mut vertices,
+                    &mut indices,
+                    text_x,
+                    baseline,
+                    &status,
+                    premul([fgc[0], fgc[1], fgc[2]], 0.7),
+                    atlas_w,
+                    atlas_h,
+                    cell_w,
+                    max_text_x,
+                );
             }
         }
 
@@ -4168,6 +4555,12 @@ impl State {
                     self.command_palette.close();
                     self.run_palette_action(action, arg);
                 }
+                Outcome::RequestChoices { action, prompt } => {
+                    // Only the host can enumerate the candidates; feed them back
+                    // so the palette can present a filtered picker.
+                    let choices = self.palette_choices(action);
+                    self.command_palette.enter_choose(action, prompt, choices);
+                }
                 Outcome::Close => self.command_palette.close(),
                 Outcome::Stay => {}
             },
@@ -4179,6 +4572,24 @@ impl State {
             Key::Named(NamedKey::ArrowRight) => self.command_palette.input.right(),
             Key::Named(NamedKey::Home) => self.command_palette.input.home(),
             Key::Named(NamedKey::End) => self.command_palette.input.end(),
+            // Ctrl-N / Ctrl-P mirror ArrowDown / ArrowUp so the selection can
+            // be moved without leaving the home row.
+            Key::Character(s)
+                if self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && s.eq_ignore_ascii_case("n") =>
+            {
+                self.command_palette.move_down()
+            }
+            Key::Character(s)
+                if self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && s.eq_ignore_ascii_case("p") =>
+            {
+                self.command_palette.move_up()
+            }
             _ => {
                 // Printable text: insert it, unless a Cmd/Ctrl/Alt chord is
                 // held (those aren't text input). winit hands us the composed
@@ -4201,6 +4612,145 @@ impl State {
         true
     }
 
+    /// Enumerate the candidate list for a pick-from-list palette command (one
+    /// with `choose: true`), answering [`Outcome::RequestChoices`]. Kept on the
+    /// host because the options come from outside the pure palette module — for
+    /// `SetTheme`, the schemes on disk.
+    fn palette_choices(&self, action: command_palette::PaletteAction) -> Vec<String> {
+        use command_palette::PaletteAction as A;
+        match action {
+            // All three theme pickers offer the same list: the on-disk schemes
+            // plus the synthetic "Default (built-in)" entry.
+            A::SetTheme | A::SetLightTheme | A::SetDarkTheme => {
+                theme_picker_choices(list_scheme_names())
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drive the find overlay from a key press while it's open. Always consumes
+    /// the event (returns `true`): like the palette, the overlay owns the
+    /// keyboard so nothing reaches the PTY. Cmd-F (open/close) is handled by the
+    /// caller before this. Enter / Down steps to the next match, Shift-Enter /
+    /// Up to the previous; editing the query re-runs the search live.
+    fn search_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                // Close but leave the viewport where it is, so the match the
+                // user found stays in view.
+                self.search.close();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if self.modifiers.shift_key() {
+                    self.search.prev();
+                } else {
+                    self.search.next();
+                }
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.search.next();
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.search.prev();
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.search.backspace();
+                self.run_search();
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.search.input.delete();
+                self.run_search();
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.search.input.left(),
+            Key::Named(NamedKey::ArrowRight) => self.search.input.right(),
+            Key::Named(NamedKey::Home) => self.search.input.home(),
+            Key::Named(NamedKey::End) => self.search.input.end(),
+            _ => {
+                // Printable text drives the query, unless a Cmd/Ctrl/Alt chord
+                // is held (those aren't text input). winit hands us composed
+                // text in `event.text`.
+                let plain = !self.modifiers.super_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key();
+                if plain {
+                    if let Some(text) = &event.text {
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                self.search.type_char(c);
+                            }
+                        }
+                    }
+                    self.run_search();
+                }
+            }
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Re-scan the whole buffer (scrollback + live grid) for the current query
+    /// and refresh the match list, then jump to the current match. An empty
+    /// query clears the matches. Called on every query edit.
+    fn run_search(&mut self) {
+        let query = self.search.input.value.clone();
+        if query.is_empty() {
+            self.search.set_matches(Vec::new());
+            self.invalidate();
+            return;
+        }
+        let case_sensitive = search::smart_case(&query);
+        let total = self.terminal.scrollback_len() + self.terminal.rows;
+        let mut matches = Vec::new();
+        for abs in 0..total as isize {
+            let Some(cells) = self.terminal.line_at(abs) else {
+                continue;
+            };
+            // One char per column. Drop trailing blanks so padding spaces don't
+            // bloat the scan; leading offsets stay intact so columns line up.
+            let last = cells
+                .iter()
+                .rposition(|c| c.ch != ' ')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if last == 0 {
+                continue;
+            }
+            let line: String = cells[..last].iter().map(|c| c.ch).collect();
+            for (start, end) in search::match_line(&line, &query, case_sensitive) {
+                matches.push(search::Match {
+                    line: abs,
+                    start_col: start,
+                    end_col: end,
+                });
+            }
+        }
+        self.search.set_matches(matches);
+        self.focus_current_match();
+    }
+
+    /// Scroll the viewport so the current match is visible, then redraw.
+    fn focus_current_match(&mut self) {
+        if let Some(m) = self.search.current_match() {
+            self.terminal.scroll_line_into_view(m.line);
+            self.scroll_y = 0.0;
+        }
+        self.invalidate();
+    }
+
+    /// This window's top-left in logical points, for handing to a child window
+    /// to cascade off (see [`spawn_new_window`]). `None` if the platform can't
+    /// report the position — the child then keeps the OS default spot.
+    fn window_origin(&self) -> Option<(f64, f64)> {
+        let phys = self.window.outer_position().ok()?;
+        let logical: winit::dpi::LogicalPosition<f64> =
+            phys.to_logical(self.window.scale_factor());
+        Some((logical.x, logical.y))
+    }
+
     /// Execute a command chosen in the palette. Every arm reuses behaviour that
     /// already exists elsewhere — the palette is a discoverable front end, not
     /// new functionality.
@@ -4219,6 +4769,36 @@ impl State {
                 .set_window_title(arg.as_deref().unwrap_or("")),
             A::ClearTitle => self.terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
+            // The picker hands back a label; map it to a scheme slot value
+            // ("Default (built-in)" / empty -> None, revert to built-in).
+            // "Set theme" is contextual: while following the system it assigns
+            // the slot for the current appearance, otherwise the single
+            // color_scheme.
+            A::SetTheme => {
+                let val = scheme_value_from_pick(arg);
+                if self.config.auto_theme {
+                    if self.system_is_dark() {
+                        self.config.dark_scheme = val;
+                    } else {
+                        self.config.light_scheme = val;
+                    }
+                } else {
+                    self.config.color_scheme = val;
+                }
+                self.persist_and_apply();
+            }
+            A::SetLightTheme => {
+                self.config.light_scheme = scheme_value_from_pick(arg);
+                self.persist_and_apply();
+            }
+            A::SetDarkTheme => {
+                self.config.dark_scheme = scheme_value_from_pick(arg);
+                self.persist_and_apply();
+            }
+            A::ToggleFollowSystem => {
+                self.config.auto_theme = !self.config.auto_theme;
+                self.persist_and_apply();
+            }
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
@@ -4229,6 +4809,7 @@ impl State {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
+            A::NewWindow => spawn_new_window(self.terminal.cwd(), self.window_origin()),
             // Re-arm first-run and relaunch into it. Each window owns a single
             // PTY (forked at startup, already attached to a shell), so there's
             // no in-place way to swap the running shell for onboarding —
@@ -4534,6 +5115,15 @@ impl State {
             || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
     }
 
+    /// Write the current in-memory config to disk and re-apply the scheme that
+    /// now matches it (and the system appearance). Used by the palette's theme
+    /// commands after they mutate a scheme slot or the follow-system flag, so
+    /// the change both persists and takes effect live.
+    fn persist_and_apply(&mut self) {
+        self.config.save();
+        self.apply_active_scheme();
+    }
+
     /// Re-read `~/.config/yutani/config` and re-install the color scheme,
     /// pushing palette-derived state into the GPU. Triggered by Cmd-Shift-R.
     ///
@@ -4542,9 +5132,27 @@ impl State {
     /// one-shot resources at startup — pipeline creation, font face
     /// objects, etc. — still need a restart.
     fn reload_config(&mut self) {
-        let new_config = Config::load();
-        install_color_scheme(new_config.color_scheme.as_deref());
-        self.config = new_config;
+        self.config = Config::load();
+        self.apply_active_scheme();
+    }
+
+    /// True when the OS is currently in dark mode, per winit's tracked window
+    /// theme (updated from `WindowEvent::ThemeChanged`). Defaults to light if
+    /// the platform doesn't report one.
+    fn system_is_dark(&self) -> bool {
+        self.window.theme() == Some(winit::window::Theme::Dark)
+    }
+
+    /// Install the color scheme that matches the current config and system
+    /// appearance (see [`Config::active_scheme`]), then push every
+    /// palette-derived value into the GPU and window chrome. Shared by config
+    /// reloads, the palette's theme commands, and live system-appearance
+    /// changes — anything that can change which scheme should be showing.
+    fn apply_active_scheme(&mut self) {
+        // Resolve to an owned name first so `self.config` isn't borrowed across
+        // the `self.*` mutations below.
+        let name = self.config.active_scheme(self.system_is_dark()).map(str::to_owned);
+        install_color_scheme(name.as_deref());
         self.refresh_palette_derived();
     }
 
@@ -6018,6 +6626,28 @@ impl State {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
+                    // Cmd-F toggles the find-in-scrollback overlay. Checked
+                    // first (and gated on !shift so it never fires for a
+                    // Cmd-Shift chord) so it both opens the overlay and, while
+                    // open, closes it before the overlay's key handler below
+                    // swallows the keystroke. Closing leaves the viewport where
+                    // it is so the found match stays in view.
+                    if self.modifiers.super_key()
+                        && !self.modifiers.shift_key()
+                        && !self.command_palette.open
+                    {
+                        if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                            if s.eq_ignore_ascii_case("f") {
+                                self.search.toggle();
+                                self.invalidate();
+                                return true;
+                            }
+                        }
+                    }
+                    // While the find overlay is open it owns the keyboard.
+                    if self.search.open {
+                        return self.search_key(&event);
+                    }
                     // Cmd-Shift-P toggles the command palette. Checked before
                     // everything else so it both opens the palette and, while
                     // it's open, closes it (the palette's own key handler below
@@ -6071,6 +6701,15 @@ impl State {
                             }
                             if s.eq_ignore_ascii_case("v") {
                                 self.paste_from_clipboard();
+                                return true;
+                            }
+                            // Cmd-N: launch a new Yutani window. It's a fresh
+                            // process (one window per process), opened in the
+                            // current shell's working directory. Guard on
+                            // !shift so Cmd-Shift-N stays free for a future
+                            // binding.
+                            if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
+                                spawn_new_window(self.terminal.cwd(), self.window_origin());
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -6838,8 +7477,164 @@ impl State {
     }
 }
 
+/// Everything `run()` needs to build the font stack, loaded as owned bytes /
+/// strings so it can be produced on a worker thread (a FreeType `Face` is not
+/// `Send`, but the raw font data is). The main thread turns this into FreeType
+/// faces + the rustybuzz shaper after the GPU has been brought up concurrently.
+struct FontData {
+    primary_name: String,
+    primary_data: Vec<u8>,
+    /// Bold / Italic / BoldItalic primary cuts that loaded, as
+    /// `(variant, bytes, face_index)`. Missing cuts are simply absent.
+    styled: Vec<(font::FaceVariant, Vec<u8>, isize)>,
+    /// Fallback faces that loaded, as `(label, family, variant, bytes,
+    /// face_index)`. Whether each is actually attached is decided on the main
+    /// thread (a styled fallback only attaches when its primary cut built).
+    fallbacks: Vec<(&'static str, String, font::FaceVariant, Vec<u8>, isize)>,
+}
+
+/// Resolve the primary family and load every font file the terminal needs —
+/// primary cut, its bold/italic/bold-italic cuts, and the fallback chain — in
+/// parallel. Pure data work (Core Text matching + file reads, all thread-safe
+/// and `Send`), so `run()` drives it on a worker thread while the GPU spins up
+/// on the main thread. Replaces what used to be ~250ms of sequential loading.
+fn load_font_data(config: &Config) -> FontData {
+    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
+        .monospace()
+        .build();
+    let mut mono_fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
+    mono_fonts.dedup();
+    let installed = font_loader::system_fonts::query_all();
+
+    // User override wins over the built-in preference list (exact name, then
+    // substring); a configured-but-missing family warns and falls through.
+    let configured_primary = config.font_family.as_deref().and_then(|want| {
+        let hit = installed
+            .iter()
+            .find(|f| f.as_str() == want)
+            .or_else(|| installed.iter().find(|f| f.contains(want)))
+            .cloned();
+        if hit.is_none() {
+            eprintln!(
+                "font: configured font_family {:?} not installed, falling back to defaults",
+                want,
+            );
+        }
+        hit
+    });
+    let primary_name = configured_primary.unwrap_or_else(|| {
+        ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
+            .iter()
+            .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
+            .expect("no monospace primary font found")
+            .clone()
+    });
+    println!("primary font: {}", primary_name);
+
+    let styled_specs = [
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ];
+
+    // Fallback chain — first installed family in each category wins. Same list
+    // and ordering as before; we only build the *job list* here, then load all
+    // jobs in parallel below.
+    let fallback_categories: &[(&str, &[&str])] = &[
+        ("nerd", &[
+            "Iosevka Nerd Font",
+            "FiraCode Nerd Font",
+            "JetBrainsMono Nerd Font",
+            "Hack Nerd Font",
+            "Symbols Nerd Font",
+        ]),
+        ("cjk", &[
+            "PingFang SC",
+            "Hiragino Sans",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+            "Sarasa Mono SC",
+        ]),
+        ("symbols", &[
+            "Apple Symbols",
+            "Symbola",
+            "Noto Sans Symbols 2",
+            "Noto Sans Symbols",
+        ]),
+        ("emoji", &["Noto Emoji"]),
+    ];
+    let variants_to_fill = [
+        (font::FaceVariant::Regular, false, false),
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ];
+    let mut fallback_jobs: Vec<(&'static str, String, font::FaceVariant, bool, bool)> = Vec::new();
+    for (label, candidates) in fallback_categories {
+        if let Some(family) = pick_family(&installed, candidates) {
+            for (variant, bold, italic) in variants_to_fill {
+                fallback_jobs.push((label, family.clone(), variant, bold, italic));
+            }
+        }
+    }
+
+    // Load primary, styled cuts, and every fallback file concurrently. Each is
+    // an independent Core Text match + file read; fanning them across threads
+    // turns the longest single load — not their sum — into the critical path.
+    // The scope borrows `primary_name`, so `FontData` is assembled only after
+    // the scope ends (all handles joined) and the borrow is released.
+    let (primary_data, styled, fallbacks) = std::thread::scope(|s| {
+        let primary_h =
+            s.spawn(|| load_family(&primary_name).expect("failed to load primary font"));
+        let styled_hs: Vec<_> = styled_specs
+            .iter()
+            .map(|&(v, b, i)| {
+                let name = &primary_name;
+                (v, s.spawn(move || load_family_styled(name, b, i)))
+            })
+            .collect();
+        let fallback_hs: Vec<_> = fallback_jobs
+            .iter()
+            .map(|job| {
+                let (label, v) = (job.0, job.2);
+                let (family, b, i) = (&job.1, job.3, job.4);
+                (label, family.clone(), v, s.spawn(move || load_family_styled(family, b, i)))
+            })
+            .collect();
+
+        let primary_data = primary_h.join().expect("primary font loader panicked");
+        let styled: Vec<_> = styled_hs
+            .into_iter()
+            .filter_map(|(v, h)| h.join().expect("styled loader panicked").map(|(d, i)| (v, d, i)))
+            .collect();
+        let fallbacks: Vec<_> = fallback_hs
+            .into_iter()
+            .filter_map(|(label, family, v, h)| {
+                h.join()
+                    .expect("fallback loader panicked")
+                    .map(|(d, i)| (label, family, v, d, i))
+            })
+            .collect();
+
+        (primary_data, styled, fallbacks)
+    });
+
+    FontData { primary_name, primary_data, styled, fallbacks }
+}
+
 async fn run() {
     env_logger::init();
+    // Startup phase timing, printed only when YUTANI_STARTUP_TIMING is set so
+    // the perf work stays reproducible without spamming every launch.
+    let t_start = std::time::Instant::now();
+    let timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
+    let lap = |label: &str| {
+        if timing {
+            eprintln!("[startup] {:>7.1}ms  {label}", t_start.elapsed().as_secs_f64() * 1000.0);
+        }
+    };
     let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event()
         .build()
         .unwrap();
@@ -6872,6 +7667,7 @@ async fn run() {
 
     // Fork before the window is created so we hold the master fd across setup.
     let pty = pty::fork_pty(fdm, child_program).expect("failed to fork pty");
+    lap("after fork_pty");
     std::thread::spawn(move || {
         let code = pty.run(|data| {
             let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
@@ -6892,187 +7688,98 @@ async fn run() {
     let initial_title = effective_title(None, initial_cwd.as_deref());
 
     let transparent = false; // needed because of a shadow bug
-    let window = WindowBuilder::new()
+    let mut window_builder = WindowBuilder::new()
         .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
         .with_decorations(true)
-        .with_blur(transparent)
-        .build(&event_loop)
-        .unwrap();
+        .with_blur(transparent);
+    // When spawned via Cmd-N the parent forwards its position; cascade off it
+    // so the new window steps down-and-right instead of stacking exactly atop.
+    if let Some(pos) = cascade_position() {
+        window_builder = window_builder.with_position(pos);
+    }
+    let window = window_builder.build(&event_loop).unwrap();
+    lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);
 
     let config = Config::load();
+    lap("after config load");
 
-    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
-        .monospace()
-        .build();
-    let mut mono_fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
-    mono_fonts.dedup();
-    let installed = font_loader::system_fonts::query_all();
+    // Load all font data on a worker thread while the GPU is brought up on
+    // this (main) thread. The two are independent until State::new needs both,
+    // so overlapping them hides whichever finishes first. Font work must hand
+    // back owned bytes (FreeType faces aren't Send); GPU/surface creation must
+    // stay on the main thread (Cocoa isn't thread-safe), hence this split.
+    let config_for_fonts = config.clone();
+    let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    // User override wins over the built-in preference list. Exact-name
-    // match first (so "Iosevka" doesn't pick "Iosevka Term" when the user
-    // typed the bare name), then substring as a forgiving fallback. We
-    // search the full `installed` list so users can opt into a
-    // proportional / display family if they want — monospace isn't
-    // enforced. A `Some(_)` value with no match warns and falls through
-    // to the default selection so a typo in the config doesn't take the
-    // terminal down.
-    let configured_primary = config.font_family.as_deref().and_then(|want| {
-        let hit = installed
-            .iter()
-            .find(|f| f.as_str() == want)
-            .or_else(|| installed.iter().find(|f| f.contains(want)))
-            .cloned();
-        if hit.is_none() {
-            eprintln!(
-                "font: configured font_family {:?} not installed, falling back to defaults",
-                want,
-            );
-        }
-        hit
-    });
+    let gpu = gpu::GpuContext::new(&window).await;
+    lap("after GpuContext::new (concurrent with font load)");
 
-    let primary_name = configured_primary.unwrap_or_else(|| {
-        ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
-            .iter()
-            .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
-            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
-            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
-            .expect("no monospace primary font found")
-            .clone()
-    });
-    println!("primary font: {}", primary_name);
-    let primary_data = load_family(&primary_name).expect("failed to load primary font");
+    let fd = font_handle.join().expect("font loader thread panicked");
+    lap("after font data loaded (joined)");
 
     // Install the color scheme before constructing State so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
-    // doesn't take the terminal down.
-    install_color_scheme(config.color_scheme.as_deref());
+    // doesn't take the terminal down. With `auto_theme` on, pick the slot for
+    // the OS's current appearance up front so we open in the right scheme.
+    // Touches the window, so it stays on the main thread (after the join).
+    let initial_dark = window.theme() == Some(winit::window::Theme::Dark);
+    install_color_scheme(config.active_scheme(initial_dark));
     // Match the NSAppearance to the palette so the title-bar text the OS
     // draws over our transparent chrome reads against the actual bg —
     // otherwise dark schemes render black "Yutani" text on a dark fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     set_native_window_bg(&window, palette::get().background);
+
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
-    // Build the rustybuzz shaper alongside the FreeType font. We keep one
-    // copy of the bytes for shaping (rustybuzz parses tables, doesn't
-    // rasterize) and hand the other to FreeType. Only primary cuts are
-    // shaped — fallbacks aren't asked to ligate.
+
+    // Turn the loaded bytes into FreeType faces + the rustybuzz shaper. This is
+    // the not-Send tail that has to run here. Regular comes from the primary
+    // lookup (face 0); the styled cuts carry their own TTC face index.
     let mut shaper = shaper::Shaper::new();
-    // Regular comes from the primary lookup (no traits requested) so
-    // it's almost always face 0 of whatever Core Text picks; passing
-    // 0 here is correct AND matches `Font::new`'s implicit behavior.
-    shaper.set_variant(font::FaceVariant::Regular, &primary_data, 0);
-    let mut font = font::Font::new(primary_data);
+    shaper.set_variant(font::FaceVariant::Regular, &fd.primary_data, 0);
+    let mut font = font::Font::new(fd.primary_data);
     font.set_char_size(pt_size, dpi);
 
-    // Bold/italic/bold-italic primary cuts of the same family. Each is best-
-    // effort: when a cut isn't installed the styled lookup falls back to the
-    // regular face. Cores like Iosevka ship all four; users without them get
-    // un-styled text rather than synthetic bolding/oblique.
-    //
-    // Iosevka and most large families pack multiple weight/italic cuts
-    // into a single TTC file, so the file Core Text hands us for the
-    // italic descriptor is usually the SAME file as the regular — just
-    // a different face index inside. `find_face_index` scans the TTC
-    // for the face whose style_flags match the requested variant. Pre-
-    // fix, both the FreeType and HarfBuzz loaders opened face 0 of the
-    // TTC, so italic and bold-italic silently rendered as regular.
-    for (variant, bold, italic) in [
-        (font::FaceVariant::Bold, true, false),
-        (font::FaceVariant::Italic, false, true),
-        (font::FaceVariant::BoldItalic, true, true),
-    ] {
-        let Some((data, face_index)) = load_family_styled(&primary_name, bold, italic) else {
-            continue;
-        };
+    for (variant, data, face_index) in fd.styled {
         shaper.set_variant(variant, &data, face_index as u32);
         if font.set_variant(variant, data, face_index, pt_size, dpi) {
-            println!("primary {:?}: {} (face index {})", variant, primary_name, face_index);
+            println!("primary {:?}: {} (face index {})", variant, fd.primary_name, face_index);
         }
     }
 
-    // Pre-shape every candidate ligature sequence for each installed
-    // variant. After this, the render loop only needs prefix-matching
-    // against a small per-variant table — no rustybuzz on the hot path.
+    // Pre-shape every candidate ligature sequence for each installed variant.
     for variant in font::FaceVariant::ALL {
         shaper.precompute(variant);
     }
 
-    // Fallback chain. Each entry is a list of candidate family substrings; the
-    // first installed family wins. Order matters — earlier fallbacks shadow
-    // later ones for any glyph they share.
-    let fallback_categories: &[(&str, &[&str])] = &[
-        // Nerd Font icons (Powerline, Devicons, Font Awesome, …) in the PUA.
-        ("nerd", &[
-            "Iosevka Nerd Font",
-            "FiraCode Nerd Font",
-            "JetBrainsMono Nerd Font",
-            "Hack Nerd Font",
-            "Symbols Nerd Font",
-        ]),
-        // CJK ideographs and kana.
-        ("cjk", &[
-            "PingFang SC",
-            "Hiragino Sans",
-            "Noto Sans CJK SC",
-            "Noto Sans CJK JP",
-            "Sarasa Mono SC",
-        ]),
-        // Long-tail symbols, math, dingbats, geometric shapes.
-        ("symbols", &[
-            "Apple Symbols",
-            "Symbola",
-            "Noto Sans Symbols 2",
-            "Noto Sans Symbols",
-        ]),
-        // Monochrome emoji. (Apple Color Emoji is bitmap-only and currently
-        // unsupported by our atlas pipeline, so we deliberately skip it.)
-        ("emoji", &["Noto Emoji"]),
-    ];
-    // For each fallback category, attach the matching cut to every variant we
-    // managed to install a primary for. A bold CJK glyph still wants the bold
-    // CJK fallback; if no styled CJK is installed, the styled variant is left
-    // without that fallback and Atlas::lookup tumbles down to Regular.
-    let variants_to_fill = [
-        (font::FaceVariant::Regular, false, false),
-        (font::FaceVariant::Bold, true, false),
-        (font::FaceVariant::Italic, false, true),
-        (font::FaceVariant::BoldItalic, true, true),
-    ];
-    for (label, candidates) in fallback_categories {
-        let Some(family) = pick_family(&installed, candidates) else {
+    // Attach the fallback faces. A styled fallback only attaches when its
+    // primary cut actually built (same guard as before — otherwise the chain
+    // is dead weight and Atlas::lookup tumbles to Regular anyway).
+    for (label, family, variant, data, face_index) in fd.fallbacks {
+        if variant != font::FaceVariant::Regular
+            && font.variants[variant as usize].face.is_none()
+        {
             continue;
-        };
-        for (variant, bold, italic) in variants_to_fill {
-            // Regular has no installed primary check — Font::new always
-            // populates it. Styled variants only get fallbacks when their
-            // primary face is installed; otherwise the chain is dead weight.
-            if variant != font::FaceVariant::Regular
-                && font.variants[variant as usize].face.is_none()
-            {
-                continue;
-            }
-            let Some((data, face_index)) = load_family_styled(&family, bold, italic) else {
-                continue;
-            };
-            if font.add_fallback(variant, data, face_index, pt_size, dpi) {
-                println!(
-                    "fallback {} {:?}: {} (face index {})",
-                    label, variant, family, face_index,
-                );
-            }
+        }
+        if font.add_fallback(variant, data, face_index, pt_size, dpi) {
+            println!(
+                "fallback {} {:?}: {} (face index {})",
+                label, variant, family, face_index,
+            );
         }
     }
 
-    let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
+    lap("after font faces + shaper built");
+    let mut state = State::new(fdm, window, gpu, font, shaper, config, dpi).await;
+    lap("after State::new (GPU/atlas/pipelines)");
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     // Size the chrome band to the real native title bar now that the window
     // exists; the field was seeded with the renderer's reserve in State::new.
@@ -7097,6 +7804,7 @@ async fn run() {
     // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
     // at which point we fall back to the cwd.
     let mut manual_title: Option<String> = None;
+    let mut first_frame_done = false;
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
@@ -7201,8 +7909,16 @@ async fn run() {
                     match event {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
-                            state.sync_theme_colors();
-                            state.invalidate();
+                            // Following the system appearance? Swap to the
+                            // scheme slot for the new mode. Otherwise just keep
+                            // the OSC color reports in sync as before — the
+                            // active scheme doesn't track the OS.
+                            if state.config.auto_theme {
+                                state.apply_active_scheme();
+                            } else {
+                                state.sync_theme_colors();
+                                state.invalidate();
+                            }
                         }
                         WindowEvent::CloseRequested => {
                             elwt.exit();
@@ -7224,6 +7940,12 @@ async fn run() {
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
+                            if !first_frame_done {
+                                first_frame_done = true;
+                                if timing {
+                                    eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                                }
+                            }
                             match result {
                                 Ok((surface_wait, fast)) => {
                                     state.perf.note_render(render_dur, surface_wait, fast);
@@ -8782,6 +9504,184 @@ mod tests {
         // installing the empty name (which would resolve to a missing file).
         let parsed = Config::parse_str("color_scheme = \"\"\n");
         assert!(parsed.color_scheme.is_none());
+    }
+
+    #[test]
+    fn theme_picker_prepends_default_entry() {
+        // The synthetic default entry leads, then the real schemes follow in
+        // the order given.
+        let choices = theme_picker_choices(vec![
+            "nostromo".to_string(),
+            "spacedust".to_string(),
+        ]);
+        assert_eq!(
+            choices,
+            vec![
+                DEFAULT_THEME_LABEL.to_string(),
+                "nostromo".to_string(),
+                "spacedust".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_picker_with_no_schemes_still_offers_default() {
+        // Even with an empty schemes directory, you can always revert to
+        // built-in defaults from the picker.
+        assert_eq!(theme_picker_choices(Vec::new()), vec![DEFAULT_THEME_LABEL.to_string()]);
+    }
+
+    #[test]
+    fn theme_picker_drops_scheme_colliding_with_default_label() {
+        // A real scheme that happens to match the synthetic label is filtered
+        // out so the default entry stays unambiguous (appears exactly once).
+        let choices = theme_picker_choices(vec![
+            DEFAULT_THEME_LABEL.to_string(),
+            "yutani".to_string(),
+        ]);
+        assert_eq!(
+            choices,
+            vec![DEFAULT_THEME_LABEL.to_string(), "yutani".to_string()]
+        );
+    }
+
+    #[test]
+    fn scheme_for_pick_maps_default_label_to_none() {
+        assert_eq!(scheme_for_pick(DEFAULT_THEME_LABEL), None);
+        assert_eq!(scheme_for_pick("yutani"), Some("yutani"));
+        // A real name is returned verbatim, including ones with spaces.
+        assert_eq!(scheme_for_pick("My Theme"), Some("My Theme"));
+    }
+
+    #[test]
+    fn scheme_value_from_pick_clears_on_default_or_empty() {
+        // The default label, an empty pick, and whitespace all clear the slot.
+        assert_eq!(scheme_value_from_pick(Some(DEFAULT_THEME_LABEL.to_string())), None);
+        assert_eq!(scheme_value_from_pick(Some(String::new())), None);
+        assert_eq!(scheme_value_from_pick(Some("   ".to_string())), None);
+        assert_eq!(scheme_value_from_pick(None), None);
+        // A real name is trimmed and stored.
+        assert_eq!(
+            scheme_value_from_pick(Some("  yutani ".to_string())),
+            Some("yutani".to_string())
+        );
+    }
+
+    #[test]
+    fn active_scheme_uses_color_scheme_when_not_following() {
+        let mut c = Config::defaults();
+        c.auto_theme = false;
+        c.color_scheme = Some("nostromo".to_string());
+        c.light_scheme = Some("light-one".to_string());
+        c.dark_scheme = Some("dark-one".to_string());
+        // System appearance is ignored when not following.
+        assert_eq!(c.active_scheme(false), Some("nostromo"));
+        assert_eq!(c.active_scheme(true), Some("nostromo"));
+    }
+
+    #[test]
+    fn active_scheme_unset_color_scheme_is_none_when_not_following() {
+        let c = Config::defaults(); // auto_theme false, all schemes None
+        assert_eq!(c.active_scheme(false), None);
+        assert_eq!(c.active_scheme(true), None);
+    }
+
+    #[test]
+    fn active_scheme_picks_slot_by_appearance_when_following() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        assert_eq!(c.active_scheme(false), Some("daytime"));
+        assert_eq!(c.active_scheme(true), Some("midnight"));
+    }
+
+    #[test]
+    fn active_scheme_following_falls_back_to_color_scheme_then_none() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.color_scheme = Some("fallback".to_string());
+        // dark_scheme set, light_scheme unset: dark uses its slot, light falls
+        // back to color_scheme.
+        c.dark_scheme = Some("midnight".to_string());
+        assert_eq!(c.active_scheme(true), Some("midnight"));
+        assert_eq!(c.active_scheme(false), Some("fallback"));
+        // With no slots and no color_scheme, it's None (built-in defaults).
+        c.color_scheme = None;
+        c.dark_scheme = None;
+        assert_eq!(c.active_scheme(true), None);
+        assert_eq!(c.active_scheme(false), None);
+    }
+
+    #[test]
+    fn config_auto_theme_fields_round_trip() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.auto_theme);
+        assert_eq!(parsed.light_scheme.as_deref(), Some("daytime"));
+        assert_eq!(parsed.dark_scheme.as_deref(), Some("midnight"));
+    }
+
+    #[test]
+    fn config_auto_theme_defaults_off_with_unset_slots() {
+        let d = Config::defaults();
+        assert!(!d.auto_theme);
+        assert!(d.light_scheme.is_none());
+        assert!(d.dark_scheme.is_none());
+        // A round trip of defaults preserves that.
+        let parsed = Config::parse_str(&d.serialize());
+        assert!(!parsed.auto_theme);
+        assert!(parsed.light_scheme.is_none());
+        assert!(parsed.dark_scheme.is_none());
+    }
+
+    #[test]
+    fn config_light_dark_scheme_empty_parses_as_none() {
+        // Explicit empty strings clear the slots, same as color_scheme.
+        let parsed = Config::parse_str("light_scheme = \"\"\ndark_scheme = \"\"\n");
+        assert!(parsed.light_scheme.is_none());
+        assert!(parsed.dark_scheme.is_none());
+    }
+
+    #[test]
+    fn config_all_theme_fields_round_trip_then_active_scheme_resolves() {
+        // Every existing round-trip leaves `color_scheme` None or sets only a
+        // subset. This is the realistic "user configured everything" state:
+        // an explicit `color_scheme` fallback PLUS auto_theme on with both
+        // slots filled. It guards against the serializer emitting one theme
+        // key in a way that clobbers another, and confirms that after a full
+        // serialize -> parse cycle `active_scheme` still selects the slot by
+        // appearance (not the color_scheme fallback) in each direction.
+        let mut c = Config::defaults();
+        c.color_scheme = Some("nostromo".to_string());
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.color_scheme.as_deref(), Some("nostromo"));
+        assert!(parsed.auto_theme);
+        assert_eq!(parsed.light_scheme.as_deref(), Some("daytime"));
+        assert_eq!(parsed.dark_scheme.as_deref(), Some("midnight"));
+        // Slots win over the color_scheme fallback, per appearance.
+        assert_eq!(parsed.active_scheme(false), Some("daytime"));
+        assert_eq!(parsed.active_scheme(true), Some("midnight"));
+    }
+
+    #[test]
+    fn active_scheme_following_each_slot_falls_back_independently() {
+        // The existing fallback test covers dark-set / light-unset. This pins
+        // the mirror case (light-set / dark-unset) so neither branch of the
+        // `if dark` slot selection silently reads the wrong field: the unset
+        // direction falls back to color_scheme while the set one keeps its slot.
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.color_scheme = Some("fallback".to_string());
+        c.light_scheme = Some("daytime".to_string());
+        assert_eq!(c.active_scheme(false), Some("daytime"));
+        assert_eq!(c.active_scheme(true), Some("fallback"));
     }
 
     #[test]

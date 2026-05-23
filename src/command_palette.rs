@@ -28,6 +28,19 @@ pub enum PaletteAction {
     ClearTitle,
     /// Re-read the config file and swap the color scheme live.
     ReloadConfig,
+    /// Switch the active color scheme. When following the system appearance is
+    /// off, this sets the single `color_scheme`; when on, it assigns the slot
+    /// for the current appearance (light or dark). Picks from the scheme list.
+    SetTheme,
+    /// Assign the scheme used in system *light* mode (`light_scheme`). Picks
+    /// from the scheme list.
+    SetLightTheme,
+    /// Assign the scheme used in system *dark* mode (`dark_scheme`). Picks from
+    /// the scheme list.
+    SetDarkTheme,
+    /// Toggle following the system light/dark appearance (`auto_theme`), then
+    /// apply the scheme that now matches.
+    ToggleFollowSystem,
     /// Increase / decrease the font size by one point.
     ZoomIn,
     ZoomOut,
@@ -35,6 +48,8 @@ pub enum PaletteAction {
     ToggleWireframe,
     /// Select + copy the last completed command's output (OSC 133).
     CopyLastOutput,
+    /// Open a new Yutani window (a fresh process) in the current working dir.
+    NewWindow,
     /// Re-run the first-time setup: re-arm the onboarding marker and relaunch
     /// Yutani so it boots into onboarding-in-PTY exactly like a real first run.
     RunOnboarding,
@@ -46,10 +61,20 @@ pub struct Command {
     pub title: &'static str,
     /// The behaviour this entry triggers.
     pub action: PaletteAction,
-    /// `Some(prompt)` if the command needs a text argument before it can run
+    /// `Some(prompt)` if the command needs an argument before it can run
     /// (e.g. the title for `SetTitle`). Selecting such a command switches the
-    /// palette into [`Mode::Argument`] rather than running immediately.
+    /// palette into [`Mode::Argument`] / [`Mode::Choose`] rather than running
+    /// immediately.
     pub arg_prompt: Option<&'static str>,
+    /// When set, the argument isn't typed freely — it's picked from a list the
+    /// host supplies at selection time (e.g. the available color schemes for
+    /// `SetTheme`). Selecting the command emits [`Outcome::RequestChoices`]; the
+    /// host enumerates the options and calls [`CommandPalette::enter_choose`],
+    /// which drops the palette into [`Mode::Choose`] — a fuzzy-filtered picker
+    /// over that list. This is what gives such commands autocomplete (the same
+    /// matcher the command list uses) and validation (you can only pick an entry
+    /// that exists). Requires `arg_prompt` to be `Some`.
+    pub choose: bool,
 }
 
 /// The static command registry. Order here is the tiebreak order when several
@@ -59,41 +84,79 @@ pub const COMMANDS: &[Command] = &[
         title: "Set title",
         action: PaletteAction::SetTitle,
         arg_prompt: Some("Title"),
+        choose: false,
     },
     Command {
         title: "Clear title",
         action: PaletteAction::ClearTitle,
         arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Reload config",
         action: PaletteAction::ReloadConfig,
         arg_prompt: None,
+        choose: false,
+    },
+    Command {
+        title: "Set theme",
+        action: PaletteAction::SetTheme,
+        arg_prompt: Some("Theme"),
+        choose: true,
+    },
+    Command {
+        title: "Set light theme",
+        action: PaletteAction::SetLightTheme,
+        arg_prompt: Some("Light theme"),
+        choose: true,
+    },
+    Command {
+        title: "Set dark theme",
+        action: PaletteAction::SetDarkTheme,
+        arg_prompt: Some("Dark theme"),
+        choose: true,
+    },
+    Command {
+        title: "Toggle follow system appearance",
+        action: PaletteAction::ToggleFollowSystem,
+        arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Zoom in",
         action: PaletteAction::ZoomIn,
         arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Zoom out",
         action: PaletteAction::ZoomOut,
         arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Toggle wireframe",
         action: PaletteAction::ToggleWireframe,
         arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Copy last output",
         action: PaletteAction::CopyLastOutput,
         arg_prompt: None,
+        choose: false,
+    },
+    Command {
+        title: "New window",
+        action: PaletteAction::NewWindow,
+        arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Run first-time setup…",
         action: PaletteAction::RunOnboarding,
         arg_prompt: None,
+        choose: false,
     },
 ];
 
@@ -241,14 +304,35 @@ pub fn filter(query: &str) -> Vec<usize> {
     scored.into_iter().map(|(i, _)| i).collect()
 }
 
+/// Indices into `choices` that match `query`, best match first — the same
+/// scoring as [`filter`], but over a host-supplied list of strings (the
+/// [`Mode::Choose`] picker). Ties keep the list's original order.
+pub fn filter_choices(choices: &[String], query: &str) -> Vec<usize> {
+    let mut scored: Vec<(usize, i32)> = choices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| fuzzy_score(s, query).map(|sc| (i, sc)))
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1)); // stable: equal scores keep order
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
 /// Whether the palette is browsing commands or collecting an argument for one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// Typing into the search field, filtering the command list.
     Commands,
-    /// A command needing an argument was chosen; the input now collects that
-    /// argument and Enter runs `action` with it.
+    /// A command needing a free-text argument was chosen; the input now collects
+    /// that argument and Enter runs `action` with it.
     Argument {
+        action: PaletteAction,
+        prompt: &'static str,
+    },
+    /// A `choose` command was chosen and the host supplied its candidate list
+    /// (see [`CommandPalette::enter_choose`]). The input now fuzzy-filters
+    /// `choices`; Enter runs `action` with the highlighted entry. Unlike
+    /// [`Mode::Argument`], the result is constrained to an existing entry.
+    Choose {
         action: PaletteAction,
         prompt: &'static str,
     },
@@ -273,6 +357,14 @@ pub enum Outcome {
         action: PaletteAction,
         arg: Option<String>,
     },
+    /// A `choose` command was selected: the host must enumerate the candidate
+    /// list for `action` and hand it back via [`CommandPalette::enter_choose`].
+    /// The palette stays open. Kept separate from `Run` because only the host
+    /// can read the choices (e.g. the schemes directory) — this module is pure.
+    RequestChoices {
+        action: PaletteAction,
+        prompt: &'static str,
+    },
 }
 
 /// The full palette state: open flag, the input field, current mode, the
@@ -282,9 +374,12 @@ pub struct CommandPalette {
     pub open: bool,
     pub input: TextField,
     pub mode: Mode,
-    /// Indices into [`COMMANDS`], in display order. Only meaningful in
-    /// [`Mode::Commands`]; empty in [`Mode::Argument`].
+    /// In [`Mode::Commands`], indices into [`COMMANDS`]; in [`Mode::Choose`],
+    /// indices into [`Self::choices`]. Empty in [`Mode::Argument`] (no list).
     pub filtered: Vec<usize>,
+    /// The host-supplied candidate list backing [`Mode::Choose`]. Empty in every
+    /// other mode. `filtered` indexes into this while choosing.
+    pub choices: Vec<String>,
     /// Selected row within `filtered`.
     pub selected: usize,
     /// First visible row when `filtered` exceeds [`PALETTE_MAX_VISIBLE`].
@@ -307,6 +402,7 @@ impl CommandPalette {
         self.input.clear();
         self.mode = Mode::Commands;
         self.filtered.clear();
+        self.choices.clear();
         self.selected = 0;
         self.scroll = 0;
     }
@@ -319,14 +415,33 @@ impl CommandPalette {
         }
     }
 
+    /// Drop into [`Mode::Choose`] over the host-supplied `choices`, fuzzy-filtered
+    /// by what the user types. Called by the host in response to
+    /// [`Outcome::RequestChoices`], once it has enumerated the candidates.
+    pub fn enter_choose(
+        &mut self,
+        action: PaletteAction,
+        prompt: &'static str,
+        choices: Vec<String>,
+    ) {
+        self.mode = Mode::Choose { action, prompt };
+        self.choices = choices;
+        self.input.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        self.refilter();
+    }
+
     /// Recompute `filtered` from the current query and keep the selection in
-    /// range. No-op (and leaves `filtered` empty) in argument mode, where there
-    /// is no list.
+    /// range. Filters [`COMMANDS`] in command mode and [`Self::choices`] in
+    /// choose mode. No-op (and leaves `filtered` empty) in argument mode, where
+    /// there is no list.
     pub fn refilter(&mut self) {
-        if !matches!(self.mode, Mode::Commands) {
-            return;
-        }
-        self.filtered = filter(&self.input.value);
+        self.filtered = match self.mode {
+            Mode::Commands => filter(&self.input.value),
+            Mode::Choose { .. } => filter_choices(&self.choices, &self.input.value),
+            Mode::Argument { .. } => return,
+        };
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
         }
@@ -356,29 +471,51 @@ impl CommandPalette {
     pub fn selected_command(&self) -> Option<&'static Command> {
         match self.mode {
             Mode::Commands => self.filtered.get(self.selected).map(|&i| &COMMANDS[i]),
+            Mode::Argument { .. } | Mode::Choose { .. } => None,
+        }
+    }
+
+    /// The label for the `i`th *visible* row (an index into `filtered`): a
+    /// command title in command mode, a candidate string in choose mode. Used by
+    /// the renderer so it doesn't need to know which list backs the current mode.
+    pub fn row_label(&self, visible_index: usize) -> Option<&str> {
+        let &idx = self.filtered.get(visible_index)?;
+        match self.mode {
+            Mode::Commands => Some(COMMANDS[idx].title),
+            Mode::Choose { .. } => self.choices.get(idx).map(String::as_str),
             Mode::Argument { .. } => None,
         }
     }
 
-    /// Handle Enter. In commands mode this either enters argument mode (for a
-    /// command that needs one) and returns [`Outcome::Stay`], or returns an
-    /// [`Outcome::Run`] to execute immediately. In argument mode it returns a
-    /// `Run` carrying the typed argument.
+    /// True when the current mode shows a scrollable result list (command or
+    /// choose mode), as opposed to argument mode's bare input line.
+    pub fn has_list(&self) -> bool {
+        !matches!(self.mode, Mode::Argument { .. })
+    }
+
+    /// Handle Enter. In commands mode this runs an immediate command, enters
+    /// argument mode (free-text commands), or emits [`Outcome::RequestChoices`]
+    /// (pick-from-list commands). In argument mode it returns a `Run` carrying
+    /// the typed text; in choose mode, a `Run` carrying the highlighted entry.
     pub fn accept(&mut self) -> Outcome {
         match self.mode {
             Mode::Commands => {
                 let Some(cmd) = self.selected_command() else {
                     return Outcome::Stay; // empty list — nothing to run
                 };
-                match cmd.arg_prompt {
-                    Some(prompt) => {
+                match (cmd.arg_prompt, cmd.choose) {
+                    (Some(prompt), true) => Outcome::RequestChoices {
+                        action: cmd.action,
+                        prompt,
+                    },
+                    (Some(prompt), false) => {
                         let action = cmd.action;
                         self.mode = Mode::Argument { action, prompt };
                         self.input.clear();
                         self.filtered.clear();
                         Outcome::Stay
                     }
-                    None => Outcome::Run {
+                    (None, _) => Outcome::Run {
                         action: cmd.action,
                         arg: None,
                     },
@@ -388,16 +525,26 @@ impl CommandPalette {
                 action,
                 arg: Some(self.input.value.clone()),
             },
+            Mode::Choose { action, .. } => match self.filtered.get(self.selected) {
+                // Validation falls out of the closed list: only an existing
+                // candidate can be selected. An empty/unmatched list runs nothing.
+                Some(&i) => Outcome::Run {
+                    action,
+                    arg: Some(self.choices[i].clone()),
+                },
+                None => Outcome::Stay,
+            },
         }
     }
 
-    /// Handle Escape. From argument mode it backs out to the command list;
-    /// from the command list it closes the palette.
+    /// Handle Escape. From argument or choose mode it backs out to the command
+    /// list; from the command list it closes the palette.
     pub fn escape(&mut self) -> Outcome {
         match self.mode {
-            Mode::Argument { .. } => {
+            Mode::Argument { .. } | Mode::Choose { .. } => {
                 self.mode = Mode::Commands;
                 self.input.clear();
+                self.choices.clear();
                 self.selected = 0;
                 self.scroll = 0;
                 self.refilter();
@@ -549,6 +696,178 @@ mod tests {
                 arg: Some("build server".into())
             }
         );
+    }
+
+    #[test]
+    fn set_theme_command_is_registered_as_a_chooser() {
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| matches!(c.action, PaletteAction::SetTheme))
+            .expect("Set theme command should be in COMMANDS");
+        assert_eq!(cmd.title, "Set theme");
+        // It picks from a host-supplied list, so it carries a prompt and the
+        // `choose` flag rather than being a free-text or immediate command.
+        assert_eq!(cmd.arg_prompt, Some("Theme"));
+        assert!(cmd.choose);
+    }
+
+    #[test]
+    fn filter_surfaces_set_theme() {
+        for query in ["set theme", "theme"] {
+            let res = filter(query);
+            let titles: Vec<&str> = res.iter().map(|&i| COMMANDS[i].title).collect();
+            assert!(
+                titles.contains(&"Set theme"),
+                "query {query:?} should surface \"Set theme\"; got {titles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn light_and_dark_theme_commands_are_choosers() {
+        for (action, title, prompt) in [
+            (PaletteAction::SetLightTheme, "Set light theme", "Light theme"),
+            (PaletteAction::SetDarkTheme, "Set dark theme", "Dark theme"),
+        ] {
+            let cmd = COMMANDS
+                .iter()
+                .find(|c| c.action == action)
+                .expect("light/dark theme command should be registered");
+            assert_eq!(cmd.title, title);
+            assert_eq!(cmd.arg_prompt, Some(prompt));
+            assert!(cmd.choose, "{title} should pick from the scheme list");
+        }
+    }
+
+    #[test]
+    fn toggle_follow_system_is_an_immediate_command() {
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.action == PaletteAction::ToggleFollowSystem)
+            .expect("Toggle follow system command should be registered");
+        // No prompt, not a chooser: selecting it runs straight away.
+        assert_eq!(cmd.arg_prompt, None);
+        assert!(!cmd.choose);
+    }
+
+    #[test]
+    fn accept_toggle_follow_system_runs_immediately() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "follow system".into();
+        p.refilter();
+        assert_eq!(
+            p.accept(),
+            Outcome::Run {
+                action: PaletteAction::ToggleFollowSystem,
+                arg: None,
+            }
+        );
+    }
+
+    #[test]
+    fn accept_set_dark_theme_requests_choices_with_its_prompt() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set dark theme".into();
+        p.refilter();
+        assert_eq!(
+            p.accept(),
+            Outcome::RequestChoices {
+                action: PaletteAction::SetDarkTheme,
+                prompt: "Dark theme",
+            }
+        );
+    }
+
+    /// Selecting a `choose` command asks the host for candidates rather than
+    /// running or entering free-text mode.
+    #[test]
+    fn accept_set_theme_requests_choices() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set theme".into();
+        p.refilter();
+        assert_eq!(
+            p.accept(),
+            Outcome::RequestChoices {
+                action: PaletteAction::SetTheme,
+                prompt: "Theme",
+            }
+        );
+        // The palette doesn't change mode on its own — it waits for the host to
+        // supply the list via `enter_choose`.
+        assert_eq!(p.mode, Mode::Commands);
+    }
+
+    /// The full picker flow: request choices, host installs them, the user
+    /// fuzzy-filters and selects an existing entry, which runs with that value.
+    #[test]
+    fn enter_choose_then_filter_and_select_runs_with_chosen_value() {
+        let mut p = CommandPalette::default();
+        p.open();
+        let choices = vec![
+            "nostromo".to_string(),
+            "spacedust".to_string(),
+            "yutani".to_string(),
+        ];
+        p.enter_choose(PaletteAction::SetTheme, "Theme", choices);
+        assert!(matches!(p.mode, Mode::Choose { .. }));
+        // All candidates listed initially, in supplied order.
+        assert_eq!(p.filtered.len(), 3);
+        assert_eq!(p.row_label(0), Some("nostromo"));
+        // Fuzzy-type to narrow to "spacedust".
+        for c in "space".chars() {
+            p.type_char(c);
+        }
+        assert_eq!(p.filtered.len(), 1);
+        assert_eq!(p.row_label(0), Some("spacedust"));
+        assert_eq!(
+            p.accept(),
+            Outcome::Run {
+                action: PaletteAction::SetTheme,
+                arg: Some("spacedust".into())
+            }
+        );
+    }
+
+    /// Validation: with no candidate matching the query (or an empty list), the
+    /// picker has nothing to select, so Enter is a no-op rather than running with
+    /// an invalid name.
+    #[test]
+    fn choose_with_no_match_runs_nothing() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.enter_choose(
+            PaletteAction::SetTheme,
+            "Theme",
+            vec!["nostromo".to_string(), "yutani".to_string()],
+        );
+        for c in "zzzz".chars() {
+            p.type_char(c);
+        }
+        assert!(p.filtered.is_empty());
+        assert_eq!(p.accept(), Outcome::Stay);
+
+        // Likewise when the host supplied no candidates at all.
+        p.enter_choose(PaletteAction::SetTheme, "Theme", Vec::new());
+        assert!(p.filtered.is_empty());
+        assert_eq!(p.accept(), Outcome::Stay);
+    }
+
+    /// Escape from the picker backs out to the command list (and clears the
+    /// candidate list), mirroring argument mode.
+    #[test]
+    fn escape_backs_out_of_choose_then_closes() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.enter_choose(PaletteAction::SetTheme, "Theme", vec!["yutani".to_string()]);
+        assert!(matches!(p.mode, Mode::Choose { .. }));
+        assert_eq!(p.escape(), Outcome::Stay);
+        assert_eq!(p.mode, Mode::Commands);
+        assert!(p.choices.is_empty());
+        // Back in the command list, Escape now closes.
+        assert_eq!(p.escape(), Outcome::Close);
     }
 
     #[test]
@@ -832,6 +1151,46 @@ mod tests {
         assert_eq!(p.scroll, 0);
     }
 
+    // ----- New window command registry entry -----
+
+    #[test]
+    fn new_window_command_is_registered() {
+        // The "New window" command must exist in the registry and map to the
+        // NewWindow action.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.title == "New window")
+            .expect("New window command should be registered");
+        assert_eq!(cmd.action, PaletteAction::NewWindow);
+    }
+
+    #[test]
+    fn new_window_runs_immediately_without_argument() {
+        // No arg_prompt means selecting it runs right away rather than entering
+        // argument mode.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.action == PaletteAction::NewWindow)
+            .unwrap();
+        assert_eq!(cmd.arg_prompt, None);
+    }
+
+    #[test]
+    fn new_window_is_discoverable_via_filter() {
+        let new_window_idx = COMMANDS
+            .iter()
+            .position(|c| c.action == PaletteAction::NewWindow)
+            .unwrap();
+        // Both the full title and a prefix should surface the command.
+        for query in ["new window", "new"] {
+            let res = filter(query);
+            assert!(
+                res.contains(&new_window_idx),
+                "query {query:?} should match the New window command"
+            );
+        }
+    }
+
     #[test]
     fn scroll_offset_advances_past_max_visible() {
         // The static registry is shorter than PALETTE_MAX_VISIBLE, so drive the
@@ -856,5 +1215,209 @@ mod tests {
         // Selected stays within the visible window [scroll, scroll+max).
         assert!(p.selected >= p.scroll);
         assert!(p.selected < p.scroll + PALETTE_MAX_VISIBLE);
+    }
+
+    // ----- filter_choices: scoring over a host-supplied string list -----
+
+    #[test]
+    fn filter_choices_ranks_relevant_first() {
+        let choices = vec![
+            "nostromo".to_string(),
+            "spacedust".to_string(),
+            "yutani".to_string(),
+        ];
+        // A query that is a contiguous substring of exactly one entry should
+        // surface that entry; a stronger (more boundary-aligned) match for a
+        // query should outrank a scattered subsequence match. "ut" is a tight
+        // run inside "yutani" but only a scattered subsequence of "nostromo"
+        // ("...t..." after) — check the better match leads.
+        let res = filter_choices(&choices, "yutani");
+        assert!(!res.is_empty());
+        assert_eq!(res[0], 2, "exact \"yutani\" should rank first");
+    }
+
+    #[test]
+    fn filter_choices_empty_query_keeps_original_order() {
+        let choices = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
+        let res = filter_choices(&choices, "");
+        assert_eq!(res, vec![0, 1, 2], "empty query keeps the supplied order");
+    }
+
+    #[test]
+    fn filter_choices_no_match_returns_empty() {
+        let choices = vec!["nostromo".to_string(), "yutani".to_string()];
+        // No entry contains this subsequence.
+        assert!(filter_choices(&choices, "zzzz").is_empty());
+    }
+
+    #[test]
+    fn filter_choices_on_empty_list_is_empty() {
+        // Both with and without a query, an empty candidate list yields nothing.
+        assert!(filter_choices(&[], "").is_empty());
+        assert!(filter_choices(&[], "anything").is_empty());
+    }
+
+    #[test]
+    fn filter_choices_ties_preserve_list_order() {
+        // An empty query scores every entry equally; the stable sort must leave
+        // the result in ascending (original) index order.
+        let choices = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ];
+        let res = filter_choices(&choices, "");
+        let mut sorted = res.clone();
+        sorted.sort();
+        assert_eq!(res, sorted, "equal scores must keep list order");
+    }
+
+    #[test]
+    fn filter_choices_narrows_to_matching_subset() {
+        let choices = vec![
+            "nostromo".to_string(),
+            "spacedust".to_string(),
+            "yutani".to_string(),
+        ];
+        // "space" is a substring of exactly one entry.
+        let res = filter_choices(&choices, "space");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0], 1);
+    }
+
+    // ----- row_label: per-mode label lookup over the filtered list -----
+
+    #[test]
+    fn row_label_returns_command_title_in_commands_mode() {
+        let mut p = CommandPalette::default();
+        p.open(); // Mode::Commands, full list in registry order.
+        // The i-th visible row maps through `filtered` to a COMMANDS title.
+        let first = p.filtered[0];
+        assert_eq!(p.row_label(0), Some(COMMANDS[first].title));
+    }
+
+    #[test]
+    fn row_label_returns_candidate_string_in_choose_mode() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.enter_choose(
+            PaletteAction::SetTheme,
+            "Theme",
+            vec![
+                "nostromo".to_string(),
+                "spacedust".to_string(),
+                "yutani".to_string(),
+            ],
+        );
+        // Unfiltered: visible rows mirror the supplied order.
+        assert_eq!(p.row_label(0), Some("nostromo"));
+        assert_eq!(p.row_label(1), Some("spacedust"));
+        assert_eq!(p.row_label(2), Some("yutani"));
+    }
+
+    #[test]
+    fn row_label_out_of_range_is_none() {
+        let mut p = CommandPalette::default();
+        p.open();
+        // One past the last visible row has no label.
+        assert_eq!(p.row_label(p.filtered.len()), None);
+        assert_eq!(p.row_label(9999), None);
+    }
+
+    #[test]
+    fn row_label_in_argument_mode_is_none() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set title".into();
+        p.refilter();
+        p.accept(); // -> Mode::Argument, which clears `filtered`.
+        assert!(matches!(p.mode, Mode::Argument { .. }));
+        // No list backs argument mode, so every index is None.
+        assert_eq!(p.row_label(0), None);
+    }
+
+    // ----- has_list: which modes show a scrollable result list -----
+
+    #[test]
+    fn has_list_true_in_commands_and_choose_false_in_argument() {
+        let mut p = CommandPalette::default();
+        p.open();
+        assert!(p.has_list(), "commands mode shows a list");
+
+        p.enter_choose(PaletteAction::SetTheme, "Theme", vec!["yutani".to_string()]);
+        assert!(p.has_list(), "choose mode shows a list");
+
+        p.input.clear();
+        p.mode = Mode::Argument {
+            action: PaletteAction::SetTitle,
+            prompt: "Title",
+        };
+        assert!(!p.has_list(), "argument mode is a bare input line");
+    }
+
+    // ----- enter_choose: navigation clamping and scroll over candidates -----
+
+    #[test]
+    fn choose_navigation_clamps_within_candidates() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.enter_choose(
+            PaletteAction::SetTheme,
+            "Theme",
+            vec![
+                "nostromo".to_string(),
+                "spacedust".to_string(),
+                "yutani".to_string(),
+            ],
+        );
+        assert_eq!(p.selected, 0);
+        // move_up at the top stays put.
+        p.move_up();
+        assert_eq!(p.selected, 0);
+        // move_down clamps at the last candidate.
+        for _ in 0..100 {
+            p.move_down();
+        }
+        assert_eq!(p.selected, p.filtered.len() - 1);
+        assert_eq!(p.selected, 2);
+    }
+
+    #[test]
+    fn choose_scroll_advances_past_max_visible() {
+        // Drive the scroll logic through a real Choose-mode candidate list that
+        // is longer than the visible window (the static registry is too short).
+        let mut p = CommandPalette::default();
+        p.open();
+        let choices: Vec<String> = (0..PALETTE_MAX_VISIBLE + 4)
+            .map(|i| format!("theme{i}"))
+            .collect();
+        p.enter_choose(PaletteAction::SetTheme, "Theme", choices);
+        // All candidates pass the empty-query filter, in order.
+        assert_eq!(p.filtered.len(), PALETTE_MAX_VISIBLE + 4);
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.scroll, 0);
+        // Walk past the visible window; scroll must begin advancing.
+        for _ in 0..PALETTE_MAX_VISIBLE {
+            p.move_down();
+        }
+        assert_eq!(p.selected, PALETTE_MAX_VISIBLE);
+        assert!(
+            p.scroll > 0,
+            "scroll {} should advance once selection passes PALETTE_MAX_VISIBLE",
+            p.scroll
+        );
+        // Selected stays within the visible window [scroll, scroll+max).
+        assert!(p.selected >= p.scroll);
+        assert!(p.selected < p.scroll + PALETTE_MAX_VISIBLE);
+        // And the highlighted row's label is still resolvable via row_label.
+        assert_eq!(
+            p.row_label(p.selected),
+            Some(format!("theme{}", p.filtered[p.selected]).as_str())
+        );
     }
 }

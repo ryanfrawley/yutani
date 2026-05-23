@@ -154,8 +154,8 @@
     padding: 0;
   }
   .swatch input[type=text].invalid { color: #ff6666; }
-  .row.disabled .swatch { opacity: 0.35; pointer-events: none; }
-  .row.disabled > label { opacity: 0.5; }
+  .row.disabled .swatch { opacity: 0.15; pointer-events: none; }
+  .row.disabled > label { opacity: 0.3; }
   .row .cap-note {
     font: 10px var(--mono);
     color: var(--muted);
@@ -207,14 +207,14 @@
   .ctl-row .val { font: 11px var(--mono); color: var(--muted); text-align: right; }
   .glow-note { font: 10px var(--mono); color: var(--muted); padding: 2px 0 8px; line-height: 1.5; }
   .glow-note code { background: #0c0c0c; padding: 1px 4px; border-radius: 3px; color: #c5c8c6; }
-  .glow-body.disabled { opacity: 0.4; pointer-events: none; filter: grayscale(0.4); }
+  .glow-body.disabled { opacity: 0.2; pointer-events: none; filter: grayscale(0.6); }
   .subhead {
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); margin: 12px 0 4px; font-weight: 600;
   }
   .opt-row { display: grid; grid-template-columns: 88px auto 1fr; align-items: center; gap: 6px; padding: 4px 0; }
   .opt-row > label { font: 12px var(--mono); color: var(--text); }
-  .opt-row .swatch.off { opacity: 0.35; pointer-events: none; }
+  .opt-row .swatch.off { opacity: 0.15; pointer-events: none; }
 
   /* ---------- Pane 2: preview ---------- */
   .preview-wrap { padding: 14px; display: flex; flex-direction: column; gap: 14px; align-items: stretch; flex: 1; }
@@ -622,12 +622,12 @@
       <div class="terminal" id="term">
         <div class="titlebar">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-          <span class="title">~/projects/yutani</span>
+          <span class="title">msgcat --color=test — ~/projects/yutani</span>
         </div>
         <div class="term-body" id="term-body"></div>
       </div>
-      <div>
-        <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
+      <div id="ansi-strip">
+        <div id="ansi-strip-head" style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
         <div class="swatch-grid" id="ansi-grid"></div>
       </div>
       <div class="contrast">
@@ -1552,30 +1552,66 @@ function buildGlowControls() {
 /* ============================================================
  * Pane 2: preview a few terminal frames using the live palette.
  * ============================================================ */
-const PREVIEW_LINES = [
-  // [ {fg, bg?, bold?, text} | string, ... ]
-  [{fg:'green', bold:true, text:'➜  '}, {fg:'cyan', bold:true, text:'~/projects/yutani'}, ' ', {fg:'magenta', text:'git:('}, {fg:'red', text:'main'}, {fg:'magenta', text:') '}, {fg:'yellow', text:'✗'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'ls --color'}],
-  [
-    {fg:'blue', bold:true, text:'src/'}, '       ',
-    {fg:'blue', bold:true, text:'target/'}, '    ',
-    {fg:'foreground', text:'Cargo.toml '},
-    {fg:'green', text:'README.md '},
-    {fg:'cyan', text:'scheme.toml'},
-  ],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'cat src/palette.rs | head'}],
-  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_toml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
-  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'let mut '}, {fg:'foreground', text:'p = '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:'::'}, {fg:'blue', text:'defaults'}, {fg:'foreground', text:'();'}],
-  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key = value'}],
-  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'for'}, {fg:'foreground', text:' (lineno, raw) '}, {fg:'magenta', text:'in'}, {fg:'foreground', text:' src.'}, {fg:'blue', text:'lines'}, {fg:'foreground', text:'().'}, {fg:'blue', text:'enumerate'}, {fg:'foreground', text:'() {'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'git status'}],
-  [{fg:'foreground', text:'On branch '}, {fg:'green', text:'main'}],
-  [{sel:true, fg:'red', text:'  modified:   '}, {sel:true, fg:'foreground', text:'src/palette.rs'}],
-  [{sel:true, fg:'green', text:'  new file:   '}, {sel:true, fg:'foreground', text:'tools/scheme-builder/index.html'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'echo '}, {fg:'yellow', text:'"hello, world"'}],
-  [{fg:'yellow', text:'hello, world'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'vim ', cursor:true}],
-];
+/* ============================================================
+ * Preview content — the first section of `msgcat --color=test`
+ * (gettext's terminal color test): a 9×9 grid of " Words " cells,
+ * every foreground color crossed with every background color. It
+ * paints black + the eight bright ANSI entries (msgcat's palette
+ * indices 0, 9-15) plus the terminal default, so a scheme's whole
+ * cell-color space — and every fg/bg contrast pairing — is on screen
+ * at once.
+ *
+ * A segment is `{fg, bg?, bold?, bgBold?, text}` (or a bare string).
+ * fg/bg resolve independently, so a cell can carry normal-black ink
+ * on a bright-color block. Rows are column-aligned (the preview font
+ * is monospace), and the renderers (DOM + glow canvas) consume them
+ * unchanged.
+ * ============================================================ */
+const S = (text, fg, extra) => ({ text, fg, ...(extra || {}) });
+const seglen = segs => segs.reduce((n, s) =>
+  n + (typeof s === 'string' ? s.length : (s.text || '').length), 0);
+
+function buildPreviewLines() {
+  const fg = 'foreground';
+  // msgcat's columns/rows: black is the normal entry (index 0); the rest map
+  // to the bright ANSI slots (9-15), hence `b: true`. `def` is the terminal
+  // default (window fg/bg), which projects nothing.
+  const COLS = [
+    { label: 'black',   c: 'black' },
+    { label: 'blue',    c: 'blue',    b: true },
+    { label: 'green',   c: 'green',   b: true },
+    { label: 'cyan',    c: 'cyan',    b: true },
+    { label: 'red',     c: 'red',     b: true },
+    { label: 'magenta', c: 'magenta', b: true },
+    { label: 'yellow',  c: 'yellow',  b: true },
+    { label: 'white',   c: 'white',   b: true },
+    { label: 'default', def: true },
+  ];
+  const W = 7;                          // label + cell column width
+  const sep = () => S('|', fg);
+  const rows = [
+    [S('$ ', fg), S('msgcat --color=test', fg)],
+    [],
+    [S('Colors (foreground/background):', fg)],
+  ];
+  // Header: empty label cell, then each column name.
+  const head = [S(' '.repeat(W), fg)];
+  for (const col of COLS) { head.push(sep(), S(col.label.padEnd(W), fg)); }
+  rows.push(head);
+  // Data rows: " Words " in the row's fg over each column's bg.
+  for (const row of COLS) {
+    const line = [S(row.label.padEnd(W), fg)];
+    for (const col of COLS) {
+      const cell = { text: ' Words ', fg: row.def ? fg : row.c };
+      if (row.b) cell.bold = true;
+      if (!col.def) { cell.bg = col.c; if (col.b) cell.bgBold = true; }
+      line.push(sep(), cell);
+    }
+    rows.push(line);
+  }
+  return rows;
+}
+const PREVIEW_LINES = buildPreviewLines();
 
 function resolveFg(name, bold) {
   // Window colors render directly — they're not "cell" colors and skip the
@@ -1583,6 +1619,12 @@ function resolveFg(name, bold) {
   if (name === 'foreground') return state.foreground;
   if (name === 'background') return state.background;
   if (name === 'cursor') return state.cursor;
+  // Mono is special (palette.rs project_cell): with only two ink levels a
+  // glyph is never nearest-color quantised — a dim/grey text color could
+  // land closer to the background and vanish. The preview's cells carry no
+  // distinct cell-background, so every glyph paints as foreground ink,
+  // regardless of which ANSI color was requested.
+  if (state.max_colors === 'mono') return state.foreground;
   const pair = state.ansi[name];
   if (!pair) return state.foreground;
   // Under an 8-color cap, the bright slot is unreachable: bold cells still
@@ -1590,6 +1632,39 @@ function resolveFg(name, bold) {
   // project(). Skipping the lookup entirely matches what yutani renders.
   const raw = (bold && brightEnabled()) ? pair[1] : pair[0];
   return projectHex(raw);
+}
+
+// Resolve a cell background color (window names direct, ANSI projected).
+function resolveBg(name, bold) {
+  if (name === 'foreground') return state.foreground;
+  if (name === 'background') return state.background;
+  if (name === 'cursor') return state.cursor;
+  if (name === 'selection') return state.selection;
+  const pair = state.ansi[name];
+  if (!pair) return state.background;
+  const raw = (bold && brightEnabled()) ? pair[1] : pair[0];
+  return projectHex(raw);
+}
+
+// Resolve a segment to the {fg, bg} actually drawn, shared by the DOM and
+// glow-canvas renderers. Selection is chrome (not cap-projected). An explicit
+// cell background invokes palette.rs project_cell: in mono a cell that carries
+// a distinct background flips to fg-ink block / bg-color glyph; a background
+// equal to the window background reads as blank (no flip); otherwise both
+// colors project independently. No background → glyph only (mono forces ink).
+function resolveSeg(s) {
+  if (s.sel) return { fg: state.selection_fg || resolveFg(s.fg || 'foreground', s.bold), bg: state.selection };
+  if (s.bg) {
+    // bg brightness is independent of the glyph's (`bgBold`), so a cell can
+    // carry normal ink over a bright-color block (as msgcat's grid does).
+    const bgc = resolveBg(s.bg, s.bgBold);
+    if (state.max_colors === 'mono') {
+      if (bgc.toLowerCase() === state.background.toLowerCase()) return { fg: state.foreground, bg: null };
+      return { fg: state.background, bg: state.foreground };
+    }
+    return { fg: resolveFg(s.fg || 'foreground', s.bold), bg: bgc };
+  }
+  return { fg: resolveFg(s.fg || 'foreground', s.bold), bg: null };
 }
 
 function renderPreview() {
@@ -1616,12 +1691,10 @@ function renderPreview() {
       }
       const span = document.createElement('span');
       span.className = 'seg' + (s.sel ? ' sel' : '');
-      const fg = resolveFg(s.fg || 'foreground', s.bold);
+      const { fg, bg } = resolveSeg(s);
       span.style.color = fg;
       if (s.bold) span.style.fontWeight = '600';
-      if (s.sel) {
-        span.style.background = state.selection;
-      }
+      if (bg) span.style.background = bg;
       span.textContent = s.text || '';
       line.append(span);
       if (s.cursor) {
@@ -1636,33 +1709,33 @@ function renderPreview() {
   }
 
   // ANSI swatch row — render each entry through the active color cap so the
-  // strip mirrors what yutani would actually paint. Slots that the cap
-  // disables (e.g. brights under `8`) get a strikethrough overlay.
+  // strip mirrors what yutani would actually paint. Mono hides the strip
+  // entirely: every cell collapses to fg/bg ink, so there's no palette to
+  // show. The 8-color cap drops the bright half (8-15 fold onto their
+  // normal siblings), leaving just 0-7.
+  const mono = state.max_colors === 'mono';
+  document.getElementById('ansi-strip').style.display = mono ? 'none' : '';
   const grid = document.getElementById('ansi-grid');
   grid.innerHTML = '';
-  const all = [];
-  for (const hue of HUES) all.push(state.ansi[hue][0]);
-  for (const hue of HUES) all.push(state.ansi[hue][1]);
-  const brightOn = brightEnabled();
-  const normalOn = normalAnsiEnabled();
-  for (let i = 0; i < all.length; i++) {
-    const isBright = i >= 8;
-    const reachable = isBright ? brightOn : normalOn;
-    const shown = reachable ? projectHex(all[i]) : all[i];
-    const c = document.createElement('div');
-    c.className = 'cell';
-    c.style.background = shown;
-    c.style.color = luma(shown) > 0.55 ? '#000' : '#fff';
-    c.style.textShadow = 'none';
-    c.textContent = i;
-    if (!reachable) {
-      c.style.opacity = '0.3';
-      c.style.textDecoration = 'line-through';
+  if (!mono) {
+    const all = [];
+    for (const hue of HUES) all.push(state.ansi[hue][0]);
+    for (const hue of HUES) all.push(state.ansi[hue][1]);
+    const count = brightEnabled() ? 16 : 8;
+    document.getElementById('ansi-strip-head').textContent = count === 16 ? 'ANSI 0-15' : 'ANSI 0-7';
+    for (let i = 0; i < count; i++) {
+      const c = document.createElement('div');
+      c.className = 'cell';
+      c.style.textShadow = 'none';
+      c.textContent = i;
+      const label = i < 8 ? HUES[i] : HUES[i-8] + ' bright';
+      const shown = projectHex(all[i]);
+      c.style.background = shown;
+      c.style.color = luma(shown) > 0.55 ? '#000' : '#fff';
+      const note = shown !== all[i] ? ` (snaps to ${shown})` : '';
+      c.title = `${label} — ${all[i]}${note}`;
+      grid.append(c);
     }
-    const label = i < 8 ? HUES[i] : HUES[i-8] + ' bright';
-    const note = reachable && shown !== all[i] ? ` (snaps to ${shown})` : (reachable ? '' : ' — unreachable under cap');
-    c.title = `${label} — ${all[i]}${note}`;
-    grid.append(c);
   }
 
   renderContrast();
@@ -1702,15 +1775,35 @@ function renderContrast() {
   const grid = document.getElementById('contrast-grid');
   grid.innerHTML = '';
   const bg = state.background;
+  // Each row is [label, fg, bgOverride?] — contrast of fg against its row
+  // background (the window background unless overridden).
   const pairs = [['foreground', state.foreground]];
-  for (const hue of HUES) pairs.push([hue, projectHex(state.ansi[hue][0])]);
-  for (const [label, fg] of pairs) {
-    const r = contrastRatio(fg, bg);
+  // Mono collapses every cell glyph to foreground ink (palette.rs
+  // project_cell), so the only meaningful readability check is fg vs bg —
+  // listing each ANSI hue would just repeat it (or mislead, since a hue
+  // that nearest-snaps to bg never actually paints as text).
+  if (state.max_colors !== 'mono') {
+    for (const hue of HUES) pairs.push([hue, projectHex(state.ansi[hue][0])]);
+    // Bright variants are only reachable at 16+ colors (the 8-color cap folds
+    // them onto their normal siblings), so list them only when they render.
+    if (brightEnabled()) {
+      for (const hue of HUES) pairs.push([hue + ' bright', projectHex(state.ansi[hue][1])]);
+    }
+  }
+  // Cursor visibility: the block sits on the terminal background, so check
+  // the cursor color against it. Selection readability: selected text draws
+  // in selection_fg (or the foreground when unset) over the selection block,
+  // so check that text color against the selection background.
+  pairs.push(['cursor', state.cursor]);
+  pairs.push(['selection', state.selection_fg || state.foreground, state.selection]);
+  for (const [label, fg, bgOverride] of pairs) {
+    const rowBg = bgOverride || bg;
+    const r = contrastRatio(fg, rowBg);
     const [gradeText, gradeClass] = gradeOf(r);
     const cell = document.createElement('div');
     cell.className = 'cpair';
     cell.innerHTML =
-      `<span class="chip" style="background:${bg};color:${fg}">Ag</span>` +
+      `<span class="chip" style="background:${rowBg};color:${fg}">Ag</span>` +
       `<span class="ratio">${label}: ${r.toFixed(1)}:1</span>` +
       `<span class="grade ${gradeClass}">${gradeText}</span>`;
     grid.append(cell);
@@ -1745,11 +1838,12 @@ function renderContrast() {
 // bound fill cost on 3x displays.
 let GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
 
-let glowCanvas = null, rasterCanvas = null, glowGL = null, glowGLFailed = false;
+let glowCanvas = null, rasterCanvas = null, maskCanvas = null, glowGL = null, glowGLFailed = false;
 function ensureGlowCanvases() {
   if (glowCanvas) return;
   glowCanvas = document.createElement('canvas'); glowCanvas.className = 'term-fx';
   rasterCanvas = document.createElement('canvas');  // offscreen sRGB scene
+  maskCanvas = document.createElement('canvas');    // bg-only scene (halo mask)
 }
 
 function smoothstep(e0, e1, x) {
@@ -1785,7 +1879,13 @@ function brightSlots() {
 // Draw the terminal scene (bg + glyphs + selection + cursor) into ctx at the
 // given scale. Geometry matches the .term-body CSS (13px/1.5 mono, 14/16 pad)
 // so the rasterised scene lines up with the DOM text it replaces under glow.
-function rasterizeScene(ctx, scale, w, h) {
+//
+// `maskOnly` draws just the cell backgrounds (no glyphs/cursor) — the bg
+// scene the composite samples to suppress the halo over colored cells, exactly
+// like the renderer's masked composite (glow.wgsl fs_composite_masked). Without
+// it, bright cell backgrounds bloom a (scanline-modulated) halo over the
+// content, which the real renderer never shows.
+function rasterizeScene(ctx, scale, w, h, maskOnly) {
   const padL = 16 * scale, padT = 14 * scale;
   const fontPx = preview.fontSize * scale, lineH = preview.fontSize * 1.5 * scale;
   const stack = fontStack(preview.fontFamily);
@@ -1805,11 +1905,14 @@ function rasterizeScene(ctx, scale, w, h) {
       const text = s.text || '';
       ctx.font = fontFor(s.bold);
       const tw = ctx.measureText(text).width;
-      if (s.sel) { ctx.fillStyle = state.selection; ctx.fillRect(x, y, tw, lineH); }
-      ctx.fillStyle = (s.sel && state.selection_fg) ? state.selection_fg : resolveFg(s.fg || 'foreground', s.bold);
-      ctx.fillText(text, x, cy);
+      const { fg, bg } = resolveSeg(s);
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(x, y, tw, lineH); }
+      if (!maskOnly) {
+        ctx.fillStyle = fg;
+        ctx.fillText(text, x, cy);
+      }
       x += tw;
-      if (s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
+      if (!maskOnly && s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
     }
     y += lineH;
   }
@@ -1891,7 +1994,7 @@ void main(){ vec2 o2=u_texel;
 const GLOW_FS_COMP = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o;
-uniform sampler2D u_scene, u_halo;
+uniform sampler2D u_scene, u_halo, u_mask;
 uniform float u_intensity, u_scanPeriod;
 uniform float u_haloScan, u_haloStrength;
 uniform float u_content, u_contentStrength, u_contentAtten, u_contentMasked;
@@ -1904,7 +2007,12 @@ void main(){
   float phase = fract(y / max(u_scanPeriod, 1.0));
   float isBright = step(0.5, phase);
   float hs = (u_haloScan>0.5) ? mix(1.0, isBright, u_haloStrength) : 1.0;
-  float k = u_intensity * hs;
+  // Halo mask (glow.wgsl fs_composite_masked): suppress the bloom — and the
+  // scanlines riding it — wherever a cell paints a background distinct from the
+  // window bg, so a colored block's own glow never washes over its content.
+  float bgDiff = distance(texture(u_mask, v_uv).rgb, u_bg);
+  float suppression = smoothstep(0.02, 0.08, bgDiff);
+  float k = u_intensity * hs * (1.0 - suppression);
   vec3 lin = halo.rgb*k + scene*(1.0 - clamp(halo.a*k, 0.0, 1.0));   // premult-over
   vec3 srgb = vec3(l2s(lin.r), l2s(lin.g), l2s(lin.b));
   if(u_content>0.5){
@@ -1945,6 +2053,7 @@ function createGlowGL(canvas) {
 
   const vao = gl.createVertexArray();           // empty VAO (vertices from gl_VertexID)
   const sceneTex = gl.createTexture();
+  const maskTex = gl.createTexture();           // bg-only scene, for halo suppression
   // Half- and quarter-resolution ping/pong targets, (re)sized on demand.
   let half = null, quarter = null, dims = { w: 0, h: 0 };
   const mkTarget = (w, h) => {
@@ -1968,19 +2077,25 @@ function createGlowGL(canvas) {
   const setU = (p, name, set) => { const loc = gl.getUniformLocation(p, name); set(loc); };
   const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  function render(raster, g, slots) {
-    const sw = canvas.width, sh = canvas.height;
-    resize(sw, sh);
-    gl.bindVertexArray(vao);
-
-    // Upload the scene as an sRGB texture (flip Y so the texture is upright).
-    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+  // Upload an sRGB texture from a canvas (flip Y so the texture is upright).
+  const uploadTex = (tex, src) => {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, raster);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, src);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
                           [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
       gl.texParameteri(gl.TEXTURE_2D, k, v);
+  };
+
+  function render(raster, mask, g, slots) {
+    const sw = canvas.width, sh = canvas.height;
+    resize(sw, sh);
+    gl.bindVertexArray(vao);
+
+    // Scene (bg + glyphs) and the bg-only mask, both as sRGB textures.
+    uploadTex(sceneTex, raster);
+    uploadTex(maskTex, mask);
 
     const wantHalo = g.match_brightness || g.match_bright_ansi || g.match_foreground;
     const fg = hexToLin(state.foreground), bg = hexToLin(state.background);
@@ -2032,9 +2147,11 @@ function createGlowGL(canvas) {
     gl.viewport(0, 0, sw, sh);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, half.tex);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex);
     const sb = hexToRgb01(g.scanline_color_bright), sd = hexToRgb01(g.scanline_color_dark);
     setU(progs.comp, 'u_scene', l => gl.uniform1i(l, 0));
     setU(progs.comp, 'u_halo', l => gl.uniform1i(l, 1));
+    setU(progs.comp, 'u_mask', l => gl.uniform1i(l, 2));
     setU(progs.comp, 'u_intensity', l => gl.uniform1f(l, wantHalo ? g.intensity : 0));
     setU(progs.comp, 'u_scanPeriod', l => gl.uniform1f(l, g.scanline_period));
     setU(progs.comp, 'u_haloScan', l => gl.uniform1f(l, (wantHalo && g.scanlines) ? 1 : 0));
@@ -2074,7 +2191,10 @@ function renderGlowPreview() {
   if (glowCanvas.height !== sh) glowCanvas.height = sh;
   if (rasterCanvas.width !== sw) rasterCanvas.width = sw;
   if (rasterCanvas.height !== sh) rasterCanvas.height = sh;
+  if (maskCanvas.width !== sw) maskCanvas.width = sw;
+  if (maskCanvas.height !== sh) maskCanvas.height = sh;
   rasterizeScene(rasterCanvas.getContext('2d'), GLOW_SCALE, sw, sh);
+  rasterizeScene(maskCanvas.getContext('2d'), GLOW_SCALE, sw, sh, true); // bg-only halo mask
 
   if (!glowGL && !glowGLFailed) {
     glowGL = createGlowGL(glowCanvas);
@@ -2085,7 +2205,7 @@ function renderGlowPreview() {
   }
   if (!glowGL) { glowCanvas.style.display = 'none'; return; }
 
-  glowGL.render(rasterCanvas, g, brightSlots());
+  glowGL.render(rasterCanvas, maskCanvas, g, brightSlots());
   // The opaque WebGL canvas sits over (and hides) the DOM text it was built
   // from. Re-attach after the DOM rebuild in renderPreview.
   body.append(glowCanvas);
