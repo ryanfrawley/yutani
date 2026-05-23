@@ -682,6 +682,16 @@ pub struct Terminal {
     // via `current_input()` by a later autocomplete slice, hence the allow.
     #[allow(dead_code)]
     current_input: Option<CurrentInput>,
+    // Shell's history file path, reported via the yutani-private OSC 2124
+    // extension. `histfile_dirty` is set when it changes so the front end can
+    // pull it via `take_histfile_update()` and read + parse the file for
+    // history-based completion suggestions.
+    histfile: Option<String>,
+    histfile_dirty: bool,
+    // The last command submitted at a prompt: the OSC 2122 edit buffer that was
+    // live when OSC 133 `C` (OutputStart) fired. Drained once via
+    // `take_submitted_command()` and folded into the in-session command history.
+    last_submitted_command: Option<String>,
     // Config-driven: when false, placements that fully scroll off the top
     // are dropped rather than promoted to `scrollback_placements`. Saves
     // memory in long-running shells with heavy image traffic. The trade-
@@ -835,6 +845,9 @@ impl Terminal {
             scrollback_placements: VecDeque::new(),
             semantic_marks: Vec::new(),
             current_input: None,
+            histfile: None,
+            histfile_dirty: false,
+            last_submitted_command: None,
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
@@ -2290,6 +2303,8 @@ impl Terminal {
             133 => self.handle_osc_133(rest),
             // yutani-private current-input report (autocomplete foundation).
             2122 => self.handle_osc_2122(rest),
+            // yutani-private history-file path report (autocomplete history).
+            2124 => self.handle_osc_2124(rest),
             // iTerm2 proprietary namespace. Only `File=...` (inline
             // images) is implemented; everything else is silently
             // dropped to match iTerm's "unknown verb is a no-op" contract.
@@ -2382,8 +2397,15 @@ impl Terminal {
             Some("A") => SemanticMarkKind::PromptStart,
             Some("B") => SemanticMarkKind::InputStart,
             Some("C") => {
-                // Command submitted: the edit line is gone, so the live
-                // input report (OSC 2122) no longer describes anything.
+                // Command submitted: capture the live edit buffer (if any,
+                // non-blank) so the front end can fold it into the in-session
+                // command history for completion. Then clear it — the edit line
+                // is gone, so the OSC 2122 report no longer describes anything.
+                if let Some(ci) = &self.current_input {
+                    if !ci.buffer.trim().is_empty() {
+                        self.last_submitted_command = Some(ci.buffer.clone());
+                    }
+                }
                 self.current_input = None;
                 SemanticMarkKind::OutputStart
             }
@@ -2445,6 +2467,46 @@ impl Terminal {
         // index by char without bounds checks (e.g. an off-by-one past EOL).
         let cursor = cursor.min(buffer.chars().count());
         self.current_input = Some(CurrentInput { buffer, cursor });
+    }
+
+    /// `OSC 2124 ; <base64(path)> \a` — yutani-private: the shell reports its
+    /// history file ($HISTFILE) so the terminal can read past commands for the
+    /// autocomplete popup. Stored once; the front end reads + parses the file.
+    /// Malformed payloads (invalid base64 / UTF-8) are ignored.
+    fn handle_osc_2124(&mut self, payload: &str) {
+        use base64::Engine;
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload.as_bytes()) else {
+            return;
+        };
+        let Ok(path) = String::from_utf8(bytes) else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        if self.histfile.as_deref() != Some(path.as_str()) {
+            self.histfile = Some(path);
+            self.histfile_dirty = true;
+        }
+    }
+
+    /// Returns the history-file path once if it changed since the last call,
+    /// clearing the dirty flag. The front end calls this after each `feed` to
+    /// read + parse the file for history-based completion suggestions.
+    pub fn take_histfile_update(&mut self) -> Option<String> {
+        if self.histfile_dirty {
+            self.histfile_dirty = false;
+            self.histfile.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Returns the last command submitted at a prompt (the OSC 2122 buffer that
+    /// was live when OSC 133 `C` fired), once, clearing it. The front end folds
+    /// it into the in-session command history for completion.
+    pub fn take_submitted_command(&mut self) -> Option<String> {
+        self.last_submitted_command.take()
     }
 
     /// Fold the recorded semantic marks into per-command regions, in

@@ -1069,6 +1069,11 @@ struct State {
     /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
     /// close the menu.
     completion_dismissed: bool,
+    /// Past command lines for history-based completion suggestions, most-recent-
+    /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
+    /// 2124) and grown with this session's submitted commands (captured at OSC
+    /// 133 `C`). Capped to bound memory.
+    command_history: Vec<String>,
     // Active local text selection, in (absolute_line, col) coordinates so it
     // stays anchored to content as the grid scrolls. `None` when nothing is
     // selected. The two endpoints are anchor (mouse-down cell) and head
@@ -2074,6 +2079,7 @@ impl State {
             selected_completion: 0,
             completion_scroll: 0,
             completion_dismissed: false,
+            command_history: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
             press_cell: None,
@@ -4472,12 +4478,21 @@ impl State {
             Vec::new()
         } else {
             match &cur {
-                Some(c) if completion::has_path_token(&c.buffer, c.cursor) => {
+                // `complete` returns empty for empty/whitespace input on its own
+                // (no history match, empty token skipped), so no separate gate.
+                Some(c) => {
                     let cwd = self.terminal.cwd().map(std::path::Path::new);
                     let path = std::env::var_os("PATH");
-                    completion::complete(&c.buffer, c.cursor, cwd, path.as_deref())
+                    completion::complete(
+                        &c.buffer,
+                        c.cursor,
+                        cwd,
+                        path.as_deref(),
+                        &self.command_history,
+                        false,
+                    )
                 }
-                _ => Vec::new(),
+                None => Vec::new(),
             }
         };
         // The cache was replaced: restart selection at the top and reset the
@@ -4505,7 +4520,14 @@ impl State {
         {
             let cwd = self.terminal.cwd().map(std::path::Path::new);
             let path = std::env::var_os("PATH");
-            self.completions = completion::complete(&buffer, cursor, cwd, path.as_deref());
+            self.completions = completion::complete(
+                &buffer,
+                cursor,
+                cwd,
+                path.as_deref(),
+                &self.command_history,
+                true,
+            );
             self.completions_input = Some((buffer, cursor));
             self.selected_completion = 0;
             self.completion_scroll = 0;
@@ -4534,12 +4556,14 @@ impl State {
         let Some(sug) = self.completions.get(self.selected_completion) else {
             return;
         };
-        let text = sug.text.clone();
+        // Clone the suggestion so the byte payload below can hold the immutable
+        // `self.terminal` borrow without also borrowing `self.completions`.
+        let sug = sug.clone();
         // Build the byte payload (cloning the suffix) while holding the
         // immutable `self.terminal` borrow, then drop it before the &self
         // `write_pty` call below.
         let bytes: Option<Vec<u8>> = self.terminal.current_input().map(|c| {
-            let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &text) {
+            let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &sug) {
                 Some(suffix) => suffix.as_bytes().to_vec(),
                 // A stale / non-extending suggestion: no suffix to insert, but
                 // we may still submit the line as-typed below.
@@ -6071,6 +6095,26 @@ async fn run() {
                     if let Some(cwd) = state.terminal.take_cwd_update() {
                         state.window.set_title(&title_for_cwd(&cwd));
                     }
+                    // The shell may have reported its history file (OSC 2124):
+                    // read + parse it and merge past commands into the in-memory
+                    // history (most-recent-first), behind any already-captured
+                    // session commands so those stay at the front.
+                    if let Some(path) = state.terminal.take_histfile_update() {
+                        if let Ok(contents) = std::fs::read_to_string(&path) {
+                            let parsed = completion::parse_zsh_history(&contents);
+                            for cmd in parsed.iter().rev() {
+                                if !state.command_history.iter().any(|c| c == cmd) {
+                                    state.command_history.push(cmd.clone());
+                                }
+                            }
+                            state.command_history.truncate(COMMAND_HISTORY_CAP);
+                        }
+                    }
+                    // A command just submitted at the prompt (OSC 133 C): fold
+                    // it into the front of the history (deduped).
+                    if let Some(cmd) = state.terminal.take_submitted_command() {
+                        dedup_prepend(&mut state.command_history, cmd);
+                    }
                     // The chunk may have carried an OSC 2122 input report;
                     // refresh the completion popup's cached suggestions (only
                     // recomputes — and only touches disk — when the input
@@ -6287,6 +6331,18 @@ fn title_for_cwd(cwd: &str) -> String {
     } else {
         format!("Yutani — {display}")
     }
+}
+
+/// Upper bound on retained command-history entries, to keep memory bounded for
+/// long-running shells with huge `$HISTFILE`s.
+const COMMAND_HISTORY_CAP: usize = 10_000;
+
+/// Insert `cmd` at the front of `history` (most-recent-first), removing any
+/// existing equal entry first so it stays deduped, then cap the length.
+fn dedup_prepend(history: &mut Vec<String>, cmd: String) {
+    history.retain(|c| c != &cmd);
+    history.insert(0, cmd);
+    history.truncate(COMMAND_HISTORY_CAP);
 }
 
 /// Metal layer redraws is filled with the window's `backgroundColor`. Left

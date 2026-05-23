@@ -23,6 +23,10 @@ pub struct Suggestion {
     /// True if the entry is a directory. The UI sorts these first and the
     /// trailing `/` in `text` reflects it.
     pub is_dir: bool,
+    /// True when `text` is a full command line (a history match) that replaces
+    /// the whole typed line, vs. a token completion that replaces only the
+    /// token under the cursor. Drives how `accept_suffix` computes what to type.
+    pub whole_line: bool,
 }
 
 /// Maximum candidates returned, to bound directory-scan cost and popup size.
@@ -77,6 +81,7 @@ pub fn complete_path(buffer: &str, cursor: usize, cwd: Option<&Path>) -> Vec<Sug
         suggestions.push(Suggestion {
             text: format!("{dir_portion}{name}{slash}"),
             is_dir,
+            whole_line: false,
         });
     }
 
@@ -168,6 +173,7 @@ pub fn complete_command(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<Sug
                 suggestions.push(Suggestion {
                     text: format!("{name} "),
                     is_dir: false,
+                    whole_line: false,
                 });
             }
         }
@@ -178,28 +184,160 @@ pub fn complete_command(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<Sug
     suggestions
 }
 
-/// Top-level completion: command (`$PATH`) completion when the cursor is on the
-/// command word, otherwise filesystem path completion. The token is treated as
-/// a command iff it's in command position, non-empty, and has no `/` and no
-/// leading `~`/`.` (a path-like first word such as `./script` or `~/bin/x`
-/// still gets path completion). `path` is `$PATH` for command completion.
+/// Parse a zsh history file's contents into commands, oldest-first. Handles the
+/// extended-history line form `: <ts>:<elapsed>;<command>` (strip through the
+/// first `;`) and plain lines. Joins `\`-continued lines (zsh's multi-line
+/// entry encoding) with a newline. Skips blank entries. v1: best-effort; exotic
+/// metafied bytes are passed through.
+pub fn parse_zsh_history(contents: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+
+    for raw in contents.lines() {
+        // A line that ends in an unescaped backslash continues onto the next
+        // physical line (zsh encodes embedded newlines this way). We detect a
+        // trailing `\` and, if present, strip it and keep accumulating.
+        let continues = raw.ends_with('\\');
+        let line = if continues {
+            &raw[..raw.len() - 1]
+        } else {
+            raw
+        };
+
+        // For a fresh entry (no continuation pending), strip the extended-
+        // history metadata prefix `: <ts>:<elapsed>;` if present.
+        let segment = if pending.is_none() {
+            strip_ext_history_prefix(line)
+        } else {
+            line
+        };
+
+        match &mut pending {
+            Some(acc) => {
+                acc.push('\n');
+                acc.push_str(segment);
+            }
+            None => pending = Some(segment.to_string()),
+        }
+
+        if !continues {
+            if let Some(cmd) = pending.take() {
+                if !cmd.is_empty() {
+                    out.push(cmd);
+                }
+            }
+        }
+    }
+
+    // A trailing continued entry with no final newline still counts.
+    if let Some(cmd) = pending.take() {
+        if !cmd.is_empty() {
+            out.push(cmd);
+        }
+    }
+
+    out
+}
+
+/// Strip zsh's extended-history metadata prefix from a line: `: <ts>:<elapsed>;`
+/// leaving just the command. A line that doesn't start with `: ` (a plain
+/// history entry) is returned unchanged.
+fn strip_ext_history_prefix(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix(": ") {
+        // `<ts>:<elapsed>;<command>` — the command begins after the first `;`.
+        if let Some(idx) = rest.find(';') {
+            return &rest[idx + 1..];
+        }
+    }
+    line
+}
+
+/// History suggestions for `prefix`: entries from `history` (assumed already
+/// most-recent-first and deduped) that START WITH the non-empty `prefix`,
+/// excluding any entry equal to `prefix` (nothing to add), preserving order,
+/// capped at MAX_SUGGESTIONS. Each is a whole-line suggestion (`whole_line:
+/// true, is_dir: false`). Empty `prefix` → empty (never suggest all history).
+pub fn history_matches(history: &[String], prefix: &str) -> Vec<Suggestion> {
+    if prefix.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Suggestion> = Vec::new();
+    for entry in history {
+        if entry == prefix {
+            continue;
+        }
+        if entry.starts_with(prefix) {
+            out.push(Suggestion {
+                text: entry.clone(),
+                is_dir: false,
+                whole_line: true,
+            });
+            if out.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Map a character (code-point) `cursor` offset into `buffer` to a byte offset,
+/// clamping past-end cursors to the buffer length.
+fn cursor_byte_offset(buffer: &str, cursor: usize) -> usize {
+    buffer
+        .char_indices()
+        .nth(cursor)
+        .map(|(b, _)| b)
+        .unwrap_or(buffer.len())
+}
+
+/// Top-level completion: whole-line history matches (shown first) merged with
+/// token completion — command (`$PATH`) completion when the cursor is on the
+/// command word, otherwise filesystem path completion.
+///
+/// `history` is most-recent-first, deduped command lines (shell history file +
+/// this session). `manual` is true for an explicit trigger (Ctrl+Space): it
+/// lets the token branch run even on an empty token (listing the cwd); the
+/// automatic path passes false so an empty token never auto-dumps the cwd.
+///
+/// The merged list is deduped by `text` (history wins over a duplicate token
+/// suggestion) and truncated to [`MAX_SUGGESTIONS`].
 pub fn complete(
     buffer: &str,
     cursor: usize,
     cwd: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
+    history: &[String],
+    manual: bool,
 ) -> Vec<Suggestion> {
+    let cursor_byte = cursor_byte_offset(buffer, cursor);
+    let prefix = &buffer[..cursor_byte];
+
+    // History matches first.
+    let mut out = history_matches(history, prefix);
+
+    // Token completion (command or path), gated so an empty token doesn't
+    // auto-dump the cwd unless this is a manual trigger.
     let (token_start, token) = token_under_cursor(buffer, cursor);
-    let looks_like_command = !token.is_empty()
-        && !token.contains('/')
-        && !token.starts_with('~')
-        && !token.starts_with('.')
-        && is_command_position(buffer, token_start);
-    if looks_like_command {
-        complete_command(token, path)
-    } else {
-        complete_path(buffer, cursor, cwd)
+    if !token.is_empty() || manual {
+        let looks_like_command = !token.is_empty()
+            && !token.contains('/')
+            && !token.starts_with('~')
+            && !token.starts_with('.')
+            && is_command_position(buffer, token_start);
+        let token_suggestions = if looks_like_command {
+            complete_command(token, path)
+        } else {
+            complete_path(buffer, cursor, cwd)
+        };
+        out.extend(token_suggestions);
     }
+
+    // Dedup by text, keeping the first occurrence (history precedes token
+    // suggestions, so a history match wins over a duplicate token suggestion).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|s| seen.insert(s.text.clone()));
+    out.truncate(MAX_SUGGESTIONS);
+    out
 }
 
 /// Computed on-screen rectangle for the completion popup, in physical pixels.
@@ -300,15 +438,21 @@ fn token_under_cursor(buffer: &str, cursor: usize) -> (usize, &str) {
     (token_start, &buffer[token_start..cursor_byte])
 }
 
-/// The bytes to append to the shell's input to accept `suggestion_text` for the
-/// path token under the cursor: the part of the suggestion beyond what the user
-/// already typed. Returns `None` when the suggestion doesn't extend the current
-/// token — a guard against writing garbage if the cached suggestion is stale
+/// Bytes to append to accept `sug` for the current line: the part of `sug.text`
+/// beyond what's already typed. For a whole-line (history) suggestion the typed
+/// part is the buffer up to the cursor; for a token suggestion it's the token
+/// under the cursor. Returns `None` when `sug.text` doesn't extend the typed
+/// part — a guard against writing garbage if the cached suggestion is stale
 /// relative to the live buffer. Assumes the cursor sits at the end of the token
 /// (v1; mid-token accept is a later refinement).
-pub fn accept_suffix<'a>(buffer: &str, cursor: usize, suggestion_text: &'a str) -> Option<&'a str> {
-    let (_start, token) = token_under_cursor(buffer, cursor);
-    suggestion_text.strip_prefix(token)
+pub fn accept_suffix<'a>(buffer: &str, cursor: usize, sug: &'a Suggestion) -> Option<&'a str> {
+    let typed = if sug.whole_line {
+        let cursor_byte = cursor_byte_offset(buffer, cursor);
+        &buffer[..cursor_byte]
+    } else {
+        token_under_cursor(buffer, cursor).1
+    };
+    sug.text.strip_prefix(typed)
 }
 
 /// New scroll-window start so row `selected` stays within a `max_visible`-row
@@ -654,22 +798,43 @@ mod tests {
         assert_eq!(s.len(), MAX_SUGGESTIONS);
     }
 
+    /// Build a token (non-whole-line) suggestion for accept_suffix tests.
+    fn tok(text: &str) -> Suggestion {
+        Suggestion {
+            text: text.to_string(),
+            is_dir: text.ends_with('/'),
+            whole_line: false,
+        }
+    }
+
+    /// Build a whole-line (history) suggestion.
+    fn line(text: &str) -> Suggestion {
+        Suggestion {
+            text: text.to_string(),
+            is_dir: false,
+            whole_line: true,
+        }
+    }
+
     #[test]
     fn accept_suffix_extends_partial_token() {
         // Token `sr` (cursor at end), suggestion `src/`: suffix is `c/`.
-        assert_eq!(accept_suffix("sr", 2, "src/"), Some("c/"));
+        assert_eq!(accept_suffix("sr", 2, &tok("src/")), Some("c/"));
     }
 
     #[test]
     fn accept_suffix_completed_dir_token() {
         // Token `src/` fully matched; suffix is the entry name.
-        assert_eq!(accept_suffix("src/", 4, "src/main.rs"), Some("main.rs"));
+        assert_eq!(
+            accept_suffix("src/", 4, &tok("src/main.rs")),
+            Some("main.rs")
+        );
     }
 
     #[test]
     fn accept_suffix_mismatch_returns_none() {
         // Suggestion doesn't extend the typed token: no bytes to write.
-        assert_eq!(accept_suffix("x", 1, "src/"), None);
+        assert_eq!(accept_suffix("x", 1, &tok("src/")), None);
     }
 
     #[test]
@@ -678,7 +843,25 @@ mod tests {
         // Token is `café` (cursor after the accented char run).
         let buffer = "ls café";
         let cursor = 7; // chars: l s ' ' c a f é -> 7 code points
-        assert_eq!(accept_suffix(buffer, cursor, "café_dir/"), Some("_dir/"));
+        assert_eq!(
+            accept_suffix(buffer, cursor, &tok("café_dir/")),
+            Some("_dir/")
+        );
+    }
+
+    #[test]
+    fn accept_suffix_whole_line_uses_full_buffer() {
+        // A whole-line history suggestion: typed part is the buffer up to the
+        // cursor (the whole line `git pu`), not the token under it.
+        let sug = line("git push origin main");
+        assert_eq!(accept_suffix("git pu", 6, &sug), Some("sh origin main"));
+    }
+
+    #[test]
+    fn accept_suffix_whole_line_mismatch_none() {
+        // History line doesn't extend what's typed.
+        let sug = line("git push");
+        assert_eq!(accept_suffix("ls fo", 5, &sug), None);
     }
 
     #[test]
@@ -816,7 +999,7 @@ mod tests {
         let p = path_of(&[bindir.path.as_path()]);
 
         // Bare command-position token -> command completion (trailing space).
-        let s = complete("yutani", 6, None, Some(p.as_os_str()));
+        let s = complete("yutani", 6, None, Some(p.as_os_str()), &[], false);
         assert_eq!(texts(&s), vec!["yutanitest "]);
     }
 
@@ -825,7 +1008,7 @@ mod tests {
         let cwd = TempDir::new();
         cwd.mkdir("src");
         // `ls sr` — `sr` is an argument; path completion against cwd finds src/.
-        let s = complete("ls sr", 5, Some(cwd.path.as_path()), None);
+        let s = complete("ls sr", 5, Some(cwd.path.as_path()), None, &[], false);
         assert_eq!(texts(&s), vec!["src/"]);
     }
 
@@ -837,17 +1020,136 @@ mod tests {
         cwd.touch("bin/x");
 
         // `./sc` in first position -> path completion (not command).
-        let s = complete("./sc", 4, Some(cwd.path.as_path()), None);
+        let s = complete("./sc", 4, Some(cwd.path.as_path()), None, &[], false);
         assert_eq!(texts(&s), vec!["./script.sh"]);
 
         // `~/x` in first position -> path completion via HOME (not command).
         let saved = std::env::var_os("HOME");
         std::env::set_var("HOME", &cwd.path);
-        let s = complete("~/b", 3, None, None);
+        let s = complete("~/b", 3, None, None, &[], false);
         match saved {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
         assert_eq!(texts(&s), vec!["~/bin/"]);
+    }
+
+    // ---- history completion (slice K16) ----
+
+    #[test]
+    fn parse_zsh_history_extended_and_plain() {
+        let contents = ": 1700000000:0;git status\nls -la\n: 1700000005:2;cargo build\n";
+        let cmds = parse_zsh_history(contents);
+        assert_eq!(cmds, vec!["git status", "ls -la", "cargo build"]);
+    }
+
+    #[test]
+    fn parse_zsh_history_joins_continued_lines() {
+        // A `\`-continued multi-line entry is joined with a newline.
+        let contents = ": 1700000000:0;echo one\\\ntwo\nls\n";
+        let cmds = parse_zsh_history(contents);
+        assert_eq!(cmds, vec!["echo one\ntwo", "ls"]);
+    }
+
+    #[test]
+    fn parse_zsh_history_skips_blank_entries() {
+        let contents = "ls\n\n: 1700000000:0;\ncargo test\n";
+        let cmds = parse_zsh_history(contents);
+        // The empty plain line and the empty extended command are skipped.
+        assert_eq!(cmds, vec!["ls", "cargo test"]);
+    }
+
+    #[test]
+    fn history_matches_filters_by_prefix() {
+        let h = vec![
+            "git push".to_string(),
+            "git pull".to_string(),
+            "ls -la".to_string(),
+        ];
+        let s = history_matches(&h, "git p");
+        assert_eq!(texts(&s), vec!["git push", "git pull"]);
+        assert!(s.iter().all(|x| x.whole_line && !x.is_dir));
+    }
+
+    #[test]
+    fn history_matches_excludes_exact_equal() {
+        let h = vec!["git push".to_string(), "git pull".to_string()];
+        // `git push` equals the prefix exactly: nothing to add, excluded.
+        let s = history_matches(&h, "git push");
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn history_matches_preserves_given_order() {
+        // Order is preserved as given (most-recent-first per the contract).
+        let h = vec![
+            "cargo test".to_string(),
+            "cargo build".to_string(),
+            "cargo check".to_string(),
+        ];
+        let s = history_matches(&h, "cargo ");
+        assert_eq!(texts(&s), vec!["cargo test", "cargo build", "cargo check"]);
+    }
+
+    #[test]
+    fn history_matches_empty_prefix_is_empty() {
+        let h = vec!["ls".to_string()];
+        assert!(history_matches(&h, "").is_empty());
+    }
+
+    #[test]
+    fn history_matches_caps_at_max() {
+        let h: Vec<String> = (0..(MAX_SUGGESTIONS + 10))
+            .map(|i| format!("run cmd_{i:04}"))
+            .collect();
+        let s = history_matches(&h, "run ");
+        assert_eq!(s.len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn complete_merges_history_ahead_of_tokens() {
+        let bindir = TempDir::new();
+        bindir.touch_mode("gitfoo", 0o755);
+        let p = path_of(&[bindir.path.as_path()]);
+        let h = vec!["git status".to_string()];
+
+        // `git` (cursor at end): history line `git status` (whole-line) comes
+        // first, then the command-completion token `gitfoo `.
+        let s = complete("git", 3, None, Some(p.as_os_str()), &h, false);
+        assert_eq!(texts(&s), vec!["git status", "gitfoo "]);
+        assert!(s[0].whole_line);
+        assert!(!s[1].whole_line);
+    }
+
+    #[test]
+    fn complete_empty_token_no_history_is_empty() {
+        // Empty token, non-manual, no history: nothing (no cwd dump).
+        let cwd = TempDir::new();
+        cwd.touch("file");
+        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, &[], false);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn complete_manual_empty_token_lists_cwd() {
+        // Manual trigger on an empty token still lists the cwd.
+        let cwd = TempDir::new();
+        cwd.touch("file");
+        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, &[], true);
+        assert_eq!(texts(&s), vec!["file"]);
+    }
+
+    #[test]
+    fn complete_dedups_history_over_token() {
+        // A history line equal to a token suggestion's text appears once
+        // (history wins, keeping whole_line).
+        let bindir = TempDir::new();
+        bindir.touch_mode("deploy", 0o755);
+        let p = path_of(&[bindir.path.as_path()]);
+        // History entry text exactly matches the command suggestion `deploy `.
+        let h = vec!["deploy ".to_string()];
+        let s = complete("deploy", 6, None, Some(p.as_os_str()), &h, false);
+        assert_eq!(texts(&s), vec!["deploy "]);
+        assert!(s[0].whole_line);
     }
 }

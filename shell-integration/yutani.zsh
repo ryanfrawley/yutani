@@ -17,6 +17,10 @@
 #                and cursor position, base64-encoded. Drives the filesystem
 #                autocomplete popup. See design/osc2122-input-report.md.
 #
+#   * OSC 2124 — yutani-private history-file path report ($HISTFILE, base64).
+#                Lets the terminal read past commands for history-based
+#                autocomplete suggestions. Emitted once at source time.
+#
 # Opt-out: set YUTANI_NO_PROMPT_MARKS=1 (any non-empty value) BEFORE sourcing
 # to suppress ALL OSC 133 emission — the prompt wrap and the C/D hooks. Use
 # this if your prompt (e.g. starship, powerlevel10k) already emits OSC 133;
@@ -181,3 +185,15 @@ if (( $+functions[add-zle-hook-widget] )); then
   # Do NOT emit here — $BUFFER holds the accepted command we don't want to report.
   add-zle-hook-widget line-finish _yutani_reset_input_cache
 fi
+
+# ---------------------------------------------------------------------------
+# OSC 2124 — history file path report (yutani-private)
+# ---------------------------------------------------------------------------
+# Report the history file path so the terminal can read past commands for the
+# autocomplete popup (base64 to survive odd characters). Emitted once at source
+# time; the terminal reads + parses the file.
+_yutani_report_histfile() {
+  local hf=${HISTFILE:-$HOME/.zsh_history}
+  printf '\e]2124;%s\a' "$(print -rn -- "$hf" | base64 | tr -d '\n')"
+}
+_yutani_report_histfile
