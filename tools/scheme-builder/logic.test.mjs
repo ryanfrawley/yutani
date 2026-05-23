@@ -549,6 +549,19 @@ function done() {
     });
   }
 
+  // fontStack lives near the preview state; it needs PREVIEW_DEFAULTS in scope.
+  const PV_SRC = html.match(/const PREVIEW_DEFAULTS = \{[\s\S]*?\};/)[0];
+  const { fontStack } = buildSandbox(['fontStack'], PV_SRC);
+  test('fontStack quotes a bare family and adds fallbacks', () => {
+    assert.equal(fontStack('Fira Code'), '"Fira Code", ui-monospace, monospace');
+  });
+  test('fontStack passes a comma-separated stack through verbatim', () => {
+    assert.equal(fontStack('Menlo, monospace'), 'Menlo, monospace');
+  });
+  test('fontStack falls back to the default when empty', () => {
+    assert.equal(fontStack('  '), 'ui-monospace, "SF Mono", Menlo, Consolas, monospace');
+  });
+
   test('the three on-disk schemes are present as presets', () => {
     for (const n of ['Nostromo', 'Spacedust', 'Yutani']) {
       assert.ok(n in PRESETS, `missing preset: ${n}`);

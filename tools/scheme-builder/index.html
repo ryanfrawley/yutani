@@ -218,6 +218,18 @@
 
   /* ---------- Pane 2: preview ---------- */
   .preview-wrap { padding: 14px; display: flex; flex-direction: column; gap: 14px; align-items: stretch; flex: 1; }
+  /* Preview-only helpers (font face + size). These tune the rendering so it
+   * resembles the user's real terminal; they're never written to the scheme. */
+  .pv-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font: 11px var(--mono); color: var(--muted); }
+  .pv-bar label { color: var(--text); }
+  .pv-bar input {
+    background: #141414; color: var(--text); border: 1px solid #2a2a2a;
+    border-radius: 4px; padding: 3px 6px; font: 12px var(--mono); outline: none;
+  }
+  .pv-bar input:focus { border-color: var(--accent); }
+  .pv-bar input.font { width: 200px; }
+  .pv-bar input.size { width: 56px; }
+  .pv-bar .pv-note { margin-left: auto; font-style: italic; }
   .terminal {
     border-radius: 8px;
     box-shadow: 0 10px 30px rgba(0,0,0,0.4);
@@ -601,6 +613,28 @@
   <section class="pane">
     <header><span>Live preview</span></header>
     <div class="preview-wrap">
+      <div class="pv-bar">
+        <label for="pv-font">Font</label>
+        <input class="font" id="pv-font" list="pv-fonts" spellcheck="false" autocomplete="off"
+               placeholder="font family">
+        <datalist id="pv-fonts">
+          <option value="ui-monospace, &quot;SF Mono&quot;, Menlo, Consolas, monospace">System mono (default)</option>
+          <option value="Menlo"></option>
+          <option value="Monaco"></option>
+          <option value="SF Mono"></option>
+          <option value="Consolas"></option>
+          <option value="Cascadia Code"></option>
+          <option value="JetBrains Mono"></option>
+          <option value="Fira Code"></option>
+          <option value="Hack"></option>
+          <option value="Source Code Pro"></option>
+          <option value="IBM Plex Mono"></option>
+          <option value="Courier New"></option>
+        </datalist>
+        <label for="pv-size">Size</label>
+        <input class="size" type="number" id="pv-size" min="8" max="32" step="1">
+        <span class="pv-note">preview only — not saved to the scheme</span>
+      </div>
       <div class="terminal" id="term">
         <div class="titlebar">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
@@ -933,6 +967,28 @@ function normalizeState(s) {
 let state = normalizeState(clone(PRESETS['Yutani default (light)']));
 let editingToml = false;     // suppress TOML→model write while typing
 let editingPickers = false;  // suppress picker→TOML loop while regenerating
+
+/* Preview-only settings. These tune how the preview is drawn so it can
+ * resemble the user's real terminal; they are NOT part of the scheme model
+ * (`state`) and never reach toToml. Persisted to localStorage so the choice
+ * survives reloads. */
+const PREVIEW_DEFAULTS = { fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace', fontSize: 13 };
+let preview = loadPreview();
+function loadPreview() {
+  try { return { ...PREVIEW_DEFAULTS, ...(JSON.parse(localStorage.getItem('yutani-sb-preview')) || {}) }; }
+  catch { return { ...PREVIEW_DEFAULTS }; }
+}
+function savePreview() {
+  try { localStorage.setItem('yutani-sb-preview', JSON.stringify(preview)); } catch { /* private mode */ }
+}
+// Resolve a user-entered font into a usable CSS font-family stack: a bare name
+// (e.g. "Fira Code") is quoted and given monospace fallbacks; a value that
+// already contains a comma is treated as a complete stack and used verbatim.
+function fontStack(name) {
+  name = (name || '').trim();
+  if (!name) return PREVIEW_DEFAULTS.fontFamily;
+  return name.includes(',') ? name : `"${name}", ui-monospace, monospace`;
+}
 
 /* ============================================================
  * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (TOML).
@@ -1500,6 +1556,10 @@ function renderPreview() {
   body.style.background = state.background;
   body.style.color = state.foreground;
   body.style.caretColor = state.cursor;
+  // Preview-only font face + size (kept out of the scheme).
+  body.style.fontFamily = fontStack(preview.fontFamily);
+  body.style.fontSize = preview.fontSize + 'px';
+  body.style.lineHeight = '1.5';
   body.innerHTML = '';
 
   for (const segs of PREVIEW_LINES) {
@@ -1684,9 +1744,13 @@ function brightSlots() {
 // given scale. Geometry matches the .term-body CSS (13px/1.5 mono, 14/16 pad)
 // so the halo lands roughly where the DOM text is.
 function rasterizeScene(ctx, scale, w, h) {
+  // Padding is the fixed .term-body CSS (14/16); font face + size follow the
+  // preview controls so the rasterised scene matches the DOM text the halo
+  // is supposed to sit on.
   const padL = 16 * scale, padT = 14 * scale;
-  const fontPx = 13 * scale, lineH = 13 * 1.5 * scale;
-  const fontFor = bold => `${bold ? '600 ' : ''}${fontPx}px ui-monospace, Menlo, monospace`;
+  const fontPx = preview.fontSize * scale, lineH = preview.fontSize * 1.5 * scale;
+  const stack = fontStack(preview.fontFamily);
+  const fontFor = bold => `${bold ? '600 ' : ''}${fontPx}px ${stack}`;
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = state.background; ctx.fillRect(0, 0, w, h);
   ctx.textBaseline = 'top';
@@ -2422,6 +2486,18 @@ function init() {
   document.getElementById('glow-enabled').addEventListener('change', e => {
     state.glow.enabled = e.target.checked;
     renderAll();
+  });
+
+  // Preview-only font controls. Seed from saved prefs, then re-render the
+  // preview (DOM + glow raster) on change. These never touch the scheme.
+  const pvFont = document.getElementById('pv-font');
+  const pvSize = document.getElementById('pv-size');
+  pvFont.value = preview.fontFamily;
+  pvSize.value = preview.fontSize;
+  pvFont.addEventListener('input', () => { preview.fontFamily = pvFont.value; savePreview(); renderPreview(); });
+  pvSize.addEventListener('input', () => {
+    const n = parseInt(pvSize.value, 10);
+    if (Number.isFinite(n)) { preview.fontSize = Math.max(8, Math.min(32, n)); savePreview(); renderPreview(); }
   });
 
   // TOML textarea — debounce edits back into the model so the pickers
