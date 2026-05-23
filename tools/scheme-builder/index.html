@@ -1838,11 +1838,12 @@ function renderContrast() {
 // bound fill cost on 3x displays.
 let GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
 
-let glowCanvas = null, rasterCanvas = null, glowGL = null, glowGLFailed = false;
+let glowCanvas = null, rasterCanvas = null, maskCanvas = null, glowGL = null, glowGLFailed = false;
 function ensureGlowCanvases() {
   if (glowCanvas) return;
   glowCanvas = document.createElement('canvas'); glowCanvas.className = 'term-fx';
   rasterCanvas = document.createElement('canvas');  // offscreen sRGB scene
+  maskCanvas = document.createElement('canvas');    // bg-only scene (halo mask)
 }
 
 function smoothstep(e0, e1, x) {
@@ -1878,7 +1879,13 @@ function brightSlots() {
 // Draw the terminal scene (bg + glyphs + selection + cursor) into ctx at the
 // given scale. Geometry matches the .term-body CSS (13px/1.5 mono, 14/16 pad)
 // so the rasterised scene lines up with the DOM text it replaces under glow.
-function rasterizeScene(ctx, scale, w, h) {
+//
+// `maskOnly` draws just the cell backgrounds (no glyphs/cursor) — the bg
+// scene the composite samples to suppress the halo over colored cells, exactly
+// like the renderer's masked composite (glow.wgsl fs_composite_masked). Without
+// it, bright cell backgrounds bloom a (scanline-modulated) halo over the
+// content, which the real renderer never shows.
+function rasterizeScene(ctx, scale, w, h, maskOnly) {
   const padL = 16 * scale, padT = 14 * scale;
   const fontPx = preview.fontSize * scale, lineH = preview.fontSize * 1.5 * scale;
   const stack = fontStack(preview.fontFamily);
@@ -1900,10 +1907,12 @@ function rasterizeScene(ctx, scale, w, h) {
       const tw = ctx.measureText(text).width;
       const { fg, bg } = resolveSeg(s);
       if (bg) { ctx.fillStyle = bg; ctx.fillRect(x, y, tw, lineH); }
-      ctx.fillStyle = fg;
-      ctx.fillText(text, x, cy);
+      if (!maskOnly) {
+        ctx.fillStyle = fg;
+        ctx.fillText(text, x, cy);
+      }
       x += tw;
-      if (s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
+      if (!maskOnly && s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
     }
     y += lineH;
   }
@@ -1985,7 +1994,7 @@ void main(){ vec2 o2=u_texel;
 const GLOW_FS_COMP = `#version 300 es
 precision highp float;
 in vec2 v_uv; out vec4 o;
-uniform sampler2D u_scene, u_halo;
+uniform sampler2D u_scene, u_halo, u_mask;
 uniform float u_intensity, u_scanPeriod;
 uniform float u_haloScan, u_haloStrength;
 uniform float u_content, u_contentStrength, u_contentAtten, u_contentMasked;
@@ -1998,7 +2007,12 @@ void main(){
   float phase = fract(y / max(u_scanPeriod, 1.0));
   float isBright = step(0.5, phase);
   float hs = (u_haloScan>0.5) ? mix(1.0, isBright, u_haloStrength) : 1.0;
-  float k = u_intensity * hs;
+  // Halo mask (glow.wgsl fs_composite_masked): suppress the bloom — and the
+  // scanlines riding it — wherever a cell paints a background distinct from the
+  // window bg, so a colored block's own glow never washes over its content.
+  float bgDiff = distance(texture(u_mask, v_uv).rgb, u_bg);
+  float suppression = smoothstep(0.02, 0.08, bgDiff);
+  float k = u_intensity * hs * (1.0 - suppression);
   vec3 lin = halo.rgb*k + scene*(1.0 - clamp(halo.a*k, 0.0, 1.0));   // premult-over
   vec3 srgb = vec3(l2s(lin.r), l2s(lin.g), l2s(lin.b));
   if(u_content>0.5){
@@ -2039,6 +2053,7 @@ function createGlowGL(canvas) {
 
   const vao = gl.createVertexArray();           // empty VAO (vertices from gl_VertexID)
   const sceneTex = gl.createTexture();
+  const maskTex = gl.createTexture();           // bg-only scene, for halo suppression
   // Half- and quarter-resolution ping/pong targets, (re)sized on demand.
   let half = null, quarter = null, dims = { w: 0, h: 0 };
   const mkTarget = (w, h) => {
@@ -2062,19 +2077,25 @@ function createGlowGL(canvas) {
   const setU = (p, name, set) => { const loc = gl.getUniformLocation(p, name); set(loc); };
   const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  function render(raster, g, slots) {
-    const sw = canvas.width, sh = canvas.height;
-    resize(sw, sh);
-    gl.bindVertexArray(vao);
-
-    // Upload the scene as an sRGB texture (flip Y so the texture is upright).
-    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+  // Upload an sRGB texture from a canvas (flip Y so the texture is upright).
+  const uploadTex = (tex, src) => {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, raster);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, src);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
                           [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
       gl.texParameteri(gl.TEXTURE_2D, k, v);
+  };
+
+  function render(raster, mask, g, slots) {
+    const sw = canvas.width, sh = canvas.height;
+    resize(sw, sh);
+    gl.bindVertexArray(vao);
+
+    // Scene (bg + glyphs) and the bg-only mask, both as sRGB textures.
+    uploadTex(sceneTex, raster);
+    uploadTex(maskTex, mask);
 
     const wantHalo = g.match_brightness || g.match_bright_ansi || g.match_foreground;
     const fg = hexToLin(state.foreground), bg = hexToLin(state.background);
@@ -2126,9 +2147,11 @@ function createGlowGL(canvas) {
     gl.viewport(0, 0, sw, sh);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, half.tex);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex);
     const sb = hexToRgb01(g.scanline_color_bright), sd = hexToRgb01(g.scanline_color_dark);
     setU(progs.comp, 'u_scene', l => gl.uniform1i(l, 0));
     setU(progs.comp, 'u_halo', l => gl.uniform1i(l, 1));
+    setU(progs.comp, 'u_mask', l => gl.uniform1i(l, 2));
     setU(progs.comp, 'u_intensity', l => gl.uniform1f(l, wantHalo ? g.intensity : 0));
     setU(progs.comp, 'u_scanPeriod', l => gl.uniform1f(l, g.scanline_period));
     setU(progs.comp, 'u_haloScan', l => gl.uniform1f(l, (wantHalo && g.scanlines) ? 1 : 0));
@@ -2168,7 +2191,10 @@ function renderGlowPreview() {
   if (glowCanvas.height !== sh) glowCanvas.height = sh;
   if (rasterCanvas.width !== sw) rasterCanvas.width = sw;
   if (rasterCanvas.height !== sh) rasterCanvas.height = sh;
+  if (maskCanvas.width !== sw) maskCanvas.width = sw;
+  if (maskCanvas.height !== sh) maskCanvas.height = sh;
   rasterizeScene(rasterCanvas.getContext('2d'), GLOW_SCALE, sw, sh);
+  rasterizeScene(maskCanvas.getContext('2d'), GLOW_SCALE, sw, sh, true); // bg-only halo mask
 
   if (!glowGL && !glowGLFailed) {
     glowGL = createGlowGL(glowCanvas);
@@ -2179,7 +2205,7 @@ function renderGlowPreview() {
   }
   if (!glowGL) { glowCanvas.style.display = 'none'; return; }
 
-  glowGL.render(rasterCanvas, g, brightSlots());
+  glowGL.render(rasterCanvas, maskCanvas, g, brightSlots());
   // The opaque WebGL canvas sits over (and hides) the DOM text it was built
   // from. Re-attach after the DOM rebuild in renderPreview.
   body.append(glowCanvas);
