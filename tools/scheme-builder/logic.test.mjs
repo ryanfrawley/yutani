@@ -628,4 +628,88 @@ function done() {
   });
 }
 
+/* ============================================================
+ * resolveFg — what color a preview cell glyph actually paints.
+ *
+ * resolveFg closes over the module `state`, brightEnabled(), and the
+ * whole projectHex color chain (hex<->linear conversion + nearest-
+ * color snapping). We grab that chain and inject HUES via buildSandbox.
+ *
+ * The mono case mirrors palette.rs::project_cell: with only two ink
+ * levels every glyph paints as the foreground ink, so a dim color that
+ * would nearest-snap to the background must NOT vanish into it.
+ * ============================================================ */
+{
+  const sb = buildSandbox([
+    'resolveFg', 'brightEnabled', 'projectHex',
+    'srgbToLinear', 'linearToSrgbU8', 'hexToLin', 'linToHex',
+    'lumaDistSq', 'nearestLin', 'ansiLinPalette', 'xterm256Lin',
+  ]);
+  const { resolveFg, __setState } = sb;
+
+  function freshState(max_colors = '') {
+    return {
+      background: '#000000', foreground: '#e0e0e0',
+      cursor: '#1a00cc', selection: '#3366d9',
+      ansi: {
+        black:   ['#000000', '#808080'],
+        red:     ['#ab0000', '#ff5555'],
+        // A dim green that nearest-snaps to the background, not the fg.
+        green:   ['#003300', '#55ff55'],
+        yellow:  ['#abab00', '#ffff55'],
+        blue:    ['#0000ab', '#5555ff'],
+        magenta: ['#ab00ab', '#ff55ff'],
+        cyan:    ['#00abab', '#55ffff'],
+        white:   ['#ababab', '#ffffff'],
+      },
+      max_colors,
+    };
+  }
+
+  test('resolveFg: truecolor returns the scheme normal/bright ANSI hex', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('red', false), '#ab0000');
+    assert.equal(resolveFg('red', true), '#ff5555');
+  });
+
+  test('resolveFg: truecolor leaves colors unprojected (no snapping)', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('green', false), '#003300');
+    assert.equal(resolveFg('cyan', true), '#55ffff');
+  });
+
+  test('resolveFg: mono paints every ANSI glyph as foreground ink', () => {
+    __setState(freshState('mono'));
+    for (const hue of ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white']) {
+      assert.equal(resolveFg(hue, false), '#e0e0e0', `${hue} normal`);
+      assert.equal(resolveFg(hue, true), '#e0e0e0', `${hue} bold`);
+    }
+  });
+
+  test('resolveFg: mono does NOT let a bg-snapping color vanish (regression)', () => {
+    const s = freshState('mono');
+    __setState(s);
+    // Sanity: under projectHex, this dim green WOULD snap to the background.
+    assert.equal(sb.projectHex(s.ansi.green[0]), s.background);
+    // But resolveFg must paint it as foreground ink, not the background.
+    assert.equal(resolveFg('green', false), s.foreground);
+    assert.equal(resolveFg('green', true), s.foreground);
+    assert.notEqual(resolveFg('green', false), s.background);
+  });
+
+  test('resolveFg: window colors return their window hex in truecolor', () => {
+    __setState(freshState(''));
+    assert.equal(resolveFg('foreground', false), '#e0e0e0');
+    assert.equal(resolveFg('background', false), '#000000');
+    assert.equal(resolveFg('cursor', false), '#1a00cc');
+  });
+
+  test('resolveFg: window colors return their window hex in mono too', () => {
+    __setState(freshState('mono'));
+    assert.equal(resolveFg('foreground', true), '#e0e0e0');
+    assert.equal(resolveFg('background', true), '#000000');
+    assert.equal(resolveFg('cursor', true), '#1a00cc');
+  });
+}
+
 done();
