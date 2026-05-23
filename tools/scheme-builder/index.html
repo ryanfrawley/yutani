@@ -759,6 +759,72 @@ const DEFAULTS = {
 
 const PRESETS = {
   'Yutani default (light)': structuredClone(DEFAULTS),
+  // The schemes currently shipping in ~/.config/yutani/schemes. Spacedust and
+  // Yutani carry glow overrides (match_brightness + halo scanlines); Nostromo
+  // caps at 8 colors. selection_fg is unset on all three.
+  'Nostromo': {
+    background: '#1d1f21', foreground: '#c5c8c6',
+    cursor: '#c5c8c6',    selection: '#373b41',
+    ansi: {
+      black:   ['#1d1f21', '#969896'],
+      red:     ['#cc6666', '#cc6666'],
+      green:   ['#b5bd68', '#b5bd68'],
+      yellow:  ['#f0c674', '#f0c674'],
+      blue:    ['#81a2be', '#81a2be'],
+      magenta: ['#b294bb', '#b294bb'],
+      cyan:    ['#8abeb7', '#8abeb7'],
+      white:   ['#c5c8c6', '#ffffff'],
+    },
+    max_colors: '8',
+  },
+  'Spacedust': {
+    background: '#0a1e24', foreground: '#ecefc1',
+    cursor: '#ffffff',    selection: '#0a385c',
+    ansi: {
+      black:   ['#6e5246', '#674c31'],
+      red:     ['#e35a00', '#ff8a39'],
+      green:   ['#5cab96', '#adcab8'],
+      yellow:  ['#e3cd7b', '#ffc777'],
+      blue:    ['#0e548b', '#67a0cd'],
+      magenta: ['#e35a00', '#ff8a39'],
+      cyan:    ['#06afc7', '#83a6b3'],
+      white:   ['#f0f1ce', '#fefff0'],
+    },
+    max_colors: '16',
+    glow: {
+      enabled: true,
+      match_brightness: true, match_bright_ansi: false, match_foreground: false,
+      threshold: 0, intensity: 0.6, softness: 1, hue_tolerance_deg: 18, fg_tolerance: 0,
+      iterations: 4, scanlines: true, scanline_strength: 1, scanline_period: 8,
+      scanlines_content: false, scanlines_content_strength: 1,
+      scanline_color_bright: '#ffffff', scanline_color_dark: '#000000',
+      scanlines_skip_primary_bg: false, scanlines_content_attenuation: 0,
+    },
+  },
+  'Yutani': {
+    background: '#fbfaf7', foreground: '#1a150e',
+    cursor: '#1a00cc',    selection: '#3366d9',
+    ansi: {
+      black:   ['#000000', '#808080'],
+      red:     ['#ab0000', '#ff5555'],
+      green:   ['#00ab00', '#55ff55'],
+      yellow:  ['#abab00', '#ffff55'],
+      blue:    ['#0000ab', '#5555ff'],
+      magenta: ['#ab00ab', '#ff55ff'],
+      cyan:    ['#00abab', '#55ffff'],
+      white:   ['#ababab', '#ffffff'],
+    },
+    max_colors: '16',
+    glow: {
+      enabled: true,
+      match_brightness: true, match_bright_ansi: false, match_foreground: false,
+      threshold: 0, intensity: 0.6, softness: 1, hue_tolerance_deg: 18, fg_tolerance: 0,
+      iterations: 4, scanlines: true, scanline_strength: 1, scanline_period: 8,
+      scanlines_content: false, scanlines_content_strength: 1,
+      scanline_color_bright: '#ffffff', scanline_color_dark: '#000000',
+      scanlines_skip_primary_bg: false, scanlines_content_attenuation: 0,
+    },
+  },
   'Solarized Dark': {
     background: '#002b36', foreground: '#839496',
     cursor: '#93a1a1',   selection: '#073642',

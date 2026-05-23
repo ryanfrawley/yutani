@@ -510,4 +510,58 @@ function done() {
   });
 }
 
+/* ============================================================
+ * Bundled presets — every PRESETS entry must survive a
+ * normalizeState → toToml → parseToml round-trip with its colours,
+ * max_colors, and glow block intact. Guards against a fat-fingered
+ * hex or a malformed glow override slipping into the preset table.
+ * ============================================================ */
+{
+  const DEFAULTS_SRC = html.match(/const DEFAULTS = \{[\s\S]*?\n\};/)[0];
+  const PRESETS_SRC = html.match(/const PRESETS = \{[\s\S]*?\n\};/)[0];
+  const api = buildSandbox(
+    ['clone', 'normHex', 'toTomlHex', 'tomlNum', 'toGlowLines', 'toToml',
+     'parseGlowKey', 'clampGlowNum', 'parseToml', 'normalizeState'],
+    DEFAULTS_SRC + '\n' + PRESETS_SRC + '\nthis.__PRESETS = PRESETS;',
+  );
+  // Surface the preset table for the test (buildSandbox doesn't return it).
+  const PRESETS = new Function(DEFAULTS_SRC + '\n' + PRESETS_SRC + '\nreturn PRESETS;')();
+  const HUES = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+
+  for (const name of Object.keys(PRESETS)) {
+    test(`preset "${name}" round-trips`, () => {
+      const s = api.normalizeState(api.clone(PRESETS[name]));
+      api.__setState(s);
+      const { out, errors } = api.parseToml(api.toToml());
+      assert.deepEqual(errors, [], `parse errors for ${name}`);
+      for (const k of ['background', 'foreground', 'cursor', 'selection']) {
+        assert.equal(out[k], s[k], `${name}.${k}`);
+      }
+      for (const hue of HUES) {
+        assert.deepEqual(out.ansi[hue], s.ansi[hue], `${name}.${hue}`);
+      }
+      assert.equal(out.max_colors, s.max_colors || '', `${name}.max_colors`);
+      // Glow keys only emit when enabled; whatever lands must match state.
+      assert.equal(out.glowSeen, !!s.glow.enabled, `${name}.glowSeen`);
+      for (const key of Object.keys(out.glow)) {
+        assert.equal(out.glow[key], s.glow[key], `${name}.glow.${key}`);
+      }
+    });
+  }
+
+  test('the three on-disk schemes are present as presets', () => {
+    for (const n of ['Nostromo', 'Spacedust', 'Yutani']) {
+      assert.ok(n in PRESETS, `missing preset: ${n}`);
+    }
+  });
+  test('Spacedust and Yutani carry enabled glow overrides', () => {
+    for (const n of ['Spacedust', 'Yutani']) {
+      const s = api.normalizeState(api.clone(PRESETS[n]));
+      assert.equal(s.glow.enabled, true, `${n}.glow.enabled`);
+      assert.equal(s.glow.match_brightness, true, `${n}.glow.match_brightness`);
+      assert.equal(s.glow.scanlines, true, `${n}.glow.scanlines`);
+    }
+  });
+}
+
 done();
