@@ -429,6 +429,9 @@ struct Config {
     shell_exit_mode: ShellExitMode,
     /// OSC 133 prompt-status gutter indicator. Off by default.
     prompt_gutter: PromptGutter,
+    /// Whether the filesystem/history autocomplete popup is shown as you
+    /// type. Default on; set `autocomplete = false` to disable.
+    autocomplete: bool,
 }
 
 impl Config {
@@ -473,6 +476,7 @@ impl Config {
             images_halfblock_for_missing: false,
             shell_exit_mode: ShellExitMode::OnSuccess,
             prompt_gutter: PromptGutter::None,
+            autocomplete: true,
         }
     }
 
@@ -606,6 +610,7 @@ impl Config {
                     self.prompt_gutter = g;
                 }
             },
+            "autocomplete" => if let Some(x) = v.as_bool() { self.autocomplete = x; },
             _ => (),
         }
     }
@@ -716,6 +721,12 @@ impl Config {
              # prompt_gutter: \"none\" | \"bar\"\n\
              prompt_gutter = {}\n",
             toml_str_lit(self.prompt_gutter.as_str()),
+        ));
+        s.push_str(&format!(
+            "\n# Completion\n\
+             # autocomplete: show the filesystem/history popup as you type\n\
+             autocomplete = {}\n",
+            self.autocomplete,
         ));
         s
     }
@@ -4473,8 +4484,10 @@ impl State {
         self.completions_input = key;
         // A dismissed popup (Enter/Esc) must not reopen when the shell re-emits
         // OSC 2122 after an accepted suffix — keep it empty until a real
-        // keystroke clears the flag.
-        self.completions = if self.completion_dismissed {
+        // keystroke clears the flag. The `autocomplete` config gate works the
+        // same way: when the feature is off, never run `completion::complete`,
+        // just keep the cache empty (read live so config reload toggles it).
+        self.completions = if self.completion_dismissed || !self.config.autocomplete {
             Vec::new()
         } else {
             match &cur {
@@ -4510,6 +4523,11 @@ impl State {
     /// current input so the next (unchanged-input) recompute doesn't immediately
     /// wipe the freshly-summoned list.
     fn trigger_completion(&mut self) {
+        // Honor the `autocomplete` config gate: no manual summon when the
+        // feature is off. Read live so a config reload toggles it.
+        if !self.config.autocomplete {
+            return;
+        }
         self.completion_dismissed = false;
         // Clone the buffer/cursor out of the immutable `current_input()` borrow so
         // it ends before we take `cwd()` and then mutably write `self.*` fields.
@@ -6980,6 +6998,37 @@ mod tests {
         c.prompt_gutter = PromptGutter::Bar;
         let parsed = Config::parse_str(&c.serialize());
         assert_eq!(parsed.prompt_gutter, PromptGutter::Bar);
+    }
+
+    #[test]
+    fn config_autocomplete_default_is_on() {
+        assert!(Config::defaults().autocomplete);
+    }
+
+    #[test]
+    fn config_autocomplete_missing_key_defaults_on() {
+        let parsed = Config::parse_str("font_size = 14.0\n");
+        assert!(parsed.autocomplete);
+    }
+
+    #[test]
+    fn config_autocomplete_parses_explicit_false() {
+        let parsed = Config::parse_str("autocomplete = false\n");
+        assert!(!parsed.autocomplete);
+    }
+
+    #[test]
+    fn config_autocomplete_parses_explicit_true() {
+        let parsed = Config::parse_str("autocomplete = true\n");
+        assert!(parsed.autocomplete);
+    }
+
+    #[test]
+    fn config_autocomplete_round_trips_through_serialize() {
+        let mut c = Config::defaults();
+        c.autocomplete = false;
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(!parsed.autocomplete);
     }
 
     #[test]
