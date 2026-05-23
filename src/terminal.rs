@@ -496,6 +496,31 @@ impl MouseProtocol {
     }
 }
 
+/// An alt-screen scroll that just happened, reported to the front end so it
+/// can animate the slide. `rows` is the net distance in cells; `up` is the
+/// direction (content moved up, the common pager-forward case). `region_top`/
+/// `region_bottom` are the scroll region it happened in (0-based, inclusive) —
+/// often not the full height because apps reserve a status line. The captured
+/// departing rows live on the `Terminal` (see `alt_anim_departing`) so the
+/// renderer can draw them in the phantom band during the slide.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AltScroll {
+    pub up: bool,
+    pub rows: usize,
+    pub region_top: usize,
+    pub region_bottom: usize,
+}
+
+/// Frozen departing rows for an in-flight scroll animation. `up` is the scroll
+/// direction; `edge_row` is the visual row where the band begins (see
+/// `alt_anim_departing`); `rows` are the cell rows, top-to-bottom.
+#[derive(Clone, Debug)]
+pub struct AltAnimRows {
+    pub up: bool,
+    pub edge_row: isize,
+    pub rows: Vec<Vec<Cell>>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Cursor {
     pub row: usize,
@@ -644,6 +669,32 @@ pub struct Terminal {
     // Bracketed paste (?2004): when set, the GUI wraps pasted text in
     // ESC [ 200 ~ … ESC [ 201 ~ before sending it to the PTY.
     bracketed_paste: bool,
+    // Alternate scroll (?1007). When set, and the alt screen is active with no
+    // mouse tracking in effect, the front end turns wheel motion into cursor-key
+    // presses so pagers (less, man) scroll. Defaults on, matching xterm's
+    // `alternateScroll` resource and iTerm2/kitty; apps disable it via ?1007l.
+    alternate_scroll: bool,
+    // Alt-screen smooth-scroll animation capture. When a full-width scroll
+    // happens on the alt screen (SU / line-feed at the bottom, SD, or RI at the
+    // top), we snapshot the pre-scroll frame and accumulate the net row delta
+    // over the current `feed`, then hand it to the front end via
+    // `take_alt_scroll`. `snapshot` is taken once, at the first qualifying
+    // scroll of the feed (so it captures the frame just before any scrolling);
+    // `net` is +up / -down; `region` is the consistent [top, bottom] the scroll
+    // happened in (apps reserve a status line, so it's often not full-height);
+    // `poison` aborts the window when a partial-width, region-changing, or
+    // mixed-direction scroll makes the clean uniform-shift assumption invalid.
+    alt_scroll_snapshot: Option<Vec<Vec<Cell>>>,
+    alt_scroll_net: isize,
+    alt_scroll_region: Option<(usize, usize)>,
+    alt_scroll_poison: bool,
+    // The rows that scrolled off, frozen for the duration of the front-end
+    // animation. `extended_cell` serves these in the phantom band so the slide
+    // shows real departing content instead of a blank stripe. `edge_row` is the
+    // visual row where the departing band begins: for an upward scroll it's the
+    // region top (rows sit just above, at edge_row-1 .. edge_row-d); for a
+    // downward scroll it's region_bottom+1 (rows sit at edge_row .. edge_row+d-1).
+    alt_anim_departing: Option<AltAnimRows>,
     // Theme-derived defaults the terminal reports back for OSC 10/11/12
     // queries. Set by the front end via `set_default_colors`.
     default_fg_rgb: [u8; 3],
@@ -906,6 +957,12 @@ impl Terminal {
             mouse_any_motion: false,
             mouse_sgr: false,
             bracketed_paste: false,
+            alternate_scroll: true,
+            alt_scroll_snapshot: None,
+            alt_scroll_net: 0,
+            alt_scroll_region: None,
+            alt_scroll_poison: false,
+            alt_anim_departing: None,
             default_fg_rgb: [0xcc, 0xcc, 0xcc],
             default_bg_rgb: [0x00, 0x00, 0x00],
             default_cursor_rgb: [0xcc, 0xcc, 0xcc],
@@ -1327,6 +1384,106 @@ impl Terminal {
         self.bracketed_paste
     }
 
+    /// DEC mode ?1007 (alternate scroll). When true and the alt screen is
+    /// active, the front end converts wheel motion into cursor-key presses
+    /// (gated on mouse tracking being off — mouse reporting takes priority).
+    pub fn alternate_scroll(&self) -> bool {
+        self.alternate_scroll
+    }
+
+    /// Consume any alt-screen scroll captured during the last `feed`, returning
+    /// its net direction, distance, and scroll region for the front end to
+    /// animate. Stashes the departing rows on the terminal for `extended_cell`
+    /// to serve during the slide; the front end must call `clear_alt_anim`
+    /// when the animation ends. Returns `None` when nothing scrolled, the
+    /// window was poisoned (partial-width, region-changing, or mixed-direction
+    /// scrolls), or the net distance was zero.
+    pub fn take_alt_scroll(&mut self) -> Option<AltScroll> {
+        let snapshot = self.alt_scroll_snapshot.take();
+        let net = std::mem::replace(&mut self.alt_scroll_net, 0);
+        let region = self.alt_scroll_region.take();
+        let poison = std::mem::replace(&mut self.alt_scroll_poison, false);
+        let snapshot = snapshot?;
+        let (region_top, region_bottom) = region?;
+        if poison || net == 0 {
+            return None;
+        }
+        let up = net > 0;
+        let region_h = region_bottom + 1 - region_top;
+        let d = (net.unsigned_abs() as usize).min(region_h);
+        if d == 0 {
+            return None;
+        }
+        // Departing rows are the edge of the pre-scroll region that slid out of
+        // view: the top `d` rows for an upward scroll (they exit at the region
+        // top), the bottom `d` for downward (they exit past the region bottom).
+        let (departing, edge_row): (Vec<Vec<Cell>>, isize) = if up {
+            (
+                snapshot[region_top..region_top + d].to_vec(),
+                region_top as isize,
+            )
+        } else {
+            (
+                snapshot[region_bottom + 1 - d..region_bottom + 1].to_vec(),
+                region_bottom as isize + 1,
+            )
+        };
+        self.alt_anim_departing = Some(AltAnimRows {
+            up,
+            edge_row,
+            rows: departing,
+        });
+        Some(AltScroll {
+            up,
+            rows: d,
+            region_top,
+            region_bottom,
+        })
+    }
+
+    /// Drop the frozen departing rows once the front end's slide completes.
+    pub fn clear_alt_anim(&mut self) {
+        self.alt_anim_departing = None;
+    }
+
+    /// Record an alt-screen scroll for later animation. Called from the scroll
+    /// primitives *before* they mutate the grid, so the first call of a `feed`
+    /// snapshots the pre-scroll frame. Only full-width scrolls animate (the
+    /// uniform vertical-shift reconstruction can't model column ranges).
+    /// Partial-width scrolls, a changing region, and direction flips within one
+    /// feed poison the window. No-op off the alt screen (the primary screen
+    /// scrolls into real scrollback and isn't animated).
+    fn note_alt_region_scroll(&mut self, up: bool, n: usize, top: usize, bottom: usize, full_width: bool) {
+        if !self.use_alternate || n == 0 || self.alt_scroll_poison {
+            return;
+        }
+        if !full_width {
+            self.alt_scroll_poison = true;
+            return;
+        }
+        // A direction flip within one feed breaks the single-shift model.
+        if (up && self.alt_scroll_net < 0) || (!up && self.alt_scroll_net > 0) {
+            self.alt_scroll_poison = true;
+            return;
+        }
+        // The region must stay constant across the accumulation window.
+        match self.alt_scroll_region {
+            Some(r) if r != (top, bottom) => {
+                self.alt_scroll_poison = true;
+                return;
+            }
+            None => self.alt_scroll_region = Some((top, bottom)),
+            _ => {}
+        }
+        if self.alt_scroll_snapshot.is_none() {
+            let snap = (0..self.rows)
+                .map(|r| self.alternate.row(r).to_vec())
+                .collect();
+            self.alt_scroll_snapshot = Some(snap);
+        }
+        self.alt_scroll_net += if up { n as isize } else { -(n as isize) };
+    }
+
     /// Mouse-protocol state, in a form the front-end can consume directly.
     pub fn mouse_protocol(&self) -> MouseProtocol {
         MouseProtocol {
@@ -1495,10 +1652,30 @@ impl Terminal {
     /// rows don't pop into / out of existence at snap boundaries.
     pub fn extended_cell(&self, visual_row: isize, col: usize) -> Option<Cell> {
         if self.use_alternate {
-            if visual_row < 0 || visual_row as usize >= self.rows {
-                return None;
+            if visual_row >= 0 && (visual_row as usize) < self.rows {
+                return Some(self.alternate.get(visual_row as usize, col));
             }
-            return Some(self.alternate.get(visual_row as usize, col));
+            // During a scroll animation, the phantom band on the departing
+            // edge is drawn from the frozen pre-scroll rows. They begin at
+            // `edge_row`: an upward scroll's sit just above it (edge_row-d ..
+            // edge_row-1); a downward scroll's sit at it and below (edge_row ..
+            // edge_row+d-1).
+            if let Some(anim) = &self.alt_anim_departing {
+                let d = anim.rows.len() as isize;
+                let idx = if anim.up {
+                    if visual_row < anim.edge_row && visual_row >= anim.edge_row - d {
+                        visual_row - (anim.edge_row - d)
+                    } else {
+                        return None;
+                    }
+                } else if visual_row >= anim.edge_row && visual_row < anim.edge_row + d {
+                    visual_row - anim.edge_row
+                } else {
+                    return None;
+                };
+                return anim.rows[idx as usize].get(col).copied();
+            }
+            return None;
         }
         let sb_target = self.scrollback.len() as isize - self.view_offset as isize + visual_row;
         if sb_target < 0 {
@@ -1538,6 +1715,13 @@ impl Terminal {
         if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
             return;
         }
+        // Captured/frozen scroll-animation rows are sized to the old grid;
+        // a dimension change retires them rather than risk an inconsistent slide.
+        self.alt_scroll_snapshot = None;
+        self.alt_scroll_net = 0;
+        self.alt_scroll_region = None;
+        self.alt_scroll_poison = false;
+        self.alt_anim_departing = None;
         let blank = Cell::new(' ', self.cursor.style);
         let old_rows = self.rows;
 
@@ -1780,15 +1964,16 @@ impl Terminal {
             Event::EraseInDisplay(mode) => self.erase_in_display(mode),
             Event::EraseInLine(mode) => self.erase_in_line(mode),
             Event::ScrollUp(n) => self.scroll_region_up_by(n as usize),
-            Event::ScrollDown(n) => {
-                let blank = self.blank();
-                let top = self.scroll_top;
-                let bottom = self.scroll_bottom;
-                let left = self.scroll_left;
-                let right = self.scroll_right;
-                self.active_grid_mut()
-                    .scroll_region_down(top, bottom, left, right, n as usize, blank);
+            Event::ScrollDown(n) => self.scroll_region_down_by(n as usize),
+            // IND / NEL behave like a line feed (NEL also returns the carriage);
+            // RI is the upward counterpart, scrolling the region down at the top.
+            Event::Index => self.line_feed_no_cr(),
+            Event::NextLine => {
+                self.cursor.col = 0;
+                self.cursor.wrap_pending = false;
+                self.line_feed_no_cr();
             }
+            Event::ReverseIndex => self.reverse_index(),
             Event::SetScrollRegion(top, bottom) => self.set_scroll_region(top, bottom),
             Event::SetLeftRightMargin(l, r) => self.set_left_right_margin(l, r),
             Event::InsertLine(n) => self.insert_lines(n as usize),
@@ -2015,6 +2200,9 @@ impl Terminal {
             && self.scroll_bottom == self.rows - 1
             && self.scroll_left == 0
             && self.scroll_right == self.cols - 1;
+        // Capture for smooth-scroll animation before the grid shifts.
+        let full_width = self.scroll_left == 0 && self.scroll_right == self.cols - 1;
+        self.note_alt_region_scroll(true, n, self.scroll_top, self.scroll_bottom, full_width);
         if !self.use_alternate && full_region && self.scrollback_limit > 0 {
             for _ in 0..n.min(self.rows) {
                 let line = self.primary.row(self.scroll_top).to_vec();
@@ -2068,6 +2256,34 @@ impl Terminal {
         // `scrollback.len()` is final here.
         if !self.use_alternate && full_region {
             self.scroll_marks_up(n);
+        }
+    }
+
+    /// Scroll the active region down by `n` (content moves down, blanks fill in
+    /// at the top). The counterpart to `scroll_region_up_by`; used by SD
+    /// (`CSI T`) and RI (`ESC M`) at the top margin. Captures for the
+    /// smooth-scroll animation before mutating the grid.
+    fn scroll_region_down_by(&mut self, n: usize) {
+        let blank = self.blank();
+        let top = self.scroll_top;
+        let bottom = self.scroll_bottom;
+        let left = self.scroll_left;
+        let right = self.scroll_right;
+        let full_width = left == 0 && right == self.cols - 1;
+        self.note_alt_region_scroll(false, n, top, bottom, full_width);
+        self.active_grid_mut()
+            .scroll_region_down(top, bottom, left, right, n, blank);
+    }
+
+    /// RI (`ESC M`): move the cursor up one row, scrolling the region down when
+    /// it sits at the top margin. This is how pagers (`less`) reveal the
+    /// previous line when scrolling back.
+    fn reverse_index(&mut self) {
+        self.cursor.wrap_pending = false;
+        if self.cursor.row == self.scroll_top {
+            self.scroll_region_down_by(1);
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
         }
     }
 
@@ -2209,6 +2425,12 @@ impl Terminal {
         let bottom = self.scroll_bottom;
         let left = self.scroll_left;
         let right = self.scroll_right;
+        // IL at the top margin is how editors (vim) scroll content back: it
+        // shifts [cursor.row, bottom] down. Treat it as a downward scroll of
+        // that effective region so the slide can animate (the front end only
+        // animates top-anchored regions, so a mid-screen open-line won't).
+        let full_width = left == 0 && right == self.cols - 1;
+        self.note_alt_region_scroll(false, n, top, bottom, full_width);
         self.active_grid_mut()
             .scroll_region_down(top, bottom, left, right, n, blank);
         self.cursor.wrap_pending = false;
@@ -2228,6 +2450,10 @@ impl Terminal {
         let bottom = self.scroll_bottom;
         let left = self.scroll_left;
         let right = self.scroll_right;
+        // DL at the top margin shifts [cursor.row, bottom] up — the upward
+        // counterpart to IL above.
+        let full_width = left == 0 && right == self.cols - 1;
+        self.note_alt_region_scroll(true, n, top, bottom, full_width);
         self.active_grid_mut()
             .scroll_region_up(top, bottom, left, right, n, blank);
         self.cursor.wrap_pending = false;
@@ -2346,6 +2572,7 @@ impl Terminal {
             1002 => self.mouse_button_motion = set,
             1003 => self.mouse_any_motion = set,
             1006 => self.mouse_sgr = set,
+            1007 => self.alternate_scroll = set,
             2004 => self.bracketed_paste = set,
             1049 | 1047 | 47 => self.switch_screen(set, code == 1049),
             // DECLRMM. Enabling/disabling resets the margins to the full
@@ -4024,6 +4251,13 @@ impl Terminal {
                 }
             }
         }
+        // A screen switch invalidates any in-flight scroll-animation capture
+        // and its frozen rows — they belong to the screen we're leaving.
+        self.alt_scroll_snapshot = None;
+        self.alt_scroll_net = 0;
+        self.alt_scroll_region = None;
+        self.alt_scroll_poison = false;
+        self.alt_anim_departing = None;
     }
 
     fn save_cursor(&mut self) {
@@ -4068,6 +4302,12 @@ impl Terminal {
         self.mouse_any_motion = false;
         self.mouse_sgr = false;
         self.bracketed_paste = false;
+        self.alternate_scroll = true;
+        self.alt_scroll_snapshot = None;
+        self.alt_scroll_net = 0;
+        self.alt_scroll_region = None;
+        self.alt_scroll_poison = false;
+        self.alt_anim_departing = None;
         self.pending_response.clear();
         self.scrollback.clear();
         // Grid::clear already dropped per-grid placements above; also drop
@@ -6811,6 +7051,389 @@ mod tests {
         t.feed("\x1b[?1049h"); // enter alt screen
         assert!(!t.scroll_up(1));
         assert_eq!(t.view_offset(), 0);
+    }
+
+    #[test]
+    fn reverse_index_scrolls_region_down_at_top_margin() {
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("AAA\r\nBBB\r\nCCC"); // rows AAA, BBB, CCC
+        t.feed("\x1b[H"); // cursor home (top margin)
+        t.feed("\x1bM"); // RI: content slides down, blank fills the top
+        assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "   ");
+        assert_eq!(t.row(1).iter().map(|c| c.ch).collect::<String>(), "AAA");
+        assert_eq!(t.row(2).iter().map(|c| c.ch).collect::<String>(), "BBB");
+    }
+
+    #[test]
+    fn reverse_index_moves_cursor_up_off_margin() {
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("AAA\r\nBBB\r\nCCC");
+        t.feed("\x1b[3;1H"); // row 2
+        t.feed("\x1bM"); // RI off the top margin: cursor up, no scroll
+        assert_eq!(t.cursor().row, 1);
+        assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "AAA");
+    }
+
+    #[test]
+    fn index_scrolls_region_up_at_bottom_margin() {
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("\x1b[?1049h"); // alt screen: no scrollback, just shifts
+        t.feed("AAA\r\nBBB\r\nCCC"); // cursor at bottom margin (row 2)
+        t.feed("\x1bD"); // IND: content slides up, blank fills the bottom
+        assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "BBB");
+        assert_eq!(t.row(1).iter().map(|c| c.ch).collect::<String>(), "CCC");
+        assert_eq!(t.row(2).iter().map(|c| c.ch).collect::<String>(), "   ");
+    }
+
+    #[test]
+    fn next_line_returns_carriage_and_indexes() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[2;3H"); // row 1, col 2
+        t.feed("\x1bE"); // NEL: CR + index
+        assert_eq!(t.cursor().row, 2);
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn reverse_index_at_top_is_captured_for_animation() {
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC");
+        t.feed("\x1b[H\x1bM"); // home + RI: full-screen scroll down
+        let s = t.take_alt_scroll().expect("RI scroll captured");
+        assert_eq!((s.up, s.rows), (false, 1));
+    }
+
+    #[test]
+    fn alternate_scroll_mode_defaults_on_and_tracks_1007() {
+        let mut t = Terminal::new(5, 3, 100);
+        assert!(t.alternate_scroll(), "?1007 defaults on (xterm alternateScroll)");
+        t.feed("\x1b[?1007l");
+        assert!(!t.alternate_scroll());
+        t.feed("\x1b[?1007h");
+        assert!(t.alternate_scroll());
+        // RIS restores the default.
+        t.feed("\x1b[?1007l\x1bc");
+        assert!(t.alternate_scroll());
+    }
+
+    #[test]
+    fn alt_scroll_up_captures_departing_rows() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD"); // rows 0..3
+        t.feed("\x1b[1S"); // SU 1: full-region scroll up
+        let s = t.take_alt_scroll().expect("scroll captured");
+        assert_eq!((s.up, s.rows), (true, 1));
+        // Live grid shifted up; the departing top row hangs in the phantom
+        // band just above the viewport so the slide shows real content.
+        assert_eq!(t.extended_cell(0, 0).unwrap().ch, 'B');
+        assert_eq!(t.extended_cell(-1, 0).unwrap().ch, 'A');
+        // Releasing the animation drops the frozen row.
+        t.clear_alt_anim();
+        assert!(t.extended_cell(-1, 0).is_none());
+    }
+
+    #[test]
+    fn alt_scroll_down_captures_below_viewport() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[1T"); // SD 1: full-region scroll down
+        let s = t.take_alt_scroll().expect("scroll captured");
+        assert_eq!((s.up, s.rows), (false, 1));
+        // Departing bottom row sits just below the viewport (row index == rows).
+        assert_eq!(t.extended_cell(4, 0).unwrap().ch, 'D');
+        // Top of the grid is now the blank scrolled in from above.
+        assert_eq!(t.extended_cell(0, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn alt_scroll_accumulates_net_linefeeds() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\r\n\r\n"); // two line-feeds at the bottom row → net up 2
+        let s = t.take_alt_scroll().expect("scroll captured");
+        assert_eq!((s.up, s.rows), (true, 2));
+        assert_eq!(t.extended_cell(-2, 0).unwrap().ch, 'A');
+        assert_eq!(t.extended_cell(-1, 0).unwrap().ch, 'B');
+    }
+
+    #[test]
+    fn alt_scroll_take_is_one_shot() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD\x1b[1S");
+        assert!(t.take_alt_scroll().is_some());
+        assert!(t.take_alt_scroll().is_none(), "second take is empty");
+    }
+
+    #[test]
+    fn alt_scroll_less_backward_ri_is_captured() {
+        // The exact byte sequence `less` emits to scroll backward one line on a
+        // full screen (no DECSTBM): home + RI, repaint top line, repaint the
+        // status line. RI at the top margin must register as a downward scroll.
+        let mut t = Terminal::new(40, 10, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=10 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        // The front end drains the capture every feed; mirror that so the
+        // fill's trailing scroll doesn't poison the window we care about.
+        t.take_alt_scroll();
+        // Now scroll backward, exactly as captured from less.
+        t.feed("\r\x1b[K\x1b[H\x1bMline 2\x1b[m\r\n\x1b[10;1H\r\x1b[K:\x1b[K");
+        let s = t.take_alt_scroll().expect("less backward RI captured");
+        assert_eq!(s.up, false);
+        assert_eq!(s.rows, 1);
+        assert_eq!((s.region_top, s.region_bottom), (0, 9));
+    }
+
+    #[test]
+    fn alt_scroll_insert_line_at_top_captured_as_down() {
+        // vim scrolls back with `CSI L` (IL) at the top of a narrowed region —
+        // not RI. IL at the region top is a downward scroll of [top, bottom].
+        let mut t = Terminal::new(40, 12, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=12 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        t.take_alt_scroll(); // drain the fill's scroll
+        t.feed("\x1b[1;11r\x1b[1;1H\x1b[L"); // region 1..11, home, insert line
+        let s = t.take_alt_scroll().expect("IL captured as down-scroll");
+        assert_eq!(s.up, false);
+        assert_eq!(s.rows, 1);
+        assert_eq!((s.region_top, s.region_bottom), (0, 10));
+    }
+
+    #[test]
+    fn alt_scroll_delete_line_at_top_captured_as_up() {
+        let mut t = Terminal::new(40, 12, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=12 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        t.take_alt_scroll();
+        t.feed("\x1b[1;11r\x1b[1;1H\x1b[M"); // region 1..11, home, delete line
+        let s = t.take_alt_scroll().expect("DL captured as up-scroll");
+        assert_eq!(s.up, true);
+        assert_eq!(s.rows, 1);
+        assert_eq!((s.region_top, s.region_bottom), (0, 10));
+    }
+
+    #[test]
+    fn alt_scroll_index_at_bottom_captured_as_up() {
+        // IND (ESC D) at the bottom margin is a plain line-feed downward of the
+        // cursor that scrolls the region up. On the alt screen this must be
+        // captured as an UP scroll via the line-feed path, mirroring SU.
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC"); // cursor parked at the bottom margin (row 2)
+        t.feed("\x1bD"); // IND at the bottom margin: region scrolls up
+        let s = t.take_alt_scroll().expect("IND scroll captured");
+        assert_eq!((s.up, s.rows), (true, 1));
+        assert_eq!((s.region_top, s.region_bottom), (0, 2));
+    }
+
+    #[test]
+    fn alt_scroll_insert_line_mid_screen_reports_cursor_region_top() {
+        // IL captures the effective region [cursor.row, scroll_bottom]. With the
+        // cursor mid-screen (row 2, not the region top) the capture's region_top
+        // is 2, so the front end's `region_top == 0` gate would skip animating
+        // it — but the capture itself still records the true region.
+        let mut t = Terminal::new(40, 6, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=6 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        t.take_alt_scroll(); // drain the fill's scroll
+        t.feed("\x1b[3;1H\x1b[L"); // cursor to row 2 (1-based 3), insert line
+        let s = t.take_alt_scroll().expect("mid-screen IL captured");
+        assert_eq!((s.up, s.rows), (false, 1));
+        assert_eq!(s.region_top, 2);
+        assert_eq!(s.region_bottom, 5);
+    }
+
+    #[test]
+    fn alt_scroll_insert_lines_multi_reports_row_count() {
+        // IL with n > 1 (`CSI 3L`) is a downward scroll of n rows.
+        let mut t = Terminal::new(40, 12, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=12 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        t.take_alt_scroll(); // drain the fill's scroll
+        t.feed("\x1b[1;11r\x1b[1;1H\x1b[3L"); // region 1..11, home, insert 3 lines
+        let s = t.take_alt_scroll().expect("multi-line IL captured");
+        assert_eq!((s.up, s.rows), (false, 3));
+        assert_eq!((s.region_top, s.region_bottom), (0, 10));
+    }
+
+    #[test]
+    fn next_line_at_bottom_margin_resets_column_and_scrolls() {
+        // NEL (ESC E) at the bottom margin: the cursor is already at the bottom
+        // row, so NEL returns the carriage (col -> 0) AND scrolls the region up.
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCC"); // cursor at row 2, col 2
+        assert_eq!((t.cursor().row, t.cursor().col), (2, 2));
+        t.feed("\x1bE"); // NEL at the bottom margin
+        assert_eq!(t.cursor().col, 0, "carriage returned");
+        assert_eq!(t.cursor().row, 2, "stays pinned to the bottom margin");
+        // Content scrolled up: top row gone, blank filled at the bottom.
+        assert_eq!(t.row(0).iter().map(|c| c.ch).collect::<String>(), "BBB");
+        assert_eq!(t.row(1).iter().map(|c| c.ch).collect::<String>(), "CC ");
+        assert_eq!(t.row(2).iter().map(|c| c.ch).collect::<String>(), "   ");
+    }
+
+    #[test]
+    fn alt_scroll_ri_then_opposite_delete_line_is_poisoned() {
+        // A direction flip inside one feed window breaks the single-shift model:
+        // RI at the top margin scrolls the region down, then DL at the same row
+        // scrolls it up. The mixed up/down poisons the capture, so nothing is
+        // reported even though each op on its own would be.
+        let mut t = Terminal::new(40, 6, 100);
+        t.feed("\x1b[?1049h");
+        for i in 1..=6 {
+            t.feed(&format!("line {}\r\n", i));
+        }
+        t.take_alt_scroll(); // drain the fill's scroll
+        // RI at home (down) followed by DL at home (up): opposite directions.
+        t.feed("\x1b[H\x1bM\x1b[H\x1b[M");
+        assert!(
+            t.take_alt_scroll().is_none(),
+            "opposite-direction ops in one window poison the capture"
+        );
+    }
+
+    #[test]
+    fn alt_scroll_reports_sub_region_bounds() {
+        let mut t = Terminal::new(3, 5, 100);
+        t.feed("\x1b[?1049h");
+        // Scroll region rows 1..4 (0-based 0..3) — an app reserving the last
+        // line. The capture records the region; the front end decides whether
+        // it can animate it (only top-anchored regions; here top == 0).
+        t.feed("\x1b[1;4r");
+        t.feed("\x1b[H"); // home into the region
+        t.feed("\x1b[1S"); // SU within the region
+        let s = t.take_alt_scroll().expect("sub-region scroll captured");
+        assert_eq!((s.up, s.rows), (true, 1));
+        assert_eq!((s.region_top, s.region_bottom), (0, 3));
+    }
+
+    #[test]
+    fn alt_scroll_mixed_direction_is_not_animated() {
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[1S\x1b[1T"); // up then down in one window
+        assert!(t.take_alt_scroll().is_none(), "direction flip poisons");
+    }
+
+    #[test]
+    fn alt_scroll_not_captured_on_primary_screen() {
+        let mut t = Terminal::new(3, 2, 100);
+        // Primary-screen scrolling rolls into real scrollback, not animation.
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        assert!(t.take_alt_scroll().is_none());
+    }
+
+    #[test]
+    fn alt_scroll_su_n_reports_rows_and_departing_rows() {
+        // A single `CSI nS` with n>1 must report rows==n with the correct
+        // departing edge: the top n rows of the pre-scroll frame.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[2S"); // SU 2 in one escape
+        let s = t.take_alt_scroll().expect("scroll captured");
+        assert_eq!((s.up, s.rows), (true, 2));
+        // Departing rows hang above the viewport: -2 = oldest top (A), -1 = B.
+        assert_eq!(t.extended_cell(-2, 0).unwrap().ch, 'A');
+        assert_eq!(t.extended_cell(-1, 0).unwrap().ch, 'B');
+        // Live grid has shifted up by 2; row 0 is now C.
+        assert_eq!(t.extended_cell(0, 0).unwrap().ch, 'C');
+    }
+
+    #[test]
+    fn alt_scroll_net_capped_at_grid_height() {
+        // Scrolling further than the grid is tall caps the reported distance
+        // at `rows` (the most that can possibly be animated).
+        let mut t = Terminal::new(3, 4, 100); // rows == 4
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[10S"); // SU 10 — far more than the 4-row grid
+        let s = t.take_alt_scroll().expect("scroll captured");
+        assert_eq!((s.up, s.rows), (true, 4), "net distance capped at rows");
+    }
+
+    #[test]
+    fn alt_scroll_cleared_on_alt_screen_switch() {
+        // Leaving the alt screen (?1049l) clears any captured scroll state.
+        // Re-entering the alt screen without scrolling must yield None rather
+        // than leaking the prior window's capture.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[1S"); // capture an up-scroll...
+        t.feed("\x1b[?1049l"); // ...then leave the alt screen before taking it.
+        t.feed("\x1b[?1049h"); // back on the alt screen, no scroll this window.
+        assert!(t.take_alt_scroll().is_none(), "switch clears capture");
+    }
+
+    #[test]
+    fn alt_scroll_none_when_nothing_scrolled() {
+        // Cursor moves and in-place overwrites on the alt screen don't scroll
+        // the frame, so there's nothing to animate.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        let _ = t.take_alt_scroll(); // drain the setup window.
+        t.feed("\x1b[1;1H"); // home the cursor
+        t.feed("XXX"); // overwrite row 0 in place — no scroll
+        t.feed("\x1b[2;1HYYY"); // move to row 1 and overwrite — no scroll
+        assert!(t.take_alt_scroll().is_none(), "no scroll → nothing to animate");
+    }
+
+    #[test]
+    fn alt_scroll_clear_anim_is_idempotent_when_nothing_captured() {
+        // clear_alt_anim must be safe to call when no animation rows are stashed,
+        // and repeated calls stay a no-op.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        // Nothing taken yet → no frozen rows.
+        t.clear_alt_anim();
+        t.clear_alt_anim();
+        assert!(t.extended_cell(-1, 0).is_none());
+        // And after a real capture, a double clear is still fine.
+        t.feed("\x1b[1S");
+        assert!(t.take_alt_scroll().is_some());
+        t.clear_alt_anim();
+        t.clear_alt_anim();
+        assert!(t.extended_cell(-1, 0).is_none());
+    }
+
+    #[test]
+    fn alt_scroll_cleared_on_resize() {
+        // A resize retires any captured (but not-yet-taken) scroll window.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[1S"); // capture, but don't take
+        t.resize(5, 6);
+        assert!(t.take_alt_scroll().is_none(), "resize clears capture");
+    }
+
+    #[test]
+    fn alt_scroll_cleared_on_ris() {
+        // RIS (\x1bc) resets capture state along with everything else.
+        let mut t = Terminal::new(3, 4, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        t.feed("\x1b[1S\x1bc");
+        assert!(t.take_alt_scroll().is_none(), "RIS clears capture");
     }
 
     #[test]

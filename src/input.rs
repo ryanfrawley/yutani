@@ -65,6 +65,19 @@ pub fn drain_wheel_accum(
     notches
 }
 
+/// Cursor-key bytes emitted for one wheel notch under DEC mode ?1007
+/// (alternate scroll). `up` = wheel scrolled toward older content → Up arrow;
+/// otherwise Down. Honors DECCKM (`app_cursor`) exactly like a real arrow-key
+/// press, so application-cursor-mode pagers receive the SS3 (`\eOA`) form.
+pub fn alt_scroll_key(up: bool, app_cursor: bool) -> [u8; 3] {
+    let fb = if up { b'A' } else { b'B' };
+    if app_cursor {
+        [0x1b, b'O', fb]
+    } else {
+        [0x1b, b'[', fb]
+    }
+}
+
 /// Encode a mouse event for the PTY in either SGR (1006) or legacy X10 form.
 /// `col`/`row` are 1-based cell positions. `motion` is set for events emitted
 /// by drag/move tracking. `press` is true on button-down (and for wheel
@@ -244,6 +257,16 @@ mod tests {
 
     fn ch(c: &str) -> Key {
         Key::Character(SmolStr::new(c))
+    }
+
+    #[test]
+    fn alt_scroll_keys_follow_deccm() {
+        // Normal cursor mode: CSI form.
+        assert_eq!(&alt_scroll_key(true, false), b"\x1b[A");
+        assert_eq!(&alt_scroll_key(false, false), b"\x1b[B");
+        // Application cursor mode (DECCKM): SS3 form.
+        assert_eq!(&alt_scroll_key(true, true), b"\x1bOA");
+        assert_eq!(&alt_scroll_key(false, true), b"\x1bOB");
     }
 
     #[test]

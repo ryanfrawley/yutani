@@ -1011,6 +1011,11 @@ struct State {
     terminal: terminal::Terminal,
     modifiers: winit::keyboard::ModifiersState,
     scroll_y: f64,
+    /// In-flight smooth slide for an explicit alt-screen scroll captured from
+    /// the running app (`Terminal::take_alt_scroll`). Drives `scroll_y` on the
+    /// alt screen while active; the departing rows it slides over live on the
+    /// terminal until `finish_alt_scroll` clears them.
+    alt_scroll_anim: Option<AltScrollAnim>,
     /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
     /// less, htop). Trackpads stream small PixelDelta events — without
     /// accumulation, every event truncates to 0 lines and slow scrolls
@@ -1660,6 +1665,25 @@ fn open_url(_url: &str) {}
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+/// Duration of the smooth-scroll slide for an explicit alt-screen scroll
+/// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
+/// stays responsive — the final frame is reached this many seconds after the
+/// scroll lands, regardless of distance.
+const ALT_SCROLL_ANIM_SECS: f32 = 0.07;
+
+/// An in-flight alt-screen scroll animation. `total_px` is the full slide
+/// distance; the rendered offset eases from `total_px` down to 0 over
+/// `ALT_SCROLL_ANIM_SECS`. `up` mirrors the captured scroll direction and
+/// picks the sign of the offset applied to `scroll_y`.
+#[derive(Copy, Clone)]
+struct AltScrollAnim {
+    up: bool,
+    rows: usize,
+    region_top: usize,
+    region_bottom: usize,
+    total_px: f32,
+    started: std::time::Instant,
+}
 
 /// Eased cursor position in cell-space (col, visual_row) floats. Lerp-with-
 /// retarget chase: when the logical cursor moves while an ease is still in
@@ -2191,6 +2215,7 @@ impl State {
             ),
             modifiers: winit::keyboard::ModifiersState::empty(),
             scroll_y: 0.0,
+            alt_scroll_anim: None,
             wheel_pty_accum: 0.0,
             scroll_suppressed: false,
             last_wheel_at: None,
@@ -2352,6 +2377,9 @@ impl State {
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
     // and the top/bottom edge fades.
     fn update_vertices(&mut self) {
+        // Advance any alt-screen scroll slide first so this frame reads the
+        // freshly-eased `scroll_y`.
+        self.update_alt_scroll();
         let cols = self.terminal.cols;
         let rows = self.terminal.rows;
         let area = cols * rows;
@@ -2471,8 +2499,8 @@ impl State {
         } else {
             self.terminal.scrollback_len() as f32
         };
-        let dist_from_bottom = view_offset * line_height + scroll_y;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
+        let (dist_from_bottom, dist_from_top) =
+            self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
@@ -2482,9 +2510,16 @@ impl State {
 
         // Two extra rows above and below the visible grid are rendered so
         // smooth sub-line scrolling stays populated through the snap. Used
-        // both for shaping (below) and the main emit loop further down.
-        let r_lo: isize = -2;
-        let r_hi: isize = rows as isize + 2;
+        // both for shaping (below) and the main emit loop further down. During
+        // an alt-screen scroll slide `scroll_y` can exceed a line, so widen the
+        // band to cover the departing rows being slid in from the edge.
+        let anim_extra = if self.terminal.on_alt_screen() {
+            (scroll_y.abs() / line_height).ceil() as isize
+        } else {
+            0
+        };
+        let r_lo: isize = -2 - anim_extra;
+        let r_hi: isize = rows as isize + 2 + anim_extra;
 
         // Programming-ligature pass. Walks each visible row, prefix-matches
         // each cell against the per-variant ligature table the Shaper
@@ -2638,6 +2673,59 @@ impl State {
         // calls against the resulting buffer so the glow pipeline can
         // bloom each layer independently.
         let strip_pad = (line_height - bg_h) * 0.5;
+
+        // Alt-screen scroll slide: the offset applies only to rows inside the
+        // moving span (the scroll region plus the departing band on the moving
+        // edge); rows outside it — a reserved status line below the region —
+        // stay put. Off the slide (scrollback smooth-scroll on the primary),
+        // every row shares the global `scroll_y`. `clip_bottom_px` keeps a
+        // moving row from drawing past the region's bottom edge, so incoming /
+        // departing content slides *under* the static status line instead of
+        // bleeding glyphs over it; for a full-height region it sits below the
+        // window and clips nothing.
+        let (anim_lo, anim_hi, clip_bottom_px) = match &self.alt_scroll_anim {
+            Some(a) => {
+                let d = a.rows as isize;
+                // Up-scroll departing rows sit above the region top (off-grid
+                // when the region is anchored at row 0, which is the only case
+                // we animate). Down-scroll departing rows sit below the region
+                // bottom — include them in the moving span only when that's
+                // off-grid (full-height region); otherwise they coincide with a
+                // static status line that must not move.
+                let lo = a.region_top as isize - if a.up { d } else { 0 };
+                let hi = a.region_bottom as isize
+                    + if !a.up && a.region_bottom + 1 == rows { d } else { 0 };
+                let clip = row_y(a.region_bottom as isize + 1) - bg_h - descender - strip_pad;
+                (lo, hi, clip)
+            }
+            None => (0, 0, f32::INFINITY),
+        };
+        let anim_active = self.alt_scroll_anim.is_some();
+        let row_moving = move |r: isize| anim_active && r >= anim_lo && r <= anim_hi;
+        // Per-row vertical offset. When no slide is active this is the global
+        // `scroll_y` for every row (unchanged scrollback behavior).
+        let row_scroll = move |r: isize| {
+            if !anim_active || row_moving(r) {
+                scroll_y
+            } else {
+                0.0
+            }
+        };
+        // Clamp `(y, h, v0, v1)` so a moving row's quad never extends past the
+        // region's bottom edge. Returns `None` if fully clipped. `v0`/`v1` are
+        // adjusted proportionally so glyph bitmaps clip cleanly (bg quads pass
+        // `v0 == v1`, leaving the single sampled texel unchanged).
+        let clip_row_quad = move |r: isize, y: f32, h: f32, v0: f32, v1: f32| {
+            if !row_moving(r) || y + h <= clip_bottom_px {
+                return Some((h, v1));
+            }
+            let visible = clip_bottom_px - y;
+            if visible <= 0.0 {
+                return None;
+            }
+            (Some((visible, v0 + (v1 - v0) * (visible / h)))).filter(|_| h > 0.0)
+        };
+
         let emit_bg_for_cell = |verts: &mut Vec<renderer::vertex::Vertex>,
                                 idxs: &mut Vec<u32>,
                                 r: isize,
@@ -2651,14 +2739,17 @@ impl State {
             // glyphs to the bottom of the strip on tall-line fonts, while
             // anchoring to the glyph extent risks overlap on tight-line ones.
             // Strip stride = line_height, so adjacent rows still tile cleanly.
-            let bg_y = baseline_y - bg_h - descender - strip_pad + scroll_y;
+            let bg_y = baseline_y - bg_h - descender - strip_pad + row_scroll(r);
+            let Some((bg_height, _)) = clip_row_quad(r, bg_y, line_height, bg_v, bg_v) else {
+                return;
+            };
             push_quad(
                 verts,
                 idxs,
                 x,
                 bg_y,
                 cell_w,
-                line_height,
+                bg_height,
                 [bg_u, bg_v],
                 [bg_u, bg_v],
                 bg,
@@ -2677,7 +2768,8 @@ impl State {
                                 fg: [f32; 4]| {
             let x = col_x(c);
             let baseline_y = row_y(r);
-            let bg_y = baseline_y - bg_h - descender - strip_pad + scroll_y;
+            let off = row_scroll(r);
+            let bg_y = baseline_y - bg_h - descender - strip_pad + off;
             // Foreground glyph. The per-cell substitution case (Fira
             // Code-style contextual alternates) deliberately uses
             // glyphs whose side bearings extend past the cell edges so
@@ -2739,7 +2831,7 @@ impl State {
                     (bg_y, line_height, p_start, p_end)
                 } else {
                     (
-                        baseline_y - by + scroll_y,
+                        baseline_y - by + off,
                         g.height as f32,
                         0.0,
                         g.height as f32,
@@ -2749,6 +2841,11 @@ impl State {
                 let u1 = (g.x as f32 + q_end) / atlas_w;
                 let v0 = (g.y as f32 + p_start) / atlas_h;
                 let v1 = (g.y as f32 + p_end) / atlas_h;
+                // Clip a moving glyph at the region's bottom edge so it slides
+                // under the static status line rather than over it.
+                let Some((gh, v1)) = clip_row_quad(r, gy, gh, v0, v1) else {
+                    return;
+                };
                 push_quad(
                     verts,
                     idxs,
@@ -2942,7 +3039,12 @@ impl State {
                     // adding `-pos` walks downward in screen coords. Subtracting
                     // half the thickness then gives the top edge of the stripe.
                     let uh = underline_thickness_px;
-                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + scroll_y;
+                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + row_scroll(r);
+                    // Drop a moving row's underline once it crosses the region's
+                    // bottom edge so it can't streak across the static status line.
+                    if row_moving(r) && uy >= clip_bottom_px {
+                        continue;
+                    }
                     // Match the cell's foreground color so the underline tracks
                     // theme overrides; fall back to the default fg.
                     let fg = self
@@ -3023,7 +3125,7 @@ impl State {
 
                 let sx = col_x(from);
                 let sw = (to - from + 1) as f32 * cell_w;
-                let sy = row_y(r) - bg_h - descender - strip_pad + scroll_y;
+                let sy = row_y(r) - bg_h - descender - strip_pad + row_scroll(r);
                 push_quad(
                     &mut vertices,
                     &mut indices,
@@ -3143,7 +3245,7 @@ impl State {
                 // Inset a little from the row's top/bottom so the bar reads as
                 // a marker rather than filling the line.
                 let inset = line_height * 0.18;
-                let sy = row_y(r) - bg_h - descender - strip_pad + scroll_y + inset;
+                let sy = row_y(r) - bg_h - descender - strip_pad + row_scroll(r) + inset;
                 let sh = (line_height - 2.0 * inset).max(2.0);
                 push_quad(
                     &mut vertices,
@@ -3316,8 +3418,8 @@ impl State {
                 // it aligns with selection / colored backgrounds.
                 let cur_baseline =
                     WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
-                let block_y =
-                    cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5 + scroll_y;
+                let block_y = cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5
+                    + row_scroll(eased_vis_row.round() as isize);
                 // Anchor the completion popup to this cell's strip: left edge at
                 // the cursor column, with `block_y` the top of the cursor row.
                 popup_anchor = Some((block_x, block_y));
@@ -4139,6 +4241,29 @@ impl State {
         anim_active || !self.cursor_ghosts.is_empty()
     }
 
+    /// Edge-fade distances `(bottom, top)` that drive the fade phases and the
+    /// title-bar decorator offset. On the primary screen they track the
+    /// scrollback viewport (sub-line `scroll_y` included). On the alt screen
+    /// there's no scrollback, so they're zero — except during an upward scroll
+    /// slide, where the top fade is engaged so the departing rows dissolve into
+    /// the translucent toolbar instead of popping out when the slide ends.
+    fn edge_fade_dists(
+        &self,
+        scroll_y: f32,
+        view_offset: f32,
+        scrollback_len: f32,
+        line_height: f32,
+    ) -> (f32, f32) {
+        if self.terminal.on_alt_screen() {
+            (0.0, 0.0)
+        } else {
+            (
+                view_offset * line_height + scroll_y,
+                (scrollback_len - view_offset) * line_height - scroll_y,
+            )
+        }
+    }
+
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     fn is_top_fade_animating(&self) -> bool {
@@ -4151,8 +4276,8 @@ impl State {
         let metrics = self.font.face().size_metrics().unwrap();
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let scroll_y = self.scroll_y as f32;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - scroll_y;
-        let dist_from_bottom = view_offset * line_height + scroll_y;
+        let (dist_from_bottom, dist_from_top) =
+            self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
         let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
         let bot_target = if dist_from_bottom > 0.0 { 1.0 } else { 0.0 };
         (self.top_fade_phase - top_target).abs() > f32::EPSILON
@@ -4844,7 +4969,85 @@ impl State {
     /// stale anchor. See sub-slice P2.4 design notes.
     fn feed_terminal(&mut self, bytes: &str) {
         self.terminal.feed(bytes);
+        self.maybe_start_alt_scroll();
         self.drain_pending_image_uploads();
+    }
+
+    /// If the just-fed output scrolled the alt screen (an explicit SU/SD or
+    /// line-feed), kick off a smooth slide for it. The terminal has stashed the
+    /// departing rows; we set the initial `scroll_y` offset and let
+    /// `update_alt_scroll` ease it to zero over `ALT_SCROLL_ANIM_SECS`.
+    fn maybe_start_alt_scroll(&mut self) {
+        if ALT_SCROLL_ANIM_SECS <= 0.0 {
+            return;
+        }
+        let Some(scroll) = self.terminal.take_alt_scroll() else {
+            return;
+        };
+        // The renderer slides the region and clips its bottom edge, so the
+        // departing rows must exit at the top (behind the toolbar). That holds
+        // only when the region is anchored at row 0 — the common case (apps
+        // reserve a *bottom* status line). A region starting mid-screen would
+        // bleed past its top edge, so skip the slide there; the scroll has
+        // already been applied to the grid, it just snaps instead of animating.
+        if scroll.region_top != 0 {
+            self.terminal.clear_alt_anim();
+            return;
+        }
+        let metrics = self.font.face().size_metrics().unwrap();
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+        let total_px = scroll.rows as f32 * line_height;
+        self.alt_scroll_anim = Some(AltScrollAnim {
+            up: scroll.up,
+            rows: scroll.rows,
+            region_top: scroll.region_top,
+            region_bottom: scroll.region_bottom,
+            total_px,
+            started: std::time::Instant::now(),
+        });
+        // Start displaying the pre-scroll frame: shift the (already-scrolled)
+        // grid back by the full distance so the departing rows fill the gap.
+        self.scroll_y = if scroll.up { total_px } else { -total_px } as f64;
+        self.invalidate();
+    }
+
+    /// Advance the alt-screen scroll slide for this frame, easing `scroll_y`
+    /// toward zero. Finishes (and releases the frozen rows) when the slide
+    /// completes or the alt screen is no longer active. No-op when idle.
+    fn update_alt_scroll(&mut self) {
+        let Some(anim) = self.alt_scroll_anim else {
+            return;
+        };
+        if !self.terminal.on_alt_screen() {
+            self.finish_alt_scroll();
+            self.scroll_y = 0.0;
+            return;
+        }
+        let t = (anim.started.elapsed().as_secs_f32() / ALT_SCROLL_ANIM_SECS).clamp(0.0, 1.0);
+        // Ease-out cubic: quick to start, gentle to settle.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let remaining = anim.total_px * (1.0 - eased);
+        if t >= 1.0 || remaining <= 0.5 {
+            self.finish_alt_scroll();
+            self.scroll_y = 0.0;
+            return;
+        }
+        self.scroll_y = if anim.up { remaining } else { -remaining } as f64;
+    }
+
+    /// End any alt-screen scroll slide and drop the terminal's frozen rows.
+    /// Leaves `scroll_y` untouched — callers that cancel mid-slide (a keystroke
+    /// snapping the view) zero it themselves.
+    fn finish_alt_scroll(&mut self) {
+        if self.alt_scroll_anim.take().is_some() {
+            self.terminal.clear_alt_anim();
+        }
+    }
+
+    /// True while an alt-screen scroll slide is mid-flight — keeps the event
+    /// loop ticking frames until it settles.
+    fn is_alt_scroll_animating(&self) -> bool {
+        self.alt_scroll_anim.is_some()
     }
 
     /// Refresh the cached completion-popup suggestions, but only when the
@@ -5394,12 +5597,42 @@ impl State {
                     }
                     return true;
                 }
-                // Alt screen has no scrollback to navigate; full-screen apps
-                // (vim, less, htop) provide their own keyboard motion. Without
-                // this guard, trackpad pixels would accumulate in scroll_y and
-                // visually drift the grid past its bounds.
+                // Alt screen has no scrollback to navigate. With DEC mode
+                // ?1007 (alternate scroll) — on by default, reachable here only
+                // because mouse reporting is off (that path returned above) —
+                // translate wheel motion into cursor-key presses so pagers
+                // (less, man) and other full-screen apps scroll. When ?1007 is
+                // disabled, swallow the wheel: full-screen apps provide their
+                // own keyboard motion, and without this guard trackpad pixels
+                // would accumulate in scroll_y and drift the grid past bounds.
                 if self.terminal.on_alt_screen() {
-                    self.scroll_y = 0.0;
+                    if self.terminal.alternate_scroll() {
+                        let pixels = match delta {
+                            MouseScrollDelta::LineDelta(_, d) => *d as f64 * line_height,
+                            MouseScrollDelta::PixelDelta(p) => p.y,
+                        };
+                        let notches = input::drain_wheel_accum(
+                            &mut self.wheel_pty_accum,
+                            pixels,
+                            line_height,
+                        );
+                        let app_cursor = self.terminal.app_cursor_keys();
+                        for _ in 0..notches.up {
+                            self.write_pty(&input::alt_scroll_key(true, app_cursor));
+                        }
+                        for _ in 0..notches.down {
+                            self.write_pty(&input::alt_scroll_key(false, app_cursor));
+                        }
+                        // The app's response (a scroll op) will arrive on the
+                        // next feed and (re)start the slide via
+                        // `maybe_start_alt_scroll`; leave `scroll_y` to the
+                        // animation rather than zeroing it here.
+                    } else {
+                        // No alternate scroll and no scrollback to navigate —
+                        // swallow the wheel so trackpad pixels can't drift the
+                        // grid via an accumulated offset.
+                        self.scroll_y = 0.0;
+                    }
                     return true;
                 }
                 match delta {
@@ -5733,6 +5966,9 @@ impl State {
                         // back to the live grid; passive modifiers (Cmd+C etc.)
                         // returned None and don't touch the scroll state.
                         self.terminal.scroll_to_bottom();
+                        // A keystroke cancels any alt-screen scroll slide —
+                        // snap straight to the settled frame.
+                        self.finish_alt_scroll();
                         self.scroll_y = 0.0;
                         // Drop any in-flight trackpad momentum so the snap
                         // sticks — otherwise the tail of the flick keeps
@@ -6653,8 +6889,9 @@ async fn run() {
                 }
                 // Edge-fade and cursor-position eases: keep ticking frames
                 // as long as either is still chasing its target.
-                let animating =
-                    state.is_top_fade_animating() || state.is_cursor_animating();
+                let animating = state.is_top_fade_animating()
+                    || state.is_cursor_animating()
+                    || state.is_alt_scroll_animating();
                 if animating {
                     state.invalidate();
                 }
