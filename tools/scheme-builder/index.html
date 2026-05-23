@@ -249,9 +249,9 @@
     text-shadow: 0 0 2px rgba(255,255,255,0.5);
   }
 
-  /* ---------- Pane 3: YAML output ---------- */
-  .yaml-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-  textarea.yaml {
+  /* ---------- Pane 3: TOML output ---------- */
+  .toml-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+  textarea.toml {
     flex: 1;
     width: 100%;
     background: #0c0c0c;
@@ -264,8 +264,8 @@
     border-top: 1px solid var(--pane-border);
     tab-size: 2;
   }
-  textarea.yaml.invalid { color: #ff8e8e; }
-  .yaml-status {
+  textarea.toml.invalid { color: #ff8e8e; }
+  .toml-status {
     padding: 6px 14px;
     font-size: 11px;
     color: var(--muted);
@@ -273,7 +273,7 @@
     border-top: 1px solid var(--pane-border);
     min-height: 26px;
   }
-  .yaml-status.error { color: #ff8e8e; }
+  .toml-status.error { color: #ff8e8e; }
   /* ---------- Import modal ---------- */
   .modal-backdrop {
     position: fixed;
@@ -544,15 +544,15 @@
   <!-- =========================== PANE 3 =========================== -->
   <section class="pane">
     <header>
-      <span>scheme.yaml</span>
+      <span>scheme.toml</span>
       <div class="actions">
         <button id="downloadBtn">Download</button>
         <button id="copyBtn" class="primary">Copy</button>
       </div>
     </header>
-    <div class="yaml-wrap">
-      <textarea class="yaml" id="yaml" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
-      <div class="yaml-status" id="yaml-status">Edits flow back to the pickers.</div>
+    <div class="toml-wrap">
+      <textarea class="toml" id="toml" spellcheck="false" autocorrect="off" autocapitalize="off"></textarea>
+      <div class="toml-status" id="toml-status">Edits flow back to the pickers.</div>
     </div>
   </section>
 </div>
@@ -740,11 +740,11 @@ const PRESETS = {
 };
 
 let state = clone(PRESETS['Yutani default (light)']);
-let editingYaml = false;     // suppress YAML→model write while typing
-let editingPickers = false;  // suppress picker→YAML loop while regenerating
+let editingToml = false;     // suppress TOML→model write while typing
+let editingPickers = false;  // suppress picker→TOML loop while regenerating
 
 /* ============================================================
- * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (YAML).
+ * Hex helpers — bridge between #rrggbb (picker) and 0xrrggbb (TOML).
  * ============================================================ */
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 function normHex(s) {
@@ -756,8 +756,8 @@ function normHex(s) {
   if (v.length !== 6 || !/^[0-9a-f]{6}$/.test(v)) return null;
   return '#' + v;
 }
-function toYamlHex(hex) {
-  // hex is '#rrggbb' — emit as 0xrrggbb to match palette.rs::parse_hex.
+function toTomlHex(hex) {
+  // hex is '#rrggbb' — emit as 0xrrggbb to match palette.rs::rgb_from_value.
   return '0x' + hex.slice(1);
 }
 function luma(hex) {
@@ -1185,12 +1185,12 @@ const PREVIEW_LINES = [
     {fg:'blue', bold:true, text:'target/'}, '    ',
     {fg:'foreground', text:'Cargo.toml '},
     {fg:'green', text:'README.md '},
-    {fg:'cyan', text:'scheme.yaml'},
+    {fg:'cyan', text:'scheme.toml'},
   ],
   [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'cat src/palette.rs | head'}],
-  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_yaml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
+  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_toml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
   [{fg:'foreground', text:'    '}, {fg:'magenta', text:'let mut '}, {fg:'foreground', text:'p = '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:'::'}, {fg:'blue', text:'defaults'}, {fg:'foreground', text:'();'}],
-  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key: value'}],
+  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key = value'}],
   [{fg:'foreground', text:'    '}, {fg:'magenta', text:'for'}, {fg:'foreground', text:' (lineno, raw) '}, {fg:'magenta', text:'in'}, {fg:'foreground', text:' src.'}, {fg:'blue', text:'lines'}, {fg:'foreground', text:'().'}, {fg:'blue', text:'enumerate'}, {fg:'foreground', text:'() {'}],
   [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'git status'}],
   [{fg:'foreground', text:'On branch '}, {fg:'green', text:'main'}],
@@ -1287,28 +1287,32 @@ function renderPreview() {
 }
 
 /* ============================================================
- * Pane 3: serialise model → YAML, and parse it back on edit.
+ * Pane 3: serialise model → TOML, and parse it back on edit.
  * ============================================================ */
-function toYaml() {
+function toToml() {
   const lines = [];
-  for (const k of SINGLES) lines.push(`${k}: ${toYamlHex(state[k])}`);
+  for (const k of SINGLES) lines.push(`${k} = ${toTomlHex(state[k])}`);
   lines.push('');
   // pad keys to a column so values align visually
-  const pad = 'magenta:'.length;
+  const pad = 'magenta'.length;
   for (const hue of HUES) {
     const [n, b] = state.ansi[hue];
-    const key = (hue + ':').padEnd(pad + 1, ' ');
-    lines.push(`${key}[${toYamlHex(n)}, ${toYamlHex(b)}]`);
+    const key = hue.padEnd(pad, ' ');
+    lines.push(`${key} = [${toTomlHex(n)}, ${toTomlHex(b)}]`);
   }
   if (state.max_colors) {
     lines.push('');
-    lines.push(`max_colors: ${state.max_colors}`);
+    // Quoted: "mono"/"truecolor" require it, and the parser accepts the
+    // numeric depths as strings too, so one form covers every value.
+    lines.push(`max_colors = "${state.max_colors}"`);
   }
   return lines.join('\n') + '\n';
 }
 
-// Tiny parser that matches palette.rs::parse_yaml (strict subset of YAML).
-function parseYaml(src) {
+// Tiny parser that matches palette.rs::parse_toml (strict subset of TOML:
+// flat `key = value` pairs, `#` line comments, hex-int colors, 2-element
+// arrays, and a string/int max_colors).
+function parseToml(src) {
   const out = {
     background: null, foreground: null, cursor: null, selection: null,
     ansi: {}, max_colors: '',
@@ -1321,8 +1325,8 @@ function parseYaml(src) {
     if (hash >= 0) raw = raw.slice(0, hash);
     const line = raw.trim();
     if (!line) continue;
-    const idx = line.indexOf(':');
-    if (idx < 0) { errors.push(`line ${i+1}: missing ':'`); continue; }
+    const idx = line.indexOf('=');
+    if (idx < 0) { errors.push(`line ${i+1}: missing '='`); continue; }
     const key = line.slice(0, idx).trim();
     const value = line.slice(idx + 1).trim();
     if (SINGLES.includes(key)) {
@@ -1330,21 +1334,25 @@ function parseYaml(src) {
       if (!h) { errors.push(`line ${i+1}: invalid hex '${value}'`); continue; }
       out[key] = h;
     } else if (HUES.includes(key)) {
-      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*\]$/);
+      // Allow an optional trailing comma — TOML permits it inside arrays.
+      const m = value.match(/^\[\s*([^,\s\]]+)\s*,\s*([^,\s\]]+)\s*,?\s*\]$/);
       if (!m) { errors.push(`line ${i+1}: expected [normal, bright]`); continue; }
       const n = normHex(m[1]), b = normHex(m[2]);
       if (!n || !b) { errors.push(`line ${i+1}: invalid hex in pair`); continue; }
       out.ansi[key] = [n, b];
     } else if (key === 'max_colors') {
-      const ok = ['mono','monochrome','8','16','256','truecolor','16m'];
-      if (!ok.includes(value)) {
+      // Accept the value bare or quoted (TOML strings) — strip one layer of
+      // matching quotes before validating.
+      const v = value.replace(/^(['"])(.*)\1$/, '$2');
+      const ok = ['mono','monochrome','8','16','256','truecolor','16m','16777216'];
+      if (!ok.includes(v)) {
         errors.push(`line ${i+1}: max_colors must be one of mono|8|16|256|truecolor`);
         continue;
       }
       // Normalize aliases
-      out.max_colors = (value === 'monochrome') ? 'mono'
-                      : (value === '16m') ? 'truecolor'
-                      : value;
+      out.max_colors = (v === 'monochrome') ? 'mono'
+                      : (v === '16m' || v === '16777216') ? 'truecolor'
+                      : v;
     } else {
       errors.push(`line ${i+1}: unknown key '${key}'`);
     }
@@ -1352,21 +1360,21 @@ function parseYaml(src) {
   return { out, errors };
 }
 
-function renderYaml() {
-  if (editingYaml) return;
-  const ta = document.getElementById('yaml');
+function renderToml() {
+  if (editingToml) return;
+  const ta = document.getElementById('toml');
   editingPickers = true;
-  ta.value = toYaml();
+  ta.value = toToml();
   ta.classList.remove('invalid');
-  document.getElementById('yaml-status').textContent = 'In sync.';
-  document.getElementById('yaml-status').classList.remove('error');
+  document.getElementById('toml-status').textContent = 'In sync.';
+  document.getElementById('toml-status').classList.remove('error');
   editingPickers = false;
 }
 
-function applyYamlEdit() {
-  const ta = document.getElementById('yaml');
-  const { out, errors } = parseYaml(ta.value);
-  const status = document.getElementById('yaml-status');
+function applyTomlEdit() {
+  const ta = document.getElementById('toml');
+  const { out, errors } = parseToml(ta.value);
+  const status = document.getElementById('toml-status');
   if (errors.length) {
     ta.classList.add('invalid');
     status.classList.add('error');
@@ -1383,7 +1391,7 @@ function applyYamlEdit() {
   state.max_colors = out.max_colors || '';
   status.textContent = 'In sync.';
   // Rebuild pickers (values changed) and preview, but DON'T regenerate the
-  // YAML — the textarea already has the source of truth.
+  // TOML — the textarea already has the source of truth.
   buildPane1();
   renderPreview();
 }
@@ -1715,7 +1723,7 @@ function mergePartial(partial) {
 function renderAll() {
   buildPane1();
   renderPreview();
-  renderYaml();
+  renderToml();
 }
 
 function init() {
@@ -1738,17 +1746,17 @@ function init() {
     renderAll();
   });
 
-  // YAML textarea — debounce edits back into the model so the pickers
+  // TOML textarea — debounce edits back into the model so the pickers
   // don't fight every keystroke.
-  const ta = document.getElementById('yaml');
+  const ta = document.getElementById('toml');
   let timer = null;
   ta.addEventListener('input', () => {
     if (editingPickers) return;
-    editingYaml = true;
+    editingToml = true;
     clearTimeout(timer);
     timer = setTimeout(() => {
-      applyYamlEdit();
-      editingYaml = false;
+      applyTomlEdit();
+      editingToml = false;
     }, 200);
   });
 
@@ -1830,11 +1838,11 @@ function init() {
   });
 
   document.getElementById('downloadBtn').addEventListener('click', () => {
-    const blob = new Blob([ta.value], { type: 'text/yaml' });
+    const blob = new Blob([ta.value], { type: 'application/toml' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'scheme.yaml';
+    a.download = 'scheme.toml';
     a.click();
     URL.revokeObjectURL(url);
   });
