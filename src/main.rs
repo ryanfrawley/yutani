@@ -10,6 +10,7 @@ mod ansi;
 mod gpu;
 mod images;
 mod input;
+mod onboard;
 mod palette;
 mod shaper;
 mod style;
@@ -85,6 +86,120 @@ fn scheme_path(name: &str) -> Option<std::path::PathBuf> {
     let mut dir = config_dir()?;
     dir.push("schemes");
     Some(dir.join(format!("{}.toml", name)))
+}
+
+/// `~/.local/state/yutani` — XDG_STATE_HOME for persistent-but-disposable
+/// state. Kept deliberately separate from `~/.config/yutani`: config is the
+/// user's to hand-edit, delete, or version-control, and none of that should
+/// silently re-arm or suppress first-run onboarding. Honors `$XDG_STATE_HOME`
+/// when set, falling back to `$HOME/.local/state`.
+fn state_dir() -> Option<std::path::PathBuf> {
+    let mut p = match std::env::var_os("XDG_STATE_HOME") {
+        Some(x) if !x.is_empty() => std::path::PathBuf::from(x),
+        _ => {
+            let home = std::env::var_os("HOME")?;
+            let mut p = std::path::PathBuf::from(home);
+            p.push(".local");
+            p.push("state");
+            p
+        }
+    };
+    p.push("yutani");
+    Some(p)
+}
+
+/// Marker file recording that first-run onboarding has completed. Its contents
+/// are the onboarding *revision* that ran (a bare integer), so a future Yutani
+/// can re-introduce setup for a new feature by bumping [`ONBOARD_REVISION`]
+/// without re-onboarding users who are already current.
+fn onboarding_marker() -> Option<std::path::PathBuf> {
+    Some(state_dir()?.join("onboarded"))
+}
+
+/// Current onboarding revision. First-run fires when the marker is missing or
+/// records a lower number; bump this when onboarding gains a step worth
+/// re-showing to existing users.
+const ONBOARD_REVISION: u32 = 1;
+
+/// Read the onboarding revision recorded on disk, if any. `None` means setup
+/// has never completed (or the marker is unreadable / malformed — both treated
+/// as "not yet onboarded", erring toward showing setup rather than skipping it).
+fn onboarded_revision() -> Option<u32> {
+    let path = onboarding_marker()?;
+    let s = std::fs::read_to_string(path).ok()?;
+    s.trim().parse().ok()
+}
+
+/// Whether first-run onboarding should run: never completed, or completed at an
+/// older revision than we ship now.
+fn needs_onboarding() -> bool {
+    onboarded_revision().map_or(true, |r| r < ONBOARD_REVISION)
+}
+
+/// Stamp the marker with the current revision, creating `state_dir()` as
+/// needed. Best-effort: a write failure just means onboarding runs again next
+/// launch, which is the safe direction to fail.
+fn mark_onboarded() {
+    let Some(path) = onboarding_marker() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, ONBOARD_REVISION.to_string());
+}
+
+/// Lower the onboarding marker so first-run fires on the next launch. Used by
+/// the "Run first-time setup…" command. Best-effort.
+fn rearm_onboarding() {
+    if let Some(path) = onboarding_marker() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Coarse CRT-glow presets the onboarding offers, mapped to the underlying
+/// `glow_*` config knobs by [`Config::apply_glow_level`]. Shared by the
+/// onboarding writer (which persists the choice) and the live-preview path in
+/// `State::apply_preview` (which mirrors it onto the running renderer), so the
+/// preview can never drift from what actually gets saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlowLevel {
+    Off,
+    Subtle,
+    Full,
+}
+
+impl GlowLevel {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "subtle" => Some(Self::Subtle),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// The single CRT-effect control the onboarding exposes: a coarse dial that
+/// turns the bloom *and* the scanline overlay on together, since they read as
+/// one "looks like an old monitor" effect to a new user. Mapped onto the
+/// underlying glow / scanline knobs by [`Config::apply_crt_level`]; like
+/// [`GlowLevel`] it's shared by the onboarding writer and the live-preview path
+/// so the two stay in lock-step. Defaults to `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrtLevel {
+    Off,
+    Low,
+    High,
+}
+
+impl CrtLevel {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
 }
 
 /// Byte size of the grid's vertex and index buffers for a viewport of
@@ -730,6 +845,96 @@ impl Config {
             self.autocomplete,
         ));
         s
+    }
+
+    /// Map a coarse [`GlowLevel`] onto the fine-grained `glow_*` knobs. The one
+    /// place the preset→knob translation lives, so the onboarding's persisted
+    /// config and its live preview stay in lock-step. Only the matching-mode
+    /// and intensity fields are touched; scanlines and per-scheme overrides are
+    /// left to their own setters / the config defaults.
+    pub fn apply_glow_level(&mut self, level: GlowLevel) {
+        match level {
+            GlowLevel::Off => {
+                self.glow_match_foreground = false;
+                self.glow_match_brightness = false;
+                self.glow_match_bright_ansi = false;
+            }
+            GlowLevel::Subtle => {
+                // Foreground match catches achromatic default text; brightness
+                // match catches anything light. Dialed-back intensity for a
+                // gentle bloom.
+                self.glow_match_foreground = true;
+                self.glow_match_brightness = true;
+                self.glow_match_bright_ansi = false;
+                self.glow_intensity = 0.6;
+            }
+            GlowLevel::Full => {
+                self.glow_match_foreground = true;
+                self.glow_match_brightness = true;
+                self.glow_match_bright_ansi = true;
+                self.glow_intensity = 1.0;
+            }
+        }
+    }
+
+    /// Toggle the CRT scanline knockout on the glow halo (`glow_scanlines`).
+    /// Whether scanlines *also* lay over the text and background is governed by
+    /// the separate `glow_scanlines_content` config setting (off by default);
+    /// the onboarding leaves that to the config so it isn't overridden here.
+    pub fn apply_scanlines(&mut self, on: bool) {
+        self.glow_scanlines = on;
+    }
+
+    /// Apply a [`CrtLevel`] — the onboarding's one-dial retro-monitor look,
+    /// bloom + halo scanlines together. The presets are tuned off the
+    /// `spacedust` theme's glow settings, which read as a sensible "this is
+    /// what a CRT looks like" default: `High` mirrors them verbatim, `Low`
+    /// dials the bloom and scanline strength back, and `Off` disables the
+    /// effect. We set the underlying glow knobs directly (rather than via the
+    /// coarse [`apply_glow_level`]) so the values are exactly the theme's.
+    ///
+    /// The content-overlay scanlines (`glow_scanlines_content`) and the
+    /// "let the active scheme's glow win" switch (`theme_overrides_glow`) are
+    /// deliberately left to their config defaults (both off) — these presets
+    /// are concrete config values, not a hand-off to the theme.
+    pub fn apply_crt_level(&mut self, level: CrtLevel) {
+        // Match mode is the same across the on presets: bloom driven by
+        // brightness, matching the spacedust theme.
+        match level {
+            CrtLevel::Off => {
+                self.glow_match_brightness = false;
+                self.glow_match_bright_ansi = false;
+                self.glow_match_foreground = false;
+                self.glow_scanlines = false;
+            }
+            CrtLevel::Low => {
+                self.glow_match_brightness = true;
+                self.glow_match_bright_ansi = false;
+                self.glow_match_foreground = false;
+                self.glow_threshold = 0.0;
+                self.glow_intensity = 0.3;
+                self.glow_softness = 1.0;
+                self.glow_iterations = 2;
+                self.glow_scanlines = true;
+                // Full-strength knockout, same as High — "low" only dials back
+                // the bloom, not the scanlines.
+                self.glow_scanline_strength = 1.0;
+                self.glow_scanline_period = 8.0;
+            }
+            CrtLevel::High => {
+                // spacedust verbatim.
+                self.glow_match_brightness = true;
+                self.glow_match_bright_ansi = false;
+                self.glow_match_foreground = false;
+                self.glow_threshold = 0.0;
+                self.glow_intensity = 0.6;
+                self.glow_softness = 1.0;
+                self.glow_iterations = 4;
+                self.glow_scanlines = true;
+                self.glow_scanline_strength = 1.0;
+                self.glow_scanline_period = 8.0;
+            }
+        }
     }
 }
 
@@ -4024,22 +4229,50 @@ impl State {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
+            // Re-arm first-run and relaunch into it. Each window owns a single
+            // PTY (forked at startup, already attached to a shell), so there's
+            // no in-place way to swap the running shell for onboarding —
+            // instead we lower the marker and start a fresh Yutani, which boots
+            // straight into onboarding-in-PTY with live preview, then exit this
+            // one. This ends the current shell session, which is why the
+            // command is spelled out plainly in the palette.
+            A::RunOnboarding => {
+                rearm_onboarding();
+                let relaunched = std::env::current_exe()
+                    .and_then(|exe| std::process::Command::new(exe).spawn());
+                match relaunched {
+                    Ok(_) => std::process::exit(0),
+                    // Couldn't relaunch — leave this session alone. The marker
+                    // is already re-armed, so the next manual launch onboards.
+                    Err(e) => eprintln!("onboarding: failed to relaunch: {e}"),
+                }
+            }
         }
         self.invalidate();
     }
 
-    /// Bump (or shrink) the font by `delta_pt` points and rebuild everything
-    /// that depends on cell metrics: atlas, font texture, bind group, terminal
-    /// grid, vertex/index buffers. Clamped so the rasterizer never gets a
-    /// nonsensical size.
+    /// Bump (or shrink) the font by `delta_pt` points and persist the new size.
+    /// Thin wrapper over [`set_font_size`]; the zoom command saves, the
+    /// onboarding live-preview path calls `set_font_size` directly so it
+    /// doesn't touch disk.
     fn change_font_size(&mut self, delta_pt: f32) {
-        let new_pt = (self.pt_size + delta_pt).clamp(6.0, 96.0);
+        if self.set_font_size(self.pt_size + delta_pt) {
+            self.config.save();
+        }
+    }
+
+    /// Set the font to an absolute point size and rebuild everything that
+    /// depends on cell metrics: atlas, font texture, bind group, terminal grid,
+    /// vertex/index buffers. Clamped to [6, 96] so the rasterizer never gets a
+    /// nonsensical size. Returns whether the size actually changed. Does NOT
+    /// persist config — callers that should (the zoom command) save themselves.
+    fn set_font_size(&mut self, pt: f32) -> bool {
+        let new_pt = pt.clamp(6.0, 96.0);
         if (new_pt - self.pt_size).abs() < f32::EPSILON {
-            return;
+            return false;
         }
         self.pt_size = new_pt;
         self.config.font_size = self.pt_size;
-        self.config.save();
         self.font.set_char_size(self.pt_size, self.dpi);
         self.atlas = self.font.build_atlas();
         self.font_texture = renderer::texture::Texture::from_memory(
@@ -4080,6 +4313,7 @@ impl State {
         self.resize_buffers();
         self.cursor_anim = None;
         self.invalidate();
+        true
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -4311,7 +4545,15 @@ impl State {
         let new_config = Config::load();
         install_color_scheme(new_config.color_scheme.as_deref());
         self.config = new_config;
+        self.refresh_palette_derived();
+    }
 
+    /// Re-push every piece of renderer / window state that depends on the live
+    /// palette and the current `self.config` glow knobs, then mark the frame
+    /// dirty. Assumes `self.config` and the installed palette are already the
+    /// ones we want shown — the caller is responsible for swapping those in
+    /// (from disk in [`reload_config`], or transiently in [`apply_preview`]).
+    fn refresh_palette_derived(&mut self) {
         // Glow uniforms cache palette-derived values (bright ANSI hues,
         // foreground / background RGB) — they don't re-read palette::get()
         // each frame the way the cell renderer does. Re-push them so the
@@ -4349,6 +4591,42 @@ impl State {
         self.window.set_theme(Some(theme_for_bg(p.background)));
         set_native_window_bg(&self.window, p.background);
         self.invalidate();
+    }
+
+    /// Apply one live-preview request from the first-run onboarding (OSC 2125).
+    /// Scheme / glow / scanline previews mutate the live palette and the
+    /// in-memory `self.config` *only* — nothing is written to disk, so quitting
+    /// onboarding early leaves the user's config untouched. `Reload` is the
+    /// commit step: the onboarding has saved its choices, so we re-read from
+    /// disk to land on exactly the persisted look.
+    fn apply_preview(&mut self, req: terminal::PreviewRequest) {
+        use terminal::PreviewRequest;
+        match req {
+            PreviewRequest::Scheme(name) => {
+                install_color_scheme(name.as_deref());
+                self.config.color_scheme = name;
+                self.refresh_palette_derived();
+            }
+            PreviewRequest::Glow(level) => {
+                self.config.apply_glow_level(level);
+                self.refresh_palette_derived();
+            }
+            PreviewRequest::Scanlines(on) => {
+                self.config.apply_scanlines(on);
+                self.refresh_palette_derived();
+            }
+            PreviewRequest::Crt(level) => {
+                self.config.apply_crt_level(level);
+                self.refresh_palette_derived();
+            }
+            // Font size rebuilds the atlas / grid itself; no palette refresh
+            // needed. set_font_size doesn't persist, so the preview is transient
+            // until the onboarding writes config + sends Reload.
+            PreviewRequest::FontSize(pt) => {
+                self.set_font_size(pt);
+            }
+            PreviewRequest::Reload => self.reload_config(),
+        }
     }
 
     /// Push the current theme's foreground / background / cursor colors into
@@ -6577,8 +6855,23 @@ async fn run() {
         }
     }
 
+    // On first run (or after a "Run first-time setup…" re-arm), the PTY child
+    // becomes the onboarding console program instead of the shell; it execs the
+    // shell in-place when done. Resolve our own path here, in the parent, so the
+    // post-fork child doesn't have to.
+    let child_program = if needs_onboarding() {
+        match std::env::current_exe() {
+            Ok(exe) => pty::ChildProgram::Onboard { exe },
+            // Can't find ourselves to re-exec — skip onboarding rather than
+            // fail to launch. It'll retry next time the marker is still unset.
+            Err(_) => pty::ChildProgram::Shell,
+        }
+    } else {
+        pty::ChildProgram::Shell
+    };
+
     // Fork before the window is created so we hold the master fd across setup.
-    let pty = pty::fork_pty(fdm).expect("failed to fork pty");
+    let pty = pty::fork_pty(fdm, child_program).expect("failed to fork pty");
     std::thread::spawn(move || {
         let code = pty.run(|data| {
             let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
@@ -6850,6 +7143,12 @@ async fn run() {
                     // it into the front of the history (deduped).
                     if let Some(cmd) = state.terminal.take_submitted_command() {
                         dedup_prepend(&mut state.command_history, cmd);
+                    }
+                    // First-run onboarding (running as the PTY child) may have
+                    // emitted OSC 2125 live-preview requests in this chunk —
+                    // apply each to the running renderer.
+                    for req in state.terminal.take_preview_requests() {
+                        state.apply_preview(req);
                     }
                     // The chunk may have carried an OSC 2122 input report;
                     // refresh the completion popup's cached suggestions (only
@@ -7278,6 +7577,15 @@ fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
 }
 
 fn main() {
+    // First-run onboarding runs as the PTY child (see `run`), re-invoking this
+    // same binary with `--onboard`. In that mode we are a thin console program
+    // talking to our host terminal over stdin/stdout, not a GUI — so branch
+    // before any window / GPU setup. `onboard::run` never returns: it execs the
+    // user's shell in-place when done, so the same PTY flows straight into the
+    // shell with no second window.
+    if std::env::args().skip(1).any(|a| a == "--onboard") {
+        onboard::run();
+    }
     pollster::block_on(run());
 }
 
@@ -9631,5 +9939,200 @@ mod tests {
         assert!(should_rearm_image_poll(false, false, 3));
         assert!(should_rearm_image_poll(false, true, 2));
         assert!(should_rearm_image_poll(true, false, 5));
+    }
+
+    // --- Onboarding: GlowLevel parsing -----------------------------------
+
+    #[test]
+    fn glow_level_from_str_maps_known_presets() {
+        assert_eq!(GlowLevel::from_str("off"), Some(GlowLevel::Off));
+        assert_eq!(GlowLevel::from_str("subtle"), Some(GlowLevel::Subtle));
+        assert_eq!(GlowLevel::from_str("full"), Some(GlowLevel::Full));
+    }
+
+    #[test]
+    fn glow_level_from_str_rejects_unknown() {
+        // Anything outside the three presets is `None`, including casing,
+        // whitespace, and the empty string — callers treat `None` as
+        // "drop the request" rather than guessing a default.
+        assert_eq!(GlowLevel::from_str(""), None);
+        assert_eq!(GlowLevel::from_str("Off"), None);
+        assert_eq!(GlowLevel::from_str("OFF"), None);
+        assert_eq!(GlowLevel::from_str(" off"), None);
+        assert_eq!(GlowLevel::from_str("medium"), None);
+        assert_eq!(GlowLevel::from_str("bogus"), None);
+    }
+
+    // --- Onboarding: GlowLevel -> Config knob mapping --------------------
+
+    #[test]
+    fn apply_glow_level_off_clears_all_match_modes() {
+        let mut c = Config::defaults();
+        // Pre-dirty the match flags so we prove `Off` actively clears them
+        // rather than relying on the defaults already being false.
+        c.glow_match_foreground = true;
+        c.glow_match_brightness = true;
+        c.glow_match_bright_ansi = true;
+        c.apply_glow_level(GlowLevel::Off);
+        assert!(!c.glow_match_foreground);
+        assert!(!c.glow_match_brightness);
+        assert!(!c.glow_match_bright_ansi);
+    }
+
+    #[test]
+    fn apply_glow_level_subtle_sets_fg_and_brightness_only() {
+        let mut c = Config::defaults();
+        c.apply_glow_level(GlowLevel::Subtle);
+        assert!(c.glow_match_foreground);
+        assert!(c.glow_match_brightness);
+        assert!(!c.glow_match_bright_ansi);
+        assert!(approx_eq(c.glow_intensity, 0.6));
+    }
+
+    #[test]
+    fn apply_glow_level_full_sets_all_match_modes_and_full_intensity() {
+        let mut c = Config::defaults();
+        c.apply_glow_level(GlowLevel::Full);
+        assert!(c.glow_match_foreground);
+        assert!(c.glow_match_brightness);
+        assert!(c.glow_match_bright_ansi);
+        assert!(approx_eq(c.glow_intensity, 1.0));
+    }
+
+    #[test]
+    fn apply_glow_level_off_leaves_scanlines_untouched() {
+        // `apply_glow_level` only owns the match-mode + intensity knobs;
+        // scanlines are `apply_scanlines`' business. Setting a glow preset
+        // must not silently flip a scanline choice the user already made.
+        let mut c = Config::defaults();
+        c.glow_scanlines = true;
+        c.glow_scanlines_content = true;
+        c.apply_glow_level(GlowLevel::Off);
+        assert!(c.glow_scanlines);
+        assert!(c.glow_scanlines_content);
+    }
+
+    // --- Onboarding: scanline toggle -------------------------------------
+
+    #[test]
+    fn apply_scanlines_on_sets_halo_only_not_content() {
+        let mut c = Config::defaults();
+        c.apply_scanlines(true);
+        assert!(c.glow_scanlines);
+        // Content overlay stays off — scanlines ride the glow, not the text.
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn apply_scanlines_leaves_content_overlay_setting_untouched() {
+        // The content overlay is its own config setting; toggling the halo
+        // scanlines must not override whatever the config chose for it.
+        let mut c = Config::defaults();
+        c.glow_scanlines_content = true;
+        c.apply_scanlines(true);
+        assert!(c.glow_scanlines);
+        assert!(c.glow_scanlines_content);
+        c.glow_scanlines_content = false;
+        c.apply_scanlines(false);
+        assert!(!c.glow_scanlines);
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn apply_scanlines_off_clears_halo() {
+        let mut c = Config::defaults();
+        c.glow_scanlines = true;
+        c.apply_scanlines(false);
+        assert!(!c.glow_scanlines);
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn apply_scanlines_leaves_glow_match_modes_untouched() {
+        // Mirror of `apply_glow_level_off_leaves_scanlines_untouched`: the
+        // two setters own disjoint knobs, so toggling scanlines must not
+        // disturb the glow match-mode state.
+        let mut c = Config::defaults();
+        c.apply_glow_level(GlowLevel::Full);
+        c.apply_scanlines(true);
+        assert!(c.glow_match_foreground);
+        assert!(c.glow_match_brightness);
+        assert!(c.glow_match_bright_ansi);
+    }
+
+    // --- Onboarding: combined CRT level ----------------------------------
+
+    #[test]
+    fn crt_level_from_str_maps_known_presets() {
+        assert_eq!(CrtLevel::from_str("off"), Some(CrtLevel::Off));
+        assert_eq!(CrtLevel::from_str("low"), Some(CrtLevel::Low));
+        assert_eq!(CrtLevel::from_str("high"), Some(CrtLevel::High));
+    }
+
+    #[test]
+    fn crt_level_from_str_rejects_unknown() {
+        assert_eq!(CrtLevel::from_str(""), None);
+        assert_eq!(CrtLevel::from_str("Off"), None);
+        assert_eq!(CrtLevel::from_str("medium"), None);
+        assert_eq!(CrtLevel::from_str("subtle"), None);
+    }
+
+    #[test]
+    fn apply_crt_level_off_clears_glow_and_scanlines() {
+        // Start from a fully-lit config to prove Off actively clears both
+        // halves of the effect.
+        let mut c = Config::defaults();
+        c.apply_crt_level(CrtLevel::High);
+        c.apply_crt_level(CrtLevel::Off);
+        assert!(!c.glow_match_foreground);
+        assert!(!c.glow_match_brightness);
+        assert!(!c.glow_match_bright_ansi);
+        assert!(!c.glow_scanlines);
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn apply_crt_level_low_is_dialed_back_spacedust() {
+        let mut c = Config::defaults();
+        c.apply_crt_level(CrtLevel::Low);
+        // Brightness-driven bloom (spacedust's match mode), dialed back.
+        assert!(c.glow_match_brightness);
+        assert!(!c.glow_match_bright_ansi);
+        assert!(!c.glow_match_foreground);
+        assert!(approx_eq(c.glow_intensity, 0.3));
+        assert_eq!(c.glow_iterations, 2);
+        // Halo scanlines on but gentler; content overlay untouched (off).
+        assert!(c.glow_scanlines);
+        // Scanline knockout is full strength, same as High; only the bloom
+        // differs between Low and High.
+        assert!(approx_eq(c.glow_scanline_strength, 1.0));
+        assert!(approx_eq(c.glow_scanline_period, 8.0));
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn apply_crt_level_high_matches_spacedust_glow() {
+        let mut c = Config::defaults();
+        c.apply_crt_level(CrtLevel::High);
+        // The spacedust theme's glow + scanline values, verbatim.
+        assert!(c.glow_match_brightness);
+        assert!(!c.glow_match_bright_ansi);
+        assert!(!c.glow_match_foreground);
+        assert!(approx_eq(c.glow_threshold, 0.0));
+        assert!(approx_eq(c.glow_intensity, 0.6));
+        assert!(approx_eq(c.glow_softness, 1.0));
+        assert_eq!(c.glow_iterations, 4);
+        assert!(c.glow_scanlines);
+        assert!(approx_eq(c.glow_scanline_strength, 1.0));
+        assert!(approx_eq(c.glow_scanline_period, 8.0));
+        // Content overlay left to its config default (off).
+        assert!(!c.glow_scanlines_content);
+    }
+
+    #[test]
+    fn theme_overrides_glow_defaults_off() {
+        // CRT presets are concrete config values; the "let the scheme's glow
+        // win" switch stays off by default so they actually take effect.
+        assert!(!Config::defaults().theme_overrides_glow);
     }
 }

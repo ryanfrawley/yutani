@@ -9,10 +9,40 @@ pub struct Pty {
     pub master: i32,
 }
 
-/// Forks and execs the user's shell on the slave side of `fdm`. Returns in the
-/// parent once `fork` has completed, without blocking on shell output. Drive
-/// I/O by calling `run` on the returned handle (typically from a worker thread).
-pub fn fork_pty(fdm: i32) -> Result<Pty, String> {
+/// What the forked PTY child should become. Normally the user's login shell;
+/// on first run it's the onboarding console program, which itself execs the
+/// shell in-place once setup completes (so the same PTY transitions seamlessly
+/// from setup to shell).
+pub enum ChildProgram {
+    Shell,
+    /// Re-exec this binary at `exe` with `--onboard`. The path is resolved in
+    /// the parent (before fork) to avoid doing the lookup post-fork.
+    Onboard { exe: std::path::PathBuf },
+}
+
+/// Replace the current process with the user's shell, started as a *login*
+/// shell (argv[0] = `-<basename>`) so the profile scripts that set PATH (brew
+/// shellenv, etc.) run. Never returns; on exec failure it exits 127. Callable
+/// from the forked child here and from the onboarding program once it finishes.
+pub fn exec_login_shell() -> ! {
+    let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let shell_c = CString::new(shell_path.clone()).unwrap();
+    let basename = std::path::Path::new(&shell_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sh");
+    let argv0 = CString::new(format!("-{basename}")).unwrap();
+    // execvp replaces the process image; the Ok branch is unreachable.
+    match nix::unistd::execvp(shell_c.as_c_str(), &[argv0.as_c_str()]) {
+        Ok(_) => std::process::exit(0),
+        Err(_) => std::process::exit(127),
+    }
+}
+
+/// Forks and execs `program` on the slave side of `fdm`. Returns in the parent
+/// once `fork` has completed, without blocking on child output. Drive I/O by
+/// calling `run` on the returned handle (typically from a worker thread).
+pub fn fork_pty(fdm: i32, program: ChildProgram) -> Result<Pty, String> {
     let fds: i32;
 
     unsafe {
@@ -53,22 +83,26 @@ pub fn fork_pty(fdm: i32) -> Result<Pty, String> {
                 let term_val = CString::new("xterm-256color").unwrap();
                 setenv(term.as_ptr(), term_val.as_ptr(), 1);
 
-                let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-                let shell_c = CString::new(shell_path.clone()).unwrap();
-                // Start the shell as a *login* shell (argv[0] = "-<basename>"),
-                // so /etc/zprofile and ~/.zprofile run. When launched from
-                // Finder we inherit only the launchd PATH, so brew shellenv —
-                // typically sourced from ~/.zprofile — is the thing that puts
-                // /opt/homebrew/bin (starship, etc.) on PATH.
-                let basename = std::path::Path::new(&shell_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("sh");
-                let argv0 = CString::new(format!("-{basename}")).unwrap();
-                // execvp replaces the process image; the Ok branch is unreachable.
-                match nix::unistd::execvp(shell_c.as_c_str(), &[argv0.as_c_str()]) {
-                    Ok(_) => std::process::exit(0),
-                    Err(_) => std::process::exit(127),
+                match program {
+                    // Start the shell as a *login* shell so /etc/zprofile and
+                    // ~/.zprofile run. When launched from Finder we inherit only
+                    // the launchd PATH, so brew shellenv — typically sourced from
+                    // ~/.zprofile — is what puts /opt/homebrew/bin on PATH.
+                    ChildProgram::Shell => exec_login_shell(),
+                    // First run: become the onboarding console program. It execs
+                    // the login shell itself once done. If the re-exec fails for
+                    // any reason, fall back to the shell so a broken onboarding
+                    // never bricks the terminal.
+                    ChildProgram::Onboard { exe } => {
+                        let exe_c = CString::new(exe.as_os_str().as_encoded_bytes())
+                            .unwrap_or_else(|_| CString::new("yutani").unwrap());
+                        let flag = CString::new("--onboard").unwrap();
+                        let _ = nix::unistd::execv(
+                            exe_c.as_c_str(),
+                            &[exe_c.as_c_str(), flag.as_c_str()],
+                        );
+                        exec_login_shell();
+                    }
                 }
             }
             Ok(nix::unistd::ForkResult::Parent { child }) => {
