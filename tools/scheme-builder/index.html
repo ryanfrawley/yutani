@@ -268,21 +268,15 @@
   .term-body .line { display: block; }
   .term-body .seg { white-space: pre; }
   .term-body .sel { padding: 0 1px; }
-  /* Glow + scanline overlays. Both sit over the live text and never
-   * intercept clicks. The halo screens onto the scene (additive bloom on
-   * dark backgrounds); the content scanlines multiply it down. They mirror
-   * how the renderer layers its bloom + CRT passes over the framebuffer. */
+  /* The WebGL glow canvas. It renders the full scene (bg + text + bloom +
+   * scanlines) and sits opaque over the DOM text it was built from, so the
+   * compositing it does internally matches the renderer's framebuffer. */
   .term-fx {
     position: absolute;
     inset: 0;
     pointer-events: none;
     z-index: 1;
   }
-  /* The halo carries its own alpha and composites with normal source-over,
-   * matching the renderer's premultiplied-over glow pass (screen blending
-   * saturated on bright text and washed the effect out). Scanlines multiply. */
-  .term-fx.glow { mix-blend-mode: normal; }
-  .term-fx.scan { mix-blend-mode: multiply; }
   .term-body .cursor {
     display: inline-block;
     width: 0.6em;
@@ -1631,7 +1625,7 @@ function renderPreview() {
 
   // Glow + scanline overlays. Deferred a frame so the rebuilt DOM has laid
   // out and term-body reports its final size before we rasterise it.
-  requestAnimationFrame(renderGlowOverlays);
+  requestAnimationFrame(renderGlowPreview);
 }
 
 /* ============================================================
@@ -1680,44 +1674,38 @@ function renderContrast() {
 }
 
 /* ============================================================
- * Glow + scanline preview. A 2D-canvas approximation of the
- * renderer's GPU pipeline (src/renderer/glow.wgsl):
- *   1. Rasterise the terminal scene to an offscreen canvas.
- *   2. Bright pass — port of fs_bright: per-pixel weight from the
- *      three match modes (brightness / bright-ANSI hue / foreground
- *      distance), computed in LINEAR space so the thresholds behave
- *      like the real config. Output is source·weight·intensity on
- *      black, so it adds nothing where it doesn't glow.
- *   3. Bloom — a Gaussian `filter: blur()` stands in for the dual-
- *      Kawase chain; iteration count drives the radius. The look is
- *      a soft halo either way.
- *   4. Composite — the halo canvas is screen-blended over the live
- *      DOM text (premultiplied-additive on dark backgrounds), with
- *      the halo scanline knockout baked in.
- *   5. Content scanlines — a separate multiply layer, masked off
- *      empty background when skip_primary_bg is set, matching the
- *      renderer's masked vs unmasked overlay split.
- * It is deliberately an approximation (Gaussian vs Kawase, single
- * combined mask vs two scene layers, sRGB blur), but threshold,
- * hue, and saturation behaviour track the shader closely enough to
- * author against.
+ * Glow + scanline preview — a WebGL2 port of src/renderer/glow.wgsl.
+ * The terminal scene is rasterised to a canvas and uploaded as an
+ * sRGB texture, so sampling yields LINEAR light exactly like the
+ * renderer's framebuffer. The pipeline then matches the GPU:
+ *   1. Bright pass (fs_bright): per-pixel weight from the three match
+ *      modes (brightness / bright-ANSI hue / foreground distance);
+ *      output = sceneLinear·weight, alpha = weight (premultiplied).
+ *   2. Dual-Kawase blur: `iterations` of fs_down / fs_up between a
+ *      half-res and quarter-res RGBA16F target — the same chain, in
+ *      linear light, so the halo spreads and brightens like the real
+ *      bloom (a Gaussian blur in sRGB does not).
+ *   3. Composite (fs_composite): halo premultiplied-over the linear
+ *      scene with intensity and the halo scanline_factor, then
+ *      sRGB-encoded.
+ *   4. Content scanlines: a multiply on the encoded result, masked
+ *      off empty background when skip_primary_bg is set.
+ * Everything bloom-related runs in linear light. If WebGL2 with
+ * float render targets is unavailable, the preview falls back to the
+ * plain DOM text (no glow) and logs once.
  * ============================================================ */
 // Work resolution as a multiple of CSS pixels. Rendering at the device pixel
-// ratio (rather than 1) is what keeps the scanlines crisp: a CSS-resolution
-// canvas shown on a HiDPI screen gets bilinearly upscaled, smearing the 1px
-// scanline knockout into a dim grey gradient. At devicePixelRatio the canvas
-// maps 1:1 to device pixels, so the stripes stay sharp and `scanline_period`
-// (which the renderer measures in framebuffer pixels) lines up. Capped at 2 to
-// bound the per-pixel bright-pass cost on 3x displays.
+// ratio (not 1) keeps scanlines crisp — a CSS-resolution canvas shown on a
+// HiDPI screen gets bilinearly upscaled, smearing the 1px stripes — and lines
+// `scanline_period` up with the renderer's framebuffer pixels. Capped at 2 to
+// bound fill cost on 3x displays.
 let GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
 
-let glowCanvas = null, scanCanvas = null, rasterCanvas = null, haloCanvas = null;
+let glowCanvas = null, rasterCanvas = null, glowGL = null, glowGLFailed = false;
 function ensureGlowCanvases() {
   if (glowCanvas) return;
-  glowCanvas = document.createElement('canvas'); glowCanvas.className = 'term-fx glow';
-  scanCanvas = document.createElement('canvas'); scanCanvas.className = 'term-fx scan';
-  rasterCanvas = document.createElement('canvas');  // offscreen scene
-  haloCanvas = document.createElement('canvas');     // offscreen bright pass
+  glowCanvas = document.createElement('canvas'); glowCanvas.className = 'term-fx';
+  rasterCanvas = document.createElement('canvas');  // offscreen sRGB scene
 }
 
 function smoothstep(e0, e1, x) {
@@ -1752,11 +1740,8 @@ function brightSlots() {
 
 // Draw the terminal scene (bg + glyphs + selection + cursor) into ctx at the
 // given scale. Geometry matches the .term-body CSS (13px/1.5 mono, 14/16 pad)
-// so the halo lands roughly where the DOM text is.
+// so the rasterised scene lines up with the DOM text it replaces under glow.
 function rasterizeScene(ctx, scale, w, h) {
-  // Padding is the fixed .term-body CSS (14/16); font face + size follow the
-  // preview controls so the rasterised scene matches the DOM text the halo
-  // is supposed to sit on.
   const padL = 16 * scale, padT = 14 * scale;
   const fontPx = preview.fontSize * scale, lineH = preview.fontSize * 1.5 * scale;
   const stack = fontStack(preview.fontFamily);
@@ -1782,164 +1767,280 @@ function rasterizeScene(ctx, scale, w, h) {
   }
 }
 
-function renderGlowOverlays() {
+// sRGB '#rrggbb' → [r,g,b] in 0..1 (gamma-encoded; used for the content
+// scanline multiplier, which the renderer applies on the encoded framebuffer).
+function hexToRgb01(hex) {
+  const h = hex.slice(1);
+  return [parseInt(h.slice(0,2),16)/255, parseInt(h.slice(2,4),16)/255, parseInt(h.slice(4,6),16)/255];
+}
+
+/* ---- WebGL2 glow pipeline ---------------------------------------------- */
+const GLOW_VS = `#version 300 es
+out vec2 v_uv;
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  v_uv = p;                                  // 0..1 across the visible quad
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// Bright pass — direct port of fs_bright (operates in linear light).
+const GLOW_FS_BRIGHT = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_scene;            // sRGB texture → sampling returns linear
+uniform float u_threshold, u_softness, u_hueTol, u_minSat, u_fgTol;
+uniform float u_useBri, u_useAnsi, u_useFg;
+uniform vec3 u_fg;                    // foreground, linear
+uniform vec4 u_hues[8];               // (hueDeg, sat, _, active)
+float vmax(vec3 c){ return max(max(c.r,c.g),c.b); }
+float vsat(vec3 c){ float mx=vmax(c), mn=min(min(c.r,c.g),c.b); return mx<=0.0?0.0:(mx-mn)/mx; }
+float vhue(vec3 c){ float mx=vmax(c), mn=min(min(c.r,c.g),c.b), d=mx-mn; if(d<=0.0) return -1.0;
+  float h; if(mx==c.r)h=(c.g-c.b)/d; else if(mx==c.g)h=2.0+(c.b-c.r)/d; else h=4.0+(c.r-c.g)/d;
+  h*=60.0; if(h<0.0)h+=360.0; return h; }
+float hdist(float a,float b){ float d=abs(a-b); return min(d,360.0-d); }
+void main(){
+  vec3 c = texture(u_scene, v_uv).rgb;
+  float w = 0.0;
+  if(u_useBri>0.5){ float lo=u_threshold, hi=min(lo+max(u_softness,1e-4),1.0); w=max(w, smoothstep(lo,hi,vmax(c))); }
+  if(u_useAnsi>0.5){ float s=vsat(c);
+    if(s>=u_minSat){ float h=vhue(c);
+      if(h>=0.0){ float tol=max(u_hueTol,0.0), edge=max(u_softness,1e-4)*180.0, best=0.0;
+        for(int i=0;i<8;i++){ if(u_hues[i].w<0.5) continue;
+          float ww=1.0-smoothstep(tol,tol+edge,hdist(h,u_hues[i].x)); best=max(best, ww*min(s,u_hues[i].y)); }
+        w=max(w,best); } } }
+  if(u_useFg>0.5){ float d=distance(c,u_fg); float lo=max(u_fgTol,0.0), hi=lo+max(u_softness,1e-4); w=max(w, 1.0-smoothstep(lo,hi,d)); }
+  o = vec4(c*w, w);                   // premultiplied by weight
+}`;
+
+// Dual-Kawase down (fs_down) and up (fs_up). texel = 1/sourceDims.
+const GLOW_FS_DOWN = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_src; uniform vec2 u_texel;
+void main(){ vec2 o2=u_texel;
+  vec4 s = texture(u_src,v_uv)*4.0;
+  s += texture(u_src,v_uv+vec2(-o2.x,-o2.y));
+  s += texture(u_src,v_uv+vec2( o2.x,-o2.y));
+  s += texture(u_src,v_uv+vec2(-o2.x, o2.y));
+  s += texture(u_src,v_uv+vec2( o2.x, o2.y));
+  o = s/8.0; }`;
+const GLOW_FS_UP = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_src; uniform vec2 u_texel;
+void main(){ vec2 o2=u_texel;
+  vec4 s = texture(u_src,v_uv+vec2(-o2.x*2.0,0.0));
+  s += texture(u_src,v_uv+vec2( o2.x*2.0,0.0));
+  s += texture(u_src,v_uv+vec2(0.0,-o2.y*2.0));
+  s += texture(u_src,v_uv+vec2(0.0, o2.y*2.0));
+  s += texture(u_src,v_uv+vec2(-o2.x, o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2( o2.x, o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2(-o2.x,-o2.y))*2.0;
+  s += texture(u_src,v_uv+vec2( o2.x,-o2.y))*2.0;
+  o = s/12.0; }`;
+
+// Composite (fs_composite) + content scanline overlay, to the canvas.
+const GLOW_FS_COMP = `#version 300 es
+precision highp float;
+in vec2 v_uv; out vec4 o;
+uniform sampler2D u_scene, u_halo;
+uniform float u_intensity, u_scanPeriod;
+uniform float u_haloScan, u_haloStrength;
+uniform float u_content, u_contentStrength, u_contentAtten, u_contentMasked;
+uniform vec3 u_stripeBright, u_stripeDark, u_bg;
+float l2s(float c){ return c<=0.0031308 ? c*12.92 : 1.055*pow(c,1.0/2.4)-0.055; }
+void main(){
+  vec3 scene = texture(u_scene, v_uv).rgb;          // linear
+  vec4 halo  = texture(u_halo, v_uv);               // linear, premultiplied
+  float y = gl_FragCoord.y;
+  float phase = fract(y / max(u_scanPeriod, 1.0));
+  float isBright = step(0.5, phase);
+  float hs = (u_haloScan>0.5) ? mix(1.0, isBright, u_haloStrength) : 1.0;
+  float k = u_intensity * hs;
+  vec3 lin = halo.rgb*k + scene*(1.0 - clamp(halo.a*k, 0.0, 1.0));   // premult-over
+  vec3 srgb = vec3(l2s(lin.r), l2s(lin.g), l2s(lin.b));
+  if(u_content>0.5){
+    vec3 stripe = mix(u_stripeDark, u_stripeBright, isBright);
+    stripe = mix(vec3(1.0), stripe, u_contentStrength);
+    float lerp = 0.0;
+    if(u_contentMasked>0.5){
+      float content = smoothstep(0.02, 0.08, distance(scene, u_bg));
+      lerp = max(1.0 - content, content * u_contentAtten);
+    }
+    srgb *= mix(stripe, vec3(1.0), lerp);
+  }
+  o = vec4(srgb, 1.0);
+}`;
+
+function createGlowGL(canvas) {
+  const gl = canvas.getContext('webgl2', { alpha: false, premultipliedAlpha: false, antialias: false });
+  if (!gl) return null;
+  if (!gl.getExtension('EXT_color_buffer_float')) return null;  // RGBA16F render targets
+  gl.getExtension('OES_texture_float_linear');
+
+  const compile = (type, src) => {
+    const sh = gl.createShader(type); gl.shaderSource(sh, src); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  };
+  const program = fs => {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, GLOW_VS));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  };
+  let progs;
+  try { progs = { bright: program(GLOW_FS_BRIGHT), down: program(GLOW_FS_DOWN), up: program(GLOW_FS_UP), comp: program(GLOW_FS_COMP) }; }
+  catch (e) { console.warn('scheme-builder: glow shader compile failed:', e.message); return null; }
+
+  const vao = gl.createVertexArray();           // empty VAO (vertices from gl_VertexID)
+  const sceneTex = gl.createTexture();
+  // Half- and quarter-resolution ping/pong targets, (re)sized on demand.
+  let half = null, quarter = null, dims = { w: 0, h: 0 };
+  const mkTarget = (w, h) => {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    return { tex, fbo, w, h };
+  };
+  const resize = (sw, sh) => {
+    const hw = Math.max(1, sw >> 1), hh = Math.max(1, sh >> 1);
+    const qw = Math.max(1, hw >> 1), qh = Math.max(1, hh >> 1);
+    if (dims.w === sw && dims.h === sh) return;
+    half = mkTarget(hw, hh); quarter = mkTarget(qw, qh); dims = { w: sw, h: sh };
+  };
+  const setU = (p, name, set) => { const loc = gl.getUniformLocation(p, name); set(loc); };
+  const draw = () => gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  function render(raster, g, slots) {
+    const sw = canvas.width, sh = canvas.height;
+    resize(sw, sh);
+    gl.bindVertexArray(vao);
+
+    // Upload the scene as an sRGB texture (flip Y so the texture is upright).
+    gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.SRGB8_ALPHA8, gl.RGBA, gl.UNSIGNED_BYTE, raster);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, v);
+
+    const wantHalo = g.match_brightness || g.match_bright_ansi || g.match_foreground;
+    const fg = hexToLin(state.foreground), bg = hexToLin(state.background);
+
+    // 1. Bright pass → half.
+    gl.useProgram(progs.bright);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, half.fbo);
+    gl.viewport(0, 0, half.w, half.h);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    setU(progs.bright, 'u_scene', l => gl.uniform1i(l, 0));
+    setU(progs.bright, 'u_threshold', l => gl.uniform1f(l, g.threshold));
+    setU(progs.bright, 'u_softness', l => gl.uniform1f(l, g.softness));
+    setU(progs.bright, 'u_hueTol', l => gl.uniform1f(l, g.hue_tolerance_deg));
+    setU(progs.bright, 'u_minSat', l => gl.uniform1f(l, MIN_PALETTE_SAT));
+    setU(progs.bright, 'u_fgTol', l => gl.uniform1f(l, g.fg_tolerance));
+    setU(progs.bright, 'u_useBri', l => gl.uniform1f(l, g.match_brightness ? 1 : 0));
+    setU(progs.bright, 'u_useAnsi', l => gl.uniform1f(l, g.match_bright_ansi ? 1 : 0));
+    setU(progs.bright, 'u_useFg', l => gl.uniform1f(l, g.match_foreground ? 1 : 0));
+    setU(progs.bright, 'u_fg', l => gl.uniform3f(l, fg[0], fg[1], fg[2]));
+    const hues = new Float32Array(32);
+    slots.forEach((s, i) => { hues[i*4] = s.h < 0 ? 0 : s.h; hues[i*4+1] = s.s; hues[i*4+3] = s.active ? 1 : 0; });
+    setU(progs.bright, 'u_hues[0]', l => gl.uniform4fv(l, hues));
+    draw();
+
+    // 2. Dual-Kawase blur: iterations of down (half→quarter) then up (quarter→half).
+    if (wantHalo) {
+      const iters = Math.max(1, Math.min(12, g.iterations | 0));
+      for (let i = 0; i < iters; i++) {
+        gl.useProgram(progs.down);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, quarter.fbo);
+        gl.viewport(0, 0, quarter.w, quarter.h);
+        gl.bindTexture(gl.TEXTURE_2D, half.tex);
+        setU(progs.down, 'u_src', l => gl.uniform1i(l, 0));
+        setU(progs.down, 'u_texel', l => gl.uniform2f(l, 1 / half.w, 1 / half.h));
+        draw();
+        gl.useProgram(progs.up);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, half.fbo);
+        gl.viewport(0, 0, half.w, half.h);
+        gl.bindTexture(gl.TEXTURE_2D, quarter.tex);
+        setU(progs.up, 'u_src', l => gl.uniform1i(l, 0));
+        setU(progs.up, 'u_texel', l => gl.uniform2f(l, 1 / quarter.w, 1 / quarter.h));
+        draw();
+      }
+    }
+
+    // 3 + 4. Composite halo over the linear scene, then content scanlines, to canvas.
+    gl.useProgram(progs.comp);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, sw, sh);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, half.tex);
+    const sb = hexToRgb01(g.scanline_color_bright), sd = hexToRgb01(g.scanline_color_dark);
+    setU(progs.comp, 'u_scene', l => gl.uniform1i(l, 0));
+    setU(progs.comp, 'u_halo', l => gl.uniform1i(l, 1));
+    setU(progs.comp, 'u_intensity', l => gl.uniform1f(l, wantHalo ? g.intensity : 0));
+    setU(progs.comp, 'u_scanPeriod', l => gl.uniform1f(l, g.scanline_period));
+    setU(progs.comp, 'u_haloScan', l => gl.uniform1f(l, (wantHalo && g.scanlines) ? 1 : 0));
+    setU(progs.comp, 'u_haloStrength', l => gl.uniform1f(l, g.scanline_strength));
+    setU(progs.comp, 'u_content', l => gl.uniform1f(l, g.scanlines_content ? 1 : 0));
+    setU(progs.comp, 'u_contentStrength', l => gl.uniform1f(l, g.scanlines_content_strength));
+    setU(progs.comp, 'u_contentAtten', l => gl.uniform1f(l, g.scanlines_content_attenuation));
+    setU(progs.comp, 'u_contentMasked', l => gl.uniform1f(l, g.scanlines_skip_primary_bg ? 1 : 0));
+    setU(progs.comp, 'u_stripeBright', l => gl.uniform3f(l, sb[0], sb[1], sb[2]));
+    setU(progs.comp, 'u_stripeDark', l => gl.uniform3f(l, sd[0], sd[1], sd[2]));
+    setU(progs.comp, 'u_bg', l => gl.uniform3f(l, bg[0], bg[1], bg[2]));
+    draw();
+    gl.bindVertexArray(null);
+  }
+
+  return { render };
+}
+
+function renderGlowPreview() {
   ensureGlowCanvases();
   const body = document.getElementById('term-body');
   const g = state.glow;
-  // Visible size of the scene; bail until the pane has laid out.
   const W = body.clientWidth, H = body.clientHeight;
   if (W < 2 || H < 2) return;
 
   const wantHalo = g.enabled && (g.match_brightness || g.match_bright_ansi || g.match_foreground);
-  const wantScan = g.enabled && g.scanlines_content;
-  glowCanvas.style.display = wantHalo ? '' : 'none';
-  scanCanvas.style.display = wantScan ? '' : 'none';
-  if (!wantHalo && !wantScan) return;
+  const wantGL = g.enabled && (wantHalo || g.scanlines_content);
+  glowCanvas.style.display = wantGL ? '' : 'none';
+  if (!wantGL) return;
 
-  // Track the live device pixel ratio (it changes when a window moves between
-  // displays) so the work resolution stays 1:1 with device pixels.
+  // Track the live device pixel ratio so the work resolution stays 1:1 with
+  // device pixels (keeps scanlines crisp; matches framebuffer-pixel period).
   GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
   const sw = Math.round(W * GLOW_SCALE), sh = Math.round(H * GLOW_SCALE);
-  for (const c of [rasterCanvas, haloCanvas, glowCanvas, scanCanvas]) {
-    if (c.width !== sw) c.width = sw;
-    if (c.height !== sh) c.height = sh;
-    c.style.width = W + 'px'; c.style.height = H + 'px';
-  }
+  glowCanvas.style.width = W + 'px'; glowCanvas.style.height = H + 'px';
+  if (glowCanvas.width !== sw) glowCanvas.width = sw;
+  if (glowCanvas.height !== sh) glowCanvas.height = sh;
+  if (rasterCanvas.width !== sw) rasterCanvas.width = sw;
+  if (rasterCanvas.height !== sh) rasterCanvas.height = sh;
+  rasterizeScene(rasterCanvas.getContext('2d'), GLOW_SCALE, sw, sh);
 
-  const rctx = rasterCanvas.getContext('2d', { willReadFrequently: true });
-  rasterizeScene(rctx, GLOW_SCALE, sw, sh);
-  const scene = rctx.getImageData(0, 0, sw, sh);
-  const px = scene.data;
-  const bgLin = hexToLin(state.background);
-
-  if (wantHalo) {
-    const fgLin = hexToLin(state.foreground);
-    const slots = g.match_bright_ansi ? brightSlots() : null;
-    const soft = Math.max(g.softness, 1e-4);
-    const hiB = Math.min(g.threshold + soft, 1);
-    const edge = soft * 180;
-    const tol = Math.max(g.hue_tolerance_deg, 0);
-    const fgLo = Math.max(g.fg_tolerance, 0), fgHi = fgLo + soft;
-    const halo = haloCanvas.getContext('2d').createImageData(sw, sh);
-    const hp = halo.data;
-    for (let i = 0; i < px.length; i += 4) {
-      const lin = [srgbToLinear(px[i]), srgbToLinear(px[i+1]), srgbToLinear(px[i+2])];
-      let weight = 0;
-      if (g.match_brightness) {
-        weight = Math.max(weight, smoothstep(g.threshold, hiB, Math.max(lin[0], lin[1], lin[2])));
-      }
-      if (g.match_bright_ansi) {
-        const { h, s } = hsvLin(lin);
-        if (s >= MIN_PALETTE_SAT && h >= 0) {
-          let best = 0;
-          for (const slot of slots) {
-            if (!slot.active) continue;
-            const w = 1 - smoothstep(tol, tol + edge, hueDist(h, slot.h));
-            best = Math.max(best, w * Math.min(s, slot.s));
-          }
-          weight = Math.max(weight, best);
-        }
-      }
-      if (g.match_foreground) {
-        const dr = lin[0]-fgLin[0], dg = lin[1]-fgLin[1], db = lin[2]-fgLin[2];
-        const dist = Math.sqrt(dr*dr + dg*dg + db*db);
-        weight = Math.max(weight, 1 - smoothstep(fgLo, fgHi, dist));
-      }
-      // Source colour with alpha = weight·intensity. The renderer composites
-      // the halo premultiplied-over (One / OneMinusSrcAlpha), so we keep the
-      // glyph colour straight and carry the coverage in alpha; drawn with
-      // normal source-over below this reproduces dst = halo·a + scene·(1-a).
-      hp[i]   = px[i];
-      hp[i+1] = px[i+1];
-      hp[i+2] = px[i+2];
-      hp[i+3] = Math.min(255, weight * g.intensity * 255);
-    }
-    const hctx = haloCanvas.getContext('2d');
-    hctx.putImageData(halo, 0, 0);
-    // Bloom: Gaussian blur stands in for the Kawase chain; radius grows with
-    // iterations. The halo lives on a transparent canvas so it paints over the
-    // DOM text directly.
-    const gctx = glowCanvas.getContext('2d');
-    gctx.globalCompositeOperation = 'source-over';
-    gctx.clearRect(0, 0, sw, sh);
-    gctx.filter = `blur(${(1 + g.iterations * 2.5) * GLOW_SCALE}px)`;
-    gctx.drawImage(haloCanvas, 0, 0);
-    gctx.filter = 'none';
-    if (g.scanlines && g.scanline_strength > 0) {
-      // Halo scanline knockout: erase a fraction of the halo's alpha on dark
-      // rows (destination-out), matching the renderer's per-row scanline_factor
-      // applied at composite.
-      applyScanlineKnockout(gctx, sw, sh, g);
+  if (!glowGL && !glowGLFailed) {
+    glowGL = createGlowGL(glowCanvas);
+    if (!glowGL) {
+      glowGLFailed = true;
+      console.warn('scheme-builder: WebGL2 + float render targets unavailable; glow preview disabled.');
     }
   }
+  if (!glowGL) { glowCanvas.style.display = 'none'; return; }
 
-  if (wantScan) {
-    drawContentScanlines(scanCanvas.getContext('2d'), scene, sw, sh, g, bgLin);
-  }
-
-  // (Re)attach over the freshly-rebuilt DOM text.
-  body.append(glowCanvas, scanCanvas);
-}
-
-// Halo scanline knockout: erase `strength` of the halo's alpha on dark rows
-// (phase < 0.5) via destination-out, leaving bright rows untouched — the
-// preview equivalent of the renderer's scanline_factor at composite. `period`
-// is in device pixels (canvas is rendered at devicePixelRatio), matching the
-// renderer's framebuffer-pixel period.
-function applyScanlineKnockout(ctx, w, h, g) {
-  const period = Math.max(g.scanline_period, 1);
-  ctx.globalCompositeOperation = 'destination-out';
-  ctx.fillStyle = `rgba(0,0,0,${g.scanline_strength})`;
-  for (let y = 0; y < h; y++) {
-    if (((y % period) / period) < 0.5) ctx.fillRect(0, y, w, 1);  // dark row
-  }
-  ctx.globalCompositeOperation = 'source-over';
-}
-
-// Content scanline overlay (multiply layer). Per row, a stripe colour lerped
-// from white (identity) toward the configured bright/dark colour by strength.
-// When skip_primary_bg is on, the stripe is lerped back toward white over
-// drawn content and empty bg per the renderer's masked overlay; otherwise it
-// applies uniformly. Computed at work resolution from the scene raster.
-function drawContentScanlines(ctx, scene, w, h, g, bgLin) {
-  const out = ctx.createImageData(w, h);
-  const op = out.data, px = scene.data;
-  const period = Math.max(g.scanline_period, 1);  // device px (canvas is at dpr)
-  const strength = g.scanlines_content_strength;
-  const cb = hexToRgb255(g.scanline_color_bright), cd = hexToRgb255(g.scanline_color_dark);
-  const atten = g.scanlines_content_attenuation;
-  const masked = g.scanlines_skip_primary_bg;
-  for (let y = 0; y < h; y++) {
-    const bright = ((y % period) / period) >= 0.5;
-    const base = bright ? cb : cd;
-    // stripe = mix(white, base, strength)
-    const sr = 255 + (base[0] - 255) * strength;
-    const sg = 255 + (base[1] - 255) * strength;
-    const sb = 255 + (base[2] - 255) * strength;
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      let lerp = 0;
-      if (masked) {
-        const dr = srgbToLinear(px[i]) - bgLin[0];
-        const dg = srgbToLinear(px[i+1]) - bgLin[1];
-        const db = srgbToLinear(px[i+2]) - bgLin[2];
-        const content = smoothstep(0.02, 0.08, Math.sqrt(dr*dr + dg*dg + db*db));
-        // Empty bg fully suppresses; drawn content softens by attenuation.
-        lerp = Math.max(1 - content, content * atten);
-      }
-      // final = mix(stripe, white, lerp), stored as the multiply colour.
-      op[i]   = sr + (255 - sr) * lerp;
-      op[i+1] = sg + (255 - sg) * lerp;
-      op[i+2] = sb + (255 - sb) * lerp;
-      op[i+3] = 255;
-    }
-  }
-  ctx.putImageData(out, 0, 0);
-}
-
-function hexToRgb255(hex) {
-  const h = hex.slice(1);
-  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+  glowGL.render(rasterCanvas, g, brightSlots());
+  // The opaque WebGL canvas sits over (and hides) the DOM text it was built
+  // from. Re-attach after the DOM rebuild in renderPreview.
+  body.append(glowCanvas);
 }
 
 /* ============================================================
