@@ -30,6 +30,12 @@ pub enum Event {
     // Scrolling
     ScrollUp(u16),
     ScrollDown(u16),
+    // ESC D (IND) — index: cursor down one row, scrolling the region up at the
+    // bottom margin. ESC M (RI) — reverse index: cursor up one row, scrolling
+    // the region down at the top margin. ESC E (NEL) — next line: CR + IND.
+    Index,
+    ReverseIndex,
+    NextLine,
     // top/bottom 1-based. None = default (full screen / no region).
     SetScrollRegion(Option<u16>, Option<u16>),
     // DECSLRM — CSI Pl ; Pr s. left/right 1-based. None for both = the
@@ -212,6 +218,18 @@ impl Parser {
             }
             '8' => {
                 emit(Event::RestoreCursor);
+                self.state = State::Ground;
+            }
+            'D' => {
+                emit(Event::Index);
+                self.state = State::Ground;
+            }
+            'M' => {
+                emit(Event::ReverseIndex);
+                self.state = State::Ground;
+            }
+            'E' => {
+                emit(Event::NextLine);
                 self.state = State::Ground;
             }
             'c' => {
