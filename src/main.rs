@@ -4474,7 +4474,8 @@ impl State {
             match &cur {
                 Some(c) if completion::has_path_token(&c.buffer, c.cursor) => {
                     let cwd = self.terminal.cwd().map(std::path::Path::new);
-                    completion::complete_path(&c.buffer, c.cursor, cwd)
+                    let path = std::env::var_os("PATH");
+                    completion::complete(&c.buffer, c.cursor, cwd, path.as_deref())
                 }
                 _ => Vec::new(),
             }
@@ -4503,7 +4504,8 @@ impl State {
             .map(|c| (c.buffer.clone(), c.cursor))
         {
             let cwd = self.terminal.cwd().map(std::path::Path::new);
-            self.completions = completion::complete_path(&buffer, cursor, cwd);
+            let path = std::env::var_os("PATH");
+            self.completions = completion::complete(&buffer, cursor, cwd, path.as_deref());
             self.completions_input = Some((buffer, cursor));
             self.selected_completion = 0;
             self.completion_scroll = 0;

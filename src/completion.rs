@@ -95,6 +95,113 @@ pub(crate) fn has_path_token(buffer: &str, cursor: usize) -> bool {
     !token_under_cursor(buffer, cursor).1.is_empty()
 }
 
+/// True when `token_start` is in command position: everything before it on the
+/// line is whitespace (so the token is the first word of the line).
+//
+// TODO: pipe/semicolon segments — v1 only treats the first word of the whole
+// line as a command; words after `|`, `;`, `&&` are not yet recognized as
+// command positions.
+fn is_command_position(buffer: &str, token_start: usize) -> bool {
+    buffer[..token_start].chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// Complete executable names on `$PATH` for `prefix`. Scans each `:`-separated
+/// directory in `path`, collects regular-file (symlinks followed) entries whose
+/// name starts with `prefix` and that have an execute bit set, dedups by name
+/// keeping the first occurrence in PATH order (matching shell command lookup),
+/// sorts the survivors lexicographically, and caps at MAX_SUGGESTIONS. Each
+/// suggestion's `text` is the command name plus a trailing space (so the user
+/// can type arguments next), `is_dir: false`. Returns empty when `path` is None
+/// or nothing matches.
+//
+// This scans PATH synchronously on each input change. The caller caches the
+// result (it is not recomputed per frame), but a future slice could index/cache
+// the PATH contents to avoid re-reading every directory on each keystroke.
+//
+// `path` here is the *terminal process's* `$PATH`, not the shell's live PATH
+// (a known limitation: the shell's PATH after `export PATH=...` would need an
+// OSC report to observe). Likewise this only sees executables on disk — no
+// shell builtins, functions, or aliases.
+pub fn complete_command(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<Suggestion> {
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(path) = path else {
+        return Vec::new();
+    };
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    // `split_paths` handles `:` separation (and empty entries) correctly.
+    for dir in std::env::split_paths(path) {
+        // Skip dirs we can't read (nonexistent, no permission, etc.).
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+
+            // Case-sensitive prefix match (matches the path completer;
+            // case-insensitive matching is a possible future option).
+            if !name.starts_with(prefix) {
+                continue;
+            }
+
+            // Follow symlinks: a symlink to an executable is itself runnable.
+            // A dangling symlink errors here and is skipped.
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            // Must be a regular file (exclude directories, which carry the
+            // exec bit but aren't commands) with an execute bit set.
+            if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+
+            // Dedup by name in PATH order: first occurrence wins (matching the
+            // shell's command lookup).
+            if seen.insert(name.to_string()) {
+                suggestions.push(Suggestion {
+                    text: format!("{name} "),
+                    is_dir: false,
+                });
+            }
+        }
+    }
+
+    suggestions.sort_by(|a, b| a.text.cmp(&b.text));
+    suggestions.truncate(MAX_SUGGESTIONS);
+    suggestions
+}
+
+/// Top-level completion: command (`$PATH`) completion when the cursor is on the
+/// command word, otherwise filesystem path completion. The token is treated as
+/// a command iff it's in command position, non-empty, and has no `/` and no
+/// leading `~`/`.` (a path-like first word such as `./script` or `~/bin/x`
+/// still gets path completion). `path` is `$PATH` for command completion.
+pub fn complete(
+    buffer: &str,
+    cursor: usize,
+    cwd: Option<&Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> Vec<Suggestion> {
+    let (token_start, token) = token_under_cursor(buffer, cursor);
+    let looks_like_command = !token.is_empty()
+        && !token.contains('/')
+        && !token.starts_with('~')
+        && !token.starts_with('.')
+        && is_command_position(buffer, token_start);
+    if looks_like_command {
+        complete_command(token, path)
+    } else {
+        complete_path(buffer, cursor, cwd)
+    }
+}
+
 /// Computed on-screen rectangle for the completion popup, in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PopupLayout {
@@ -301,6 +408,14 @@ mod tests {
 
         fn mkdir(&self, name: &str) {
             std::fs::create_dir_all(self.path.join(name)).unwrap();
+        }
+
+        /// Create a file with the given octal mode (used to make executables).
+        fn touch_mode(&self, name: &str, mode: u32) {
+            use std::os::unix::fs::PermissionsExt;
+            let p = self.path.join(name);
+            std::fs::write(&p, b"").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         }
     }
 
@@ -590,5 +705,149 @@ mod tests {
     #[test]
     fn visible_window_zero_max_is_noop() {
         assert_eq!(visible_window_start(5, 2, 0), 2);
+    }
+
+    // ---- command completion (slice K15) ----
+
+    /// Build an `OsString` PATH from temp dirs for `complete_command` tests.
+    fn path_of(dirs: &[&Path]) -> std::ffi::OsString {
+        std::env::join_paths(dirs.iter().map(|d| d.as_os_str())).unwrap()
+    }
+
+    #[test]
+    fn complete_command_matches_executable_excludes_others() {
+        let tmp = TempDir::new();
+        // `gizmo` is executable and matches; `ginormous` matches the prefix but
+        // is not executable (mode 0o644).
+        tmp.touch_mode("gizmo", 0o755);
+        tmp.touch_mode("ginormous", 0o644);
+        // A subdirectory matching the prefix is excluded even with the exec bit.
+        tmp.mkdir("gitdir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                tmp.path.join("gitdir"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let p = path_of(&[tmp.path.as_path()]);
+        let s = complete_command("gi", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["gizmo "]);
+        assert!(!s[0].is_dir);
+    }
+
+    #[test]
+    fn complete_command_dedups_by_path_order() {
+        let dir1 = TempDir::new();
+        let dir2 = TempDir::new();
+        dir1.touch_mode("dup", 0o755);
+        dir2.touch_mode("dup", 0o755);
+
+        // dir1 first: its `dup` wins, exactly one result.
+        let p = path_of(&[dir1.path.as_path(), dir2.path.as_path()]);
+        let s = complete_command("dup", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["dup "]);
+
+        // Reverse order: still exactly one (independence of which copy is kept).
+        let p = path_of(&[dir2.path.as_path(), dir1.path.as_path()]);
+        let s = complete_command("dup", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["dup "]);
+    }
+
+    #[test]
+    fn complete_command_prefix_filters() {
+        let tmp = TempDir::new();
+        tmp.touch_mode("alpha", 0o755);
+        tmp.touch_mode("alps", 0o755);
+        tmp.touch_mode("beta", 0o755);
+
+        let p = path_of(&[tmp.path.as_path()]);
+        let s = complete_command("al", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["alpha ", "alps "]);
+    }
+
+    #[test]
+    fn complete_command_nonexistent_dir_skipped_and_none_empty() {
+        let tmp = TempDir::new();
+        tmp.touch_mode("run", 0o755);
+        let missing = tmp.path.join("does_not_exist");
+
+        // A nonexistent dir in PATH is skipped without panic.
+        let p = path_of(&[missing.as_path(), tmp.path.as_path()]);
+        let s = complete_command("ru", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["run "]);
+
+        // path: None -> empty.
+        assert!(complete_command("ru", None).is_empty());
+    }
+
+    #[test]
+    fn complete_command_caps_at_max() {
+        let tmp = TempDir::new();
+        for i in 0..(MAX_SUGGESTIONS + 10) {
+            tmp.touch_mode(&format!("cmd_{i:04}"), 0o755);
+        }
+        let p = path_of(&[tmp.path.as_path()]);
+        let s = complete_command("cmd_", Some(p.as_os_str()));
+        assert_eq!(s.len(), MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn is_command_position_cases() {
+        // `"gi"`: token at start -> true.
+        let (start, _) = token_under_cursor("gi", 2);
+        assert!(is_command_position("gi", start));
+        // `"  gi"`: leading spaces, token_start at the 'g' -> true.
+        let (start, tok) = token_under_cursor("  gi", 4);
+        assert_eq!(tok, "gi");
+        assert!(is_command_position("  gi", start));
+        // `"ls foo"`: token_start at `foo` -> false (a command precedes it).
+        let (start, tok) = token_under_cursor("ls foo", 6);
+        assert_eq!(tok, "foo");
+        assert!(!is_command_position("ls foo", start));
+    }
+
+    #[test]
+    fn complete_dispatches_command_for_bare_first_token() {
+        let bindir = TempDir::new();
+        bindir.touch_mode("yutanitest", 0o755);
+        let p = path_of(&[bindir.path.as_path()]);
+
+        // Bare command-position token -> command completion (trailing space).
+        let s = complete("yutani", 6, None, Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["yutanitest "]);
+    }
+
+    #[test]
+    fn complete_dispatches_path_for_argument() {
+        let cwd = TempDir::new();
+        cwd.mkdir("src");
+        // `ls sr` — `sr` is an argument; path completion against cwd finds src/.
+        let s = complete("ls sr", 5, Some(cwd.path.as_path()), None);
+        assert_eq!(texts(&s), vec!["src/"]);
+    }
+
+    #[test]
+    fn complete_path_like_first_word_goes_to_path() {
+        let cwd = TempDir::new();
+        cwd.touch("script.sh");
+        cwd.mkdir("bin");
+        cwd.touch("bin/x");
+
+        // `./sc` in first position -> path completion (not command).
+        let s = complete("./sc", 4, Some(cwd.path.as_path()), None);
+        assert_eq!(texts(&s), vec!["./script.sh"]);
+
+        // `~/x` in first position -> path completion via HOME (not command).
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", &cwd.path);
+        let s = complete("~/b", 3, None, None);
+        match saved {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(texts(&s), vec!["~/bin/"]);
     }
 }
