@@ -4486,6 +4486,31 @@ impl State {
         true
     }
 
+    /// Manually (re)open the completion popup for the current input — the
+    /// Ctrl+Space command. Unlike the automatic path, this bypasses the
+    /// `has_path_token` gate, so triggering on an empty token lists the whole
+    /// working directory ("show me what's here"). Clears the dismissed flag so a
+    /// popup closed with Esc/Enter comes back, and pins `completions_input` to the
+    /// current input so the next (unchanged-input) recompute doesn't immediately
+    /// wipe the freshly-summoned list.
+    fn trigger_completion(&mut self) {
+        self.completion_dismissed = false;
+        // Clone the buffer/cursor out of the immutable `current_input()` borrow so
+        // it ends before we take `cwd()` and then mutably write `self.*` fields.
+        if let Some((buffer, cursor)) = self
+            .terminal
+            .current_input()
+            .map(|c| (c.buffer.clone(), c.cursor))
+        {
+            let cwd = self.terminal.cwd().map(std::path::Path::new);
+            self.completions = completion::complete_path(&buffer, cursor, cwd);
+            self.completions_input = Some((buffer, cursor));
+            self.selected_completion = 0;
+            self.completion_scroll = 0;
+        }
+        self.invalidate();
+    }
+
     /// Accept the highlighted suggestion: write the bytes that extend the typed
     /// token into the chosen path, straight to the PTY (the shell's line editor
     /// inserts them at the cursor). Computes the suffix against the LIVE buffer
@@ -5118,6 +5143,28 @@ impl State {
                                 self.window.request_redraw();
                                 return true;
                             }
+                        }
+                    }
+                    // Ctrl+Space manually summons/refreshes the completion popup
+                    // (autocomplete slice K14). Placed after the Cmd shortcuts and
+                    // before the popup-active interception so it works whether or
+                    // not a popup is currently open, and before the general
+                    // encode_key path that would otherwise send NUL to the shell.
+                    if self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key()
+                    {
+                        use winit::keyboard::{Key, NamedKey};
+                        // winit 0.29 may deliver Space as Named(Space) (see
+                        // input::named_key) or as a Character(" ") (folded to NUL
+                        // by ctrl_byte); match both so the trigger is robust.
+                        let is_space = matches!(&event.logical_key, Key::Named(NamedKey::Space))
+                            || matches!(&event.logical_key, Key::Character(s) if s.as_str() == " ");
+                        if is_space {
+                            // Consume the key so the usual NUL byte doesn't reach
+                            // the shell; summon/refresh the popup instead.
+                            self.trigger_completion();
+                            return true;
                         }
                     }
                     // Completion popup keyboard interaction (autocomplete slice
