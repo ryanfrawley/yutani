@@ -1,5 +1,6 @@
 mod app_window;
 mod box_drawing;
+mod command_palette;
 mod completion;
 mod font;
 mod font_loader;
@@ -1080,6 +1081,11 @@ struct State {
     /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
     /// close the menu.
     completion_dismissed: bool,
+    /// The command palette overlay (Cmd-Shift-P). While `open`, it owns the
+    /// keyboard: keystrokes filter/drive it instead of reaching the PTY. Holds
+    /// its own search/argument text field and selection state; see
+    /// `command_palette.rs`.
+    command_palette: command_palette::CommandPalette,
     /// Past command lines for history-based completion suggestions, most-recent-
     /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
     /// 2124) and grown with this session's submitted commands (captured at OSC
@@ -2090,6 +2096,7 @@ impl State {
             selected_completion: 0,
             completion_scroll: 0,
             completion_dismissed: false,
+            command_palette: command_palette::CommandPalette::default(),
             command_history: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
@@ -3357,6 +3364,180 @@ impl State {
             }
         }
 
+        // Command palette overlay (Cmd-Shift-P). Drawn last so it sits above
+        // everything, anchored top-center rather than at the cursor. Reuses the
+        // popup's quad/glyph helpers and palette-derived colors. Layout: a dim
+        // backdrop, a rounded box, an input line with a caret, then (in command
+        // mode) a separator and the filtered, scrollable command rows.
+        if self.command_palette.open {
+            use command_palette::{Mode, COMMANDS, PALETTE_MAX_VISIBLE};
+            let cp = &self.command_palette;
+            let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+            let screen_w = self.gpu.config.width as f32;
+            let screen_h = self.gpu.config.height as f32;
+
+            // Dim the terminal behind the palette to pull focus.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                0.0,
+                0.0,
+                screen_w,
+                screen_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                premul([0.0, 0.0, 0.0], 0.45),
+                [0.0; 4],
+            );
+
+            // Box geometry: a fixed-ish width centered horizontally, parked near
+            // the top of the window.
+            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - WINDOW_PADDING * 2.0);
+            let box_x = ((screen_w - box_w) * 0.5).round();
+            let box_y = (screen_h * 0.12).round();
+            let pad_v = (line_height * 0.45).round();
+            let row_h = line_height;
+            let sep_h = 1.0_f32;
+
+            // Visible slice of the filtered command list (command mode only).
+            let list_mode = matches!(cp.mode, Mode::Commands);
+            let start = cp.scroll.min(cp.filtered.len());
+            let end = (start + PALETTE_MAX_VISIBLE).min(cp.filtered.len());
+            let n = if list_mode { end - start } else { 0 };
+            let has_list = n > 0;
+
+            let total_h = pad_v * 2.0
+                + row_h
+                + if has_list { sep_h + n as f32 * row_h } else { 0.0 };
+
+            // Colors, mirroring the completion popup so themes apply.
+            let bg = pal.background;
+            let box_color = premul([bg[0] * 0.55, bg[1] * 0.55, bg[2] * 0.55], 0.96);
+            let fgc = pal.foreground;
+            let hl_color = premul(
+                [
+                    bg[0] * 0.4 + fgc[0] * 0.6,
+                    bg[1] * 0.4 + fgc[1] * 0.6,
+                    bg[2] * 0.4 + fgc[2] * 0.6,
+                ],
+                0.9,
+            );
+            let text_color = pal.foreground;
+            let caret_color = premul([fgc[0], fgc[1], fgc[2]], 0.9);
+            let radius = 8.0_f32;
+
+            // Box background.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                box_x,
+                box_y,
+                box_w,
+                total_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                box_color,
+                [radius; 4],
+            );
+
+            let text_x = box_x + cell_w;
+            let max_text_x = box_x + box_w - cell_w;
+
+            // Input line: a prompt prefix, then the typed text. In argument mode
+            // the prefix names what's being entered (e.g. "Title: ").
+            let prefix = match cp.mode {
+                Mode::Commands => "> ".to_string(),
+                Mode::Argument { prompt, .. } => format!("{prompt}: "),
+            };
+            let input_top = box_y + pad_v;
+            let input_text = format!("{prefix}{}", cp.input.value);
+            let baseline = input_top + bg_h + descender + strip_pad;
+            emit_text_run(
+                atlas,
+                &mut vertices,
+                &mut indices,
+                text_x,
+                baseline,
+                &input_text,
+                text_color,
+                atlas_w,
+                atlas_h,
+                cell_w,
+                max_text_x,
+            );
+
+            // Caret: a thin bar after the prefix + the chars left of the cursor.
+            let caret_col = prefix.chars().count() + cp.input.cursor_col();
+            let caret_x = text_x + caret_col as f32 * cell_w;
+            if caret_x + 2.0 <= max_text_x {
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    caret_x,
+                    input_top + strip_pad,
+                    2.0,
+                    bg_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    caret_color,
+                    [0.0; 4],
+                );
+            }
+
+            if has_list {
+                let list_top = input_top + row_h + sep_h;
+                // Separator between the input and the results.
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    box_x,
+                    input_top + row_h,
+                    box_w,
+                    sep_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    premul([fgc[0], fgc[1], fgc[2]], 0.18),
+                    [0.0; 4],
+                );
+
+                // Highlight the selected row within the visible window.
+                let hl_row = cp.selected.saturating_sub(start);
+                if hl_row < n {
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        box_x,
+                        list_top + hl_row as f32 * row_h,
+                        box_w,
+                        row_h,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        hl_color,
+                        [0.0; 4],
+                    );
+                }
+
+                // Command titles.
+                for (i, &cmd_idx) in cp.filtered[start..end].iter().enumerate() {
+                    let row_top = list_top + i as f32 * row_h;
+                    let baseline = row_top + bg_h + descender + strip_pad;
+                    emit_text_run(
+                        atlas,
+                        &mut vertices,
+                        &mut indices,
+                        text_x,
+                        baseline,
+                        COMMANDS[cmd_idx].title,
+                        text_color,
+                        atlas_w,
+                        atlas_h,
+                        cell_w,
+                        max_text_x,
+                    );
+                }
+            }
+        }
+
         // Refresh the visible-grid snapshot with the current frame's cells
         // so the next retarget can spot what just got cleared. Keyed by
         // viewport so a resize / scrollback / alt-screen flip flushes the
@@ -3533,6 +3714,90 @@ impl State {
             0,
             bytemuck::cast_slice(&fade_data),
         );
+    }
+
+    /// Drive the command palette from a key press while it's open. Always
+    /// consumes the event (returns `true`): the palette owns the keyboard, so
+    /// nothing here reaches the PTY. Cmd-Shift-P (open/close) is handled by the
+    /// caller before this; everything else — navigation, text editing, accept,
+    /// dismiss — is handled here.
+    fn command_palette_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use command_palette::Outcome;
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                if self.command_palette.escape() == Outcome::Close {
+                    self.command_palette.close();
+                }
+            }
+            Key::Named(NamedKey::Enter) => match self.command_palette.accept() {
+                Outcome::Run { action, arg } => {
+                    self.command_palette.close();
+                    self.run_palette_action(action, arg);
+                }
+                Outcome::Close => self.command_palette.close(),
+                Outcome::Stay => {}
+            },
+            Key::Named(NamedKey::ArrowDown) => self.command_palette.move_down(),
+            Key::Named(NamedKey::ArrowUp) => self.command_palette.move_up(),
+            Key::Named(NamedKey::Backspace) => self.command_palette.backspace(),
+            Key::Named(NamedKey::Delete) => self.command_palette.input.delete(),
+            Key::Named(NamedKey::ArrowLeft) => self.command_palette.input.left(),
+            Key::Named(NamedKey::ArrowRight) => self.command_palette.input.right(),
+            Key::Named(NamedKey::Home) => self.command_palette.input.home(),
+            Key::Named(NamedKey::End) => self.command_palette.input.end(),
+            _ => {
+                // Printable text: insert it, unless a Cmd/Ctrl/Alt chord is
+                // held (those aren't text input). winit hands us the composed
+                // text in `event.text`.
+                let plain = !self.modifiers.super_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key();
+                if plain {
+                    if let Some(text) = &event.text {
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                self.command_palette.type_char(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Execute a command chosen in the palette. Every arm reuses behaviour that
+    /// already exists elsewhere — the palette is a discoverable front end, not
+    /// new functionality.
+    fn run_palette_action(
+        &mut self,
+        action: command_palette::PaletteAction,
+        arg: Option<String>,
+    ) {
+        use command_palette::PaletteAction as A;
+        match action {
+            // Route through the OSC-0/2 path so the existing title plumbing
+            // (take_title_update -> effective_title) applies uniformly; the
+            // event loop picks the change up after this returns.
+            A::SetTitle => self
+                .terminal
+                .set_window_title(arg.as_deref().unwrap_or("")),
+            A::ClearTitle => self.terminal.set_window_title(""),
+            A::ReloadConfig => self.reload_config(),
+            A::ZoomIn => self.change_font_size(1.0),
+            A::ZoomOut => self.change_font_size(-1.0),
+            A::ToggleWireframe => {
+                if self.wireframe_pipeline.is_some() {
+                    self.wireframe = !self.wireframe;
+                }
+            }
+            A::CopyLastOutput => {
+                self.select_last_command_output();
+            }
+        }
+        self.invalidate();
     }
 
     /// Bump (or shrink) the font by `delta_pt` points and rebuild everything
@@ -5074,6 +5339,24 @@ impl State {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
+                    // Cmd-Shift-P toggles the command palette. Checked before
+                    // everything else so it both opens the palette and, while
+                    // it's open, closes it (the palette's own key handler below
+                    // otherwise swallows the keystroke).
+                    if self.modifiers.super_key() && self.modifiers.shift_key() {
+                        if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                            if s.eq_ignore_ascii_case("p") {
+                                self.command_palette.toggle();
+                                self.invalidate();
+                                return true;
+                            }
+                        }
+                    }
+                    // While the palette is open it owns the keyboard: every
+                    // keystroke filters/drives it and nothing reaches the PTY.
+                    if self.command_palette.open {
+                        return self.command_palette_key(&event);
+                    }
                     // Cmd+C / Cmd+V: copy / paste through the system
                     // clipboard. Done before encode_key so the super_key
                     // check there doesn't drop them.
@@ -6196,7 +6479,19 @@ async fn run() {
                 }
             },
             Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
-                if !state.input(&event, elwt) {
+                let consumed = state.input(&event, elwt);
+                // The palette's Set/Clear title actions set the title through
+                // the same terminal path OSC 0/2 uses, but a keystroke isn't
+                // followed by PtyInput, so poll the title update here too.
+                // Mirrors the OSC-driven poll in the PtyInput arm above.
+                if let Some(t) = state.terminal.take_title_update() {
+                    manual_title = t;
+                    state.window.set_title(&effective_title(
+                        manual_title.as_deref(),
+                        state.terminal.cwd(),
+                    ));
+                }
+                if !consumed {
                     match event {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
