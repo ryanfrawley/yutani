@@ -3016,6 +3016,24 @@ impl Terminal {
         true
     }
 
+    /// Scroll so absolute line `abs` is comfortably visible, placing it about a
+    /// third of the way down the viewport for context. No-op on the alt screen
+    /// (no scrollback) or when `abs` is already within the visible band.
+    /// Returns whether the view actually moved. Drives find-in-scrollback's
+    /// "jump to current match".
+    pub fn scroll_line_into_view(&mut self, abs: isize) -> bool {
+        if self.use_alternate {
+            return false;
+        }
+        let top = self.visual_to_abs_line(0);
+        let bottom = top + self.rows as isize - 1;
+        if abs >= top && abs <= bottom {
+            return false;
+        }
+        let margin = self.rows as isize / 3;
+        self.scroll_to_abs_top(abs - margin)
+    }
+
     /// One `(absolute_line, status)` per command region, anchored at the
     /// region's prompt-start line. The renderer maps each absolute line to a
     /// visible row (via [`visual_to_abs_line`](Self::visual_to_abs_line)) and
