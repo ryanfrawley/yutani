@@ -194,18 +194,23 @@ impl Palette {
     /// each color independently. Mono is special: with only two ink levels a
     /// quantised background can collapse onto the window background, leaving an
     /// empty cell and a cell that carries a background color
-    /// indistinguishable. So in Mono any explicit (non-transparent) background
-    /// is drawn as the [`foreground`] "ink" color and its glyph is flipped to
-    /// the [`background`] color — keeping three states mutually distinct: an
-    /// empty cell (window bg), a filled cell (fg ink), and its text (bg). A
-    /// transparent background (the "no color" sentinel) passes straight
-    /// through so empty cells still show the window through them.
+    /// indistinguishable. So in Mono a background that *differs* from the
+    /// window background is drawn as the [`foreground`] "ink" color and its
+    /// glyph is flipped to the [`background`] color — keeping three states
+    /// mutually distinct: an empty cell (window bg), a filled cell (fg ink),
+    /// and its text (bg).
+    ///
+    /// Two cases skip the flip and project normally: a transparent background
+    /// (the "no color" sentinel, alpha 0) so empty cells still show the window
+    /// through them, and a background that already equals the window
+    /// background — an app explicitly painting the scheme's own bg color reads
+    /// as "blank", so inverting it to fg ink would be wrong.
     ///
     /// [`project`]: Palette::project
     /// [`foreground`]: Palette::foreground
     /// [`background`]: Palette::background
     pub fn project_cell(&self, fg: [f32; 4], bg: [f32; 4]) -> ([f32; 4], [f32; 4]) {
-        if self.max_colors == ColorCap::Mono && bg[3] != 0.0 {
+        if self.max_colors == ColorCap::Mono && bg[3] != 0.0 && !rgb_eq(bg, self.background) {
             (self.background, self.foreground)
         } else {
             (self.project(fg), self.project(bg))
@@ -299,6 +304,14 @@ fn luma_dist_sq(a: [f32; 4], b: [f32; 4]) -> f32 {
     let dg = a[1] - b[1];
     let db = a[2] - b[2];
     0.299 * dr * dr + 0.587 * dg * dg + 0.114 * db * db
+}
+
+/// RGB equality within a small epsilon, ignoring alpha. Used to detect a
+/// cell background that matches the window background despite float rounding
+/// from sRGB/linear conversion or palette indexing.
+fn rgb_eq(a: [f32; 4], b: [f32; 4]) -> bool {
+    const EPS: f32 = 1.0 / 512.0;
+    (a[0] - b[0]).abs() < EPS && (a[1] - b[1]).abs() < EPS && (a[2] - b[2]).abs() < EPS
 }
 
 fn nearest(c: [f32; 4], candidates: &[[f32; 4]]) -> [f32; 4] {
@@ -866,6 +879,24 @@ blue = [0x0000ab, 0x5555ff]
         let (fg, bg) = p.project_cell([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(bg, [0.0, 0.0, 0.0, 0.0], "transparent bg must pass through");
         assert_eq!(fg, p.foreground, "glyph on empty cell stays fg ink");
+    }
+
+    #[test]
+    fn project_cell_mono_bg_matching_window_does_not_invert() {
+        // An app that explicitly paints the scheme's own background color
+        // means "blank" — it must NOT flip to fg ink, or every such cell would
+        // look like a filled block. It projects normally instead (bg snaps to
+        // the window background, the nearest mono end).
+        let mut p = Palette::defaults();
+        p.background = [0.05, 0.05, 0.05, 1.0];
+        p.foreground = [0.95, 0.95, 0.95, 1.0];
+        p.max_colors = ColorCap::Mono;
+        // Background equal to the window bg (alpha differs, RGB matches).
+        let (_fg, bg) = p.project_cell([0.95, 0.95, 0.95, 1.0], [0.05, 0.05, 0.05, 1.0]);
+        assert_eq!(bg, p.background, "window-bg-colored cell stays blank, no flip");
+        // A tiny rounding wobble within epsilon must still count as a match.
+        let (_fg, bg) = p.project_cell([0.95, 0.95, 0.95, 1.0], [0.051, 0.049, 0.05, 1.0]);
+        assert_eq!(bg, p.background, "near-equal bg within epsilon stays blank");
     }
 
     #[test]
