@@ -38,14 +38,23 @@ pub const MAX_SUGGESTIONS: usize = 50;
 /// offset into it (the units `Terminal::current_input()` reports). `cwd` is
 /// the shell's working directory used to resolve relative tokens; when `None`,
 /// only absolute and `~` tokens can resolve (relative tokens yield no results).
+/// `home` is the directory a leading `~` expands to (the value of `$HOME`);
+/// when `None`, `~`-tokens yield no results. It is passed in rather than read
+/// from the process environment so tests can supply an explicit temp home
+/// without mutating the shared `HOME` env var.
 ///
 /// Returns up to [`MAX_SUGGESTIONS`] entries, directories first then files,
 /// each sorted lexicographically. Returns empty when there is no token, the
 /// target directory can't be read, or nothing matches.
-pub fn complete_path(buffer: &str, cursor: usize, cwd: Option<&Path>) -> Vec<Suggestion> {
+pub fn complete_path(
+    buffer: &str,
+    cursor: usize,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<Suggestion> {
     let (_token_start, token) = token_under_cursor(buffer, cursor);
 
-    let Some((scan_dir, file_prefix, dir_portion)) = split_path(token, cwd) else {
+    let Some((scan_dir, file_prefix, dir_portion)) = split_path(token, cwd, home) else {
         return Vec::new();
     };
 
@@ -301,11 +310,16 @@ fn cursor_byte_offset(buffer: &str, cursor: usize) -> usize {
 ///
 /// The merged list is deduped by `text` (history wins over a duplicate token
 /// suggestion) and truncated to [`MAX_SUGGESTIONS`].
+///
+/// `home` is the `$HOME` directory used to expand a leading `~`; it is passed
+/// in (rather than read from the process env here) so tests can supply an
+/// explicit temp home without mutating the shared `HOME` env var.
 pub fn complete(
     buffer: &str,
     cursor: usize,
     cwd: Option<&Path>,
     path: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
     history: &[String],
     manual: bool,
 ) -> Vec<Suggestion> {
@@ -327,7 +341,7 @@ pub fn complete(
         let token_suggestions = if looks_like_command {
             complete_command(token, path)
         } else {
-            complete_path(buffer, cursor, cwd)
+            complete_path(buffer, cursor, cwd, home)
         };
         out.extend(token_suggestions);
     }
@@ -475,7 +489,11 @@ pub fn visible_window_start(selected: usize, current_start: usize, max_visible: 
 ///
 /// Returns `None` when the token can't resolve to a scannable directory: a
 /// `~`-token with no `HOME`, or a relative token with no `cwd`.
-fn split_path<'a>(token: &'a str, cwd: Option<&Path>) -> Option<(PathBuf, &'a str, &'a str)> {
+fn split_path<'a>(
+    token: &'a str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<(PathBuf, &'a str, &'a str)> {
     // The directory portion is the token up to and including its last `/`.
     let (dir_portion, prefix) = match token.rfind('/') {
         Some(i) => (&token[..=i], &token[i + 1..]),
@@ -483,10 +501,9 @@ fn split_path<'a>(token: &'a str, cwd: Option<&Path>) -> Option<(PathBuf, &'a st
     };
 
     if token.starts_with('~') {
-        // Expand a leading `~` / `~/...` against HOME. Without HOME, a
-        // `~`-token can't resolve.
-        let home = std::env::var_os("HOME")?;
-        let home = PathBuf::from(home);
+        // Expand a leading `~` / `~/...` against the supplied home directory.
+        // Without a home, a `~`-token can't resolve.
+        let home = home?.to_path_buf();
         // The directory portion after the leading `~`, e.g. `~/src/` -> `src/`.
         // For a bare `~` (or `~foo` with no slash) the `~` lands in `prefix`,
         // not `dir_portion`, so `dir_portion` is empty — strip safely rather
@@ -612,7 +629,7 @@ mod tests {
         tmp.touch("apricot");
         tmp.touch("banana");
 
-        let s = complete_path("cat ap", 6, Some(tmp.path.as_path()));
+        let s = complete_path("cat ap", 6, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec!["apple", "apricot"]);
     }
 
@@ -623,7 +640,7 @@ mod tests {
         tmp.touch("sub/main.rs");
         tmp.touch("sub/mod.rs");
 
-        let s = complete_path("vim sub/m", 9, Some(tmp.path.as_path()));
+        let s = complete_path("vim sub/m", 9, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec!["sub/main.rs", "sub/mod.rs"]);
     }
 
@@ -635,7 +652,7 @@ mod tests {
 
         // Both match the empty prefix; the directory sorts first despite the
         // later name, and carries a trailing slash.
-        let s = complete_path("ls ", 3, Some(tmp.path.as_path()));
+        let s = complete_path("ls ", 3, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec!["zeta_dir/", "aaa_file"]);
         assert!(s[0].is_dir);
         assert!(!s[1].is_dir);
@@ -648,7 +665,7 @@ mod tests {
         tmp.touch("sub/one");
         tmp.touch("sub/two");
 
-        let s = complete_path("ls sub/", 7, Some(tmp.path.as_path()));
+        let s = complete_path("ls sub/", 7, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec!["sub/one", "sub/two"]);
     }
 
@@ -659,11 +676,11 @@ mod tests {
         tmp.touch("visible");
 
         // Empty prefix: hidden entry excluded.
-        let s = complete_path("ls ", 3, Some(tmp.path.as_path()));
+        let s = complete_path("ls ", 3, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec!["visible"]);
 
         // Dot prefix: hidden entry included.
-        let s = complete_path("ls .h", 5, Some(tmp.path.as_path()));
+        let s = complete_path("ls .h", 5, Some(tmp.path.as_path()), None);
         assert_eq!(texts(&s), vec![".hidden"]);
     }
 
@@ -672,14 +689,9 @@ mod tests {
         let tmp = TempDir::new();
         tmp.touch("somefile");
 
-        // Save/restore HOME around the expansion so other tests are unaffected.
-        let saved = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp.path);
-        let s = complete_path("cat ~/somef", 11, None);
-        match saved {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        // Pass an explicit home so `~` expands to the temp dir without touching
+        // the process-global `HOME` (which would race with parallel tests).
+        let s = complete_path("cat ~/somef", 11, None, Some(tmp.path.as_path()));
 
         assert_eq!(texts(&s), vec!["~/somefile"]);
     }
@@ -690,10 +702,10 @@ mod tests {
         // "byte index 1 is out of bounds of ``" because the bare `~` lands in
         // `prefix` (not `dir_portion`), leaving `dir_portion` empty and the
         // old `&dir_portion[1..]` slice out of bounds. A bare `~` token must
-        // simply return (no panic). With HOME a normal dir, no home entry
+        // simply return (no panic). With home a normal dir, no home entry
         // starts with the literal `~`, so the result is empty.
         let tmp = TempDir::new();
-        let s = complete_path("~", 1, Some(tmp.path.as_path()));
+        let s = complete_path("~", 1, Some(tmp.path.as_path()), Some(tmp.path.as_path()));
         assert!(s.is_empty());
     }
 
@@ -702,7 +714,12 @@ mod tests {
         // Same crash repro, with the `~` as the token under the cursor in a
         // real command line (`ls ~`, cursor after the `~`).
         let tmp = TempDir::new();
-        let s = complete_path("ls ~", 4, Some(tmp.path.as_path()));
+        let s = complete_path(
+            "ls ~",
+            4,
+            Some(tmp.path.as_path()),
+            Some(tmp.path.as_path()),
+        );
         assert!(s.is_empty());
     }
 
@@ -712,22 +729,16 @@ mod tests {
         let tmp = TempDir::new();
         tmp.touch("homefile");
 
-        // Save/restore HOME around the expansion so other tests are unaffected.
-        let saved = std::env::var_os("HOME");
-        std::env::set_var("HOME", &tmp.path);
-        // cwd None is fine: `~` resolves via HOME, not cwd.
-        let s = complete_path("~/", 2, None);
-        match saved {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        // Pass an explicit home; `~` resolves via that, not cwd, so cwd None is
+        // fine. No process-global `HOME` mutation, so no parallel-test race.
+        let s = complete_path("~/", 2, None, Some(tmp.path.as_path()));
 
         assert_eq!(texts(&s), vec!["~/homefile"]);
     }
 
     #[test]
     fn no_cwd_relative_token_is_empty() {
-        let s = complete_path("cat ap", 6, None);
+        let s = complete_path("cat ap", 6, None, None);
         assert!(s.is_empty());
     }
 
@@ -735,7 +746,7 @@ mod tests {
     fn nonexistent_directory_is_empty() {
         let tmp = TempDir::new();
         // Scan a subdirectory that does not exist; must not panic.
-        let s = complete_path("cat does_not_exist/x", 20, Some(tmp.path.as_path()));
+        let s = complete_path("cat does_not_exist/x", 20, Some(tmp.path.as_path()), None);
         assert!(s.is_empty());
     }
 
@@ -794,7 +805,7 @@ mod tests {
         for i in 0..(MAX_SUGGESTIONS + 10) {
             tmp.touch(&format!("file_{i:04}"));
         }
-        let s = complete_path("ls file_", 8, Some(tmp.path.as_path()));
+        let s = complete_path("ls file_", 8, Some(tmp.path.as_path()), None);
         assert_eq!(s.len(), MAX_SUGGESTIONS);
     }
 
@@ -999,7 +1010,7 @@ mod tests {
         let p = path_of(&[bindir.path.as_path()]);
 
         // Bare command-position token -> command completion (trailing space).
-        let s = complete("yutani", 6, None, Some(p.as_os_str()), &[], false);
+        let s = complete("yutani", 6, None, Some(p.as_os_str()), None, &[], false);
         assert_eq!(texts(&s), vec!["yutanitest "]);
     }
 
@@ -1008,7 +1019,7 @@ mod tests {
         let cwd = TempDir::new();
         cwd.mkdir("src");
         // `ls sr` — `sr` is an argument; path completion against cwd finds src/.
-        let s = complete("ls sr", 5, Some(cwd.path.as_path()), None, &[], false);
+        let s = complete("ls sr", 5, Some(cwd.path.as_path()), None, None, &[], false);
         assert_eq!(texts(&s), vec!["src/"]);
     }
 
@@ -1020,17 +1031,13 @@ mod tests {
         cwd.touch("bin/x");
 
         // `./sc` in first position -> path completion (not command).
-        let s = complete("./sc", 4, Some(cwd.path.as_path()), None, &[], false);
+        let s = complete("./sc", 4, Some(cwd.path.as_path()), None, None, &[], false);
         assert_eq!(texts(&s), vec!["./script.sh"]);
 
-        // `~/x` in first position -> path completion via HOME (not command).
-        let saved = std::env::var_os("HOME");
-        std::env::set_var("HOME", &cwd.path);
-        let s = complete("~/b", 3, None, None, &[], false);
-        match saved {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        // `~/x` in first position -> path completion via the supplied home (not
+        // command). The explicit `home` arg avoids mutating the process-global
+        // `HOME`, which would race with parallel tests.
+        let s = complete("~/b", 3, None, None, Some(cwd.path.as_path()), &[], false);
         assert_eq!(texts(&s), vec!["~/bin/"]);
     }
 
@@ -1115,7 +1122,7 @@ mod tests {
 
         // `git` (cursor at end): history line `git status` (whole-line) comes
         // first, then the command-completion token `gitfoo `.
-        let s = complete("git", 3, None, Some(p.as_os_str()), &h, false);
+        let s = complete("git", 3, None, Some(p.as_os_str()), None, &h, false);
         assert_eq!(texts(&s), vec!["git status", "gitfoo "]);
         assert!(s[0].whole_line);
         assert!(!s[1].whole_line);
@@ -1126,7 +1133,7 @@ mod tests {
         // Empty token, non-manual, no history: nothing (no cwd dump).
         let cwd = TempDir::new();
         cwd.touch("file");
-        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, &[], false);
+        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, None, &[], false);
         assert!(s.is_empty());
     }
 
@@ -1135,7 +1142,7 @@ mod tests {
         // Manual trigger on an empty token still lists the cwd.
         let cwd = TempDir::new();
         cwd.touch("file");
-        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, &[], true);
+        let s = complete("ls ", 3, Some(cwd.path.as_path()), None, None, &[], true);
         assert_eq!(texts(&s), vec!["file"]);
     }
 
@@ -1148,7 +1155,7 @@ mod tests {
         let p = path_of(&[bindir.path.as_path()]);
         // History entry text exactly matches the command suggestion `deploy `.
         let h = vec!["deploy ".to_string()];
-        let s = complete("deploy", 6, None, Some(p.as_os_str()), &h, false);
+        let s = complete("deploy", 6, None, Some(p.as_os_str()), None, &h, false);
         assert_eq!(texts(&s), vec!["deploy "]);
         assert!(s[0].whole_line);
     }

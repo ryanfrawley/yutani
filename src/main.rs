@@ -4496,11 +4496,13 @@ impl State {
                 Some(c) => {
                     let cwd = self.terminal.cwd().map(std::path::Path::new);
                     let path = std::env::var_os("PATH");
+                    let home = std::env::var_os("HOME");
                     completion::complete(
                         &c.buffer,
                         c.cursor,
                         cwd,
                         path.as_deref(),
+                        home.as_deref().map(std::path::Path::new),
                         &self.command_history,
                         false,
                     )
@@ -4538,11 +4540,13 @@ impl State {
         {
             let cwd = self.terminal.cwd().map(std::path::Path::new);
             let path = std::env::var_os("PATH");
+            let home = std::env::var_os("HOME");
             self.completions = completion::complete(
                 &buffer,
                 cursor,
                 cwd,
                 path.as_deref(),
+                home.as_deref().map(std::path::Path::new),
                 &self.command_history,
                 true,
             );
