@@ -1118,10 +1118,16 @@ struct State {
     // detection there. Separate from `last_click` (which keys on a grid cell)
     // since toolbar clicks have no cell. A double-click toggles window zoom.
     last_toolbar_click: Option<std::time::Instant>,
-    // Whether the pointer is currently in the title-bar band. Tracked so we
-    // flip the cursor between the grid's I-beam and the arrow only on
-    // crossings, not on every motion event.
+    // Whether the pointer is currently in the title-bar band. Tracked so a
+    // crossing back into the grid can restore the I-beam exactly once.
     over_toolbar: bool,
+    /// Height (physical px) of the title-bar / toolbar chrome band — the region
+    /// where pointer input drives the window (drag / zoom / traffic lights) and
+    /// the cursor is the arrow, not the grid's I-beam. Derived from the live
+    /// native title-bar height (which scales with DPI) plus a small margin, not
+    /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
+    /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
+    chrome_band_px: f64,
     /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
     /// the pointer isn't over a URL. Drives the underline overlay and the
     /// Cmd-click open behavior.
@@ -2246,6 +2252,10 @@ impl State {
             click_count: 0,
             last_toolbar_click: None,
             over_toolbar: false,
+            // Seeded with the renderer's reserve; refresh_chrome_band() below
+            // (and on every resize / scale change) replaces it with the real
+            // DPI-scaled native title-bar height.
+            chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
             hover_url: None,
             master,
             perf: PerfLog::new(),
@@ -4070,6 +4080,9 @@ impl State {
     }
 
     pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        // A move to a display with a different scale factor changes the native
+        // title bar's physical height; keep the chrome band in step.
+        self.refresh_chrome_band();
         self.gpu.resize(size);
         if size.width > 0 && size.height > 0 {
             self.blur
@@ -4357,17 +4370,37 @@ impl State {
         (c as u16 + 1, r as u16 + 1)
     }
 
-    /// True when a window-relative `py` falls inside the title bar / toolbar
-    /// band at the top of the window. The app draws with `fullsize_content_view`
-    /// so terminal content renders behind the translucent macOS title bar; the
-    /// renderer reserves `WINDOW_PADDING + DECORATOR_HEIGHT` here (see the top
-    /// fade strip). Cursor events landing in this band are the user driving the
-    /// window chrome — dragging the bar, hitting the traffic lights — and must
-    /// be swallowed rather than translated into mouse reports for the shell
-    /// below. The band is fixed (not the scroll-animated decorator offset)
-    /// because the native title bar doesn't move with scroll.
+    /// True when a window-relative `py` (physical px) falls inside the title
+    /// bar / toolbar chrome band at the top of the window. The app draws with
+    /// `fullsize_content_view` so terminal content renders behind the
+    /// translucent macOS title bar. Pointer events landing in this band are the
+    /// user driving the window chrome — dragging the bar, hitting the traffic
+    /// lights — and must be swallowed rather than translated into mouse reports
+    /// for the shell below, and the cursor must be the arrow rather than the
+    /// grid's I-beam. The band tracks the live native title-bar height (see
+    /// `chrome_band_px` / `refresh_chrome_band`), not the scroll-animated
+    /// decorator offset, because the native title bar doesn't move with scroll.
     fn in_top_toolbar(&self, py: f64) -> bool {
-        py_in_top_toolbar(py)
+        py_in_top_toolbar(py, self.chrome_band_px)
+    }
+
+    /// Recompute `chrome_band_px` from the live native title-bar height.
+    ///
+    /// The renderer's `WINDOW_PADDING + DECORATOR_HEIGHT` reserve is fixed in
+    /// physical px, but the native title bar is a fixed number of *points*, so
+    /// on a Retina display it's physically taller than the reserve. Sizing the
+    /// band to the reserve left it shorter than the bar, and since macOS
+    /// swallows pointer-moved events over the bar, the band's logic never ran
+    /// up there — the grid's I-beam stayed frozen over the title bar. Track the
+    /// real bar height instead (plus `CHROME_BAND_MARGIN_PX`, so the lowest grid
+    /// move we still receive lands inside the band and flips the cursor to the
+    /// arrow before the events cut out). Falls back to the reserve when the
+    /// query fails or yields something shorter than the reserve (e.g. low-DPI,
+    /// where the reserve already comfortably covers the bar).
+    fn refresh_chrome_band(&mut self) {
+        let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
+        self.chrome_band_px =
+            chrome_band_from(native_titlebar_height_physical(&self.window), reserve);
     }
 
     /// Forward a mouse event to the PTY in the host's preferred encoding,
@@ -5427,16 +5460,16 @@ impl State {
                 // any hovered-URL highlight since nothing hoverable is up there.
                 if self.in_top_toolbar(position.y) {
                     // Re-assert the arrow on *every* move within the band, not
-                    // just on entry. macOS owns the cursor rect while the
-                    // pointer is over the native title-bar overlay, so the
-                    // Default we set there never reaches our content view;
-                    // sliding back down onto the content-view slice of the band
-                    // would otherwise leave the grid's stale I-beam showing
-                    // (the old entry-only branch was skipped once over_toolbar
-                    // had been latched true).
+                    // just on entry. set_cursor_icon keeps winit's stored cursor
+                    // in sync (and covers non-macOS), but on macOS it's applied
+                    // lazily via cursorUpdate:, which never fires over the native
+                    // title-bar overlay — so we also push the arrow straight onto
+                    // NSCursor here, or the grid's I-beam stays frozen on screen
+                    // while the pointer is up here. See force_native_arrow_cursor.
                     self.over_toolbar = true;
                     self.window
                         .set_cursor_icon(winit::window::CursorIcon::Default);
+                    force_native_arrow_cursor(&self.window);
                     if self.hover_url.take().is_some() {
                         self.invalidate();
                     }
@@ -6745,6 +6778,9 @@ async fn run() {
 
     let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
+    // Size the chrome band to the real native title bar now that the window
+    // exists; the field was seeded with the renderer's reserve in State::new.
+    state.refresh_chrome_band();
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
     state
@@ -6877,6 +6913,7 @@ async fn run() {
                             scale_factor: _scale_factor,
                             ..
                         } => {
+                            state.refresh_chrome_band();
                             state.window.request_redraw();
                         }
                         WindowEvent::RedrawRequested => {
@@ -7094,6 +7131,105 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
 #[cfg(not(target_os = "macos"))]
 fn set_native_window_bg(_window: &Window, _bg: [f32; 4]) {}
 
+/// Force the system arrow cursor onto `NSCursor` immediately.
+///
+/// winit applies `set_cursor_icon` lazily: it stores the cursor and lets the
+/// content view's `cursorUpdate:` push it the next time AppKit decides to.
+/// AppKit does *not* fire `cursorUpdate:` while the pointer is over the native
+/// title-bar overlay (which sits above our `fullsize_content_view` content
+/// view), so the I-beam last applied down in the grid stays frozen on screen
+/// up there — `set_cursor_icon(Default)` alone has no visible effect. Pushing
+/// the arrow straight onto `[NSCursor set]` sidesteps `cursorUpdate:` and lands
+/// the change now. Called on every move within the chrome band, so even if a
+/// later `cursorUpdate:` re-applied something, the next move re-asserts it.
+#[cfg(target_os = "macos")]
+fn force_native_arrow_cursor(window: &Window) {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::AppKit(_handle) = window.raw_window_handle() else {
+        return;
+    };
+    unsafe {
+        let cursor: *mut Object = msg_send![class!(NSCursor), arrowCursor];
+        if cursor.is_null() {
+            return;
+        }
+        let _: () = msg_send![cursor, set];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn force_native_arrow_cursor(_window: &Window) {}
+
+/// Margin (physical px) added below the native title bar when sizing the chrome
+/// band. macOS stops delivering pointer-moved events the instant the pointer
+/// crosses into the title bar, so the lowest move we ever see sits just *below*
+/// the bar, in the top grid row. That boundary event is our only chance to flip
+/// the cursor to the arrow (which then sticks as the pointer continues up into
+/// the event-dead bar). The margin pulls the band down far enough to include
+/// it. Kept tiny so it barely reaches into real content.
+const CHROME_BAND_MARGIN_PX: f64 = 4.0;
+
+/// Height of the native `NSWindow` title bar in *physical* pixels, or `None` if
+/// the handle isn't AppKit. This is the region macOS owns: it drives window
+/// drag / zoom / traffic lights and swallows our pointer-moved events. Unlike
+/// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve (physical,
+/// DPI-independent), the title bar is a fixed number of *points*, so on a
+/// Retina display it's physically taller than that reserve — which is why a
+/// band sized to the reserve never reached the bar and left the grid's I-beam
+/// frozen over it. `contentLayoutRect` excludes the title bar even under
+/// `fullsize_content_view`, so `frame.height - contentLayoutRect.height` is the
+/// bar height in points; scale to physical.
+#[cfg(target_os = "macos")]
+fn native_titlebar_height_physical(window: &Window) -> Option<f64> {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
+
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return None;
+    };
+    unsafe {
+        let ns_view = handle.ns_view as *mut Object;
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return None;
+        }
+        let frame: NSRect = msg_send![ns_window, frame];
+        let content: NSRect = msg_send![ns_window, contentLayoutRect];
+        let scale: f64 = msg_send![ns_window, backingScaleFactor];
+        let titlebar_pts = frame.size.height - content.size.height;
+        if titlebar_pts <= 0.0 || scale <= 0.0 {
+            return None;
+        }
+        Some(titlebar_pts * scale)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_titlebar_height_physical(_window: &Window) -> Option<f64> {
+    None
+}
+
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray
     // (sRGB 0.5). Below that, dark chrome reads better.
@@ -7106,12 +7242,26 @@ fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
 }
 
 /// Window-relative `py` (physical pixels) falls inside the title bar / toolbar
-/// band at the top of the window. Free function so the boundary is unit-testable
-/// without standing up a full `State`; `State::in_top_toolbar` delegates here.
-/// The band matches the chrome the renderer reserves at the top — see
-/// `in_top_toolbar` for why it's fixed rather than the scroll-animated offset.
-fn py_in_top_toolbar(py: f64) -> bool {
-    py < (WINDOW_PADDING + DECORATOR_HEIGHT) as f64
+/// chrome band of height `band_px`. Free function so the boundary is
+/// unit-testable without standing up a full `State`; `State::in_top_toolbar`
+/// delegates here, passing the live `chrome_band_px`. See `in_top_toolbar` for
+/// why the band tracks the native title-bar height rather than the
+/// scroll-animated decorator offset.
+fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
+    py < band_px
+}
+
+/// Choose the chrome band height from the live native title-bar height (if
+/// queryable) and the renderer's fixed `reserve`. Extracted from
+/// `State::refresh_chrome_band` so the selection arithmetic is unit-testable
+/// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
+/// but never go below the reserve (and fall back to the reserve when the query
+/// failed). See `refresh_chrome_band` for the rationale.
+fn chrome_band_from(native: Option<f64>, reserve: f64) -> f64 {
+    native
+        .map(|h| h + CHROME_BAND_MARGIN_PX)
+        .filter(|band| *band >= reserve)
+        .unwrap_or(reserve)
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
@@ -7302,16 +7452,18 @@ mod tests {
 
     #[test]
     fn py_in_top_toolbar_true_inside_band() {
-        // The very top edge and a point comfortably within the 40px
-        // toolbar band both belong to the OS chrome.
-        assert!(py_in_top_toolbar(0.0));
-        assert!(py_in_top_toolbar(20.0));
+        // The very top edge and a point comfortably within an example 56px
+        // (Retina) chrome band both belong to the OS chrome.
+        let band = 56.0;
+        assert!(py_in_top_toolbar(0.0, band));
+        assert!(py_in_top_toolbar(20.0, band));
+        assert!(py_in_top_toolbar(50.0, band));
     }
 
     #[test]
     fn py_in_top_toolbar_false_below_band() {
         // Well into the terminal grid: events here should reach the PTY.
-        assert!(!py_in_top_toolbar(100.0));
+        assert!(!py_in_top_toolbar(100.0, 56.0));
     }
 
     #[test]
@@ -7319,11 +7471,50 @@ mod tests {
         // The band is a strict `<`, so the boundary pixel itself is *not*
         // toolbar (it's the first row of the grid) but anything just above
         // it still is.
-        let band = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
-        assert_eq!(band, 40.0);
-        assert!(!py_in_top_toolbar(band)); // exactly 40.0 → false
-        assert!(!py_in_top_toolbar(40.0));
-        assert!(py_in_top_toolbar(39.9)); // just under → true
+        let band = 56.0;
+        assert!(!py_in_top_toolbar(band, band)); // exactly the band → false
+        assert!(py_in_top_toolbar(band - 0.1, band)); // just under → true
+    }
+
+    #[test]
+    fn py_in_top_toolbar_band_scales_with_dpi() {
+        // The whole point of the chrome band tracking the native title-bar
+        // height: a taller (Retina) band reaches a y that a shorter band
+        // would have treated as grid. y=50 is chrome at 56px, grid at 40px.
+        assert!(py_in_top_toolbar(50.0, 56.0));
+        assert!(!py_in_top_toolbar(50.0, 40.0));
+    }
+
+    #[test]
+    fn chrome_band_from_falls_back_to_reserve_when_query_fails() {
+        // No native height available → use the renderer's fixed reserve.
+        let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
+        assert_eq!(chrome_band_from(None, reserve), reserve);
+    }
+
+    #[test]
+    fn chrome_band_from_clamps_short_native_up_to_reserve() {
+        // Low-DPI: a native bar shorter than the reserve (even after the
+        // margin) is clamped up, since the reserve already covers the bar.
+        let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64; // 40.0
+        // 30 + CHROME_BAND_MARGIN_PX (4) = 34 < 40 → reserve.
+        assert_eq!(chrome_band_from(Some(30.0), reserve), reserve);
+        // Boundary: native+margin exactly equal to reserve is kept (>= reserve).
+        assert_eq!(
+            chrome_band_from(Some(reserve - CHROME_BAND_MARGIN_PX), reserve),
+            reserve
+        );
+    }
+
+    #[test]
+    fn chrome_band_from_uses_native_plus_margin_when_taller() {
+        // Retina: a native bar taller than the reserve drives the band,
+        // with CHROME_BAND_MARGIN_PX added so the lowest grid move lands inside.
+        let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64; // 40.0
+        assert_eq!(
+            chrome_band_from(Some(52.0), reserve),
+            52.0 + CHROME_BAND_MARGIN_PX
+        );
     }
 
     /// Build a `CursorAnim` whose `started_at` is back-dated so that
