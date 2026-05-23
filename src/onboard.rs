@@ -46,6 +46,10 @@ enum Key {
 /// Run the onboarding flow. Never returns: it execs the user's shell in-place
 /// whether the user completes setup or skips it.
 pub fn run() -> ! {
+    let font_size = match ask_font_size() {
+        Some(f) => f,
+        None => skip(),
+    };
     let scheme = match ask_scheme() {
         Some(s) => s,
         None => skip(),
@@ -54,14 +58,14 @@ pub fn run() -> ! {
         Some(c) => c,
         None => skip(),
     };
-    let font_size = match ask_font_size() {
-        Some(f) => f,
+    let autocomplete = match ask_autocomplete() {
+        Some(b) => b,
         None => skip(),
     };
-    finish(scheme, crt, font_size)
+    finish(scheme, crt, font_size, autocomplete)
 }
 
-/// Question 1: color scheme. Offers the built-in default plus any schemes the
+/// Question 2: color scheme. Offers the built-in default plus any schemes the
 /// user already has under `~/.config/yutani/schemes/`. Returns the chosen
 /// scheme name (`None` = built-in default), or `None`-via-skip handled by caller.
 fn ask_scheme() -> Option<Option<String>> {
@@ -86,7 +90,7 @@ fn ask_scheme() -> Option<Option<String>> {
     })
 }
 
-/// Question 2: CRT effect. One dial for the retro-monitor look — bloom and
+/// Question 3: CRT effect. One dial for the retro-monitor look — bloom and
 /// scanlines move together. Defaults to Off.
 fn ask_crt() -> Option<CrtLevel> {
     let labels: Vec<String> = ["Off", "Low", "High"]
@@ -99,7 +103,7 @@ fn ask_crt() -> Option<CrtLevel> {
     Some(levels[pick])
 }
 
-/// Question 3: font size. Previews live — the cell grid reflows under the
+/// Question 1: font size. Previews live — the cell grid reflows under the
 /// onboarding screen, which repaints to fit on the next keypress.
 fn ask_font_size() -> Option<f32> {
     let labels: Vec<String> = [
@@ -114,6 +118,18 @@ fn ask_font_size() -> Option<f32> {
     let sizes = [9.0_f32, 10.0, 12.0, 14.0];
     let pick = ask("  Font size", &labels, 1, |i| osc(&format!("font;{}", sizes[i])))?;
     Some(sizes[pick])
+}
+
+/// Question 4: autocomplete popup. No live preview — the filesystem/history
+/// suggestions only appear while typing at a shell prompt, which doesn't exist
+/// during setup, so this just records the choice. Defaults to On.
+fn ask_autocomplete() -> Option<bool> {
+    let labels: Vec<String> = ["On (recommended)", "Off"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let pick = ask("  Autocomplete (as-you-type suggestions)", &labels, 0, |_| {})?;
+    Some(pick == 0)
 }
 
 /// Render a single-choice question and drive it from keypresses. The current
@@ -172,11 +188,12 @@ fn ask(question: &str, labels: &[String], default_ix: usize, mut preview: impl F
 /// Commit the chosen settings: write config, stamp the marker, ask the host to
 /// reload from disk (so the live look matches exactly what was saved), then exec
 /// the shell. Never returns.
-fn finish(scheme: Option<String>, crt: CrtLevel, font_size: f32) -> ! {
+fn finish(scheme: Option<String>, crt: CrtLevel, font_size: f32, autocomplete: bool) -> ! {
     let mut cfg = crate::Config::defaults();
     cfg.color_scheme = scheme;
     cfg.font_size = font_size;
     cfg.apply_crt_level(crt);
+    cfg.autocomplete = autocomplete;
     cfg.save();
     crate::mark_onboarded();
     // Reload from disk so the running window reflects exactly the persisted
