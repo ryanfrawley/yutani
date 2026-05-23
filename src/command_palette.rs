@@ -48,6 +48,8 @@ pub enum PaletteAction {
     ToggleWireframe,
     /// Select + copy the last completed command's output (OSC 133).
     CopyLastOutput,
+    /// Open a new Yutani window (a fresh process) in the current working dir.
+    NewWindow,
 }
 
 /// One entry in the palette's command list.
@@ -140,6 +142,11 @@ pub const COMMANDS: &[Command] = &[
         action: PaletteAction::CopyLastOutput,
         arg_prompt: None,
         choose: false,
+    },
+    Command {
+        title: "New window",
+        action: PaletteAction::NewWindow,
+        arg_prompt: None,
     },
 ];
 
@@ -1132,6 +1139,46 @@ mod tests {
         p.move_down();
         assert_eq!(p.selected, 0);
         assert_eq!(p.scroll, 0);
+    }
+
+    // ----- New window command registry entry -----
+
+    #[test]
+    fn new_window_command_is_registered() {
+        // The "New window" command must exist in the registry and map to the
+        // NewWindow action.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.title == "New window")
+            .expect("New window command should be registered");
+        assert_eq!(cmd.action, PaletteAction::NewWindow);
+    }
+
+    #[test]
+    fn new_window_runs_immediately_without_argument() {
+        // No arg_prompt means selecting it runs right away rather than entering
+        // argument mode.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.action == PaletteAction::NewWindow)
+            .unwrap();
+        assert_eq!(cmd.arg_prompt, None);
+    }
+
+    #[test]
+    fn new_window_is_discoverable_via_filter() {
+        let new_window_idx = COMMANDS
+            .iter()
+            .position(|c| c.action == PaletteAction::NewWindow)
+            .unwrap();
+        // Both the full title and a prefix should surface the command.
+        for query in ["new window", "new"] {
+            let res = filter(query);
+            assert!(
+                res.contains(&new_window_idx),
+                "query {query:?} should match the New window command"
+            );
+        }
     }
 
     #[test]

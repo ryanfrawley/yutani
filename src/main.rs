@@ -1779,6 +1779,32 @@ fn open_url(url: &str) {
 #[cfg(not(target_os = "macos"))]
 fn open_url(_url: &str) {}
 
+/// Launch a fresh Yutani window. Each window is its own process (the app is
+/// single-window per process), so a new window is just another instance of our
+/// own executable. `cwd` — the running shell's working directory from OSC 7 —
+/// becomes the child's working directory so the new window opens where the
+/// current one is, falling back to inheriting ours when it's unknown. Failures
+/// are logged rather than fatal: a missing exe path shouldn't kill the window
+/// the user is already in.
+fn spawn_new_window(cwd: Option<&str>) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("new window: cannot resolve current exe: {e}");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(dir) = cwd {
+        if !dir.is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
+    if let Err(e) = cmd.spawn() {
+        eprintln!("new window: failed to spawn: {e}");
+    }
+}
+
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// Duration of the smooth-scroll slide for an explicit alt-screen scroll
@@ -4537,6 +4563,7 @@ impl State {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
+            A::NewWindow => spawn_new_window(self.terminal.cwd()),
         }
         self.invalidate();
     }
@@ -6355,6 +6382,15 @@ impl State {
                             }
                             if s.eq_ignore_ascii_case("v") {
                                 self.paste_from_clipboard();
+                                return true;
+                            }
+                            // Cmd-N: launch a new Yutani window. It's a fresh
+                            // process (one window per process), opened in the
+                            // current shell's working directory. Guard on
+                            // !shift so Cmd-Shift-N stays free for a future
+                            // binding.
+                            if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
+                                spawn_new_window(self.terminal.cwd());
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
