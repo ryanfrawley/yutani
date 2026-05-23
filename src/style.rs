@@ -172,6 +172,12 @@ pub struct Cell {
     /// the second combining diacritic that follows U+10EEEE.
     /// Meaningful only when `placeholder_image_id` is `Some`.
     pub placeholder_image_col: u16,
+    /// OSC 8 explicit-hyperlink target, as an id into the terminal's
+    /// `HyperlinkStore` (`crate::terminal::Terminal::hyperlink_uri`).
+    /// `Some` for cells printed while a hyperlink was open; `None` for the
+    /// common case. Independent of `style` so an SGR reset (`CSI 0 m`) does
+    /// not clear the link — only `OSC 8 ; ; ST` does.
+    pub hyperlink: Option<std::num::NonZeroU32>,
 }
 
 impl Cell {
@@ -182,6 +188,7 @@ impl Cell {
             placeholder_image_id: None,
             placeholder_image_row: 0,
             placeholder_image_col: 0,
+            hyperlink: None,
         }
     }
 }

@@ -1509,11 +1509,103 @@ fn build_wrapped_line(
 /// Locate the URL under `(abs_line, col)`, joining wrap-continued rows so a
 /// link that spilled past the right edge still resolves as a single span.
 /// Falls back to a same-row search when no wrap continuation is in play.
+/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)`. Returns the
+/// contiguous run of cells sharing the cell's interned link id — extended
+/// across autowrapped rows — as a [`HoverUrl`]. Unlike the heuristic this is
+/// exact: the link's extent is whatever the app marked, and the target can be
+/// any scheme (filtered for safety only at click time).
+fn find_osc8_link_at(
+    terminal: &terminal::Terminal,
+    abs_line: isize,
+    col: usize,
+) -> Option<HoverUrl> {
+    let row = terminal.line_at(abs_line)?;
+    if col >= row.len() {
+        return None;
+    }
+    let id = row[col].hyperlink?;
+    let uri = terminal.hyperlink_uri(id)?.to_string();
+
+    // Contiguous run of the same id on the starting row.
+    let mut start_col = col;
+    while start_col > 0 && row[start_col - 1].hyperlink == Some(id) {
+        start_col -= 1;
+    }
+    let mut end_col = col;
+    while end_col + 1 < row.len() && row[end_col + 1].hyperlink == Some(id) {
+        end_col += 1;
+    }
+
+    // Extend upward: while this row's run starts at column 0 and the row above
+    // ends with the same link, the link wrapped down from there. Bounded by
+    // URL_WRAP_MAX_ROWS like the heuristic.
+    let mut start_abs_line = abs_line;
+    let mut steps = 0;
+    while steps < URL_WRAP_MAX_ROWS && start_col == 0 {
+        let above = match terminal.line_at(start_abs_line - 1) {
+            Some(a) if a.last().and_then(|c| c.hyperlink) == Some(id) => a,
+            _ => break,
+        };
+        start_abs_line -= 1;
+        let mut s = above.len() - 1;
+        while s > 0 && above[s - 1].hyperlink == Some(id) {
+            s -= 1;
+        }
+        start_col = s;
+        steps += 1;
+    }
+
+    // Extend downward: while this row's run reaches the right edge and the row
+    // below begins with the same link.
+    let mut end_abs_line = abs_line;
+    let mut steps = 0;
+    while steps < URL_WRAP_MAX_ROWS {
+        let cur_len = terminal.line_at(end_abs_line).map(|r| r.len()).unwrap_or(0);
+        if end_col + 1 != cur_len {
+            break;
+        }
+        let below = match terminal.line_at(end_abs_line + 1) {
+            Some(b) if b.first().and_then(|c| c.hyperlink) == Some(id) => b,
+            _ => break,
+        };
+        end_abs_line += 1;
+        let mut e = 0;
+        while e + 1 < below.len() && below[e + 1].hyperlink == Some(id) {
+            e += 1;
+        }
+        end_col = e;
+        steps += 1;
+    }
+
+    Some(HoverUrl {
+        start_abs_line,
+        start_col,
+        end_abs_line,
+        end_col,
+        url: uri,
+    })
+}
+
+/// Scheme allowlist for opening a clicked link. The heuristic only ever
+/// produces http/https, but OSC 8 lets an app declare an arbitrary target, so
+/// we refuse anything outside a small safe set (no `javascript:`, `data:`,
+/// `vbscript:`, etc.) before handing it to the OS opener.
+fn is_safe_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    const SAFE: [&str; 6] = ["http://", "https://", "mailto:", "ftp://", "file://", "ssh://"];
+    SAFE.iter().any(|p| lower.starts_with(p))
+}
+
 fn find_url_at(
     terminal: &terminal::Terminal,
     abs_line: isize,
     col: usize,
 ) -> Option<HoverUrl> {
+    // App-declared OSC 8 links win over the heuristic: exact bounds, and they
+    // may carry non-http schemes the heuristic can't express.
+    if let Some(hu) = find_osc8_link_at(terminal, abs_line, col) {
+        return Some(hu);
+    }
     let (start_abs, cols, flat) = build_wrapped_line(terminal, abs_line)?;
     if cols == 0 || col >= cols {
         return None;
@@ -4931,7 +5023,11 @@ impl State {
                         && self.modifiers.super_key()
                     {
                         if let Some(hu) = self.hover_url.clone() {
-                            open_url(&hu.url);
+                            if is_safe_url(&hu.url) {
+                                open_url(&hu.url);
+                            }
+                            // Consume the click either way: a Cmd-click on a
+                            // link shouldn't also fall through to selection.
                             return true;
                         }
                     }
@@ -7776,6 +7872,107 @@ mod tests {
         let row = cells_from_str("(see https://example.com)");
         let (_, _, url) = find_url_in_cells(&row, 10).expect("should find url");
         assert_eq!(url, "https://example.com");
+    }
+
+    #[test]
+    fn is_safe_url_allows_known_schemes() {
+        for u in [
+            "https://x/",
+            "http://x/",
+            "mailto:a@b.com",
+            "file:///etc/hosts",
+            "ftp://host/f",
+            "ssh://host",
+            "  HTTPS://Upper/  ",
+        ] {
+            assert!(is_safe_url(u), "{u} should be safe");
+        }
+    }
+
+    #[test]
+    fn is_safe_url_rejects_dangerous_or_bare() {
+        for u in [
+            "javascript:alert(1)",
+            "data:text/html,<script>",
+            "vbscript:x",
+            "not a url",
+            "example.com",
+        ] {
+            assert!(!is_safe_url(u), "{u} should be rejected");
+        }
+    }
+
+    #[test]
+    fn osc8_link_preferred_over_heuristic_anchor_text() {
+        // Anchor text "click here" links to a different target via OSC 8.
+        // find_url_at must return the OSC 8 target, not parse the visible text.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://real.example/path\x07click here\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_url_at(&t, abs, 2).expect("link under 'click'");
+        assert_eq!(hu.url, "https://real.example/path");
+        assert_eq!(hu.start_col, 0);
+        assert_eq!(hu.end_col, "click here".len() - 1);
+    }
+
+    #[test]
+    fn osc8_link_span_stops_at_unlinked_cells() {
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        // "pre " unlinked, "LINK" linked, " post" unlinked.
+        t.feed("pre \x1b]8;;https://x/\x07LINK\x1b]8;;\x07 post");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_osc8_link_at(&t, abs, 5).expect("link under LINK");
+        assert_eq!(hu.start_col, 4);
+        assert_eq!(hu.end_col, 7);
+        assert_eq!(hu.url, "https://x/");
+        // A cell in "pre " has no OSC 8 link.
+        assert!(find_osc8_link_at(&t, abs, 1).is_none());
+    }
+
+    #[test]
+    fn heuristic_still_works_without_osc8() {
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("see https://example.com today");
+        let abs = t.visual_to_abs_line(0);
+        let hu = find_url_at(&t, abs, 12).expect("heuristic url");
+        assert_eq!(hu.url, "https://example.com");
+    }
+
+    #[test]
+    fn find_osc8_link_at_none_on_unlinked_cell() {
+        // A grid with no OSC 8 link anywhere yields None for every cell.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("just plain text");
+        let abs = t.visual_to_abs_line(0);
+        assert!(find_osc8_link_at(&t, abs, 0).is_none());
+        assert!(find_osc8_link_at(&t, abs, 5).is_none());
+    }
+
+    #[test]
+    fn find_osc8_link_at_out_of_bounds_col_is_none() {
+        // A col past the row width must not panic and must return None.
+        let mut t = terminal::Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://x/\x07AB\x1b]8;;\x07");
+        let abs = t.visual_to_abs_line(0);
+        assert!(find_osc8_link_at(&t, abs, 10_000).is_none());
+    }
+
+    #[test]
+    fn find_osc8_link_at_extends_across_wrapped_rows() {
+        // A single OSC 8 link whose anchor text wraps across rows must resolve
+        // to one span covering both rows, whether hovered on the first or the
+        // continuation row. Grid is 10 cols; 14 linked glyphs wrap to row 1.
+        let mut t = make_terminal(5, 10);
+        t.feed("\x1b]8;;https://wrap/target\x07ABCDEFGHIJKLMN\x1b]8;;\x07");
+        // Row 0 is full (cols 0..9), row 1 holds the remaining 4 (cols 0..3).
+        let from_first = find_osc8_link_at(&t, 0, 2).expect("hover first row");
+        let from_tail = find_osc8_link_at(&t, 1, 1).expect("hover continuation row");
+        assert_eq!(from_first, from_tail, "both hovers resolve to one span");
+        assert_eq!(from_first.start_abs_line, 0);
+        assert_eq!(from_first.start_col, 0);
+        assert_eq!(from_first.end_abs_line, 1);
+        assert_eq!(from_first.end_col, 3, "14 glyphs over 10 cols end at col 3 of row 1");
+        assert_eq!(from_first.url, "https://wrap/target");
     }
 
     #[test]

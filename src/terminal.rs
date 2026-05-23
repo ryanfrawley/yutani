@@ -505,6 +505,11 @@ pub struct Cursor {
     // to true without advancing the cursor; the wrap happens on the next
     // print (if autowrap is still on). CR / LF / cursor addressing clear it.
     pub wrap_pending: bool,
+    // OSC 8 active hyperlink. Cells printed while this is `Some` carry the
+    // id (see `Cell::hyperlink`). Saved/restored with the cursor (DECSC/DECRC)
+    // for free since `Cursor` is copied wholesale; reset by a full terminal
+    // reset. Lives on the cursor, not `Style`, so SGR resets don't drop it.
+    pub hyperlink: Option<std::num::NonZeroU32>,
 }
 
 impl Cursor {
@@ -514,6 +519,7 @@ impl Cursor {
             col: 0,
             style: Style::new(),
             wrap_pending: false,
+            hyperlink: None,
         }
     }
 }
@@ -789,6 +795,8 @@ pub struct Terminal {
     /// the most recent `U+10EEEE` and tracks which diacritic slot is
     /// next. Reset on the first non-diacritic `print()`.
     placeholder_decode: Option<PlaceholderDecode>,
+    /// OSC 8 hyperlink target interner. See [`HyperlinkStore`].
+    hyperlinks: HyperlinkStore,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -809,6 +817,44 @@ struct ScrollbackPlacement {
     /// eviction; placements that would go negative are dropped.
     scrollback_row: isize,
     placement: Placement,
+}
+
+/// Max length of an OSC 8 target URI we'll intern. Anything longer is treated
+/// as a malformed sequence and closes the active link rather than growing the
+/// store with an unbounded string.
+const MAX_HYPERLINK_URI_LEN: usize = 4096;
+
+/// Interns OSC 8 hyperlink target URIs so each `Cell` references one by a
+/// compact id instead of owning the string. Identical URIs dedupe to the same
+/// id, so the cells of one link — and repeats of the same link elsewhere —
+/// share an id and group together on hover. The table only grows: distinct
+/// URIs per session are few, and dropping entries would orphan ids still held
+/// by scrollback cells.
+#[derive(Default)]
+pub struct HyperlinkStore {
+    uris: Vec<String>,
+    index: std::collections::HashMap<String, std::num::NonZeroU32>,
+}
+
+impl HyperlinkStore {
+    /// Intern `uri`, returning its (stable, 1-based) id. Idempotent for a
+    /// given URI string.
+    fn intern(&mut self, uri: &str) -> std::num::NonZeroU32 {
+        if let Some(&id) = self.index.get(uri) {
+            return id;
+        }
+        self.uris.push(uri.to_string());
+        // 1-based so the id is never zero — lets `Cell` carry it as a niche
+        // `Option<NonZeroU32>` with no extra storage.
+        let id = std::num::NonZeroU32::new(self.uris.len() as u32).expect("len >= 1");
+        self.index.insert(uri.to_string(), id);
+        id
+    }
+
+    /// Resolve an id back to its target URI.
+    pub fn get(&self, id: std::num::NonZeroU32) -> Option<&str> {
+        self.uris.get(id.get() as usize - 1).map(String::as_str)
+    }
 }
 
 impl Terminal {
@@ -869,6 +915,7 @@ impl Terminal {
             cell_w_px: 1,
             line_h_px: 1,
             placeholder_decode: None,
+            hyperlinks: HyperlinkStore::default(),
         }
     }
 
@@ -1783,6 +1830,9 @@ impl Terminal {
             self.line_feed_no_cr();
         }
         let mut cell = Cell::new(ch, self.cursor.style);
+        // Carry the active OSC 8 hyperlink (if any) onto the cell. Kept off
+        // `Style` so an SGR reset mid-link doesn't sever it.
+        cell.hyperlink = self.cursor.hyperlink;
         // Kitty virtual placement: U+10EEEE is the placeholder
         // codepoint. The image id is encoded in the cell's foreground
         // color (24-bit truecolor); the renderer scans for these
@@ -2312,6 +2362,8 @@ impl Terminal {
             // Shell working-directory report (used to seed new-tab cwd /
             // window titles). Payload is a `file://host/path` URL.
             7 => self.handle_osc_7(rest),
+            // OSC 8 explicit hyperlinks (iTerm2 / VTE protocol).
+            8 => self.handle_osc_8(rest),
             // FinalTerm / shell-integration semantic prompt marks.
             133 => self.handle_osc_133(rest),
             // yutani-private current-input report (autocomplete foundation).
@@ -2324,6 +2376,33 @@ impl Terminal {
             1337 => self.handle_osc_1337(rest),
             _ => {}
         }
+    }
+
+    /// Resolve an OSC 8 hyperlink id (from [`Cell::hyperlink`]) to its target
+    /// URI. Used by the front end to turn a hovered cell into a clickable URL.
+    pub fn hyperlink_uri(&self, id: std::num::NonZeroU32) -> Option<&str> {
+        self.hyperlinks.get(id)
+    }
+
+    /// `OSC 8 ; params ; URI ST` — open or close an explicit hyperlink (the
+    /// iTerm2 / VTE protocol). `params` is a colon-separated `key=value` list;
+    /// only `id=` is defined and we accept-and-ignore it (links group by URI
+    /// instead). An empty — or absent, or over-long — URI closes the active
+    /// link. While a link is open, every printed cell carries its interned id
+    /// (`Cell::hyperlink`); the heuristic URL detector in the front end still
+    /// covers bare URLs that arrive without this wrapper.
+    fn handle_osc_8(&mut self, rest: &str) {
+        // `rest` is `params;URI`. The first ';' ends params; the URI itself
+        // may contain ';' (query strings), so split exactly once and keep the
+        // remainder verbatim. A `rest` with no ';' is malformed — treat the
+        // whole thing as the URI rather than dropping it.
+        let (_params, uri) = rest.split_once(';').unwrap_or(("", rest));
+        let uri = uri.trim();
+        if uri.is_empty() || uri.len() > MAX_HYPERLINK_URI_LEN {
+            self.cursor.hyperlink = None;
+            return;
+        }
+        self.cursor.hyperlink = Some(self.hyperlinks.intern(uri));
     }
 
     /// `OSC 7 ; file://<host>/<path> ST` — the shell reports its current
@@ -7820,6 +7899,147 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.feed("\x1b]7;file://myhost/Users/ry/projects\x07");
         assert_eq!(t.take_cwd_update().as_deref(), Some("/Users/ry/projects"));
+    }
+
+    #[test]
+    fn osc_8_open_attaches_link_to_printed_cells() {
+        let mut t = Terminal::new(80, 24, 100);
+        // Open a link, print two glyphs, close it, print a third.
+        t.feed("\x1b]8;;https://example.com/\x07AB\x1b]8;;\x07C");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A is linked");
+        let b = t.visible_cell(0, 1).hyperlink.expect("B is linked");
+        assert_eq!(a, b, "adjacent cells of one link share an id");
+        assert_eq!(t.hyperlink_uri(a).as_deref(), Some("https://example.com/"));
+        assert!(t.visible_cell(0, 2).hyperlink.is_none(), "C is after close");
+    }
+
+    #[test]
+    fn osc_8_empty_uri_closes_link() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://a/\x07X\x1b]8;;\x07Y");
+        assert!(t.visible_cell(0, 0).hyperlink.is_some());
+        assert!(t.visible_cell(0, 1).hyperlink.is_none());
+    }
+
+    #[test]
+    fn osc_8_ignores_id_param_and_keeps_uri() {
+        let mut t = Terminal::new(80, 24, 100);
+        // params field (`id=foo`) is accepted and ignored; URI still applies.
+        t.feed("\x1b]8;id=foo;https://example.org/\x07Z");
+        let z = t.visible_cell(0, 0).hyperlink.expect("Z is linked");
+        assert_eq!(t.hyperlink_uri(z).as_deref(), Some("https://example.org/"));
+    }
+
+    #[test]
+    fn osc_8_dedupes_identical_uris() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://dup/\x07A\x1b]8;;\x07 \x1b]8;;https://dup/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 2).hyperlink.expect("B linked");
+        assert_eq!(a, b, "same URI interns to the same id");
+    }
+
+    #[test]
+    fn osc_8_survives_sgr_reset() {
+        let mut t = Terminal::new(80, 24, 100);
+        // An SGR reset (CSI 0 m) mid-link must NOT sever the hyperlink: it
+        // lives on the cursor, not the SGR style.
+        t.feed("\x1b]8;;https://keep/\x07A\x1b[0mB\x1b]8;;\x07");
+        assert!(t.visible_cell(0, 0).hyperlink.is_some());
+        assert!(
+            t.visible_cell(0, 1).hyperlink.is_some(),
+            "link persists across SGR reset"
+        );
+    }
+
+    #[test]
+    fn osc_8_over_long_uri_closes_instead_of_interning() {
+        let mut t = Terminal::new(80, 24, 100);
+        let long = "https://".to_string() + &"a".repeat(MAX_HYPERLINK_URI_LEN);
+        t.feed(&format!("\x1b]8;;{long}\x07X"));
+        assert!(
+            t.visible_cell(0, 0).hyperlink.is_none(),
+            "over-long URI is treated as a close"
+        );
+    }
+
+    #[test]
+    fn osc_8_link_resets_on_full_reset() {
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://x/\x07");
+        t.feed("\x1bc"); // RIS full reset clears the cursor (and its link).
+        t.feed("Y");
+        assert!(t.visible_cell(0, 0).hyperlink.is_none());
+    }
+
+    #[test]
+    fn osc_8_uri_with_semicolon_query_survives_intact() {
+        // Only the first ';' separates params from the URI; semicolons inside
+        // the URI (matrix/query params) must be kept verbatim, not truncated.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://h/p?a=1;b=2;c=3\x07Q\x1b]8;;\x07");
+        let q = t.visible_cell(0, 0).hyperlink.expect("Q is linked");
+        assert_eq!(t.hyperlink_uri(q).as_deref(), Some("https://h/p?a=1;b=2;c=3"));
+    }
+
+    #[test]
+    fn osc_8_malformed_no_semicolon_treats_whole_as_uri() {
+        // `rest` with no ';' at all is malformed per spec; we keep it as the
+        // URI rather than dropping the link entirely.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;https://noparams/\x07W\x1b]8;;\x07");
+        let w = t.visible_cell(0, 0).hyperlink.expect("W is linked");
+        assert_eq!(t.hyperlink_uri(w).as_deref(), Some("https://noparams/"));
+    }
+
+    #[test]
+    fn osc_8_reopen_with_different_uri_gives_distinct_ids() {
+        // Switching the active link mid-line (without an explicit close) must
+        // retag subsequent cells with the new target's id.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://one/\x07A\x1b]8;;https://two/\x07B\x1b]8;;\x07");
+        let a = t.visible_cell(0, 0).hyperlink.expect("A linked");
+        let b = t.visible_cell(0, 1).hyperlink.expect("B linked");
+        assert_ne!(a, b, "different URIs must intern to different ids");
+        assert_eq!(t.hyperlink_uri(a).as_deref(), Some("https://one/"));
+        assert_eq!(t.hyperlink_uri(b).as_deref(), Some("https://two/"));
+    }
+
+    #[test]
+    fn osc_8_left_open_tags_trailing_cells() {
+        // A link never explicitly closed before input ends still tags every
+        // glyph printed after it was opened.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://open/\x07XYZ");
+        let x = t.visible_cell(0, 0).hyperlink.expect("X linked");
+        let y = t.visible_cell(0, 1).hyperlink.expect("Y linked");
+        let z = t.visible_cell(0, 2).hyperlink.expect("Z linked");
+        assert_eq!(x, y);
+        assert_eq!(y, z);
+        assert_eq!(t.hyperlink_uri(x).as_deref(), Some("https://open/"));
+    }
+
+    #[test]
+    fn osc_8_open_then_close_with_no_glyphs_tags_nothing() {
+        // Opening and immediately closing with nothing printed in between must
+        // leave no tagged cell, and whatever prints afterward is unlinked.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://void/\x07\x1b]8;;\x07P");
+        assert!(t.visible_cell(0, 0).hyperlink.is_none(), "P prints after close");
+    }
+
+    #[test]
+    fn osc_8_link_saved_and_restored_with_cursor() {
+        // DECSC/DECRC (ESC 7 / ESC 8) save and restore the whole cursor,
+        // including the active hyperlink. Open a link, save, close it, then
+        // restore: the next glyph must carry the saved link again.
+        let mut t = Terminal::new(80, 24, 100);
+        t.feed("\x1b]8;;https://saved/\x07\x1b7"); // open + DECSC
+        t.feed("\x1b]8;;\x07"); // close the active link
+        t.feed("\x1b8"); // DECRC restores cursor (and its link)
+        t.feed("R");
+        let r = t.visible_cell(0, 0).hyperlink.expect("R relinked after restore");
+        assert_eq!(t.hyperlink_uri(r).as_deref(), Some("https://saved/"));
     }
 
     #[test]
