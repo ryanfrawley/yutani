@@ -87,6 +87,34 @@ fn scheme_path(name: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{}.toml", name)))
 }
 
+/// The names of every color scheme available under `~/.config/yutani/schemes/`,
+/// i.e. the file stems of the `.toml` files there, sorted alphabetically. These
+/// are exactly the names `scheme_path` / `install_color_scheme` accept, so the
+/// command palette's theme picker can only offer schemes that actually load.
+/// A missing or unreadable directory yields an empty list.
+fn list_scheme_names() -> Vec<String> {
+    let mut dir = match config_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    dir.push("schemes");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("toml") {
+                return None;
+            }
+            path.file_stem()?.to_str().map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
 /// truth so the `State::new` and `resize_buffers` paths can't drift.
@@ -3598,7 +3626,7 @@ impl State {
         // backdrop, a rounded box, an input line with a caret, then (in command
         // mode) a separator and the filtered, scrollable command rows.
         if self.command_palette.open {
-            use command_palette::{Mode, COMMANDS, PALETTE_MAX_VISIBLE};
+            use command_palette::{Mode, PALETTE_MAX_VISIBLE};
             let cp = &self.command_palette;
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
             let screen_w = self.gpu.config.width as f32;
@@ -3627,8 +3655,10 @@ impl State {
             let row_h = line_height;
             let sep_h = 1.0_f32;
 
-            // Visible slice of the filtered command list (command mode only).
-            let list_mode = matches!(cp.mode, Mode::Commands);
+            // Visible slice of the filtered list. Both command mode and the
+            // choose-a-value mode (e.g. the theme picker) show a list; only
+            // free-text argument mode hides it.
+            let list_mode = cp.has_list();
             let start = cp.scroll.min(cp.filtered.len());
             let end = (start + PALETTE_MAX_VISIBLE).min(cp.filtered.len());
             let n = if list_mode { end - start } else { 0 };
@@ -3671,11 +3701,14 @@ impl State {
             let text_x = box_x + cell_w;
             let max_text_x = box_x + box_w - cell_w;
 
-            // Input line: a prompt prefix, then the typed text. In argument mode
-            // the prefix names what's being entered (e.g. "Title: ").
+            // Input line: a prompt prefix, then the typed text. In argument /
+            // choose mode the prefix names what's being entered (e.g. "Title: ",
+            // "Theme: ").
             let prefix = match cp.mode {
                 Mode::Commands => "> ".to_string(),
-                Mode::Argument { prompt, .. } => format!("{prompt}: "),
+                Mode::Argument { prompt, .. } | Mode::Choose { prompt, .. } => {
+                    format!("{prompt}: ")
+                }
             };
             let input_top = box_y + pad_v;
             let input_text = format!("{prefix}{}", cp.input.value);
@@ -3745,8 +3778,12 @@ impl State {
                     );
                 }
 
-                // Command titles.
-                for (i, &cmd_idx) in cp.filtered[start..end].iter().enumerate() {
+                // Row labels: command titles in command mode, candidate values
+                // (e.g. theme names) in choose mode — `row_label` hides which.
+                for i in 0..n {
+                    let Some(label) = cp.row_label(start + i) else {
+                        continue;
+                    };
                     let row_top = list_top + i as f32 * row_h;
                     let baseline = row_top + bg_h + descender + strip_pad;
                     emit_text_run(
@@ -3755,7 +3792,7 @@ impl State {
                         &mut indices,
                         text_x,
                         baseline,
-                        COMMANDS[cmd_idx].title,
+                        label,
                         text_color,
                         atlas_w,
                         atlas_h,
@@ -3963,6 +4000,12 @@ impl State {
                     self.command_palette.close();
                     self.run_palette_action(action, arg);
                 }
+                Outcome::RequestChoices { action, prompt } => {
+                    // Only the host can enumerate the candidates; feed them back
+                    // so the palette can present a filtered picker.
+                    let choices = self.palette_choices(action);
+                    self.command_palette.enter_choose(action, prompt, choices);
+                }
                 Outcome::Close => self.command_palette.close(),
                 Outcome::Stay => {}
             },
@@ -3994,6 +4037,18 @@ impl State {
         }
         self.invalidate();
         true
+    }
+
+    /// Enumerate the candidate list for a pick-from-list palette command (one
+    /// with `choose: true`), answering [`Outcome::RequestChoices`]. Kept on the
+    /// host because the options come from outside the pure palette module — for
+    /// `SetTheme`, the schemes on disk.
+    fn palette_choices(&self, action: command_palette::PaletteAction) -> Vec<String> {
+        use command_palette::PaletteAction as A;
+        match action {
+            A::SetTheme => list_scheme_names(),
+            _ => Vec::new(),
+        }
     }
 
     /// Execute a command chosen in the palette. Every arm reuses behaviour that
