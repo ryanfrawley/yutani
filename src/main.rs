@@ -138,6 +138,18 @@ fn scheme_for_pick(label: &str) -> Option<&str> {
     (label != DEFAULT_THEME_LABEL).then_some(label)
 }
 
+/// Convert a theme-picker selection into the value to store in a config scheme
+/// slot (`color_scheme` / `light_scheme` / `dark_scheme`). The synthetic
+/// "Default (built-in)" entry and an empty/whitespace pick both map to `None`
+/// (revert to defaults); any other label becomes the scheme name.
+fn scheme_value_from_pick(arg: Option<String>) -> Option<String> {
+    let arg = arg.unwrap_or_default();
+    match scheme_for_pick(arg.trim()) {
+        Some(name) if !name.is_empty() => Some(name.to_string()),
+        _ => None,
+    }
+}
+
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
 /// truth so the `State::new` and `resize_buffers` paths can't drift.
@@ -346,8 +358,20 @@ struct Config {
     blur_iterations: usize,
     /// Name of a TOML scheme under ~/.config/yutani/schemes/. `None` keeps
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
-    /// back to defaults.
+    /// back to defaults. Used as the active scheme when `auto_theme` is off,
+    /// and as the fallback when an `auto_theme` slot below is unset.
     color_scheme: Option<String>,
+    /// When true, follow the system light/dark appearance: install
+    /// `light_scheme` in light mode and `dark_scheme` in dark mode, swapping
+    /// live when the OS appearance changes. When false, `color_scheme` is used
+    /// regardless of system appearance.
+    auto_theme: bool,
+    /// Scheme to use in system light mode while `auto_theme` is on. `None`
+    /// falls back to `color_scheme`, then the built-in defaults.
+    light_scheme: Option<String>,
+    /// Scheme to use in system dark mode while `auto_theme` is on. `None`
+    /// falls back to `color_scheme`, then the built-in defaults.
+    dark_scheme: Option<String>,
     /// Preferred font family name. `None` (or empty) falls back to the
     /// built-in preference list (Iosevka Term → Iosevka → Fira Code → Menlo).
     /// Matched by exact family name first; failing that, by substring (so
@@ -499,6 +523,9 @@ impl Config {
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
+            auto_theme: false,
+            light_scheme: None,
+            dark_scheme: None,
             font_family: None,
             glow_match_brightness: false,
             glow_match_bright_ansi: false,
@@ -574,6 +601,13 @@ impl Config {
             },
             "color_scheme" => if let Some(x) = v.as_str() {
                 self.color_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "auto_theme" => if let Some(x) = v.as_bool() { self.auto_theme = x; },
+            "light_scheme" => if let Some(x) = v.as_str() {
+                self.light_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
+            },
+            "dark_scheme" => if let Some(x) = v.as_str() {
+                self.dark_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
             },
             "font_family" => if let Some(x) = v.as_str() {
                 self.font_family = if x.is_empty() { None } else { Some(x.to_string()) };
@@ -675,6 +709,19 @@ impl Config {
         let _ = std::fs::write(p, self.serialize());
     }
 
+    /// The scheme name to install for the current system appearance, or `None`
+    /// to use the built-in defaults. When `auto_theme` is off this is just
+    /// `color_scheme`. When on, it's the `dark_scheme` / `light_scheme` slot for
+    /// `dark`, falling back to `color_scheme` if that slot is unset — so a user
+    /// can configure only one slot and keep their existing scheme for the other.
+    fn active_scheme(&self, dark: bool) -> Option<&str> {
+        if !self.auto_theme {
+            return self.color_scheme.as_deref();
+        }
+        let slot = if dark { &self.dark_scheme } else { &self.light_scheme };
+        slot.as_deref().or(self.color_scheme.as_deref())
+    }
+
     fn serialize(&self) -> String {
         let mut s = String::from("# Yutani configuration\n\n");
         s.push_str(&format!(
@@ -700,6 +747,13 @@ impl Config {
         ));
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", toml_str_lit(name)));
+        }
+        s.push_str(&format!("auto_theme = {}\n", self.auto_theme));
+        if let Some(name) = &self.light_scheme {
+            s.push_str(&format!("light_scheme = {}\n", toml_str_lit(name)));
+        }
+        if let Some(name) = &self.dark_scheme {
+            s.push_str(&format!("dark_scheme = {}\n", toml_str_lit(name)));
         }
         if let Some(name) = &self.font_family {
             s.push_str(&format!("font_family = {}\n", toml_str_lit(name)));
@@ -4069,7 +4123,11 @@ impl State {
     fn palette_choices(&self, action: command_palette::PaletteAction) -> Vec<String> {
         use command_palette::PaletteAction as A;
         match action {
-            A::SetTheme => theme_picker_choices(list_scheme_names()),
+            // All three theme pickers offer the same list: the on-disk schemes
+            // plus the synthetic "Default (built-in)" entry.
+            A::SetTheme | A::SetLightTheme | A::SetDarkTheme => {
+                theme_picker_choices(list_scheme_names())
+            }
             _ => Vec::new(),
         }
     }
@@ -4092,12 +4150,35 @@ impl State {
                 .set_window_title(arg.as_deref().unwrap_or("")),
             A::ClearTitle => self.terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
-            // The picker hands back a label; "Default (built-in)" maps to None
-            // (clear the scheme), every other label is a real scheme name. An
-            // empty/whitespace name also clears, via set_color_scheme.
+            // The picker hands back a label; map it to a scheme slot value
+            // ("Default (built-in)" / empty -> None, revert to built-in).
+            // "Set theme" is contextual: while following the system it assigns
+            // the slot for the current appearance, otherwise the single
+            // color_scheme.
             A::SetTheme => {
-                let arg = arg.unwrap_or_default();
-                self.set_color_scheme(scheme_for_pick(&arg).unwrap_or(""));
+                let val = scheme_value_from_pick(arg);
+                if self.config.auto_theme {
+                    if self.system_is_dark() {
+                        self.config.dark_scheme = val;
+                    } else {
+                        self.config.light_scheme = val;
+                    }
+                } else {
+                    self.config.color_scheme = val;
+                }
+                self.persist_and_apply();
+            }
+            A::SetLightTheme => {
+                self.config.light_scheme = scheme_value_from_pick(arg);
+                self.persist_and_apply();
+            }
+            A::SetDarkTheme => {
+                self.config.dark_scheme = scheme_value_from_pick(arg);
+                self.persist_and_apply();
+            }
+            A::ToggleFollowSystem => {
+                self.config.auto_theme = !self.config.auto_theme;
+                self.persist_and_apply();
             }
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
@@ -4385,16 +4466,13 @@ impl State {
             || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
     }
 
-    /// Persist `name` as the active `color_scheme` and apply it live. An empty
-    /// (or whitespace-only) name clears the setting, reverting to the built-in
-    /// defaults — matching `Config`'s "empty string == None" semantics. The
-    /// scheme is written to the config first, then `reload_config` re-reads and
-    /// installs it, so this shares the exact live-swap path Cmd-Shift-R uses.
-    fn set_color_scheme(&mut self, name: &str) {
-        let name = name.trim();
-        self.config.color_scheme = (!name.is_empty()).then(|| name.to_string());
+    /// Write the current in-memory config to disk and re-apply the scheme that
+    /// now matches it (and the system appearance). Used by the palette's theme
+    /// commands after they mutate a scheme slot or the follow-system flag, so
+    /// the change both persists and takes effect live.
+    fn persist_and_apply(&mut self) {
         self.config.save();
-        self.reload_config();
+        self.apply_active_scheme();
     }
 
     /// Re-read `~/.config/yutani/config` and re-install the color scheme,
@@ -4405,9 +4483,27 @@ impl State {
     /// one-shot resources at startup — pipeline creation, font face
     /// objects, etc. — still need a restart.
     fn reload_config(&mut self) {
-        let new_config = Config::load();
-        install_color_scheme(new_config.color_scheme.as_deref());
-        self.config = new_config;
+        self.config = Config::load();
+        self.apply_active_scheme();
+    }
+
+    /// True when the OS is currently in dark mode, per winit's tracked window
+    /// theme (updated from `WindowEvent::ThemeChanged`). Defaults to light if
+    /// the platform doesn't report one.
+    fn system_is_dark(&self) -> bool {
+        self.window.theme() == Some(winit::window::Theme::Dark)
+    }
+
+    /// Install the color scheme that matches the current config and system
+    /// appearance (see [`Config::active_scheme`]), then push every
+    /// palette-derived value into the GPU and window chrome. Shared by config
+    /// reloads, the palette's theme commands, and live system-appearance
+    /// changes — anything that can change which scheme should be showing.
+    fn apply_active_scheme(&mut self) {
+        // Resolve to an owned name first so `self.config` isn't borrowed across
+        // the `self.*` mutations below.
+        let name = self.config.active_scheme(self.system_is_dark()).map(str::to_owned);
+        install_color_scheme(name.as_deref());
 
         // Glow uniforms cache palette-derived values (bright ANSI hues,
         // foreground / background RGB) — they don't re-read palette::get()
@@ -6756,8 +6852,10 @@ async fn run() {
     // Install the color scheme before constructing State so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
-    // doesn't take the terminal down.
-    install_color_scheme(config.color_scheme.as_deref());
+    // doesn't take the terminal down. With `auto_theme` on, pick the slot for
+    // the OS's current appearance up front so we open in the right scheme.
+    let initial_dark = window.theme() == Some(winit::window::Theme::Dark);
+    install_color_scheme(config.active_scheme(initial_dark));
     // Match the NSAppearance to the palette so the title-bar text the OS
     // draws over our transparent chrome reads against the actual bg —
     // otherwise dark schemes render black "Yutani" text on a dark fill.
@@ -6999,8 +7097,16 @@ async fn run() {
                     match event {
                         WindowEvent::ThemeChanged(new_theme) => {
                             theme = new_theme;
-                            state.sync_theme_colors();
-                            state.invalidate();
+                            // Following the system appearance? Swap to the
+                            // scheme slot for the new mode. Otherwise just keep
+                            // the OSC color reports in sync as before — the
+                            // active scheme doesn't track the OS.
+                            if state.config.auto_theme {
+                                state.apply_active_scheme();
+                            } else {
+                                state.sync_theme_colors();
+                                state.invalidate();
+                            }
                         }
                         WindowEvent::CloseRequested => {
                             elwt.exit();
@@ -8618,6 +8724,137 @@ mod tests {
         assert_eq!(scheme_for_pick("yutani"), Some("yutani"));
         // A real name is returned verbatim, including ones with spaces.
         assert_eq!(scheme_for_pick("My Theme"), Some("My Theme"));
+    }
+
+    #[test]
+    fn scheme_value_from_pick_clears_on_default_or_empty() {
+        // The default label, an empty pick, and whitespace all clear the slot.
+        assert_eq!(scheme_value_from_pick(Some(DEFAULT_THEME_LABEL.to_string())), None);
+        assert_eq!(scheme_value_from_pick(Some(String::new())), None);
+        assert_eq!(scheme_value_from_pick(Some("   ".to_string())), None);
+        assert_eq!(scheme_value_from_pick(None), None);
+        // A real name is trimmed and stored.
+        assert_eq!(
+            scheme_value_from_pick(Some("  yutani ".to_string())),
+            Some("yutani".to_string())
+        );
+    }
+
+    #[test]
+    fn active_scheme_uses_color_scheme_when_not_following() {
+        let mut c = Config::defaults();
+        c.auto_theme = false;
+        c.color_scheme = Some("nostromo".to_string());
+        c.light_scheme = Some("light-one".to_string());
+        c.dark_scheme = Some("dark-one".to_string());
+        // System appearance is ignored when not following.
+        assert_eq!(c.active_scheme(false), Some("nostromo"));
+        assert_eq!(c.active_scheme(true), Some("nostromo"));
+    }
+
+    #[test]
+    fn active_scheme_unset_color_scheme_is_none_when_not_following() {
+        let c = Config::defaults(); // auto_theme false, all schemes None
+        assert_eq!(c.active_scheme(false), None);
+        assert_eq!(c.active_scheme(true), None);
+    }
+
+    #[test]
+    fn active_scheme_picks_slot_by_appearance_when_following() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        assert_eq!(c.active_scheme(false), Some("daytime"));
+        assert_eq!(c.active_scheme(true), Some("midnight"));
+    }
+
+    #[test]
+    fn active_scheme_following_falls_back_to_color_scheme_then_none() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.color_scheme = Some("fallback".to_string());
+        // dark_scheme set, light_scheme unset: dark uses its slot, light falls
+        // back to color_scheme.
+        c.dark_scheme = Some("midnight".to_string());
+        assert_eq!(c.active_scheme(true), Some("midnight"));
+        assert_eq!(c.active_scheme(false), Some("fallback"));
+        // With no slots and no color_scheme, it's None (built-in defaults).
+        c.color_scheme = None;
+        c.dark_scheme = None;
+        assert_eq!(c.active_scheme(true), None);
+        assert_eq!(c.active_scheme(false), None);
+    }
+
+    #[test]
+    fn config_auto_theme_fields_round_trip() {
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.auto_theme);
+        assert_eq!(parsed.light_scheme.as_deref(), Some("daytime"));
+        assert_eq!(parsed.dark_scheme.as_deref(), Some("midnight"));
+    }
+
+    #[test]
+    fn config_auto_theme_defaults_off_with_unset_slots() {
+        let d = Config::defaults();
+        assert!(!d.auto_theme);
+        assert!(d.light_scheme.is_none());
+        assert!(d.dark_scheme.is_none());
+        // A round trip of defaults preserves that.
+        let parsed = Config::parse_str(&d.serialize());
+        assert!(!parsed.auto_theme);
+        assert!(parsed.light_scheme.is_none());
+        assert!(parsed.dark_scheme.is_none());
+    }
+
+    #[test]
+    fn config_light_dark_scheme_empty_parses_as_none() {
+        // Explicit empty strings clear the slots, same as color_scheme.
+        let parsed = Config::parse_str("light_scheme = \"\"\ndark_scheme = \"\"\n");
+        assert!(parsed.light_scheme.is_none());
+        assert!(parsed.dark_scheme.is_none());
+    }
+
+    #[test]
+    fn config_all_theme_fields_round_trip_then_active_scheme_resolves() {
+        // Every existing round-trip leaves `color_scheme` None or sets only a
+        // subset. This is the realistic "user configured everything" state:
+        // an explicit `color_scheme` fallback PLUS auto_theme on with both
+        // slots filled. It guards against the serializer emitting one theme
+        // key in a way that clobbers another, and confirms that after a full
+        // serialize -> parse cycle `active_scheme` still selects the slot by
+        // appearance (not the color_scheme fallback) in each direction.
+        let mut c = Config::defaults();
+        c.color_scheme = Some("nostromo".to_string());
+        c.auto_theme = true;
+        c.light_scheme = Some("daytime".to_string());
+        c.dark_scheme = Some("midnight".to_string());
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.color_scheme.as_deref(), Some("nostromo"));
+        assert!(parsed.auto_theme);
+        assert_eq!(parsed.light_scheme.as_deref(), Some("daytime"));
+        assert_eq!(parsed.dark_scheme.as_deref(), Some("midnight"));
+        // Slots win over the color_scheme fallback, per appearance.
+        assert_eq!(parsed.active_scheme(false), Some("daytime"));
+        assert_eq!(parsed.active_scheme(true), Some("midnight"));
+    }
+
+    #[test]
+    fn active_scheme_following_each_slot_falls_back_independently() {
+        // The existing fallback test covers dark-set / light-unset. This pins
+        // the mirror case (light-set / dark-unset) so neither branch of the
+        // `if dark` slot selection silently reads the wrong field: the unset
+        // direction falls back to color_scheme while the set one keeps its slot.
+        let mut c = Config::defaults();
+        c.auto_theme = true;
+        c.color_scheme = Some("fallback".to_string());
+        c.light_scheme = Some("daytime".to_string());
+        assert_eq!(c.active_scheme(false), Some("daytime"));
+        assert_eq!(c.active_scheme(true), Some("fallback"));
     }
 
     #[test]

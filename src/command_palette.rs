@@ -28,9 +28,19 @@ pub enum PaletteAction {
     ClearTitle,
     /// Re-read the config file and swap the color scheme live.
     ReloadConfig,
-    /// Switch to a named color scheme (a `.toml` under `schemes/`) and persist
-    /// the choice to the config. An empty name reverts to the built-in defaults.
+    /// Switch the active color scheme. When following the system appearance is
+    /// off, this sets the single `color_scheme`; when on, it assigns the slot
+    /// for the current appearance (light or dark). Picks from the scheme list.
     SetTheme,
+    /// Assign the scheme used in system *light* mode (`light_scheme`). Picks
+    /// from the scheme list.
+    SetLightTheme,
+    /// Assign the scheme used in system *dark* mode (`dark_scheme`). Picks from
+    /// the scheme list.
+    SetDarkTheme,
+    /// Toggle following the system light/dark appearance (`auto_theme`), then
+    /// apply the scheme that now matches.
+    ToggleFollowSystem,
     /// Increase / decrease the font size by one point.
     ZoomIn,
     ZoomOut,
@@ -88,6 +98,24 @@ pub const COMMANDS: &[Command] = &[
         action: PaletteAction::SetTheme,
         arg_prompt: Some("Theme"),
         choose: true,
+    },
+    Command {
+        title: "Set light theme",
+        action: PaletteAction::SetLightTheme,
+        arg_prompt: Some("Light theme"),
+        choose: true,
+    },
+    Command {
+        title: "Set dark theme",
+        action: PaletteAction::SetDarkTheme,
+        arg_prompt: Some("Dark theme"),
+        choose: true,
+    },
+    Command {
+        title: "Toggle follow system appearance",
+        action: PaletteAction::ToggleFollowSystem,
+        arg_prompt: None,
+        choose: false,
     },
     Command {
         title: "Zoom in",
@@ -676,6 +704,63 @@ mod tests {
                 "query {query:?} should surface \"Set theme\"; got {titles:?}"
             );
         }
+    }
+
+    #[test]
+    fn light_and_dark_theme_commands_are_choosers() {
+        for (action, title, prompt) in [
+            (PaletteAction::SetLightTheme, "Set light theme", "Light theme"),
+            (PaletteAction::SetDarkTheme, "Set dark theme", "Dark theme"),
+        ] {
+            let cmd = COMMANDS
+                .iter()
+                .find(|c| c.action == action)
+                .expect("light/dark theme command should be registered");
+            assert_eq!(cmd.title, title);
+            assert_eq!(cmd.arg_prompt, Some(prompt));
+            assert!(cmd.choose, "{title} should pick from the scheme list");
+        }
+    }
+
+    #[test]
+    fn toggle_follow_system_is_an_immediate_command() {
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.action == PaletteAction::ToggleFollowSystem)
+            .expect("Toggle follow system command should be registered");
+        // No prompt, not a chooser: selecting it runs straight away.
+        assert_eq!(cmd.arg_prompt, None);
+        assert!(!cmd.choose);
+    }
+
+    #[test]
+    fn accept_toggle_follow_system_runs_immediately() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "follow system".into();
+        p.refilter();
+        assert_eq!(
+            p.accept(),
+            Outcome::Run {
+                action: PaletteAction::ToggleFollowSystem,
+                arg: None,
+            }
+        );
+    }
+
+    #[test]
+    fn accept_set_dark_theme_requests_choices_with_its_prompt() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set dark theme".into();
+        p.refilter();
+        assert_eq!(
+            p.accept(),
+            Outcome::RequestChoices {
+                action: PaletteAction::SetDarkTheme,
+                prompt: "Dark theme",
+            }
+        );
     }
 
     /// Selecting a `choose` command asks the host for candidates rather than
