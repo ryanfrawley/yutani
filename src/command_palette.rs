@@ -28,6 +28,9 @@ pub enum PaletteAction {
     ClearTitle,
     /// Re-read the config file and swap the color scheme live.
     ReloadConfig,
+    /// Switch to a named color scheme (a `.toml` under `schemes/`) and persist
+    /// the choice to the config. An empty name reverts to the built-in defaults.
+    SetTheme,
     /// Increase / decrease the font size by one point.
     ZoomIn,
     ZoomOut,
@@ -66,6 +69,11 @@ pub const COMMANDS: &[Command] = &[
         title: "Reload config",
         action: PaletteAction::ReloadConfig,
         arg_prompt: None,
+    },
+    Command {
+        title: "Set theme",
+        action: PaletteAction::SetTheme,
+        arg_prompt: Some("Theme name"),
     },
     Command {
         title: "Zoom in",
@@ -539,6 +547,71 @@ mod tests {
             Outcome::Run {
                 action: PaletteAction::SetTitle,
                 arg: Some("build server".into())
+            }
+        );
+    }
+
+    #[test]
+    fn set_theme_command_is_registered_with_arg_prompt() {
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| matches!(c.action, PaletteAction::SetTheme))
+            .expect("Set theme command should be in COMMANDS");
+        assert_eq!(cmd.title, "Set theme");
+        assert_eq!(cmd.arg_prompt, Some("Theme name"));
+    }
+
+    #[test]
+    fn filter_surfaces_set_theme() {
+        for query in ["set theme", "theme"] {
+            let res = filter(query);
+            let titles: Vec<&str> = res.iter().map(|&i| COMMANDS[i].title).collect();
+            assert!(
+                titles.contains(&"Set theme"),
+                "query {query:?} should surface \"Set theme\"; got {titles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_set_theme_enters_argument_mode_then_runs_with_typed_name() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set theme".into();
+        p.refilter();
+        // First Enter: enters argument mode, stays open.
+        assert_eq!(p.accept(), Outcome::Stay);
+        assert!(matches!(p.mode, Mode::Argument { .. }));
+        // Type the theme name and submit.
+        for c in "yutani".chars() {
+            p.type_char(c);
+        }
+        let out = p.accept();
+        assert_eq!(
+            out,
+            Outcome::Run {
+                action: PaletteAction::SetTheme,
+                arg: Some("yutani".into())
+            }
+        );
+    }
+
+    #[test]
+    fn accept_set_theme_with_empty_arg_runs_with_empty_string() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "set theme".into();
+        p.refilter();
+        assert_eq!(p.accept(), Outcome::Stay);
+        assert!(matches!(p.mode, Mode::Argument { .. }));
+        // Submit without typing anything: the empty-name-clears behavior lives
+        // downstream in main.rs, so the palette still emits Run with Some("").
+        let out = p.accept();
+        assert_eq!(
+            out,
+            Outcome::Run {
+                action: PaletteAction::SetTheme,
+                arg: Some("".into())
             }
         );
     }

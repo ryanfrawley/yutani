@@ -4014,6 +4014,7 @@ impl State {
                 .set_window_title(arg.as_deref().unwrap_or("")),
             A::ClearTitle => self.terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
+            A::SetTheme => self.set_color_scheme(arg.as_deref().unwrap_or("")),
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
@@ -4298,6 +4299,18 @@ impl State {
         let bot_target = if dist_from_bottom > 0.0 { 1.0 } else { 0.0 };
         (self.top_fade_phase - top_target).abs() > f32::EPSILON
             || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
+    }
+
+    /// Persist `name` as the active `color_scheme` and apply it live. An empty
+    /// (or whitespace-only) name clears the setting, reverting to the built-in
+    /// defaults — matching `Config`'s "empty string == None" semantics. The
+    /// scheme is written to the config first, then `reload_config` re-reads and
+    /// installs it, so this shares the exact live-swap path Cmd-Shift-R uses.
+    fn set_color_scheme(&mut self, name: &str) {
+        let name = name.trim();
+        self.config.color_scheme = (!name.is_empty()).then(|| name.to_string());
+        self.config.save();
+        self.reload_config();
     }
 
     /// Re-read `~/.config/yutani/config` and re-install the color scheme,
