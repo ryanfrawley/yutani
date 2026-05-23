@@ -187,6 +187,31 @@ impl Palette {
         }
     }
 
+    /// Resolve a cell's `(foreground, background)` colors down to what this
+    /// palette's [`ColorCap`] permits, returning the pair to actually draw.
+    ///
+    /// For every cap except [`ColorCap::Mono`] this is just [`project`] on
+    /// each color independently. Mono is special: with only two ink levels a
+    /// quantised background can collapse onto the window background, leaving an
+    /// empty cell and a cell that carries a background color
+    /// indistinguishable. So in Mono any explicit (non-transparent) background
+    /// is drawn as the [`foreground`] "ink" color and its glyph is flipped to
+    /// the [`background`] color — keeping three states mutually distinct: an
+    /// empty cell (window bg), a filled cell (fg ink), and its text (bg). A
+    /// transparent background (the "no color" sentinel) passes straight
+    /// through so empty cells still show the window through them.
+    ///
+    /// [`project`]: Palette::project
+    /// [`foreground`]: Palette::foreground
+    /// [`background`]: Palette::background
+    pub fn project_cell(&self, fg: [f32; 4], bg: [f32; 4]) -> ([f32; 4], [f32; 4]) {
+        if self.max_colors == ColorCap::Mono && bg[3] != 0.0 {
+            (self.background, self.foreground)
+        } else {
+            (self.project(fg), self.project(bg))
+        }
+    }
+
     pub fn ansi(&self, n: u8, bright: bool) -> [f32; 4] {
         let idx = (n & 7) as usize + if bright { 8 } else { 0 };
         self.ansi[idx]
@@ -812,6 +837,48 @@ blue = [0x0000ab, 0x5555ff]
         p.max_colors = ColorCap::Xterm256;
         let c196 = p.xterm_256(196);
         assert_eq!(p.project(c196), c196);
+    }
+
+    #[test]
+    fn project_cell_mono_explicit_bg_becomes_fg_ink() {
+        // A cell with any explicit (non-transparent) background must paint as
+        // the fg "ink" color, and its glyph flips to the bg color — so a
+        // filled cell stays distinct from an empty cell and the text stays
+        // readable against the block.
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        // Original cell: near-white glyph on a mid-grey explicit background.
+        let (fg, bg) = p.project_cell([0.9, 0.9, 0.9, 1.0], [0.4, 0.4, 0.4, 1.0]);
+        assert_eq!(bg, p.foreground, "filled bg should become fg ink");
+        assert_eq!(fg, p.background, "glyph should flip to bg color");
+    }
+
+    #[test]
+    fn project_cell_mono_transparent_bg_keeps_window_through() {
+        // No explicit background: the bg stays the transparent sentinel so the
+        // window shows through, and the glyph projects normally to fg ink.
+        let mut p = Palette::defaults();
+        p.background = [0.0, 0.0, 0.0, 1.0];
+        p.foreground = [1.0, 1.0, 1.0, 1.0];
+        p.max_colors = ColorCap::Mono;
+        let (fg, bg) = p.project_cell([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(bg, [0.0, 0.0, 0.0, 0.0], "transparent bg must pass through");
+        assert_eq!(fg, p.foreground, "glyph on empty cell stays fg ink");
+    }
+
+    #[test]
+    fn project_cell_non_mono_is_independent_projection() {
+        // Outside Mono there's no inversion: each color projects on its own.
+        // Truecolor is identity, so the pair round-trips unchanged.
+        let mut p = Palette::defaults();
+        p.max_colors = ColorCap::Truecolor;
+        let fg_in = [0.2, 0.5, 0.7, 1.0];
+        let bg_in = [0.1, 0.1, 0.1, 1.0];
+        let (fg, bg) = p.project_cell(fg_in, bg_in);
+        assert_eq!(fg, fg_in);
+        assert_eq!(bg, bg_in);
     }
 
     #[test]
