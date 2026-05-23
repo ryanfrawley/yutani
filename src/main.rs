@@ -4450,6 +4450,15 @@ impl State {
     /// state change here flips the system cursor icon and invalidates the
     /// frame so the underline can repaint.
     fn update_hover_url(&mut self) {
+        // The pointer is over the title bar / toolbar band — window chrome,
+        // not the grid. This method also runs on events that don't move the
+        // mouse (PTY output, Cmd press/release, scroll, prompt jumps), and
+        // must not flip the chrome's arrow back to the grid's I-beam (or to a
+        // Pointer from a URL on the clamped row-0 hit-test) while it sits there.
+        // CursorMoved owns the cursor in this band and clears any hovered URL.
+        if self.in_top_toolbar(self.mouse_y) {
+            return;
+        }
         let new = if self.modifiers.super_key() {
             let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
             let abs_line = self.terminal.visual_to_abs_line(vrow);
@@ -5417,11 +5426,17 @@ impl State {
                 // chrome. Show the arrow instead of the grid's I-beam, and drop
                 // any hovered-URL highlight since nothing hoverable is up there.
                 if self.in_top_toolbar(position.y) {
-                    if !self.over_toolbar {
-                        self.over_toolbar = true;
-                        self.window
-                            .set_cursor_icon(winit::window::CursorIcon::Default);
-                    }
+                    // Re-assert the arrow on *every* move within the band, not
+                    // just on entry. macOS owns the cursor rect while the
+                    // pointer is over the native title-bar overlay, so the
+                    // Default we set there never reaches our content view;
+                    // sliding back down onto the content-view slice of the band
+                    // would otherwise leave the grid's stale I-beam showing
+                    // (the old entry-only branch was skipped once over_toolbar
+                    // had been latched true).
+                    self.over_toolbar = true;
+                    self.window
+                        .set_cursor_icon(winit::window::CursorIcon::Default);
                     if self.hover_url.take().is_some() {
                         self.invalidate();
                     }
