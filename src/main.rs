@@ -5902,9 +5902,18 @@ async fn run() {
         let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
     });
 
+    // Seed the window title from our own working directory — the shell the
+    // PTY just forked inherits it (no chdir in the child), so this matches
+    // what the first OSC 7 will report, avoiding a bare "Yutani" flash before
+    // the first prompt.
+    let initial_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned));
+    let initial_title = effective_title(None, initial_cwd.as_deref());
+
     let transparent = false; // needed because of a shadow bug
     let window = WindowBuilder::new()
-        .with_title("Yutani")
+        .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
