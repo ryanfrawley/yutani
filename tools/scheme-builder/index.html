@@ -1748,10 +1748,14 @@ function rasterizeScene(ctx, scale, w, h) {
   const fontFor = bold => `${bold ? '600 ' : ''}${fontPx}px ${stack}`;
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = state.background; ctx.fillRect(0, 0, w, h);
-  ctx.textBaseline = 'top';
+  // Glyphs are vertically centred in their line cell so the full-cell block
+  // cursor and selection rects wrap the text symmetrically (a top-aligned
+  // baseline left the cursor hanging below the glyphs).
+  ctx.textBaseline = 'middle';
   let y = padT;
   for (const segs of PREVIEW_LINES) {
     let x = padL;
+    const cy = y + lineH / 2;
     for (const s of segs) {
       if (typeof s === 'string') { ctx.font = fontFor(false); x += ctx.measureText(s).width; continue; }
       const text = s.text || '';
@@ -1759,7 +1763,7 @@ function rasterizeScene(ctx, scale, w, h) {
       const tw = ctx.measureText(text).width;
       if (s.sel) { ctx.fillStyle = state.selection; ctx.fillRect(x, y, tw, lineH); }
       ctx.fillStyle = (s.sel && state.selection_fg) ? state.selection_fg : resolveFg(s.fg || 'foreground', s.bold);
-      ctx.fillText(text, x, y);
+      ctx.fillText(text, x, cy);
       x += tw;
       if (s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }
     }
