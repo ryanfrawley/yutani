@@ -1922,16 +1922,21 @@ impl State {
     async fn new(
         master: i32,
         window: Window,
+        gpu: gpu::GpuContext,
         mut font: font::Font,
         shaper: shaper::Shaper,
         config: Config,
         dpi: u32,
     ) -> Self {
+        let _sw = std::time::Instant::now();
+        let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
+        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         let pt_size = config.font_size;
-        let gpu = gpu::GpuContext::new(&window).await;
+        sub!("GpuContext (passed in, built concurrently)");
 
         // Font texture setup
         let atlas = font.build_atlas();
+        sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
             &gpu.device,
@@ -2138,6 +2143,7 @@ impl State {
         } else {
             None
         };
+        sub!("main render + wireframe pipelines");
 
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
@@ -2196,6 +2202,7 @@ impl State {
         );
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
+        sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
             &gpu.device,
@@ -2226,6 +2233,7 @@ impl State {
             gpu.config.height,
             &scene_fg.view,
         );
+        sub!("Glow::new x2 + scene_fg");
         let initial_overrides = palette::get().glow;
         for g in [&mut glow, &mut glow_fg] {
             apply_glow_config(g, &config, &initial_overrides);
@@ -2284,6 +2292,7 @@ impl State {
             &camera_bind_group_layout,
         );
         let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
+        sub!("ImagePipeline::new + Store");
 
         Self {
             window,
@@ -7113,8 +7122,164 @@ impl State {
     }
 }
 
+/// Everything `run()` needs to build the font stack, loaded as owned bytes /
+/// strings so it can be produced on a worker thread (a FreeType `Face` is not
+/// `Send`, but the raw font data is). The main thread turns this into FreeType
+/// faces + the rustybuzz shaper after the GPU has been brought up concurrently.
+struct FontData {
+    primary_name: String,
+    primary_data: Vec<u8>,
+    /// Bold / Italic / BoldItalic primary cuts that loaded, as
+    /// `(variant, bytes, face_index)`. Missing cuts are simply absent.
+    styled: Vec<(font::FaceVariant, Vec<u8>, isize)>,
+    /// Fallback faces that loaded, as `(label, family, variant, bytes,
+    /// face_index)`. Whether each is actually attached is decided on the main
+    /// thread (a styled fallback only attaches when its primary cut built).
+    fallbacks: Vec<(&'static str, String, font::FaceVariant, Vec<u8>, isize)>,
+}
+
+/// Resolve the primary family and load every font file the terminal needs —
+/// primary cut, its bold/italic/bold-italic cuts, and the fallback chain — in
+/// parallel. Pure data work (Core Text matching + file reads, all thread-safe
+/// and `Send`), so `run()` drives it on a worker thread while the GPU spins up
+/// on the main thread. Replaces what used to be ~250ms of sequential loading.
+fn load_font_data(config: &Config) -> FontData {
+    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
+        .monospace()
+        .build();
+    let mut mono_fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
+    mono_fonts.dedup();
+    let installed = font_loader::system_fonts::query_all();
+
+    // User override wins over the built-in preference list (exact name, then
+    // substring); a configured-but-missing family warns and falls through.
+    let configured_primary = config.font_family.as_deref().and_then(|want| {
+        let hit = installed
+            .iter()
+            .find(|f| f.as_str() == want)
+            .or_else(|| installed.iter().find(|f| f.contains(want)))
+            .cloned();
+        if hit.is_none() {
+            eprintln!(
+                "font: configured font_family {:?} not installed, falling back to defaults",
+                want,
+            );
+        }
+        hit
+    });
+    let primary_name = configured_primary.unwrap_or_else(|| {
+        ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
+            .iter()
+            .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
+            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
+            .expect("no monospace primary font found")
+            .clone()
+    });
+    println!("primary font: {}", primary_name);
+
+    let styled_specs = [
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ];
+
+    // Fallback chain — first installed family in each category wins. Same list
+    // and ordering as before; we only build the *job list* here, then load all
+    // jobs in parallel below.
+    let fallback_categories: &[(&str, &[&str])] = &[
+        ("nerd", &[
+            "Iosevka Nerd Font",
+            "FiraCode Nerd Font",
+            "JetBrainsMono Nerd Font",
+            "Hack Nerd Font",
+            "Symbols Nerd Font",
+        ]),
+        ("cjk", &[
+            "PingFang SC",
+            "Hiragino Sans",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK JP",
+            "Sarasa Mono SC",
+        ]),
+        ("symbols", &[
+            "Apple Symbols",
+            "Symbola",
+            "Noto Sans Symbols 2",
+            "Noto Sans Symbols",
+        ]),
+        ("emoji", &["Noto Emoji"]),
+    ];
+    let variants_to_fill = [
+        (font::FaceVariant::Regular, false, false),
+        (font::FaceVariant::Bold, true, false),
+        (font::FaceVariant::Italic, false, true),
+        (font::FaceVariant::BoldItalic, true, true),
+    ];
+    let mut fallback_jobs: Vec<(&'static str, String, font::FaceVariant, bool, bool)> = Vec::new();
+    for (label, candidates) in fallback_categories {
+        if let Some(family) = pick_family(&installed, candidates) {
+            for (variant, bold, italic) in variants_to_fill {
+                fallback_jobs.push((label, family.clone(), variant, bold, italic));
+            }
+        }
+    }
+
+    // Load primary, styled cuts, and every fallback file concurrently. Each is
+    // an independent Core Text match + file read; fanning them across threads
+    // turns the longest single load — not their sum — into the critical path.
+    // The scope borrows `primary_name`, so `FontData` is assembled only after
+    // the scope ends (all handles joined) and the borrow is released.
+    let (primary_data, styled, fallbacks) = std::thread::scope(|s| {
+        let primary_h =
+            s.spawn(|| load_family(&primary_name).expect("failed to load primary font"));
+        let styled_hs: Vec<_> = styled_specs
+            .iter()
+            .map(|&(v, b, i)| {
+                let name = &primary_name;
+                (v, s.spawn(move || load_family_styled(name, b, i)))
+            })
+            .collect();
+        let fallback_hs: Vec<_> = fallback_jobs
+            .iter()
+            .map(|job| {
+                let (label, v) = (job.0, job.2);
+                let (family, b, i) = (&job.1, job.3, job.4);
+                (label, family.clone(), v, s.spawn(move || load_family_styled(family, b, i)))
+            })
+            .collect();
+
+        let primary_data = primary_h.join().expect("primary font loader panicked");
+        let styled: Vec<_> = styled_hs
+            .into_iter()
+            .filter_map(|(v, h)| h.join().expect("styled loader panicked").map(|(d, i)| (v, d, i)))
+            .collect();
+        let fallbacks: Vec<_> = fallback_hs
+            .into_iter()
+            .filter_map(|(label, family, v, h)| {
+                h.join()
+                    .expect("fallback loader panicked")
+                    .map(|(d, i)| (label, family, v, d, i))
+            })
+            .collect();
+
+        (primary_data, styled, fallbacks)
+    });
+
+    FontData { primary_name, primary_data, styled, fallbacks }
+}
+
 async fn run() {
     env_logger::init();
+    // Startup phase timing, printed only when YUTANI_STARTUP_TIMING is set so
+    // the perf work stays reproducible without spamming every launch.
+    let t_start = std::time::Instant::now();
+    let timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
+    let lap = |label: &str| {
+        if timing {
+            eprintln!("[startup] {:>7.1}ms  {label}", t_start.elapsed().as_secs_f64() * 1000.0);
+        }
+    };
     let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event()
         .build()
         .unwrap();
@@ -7132,6 +7297,7 @@ async fn run() {
 
     // Fork before the window is created so we hold the master fd across setup.
     let pty = pty::fork_pty(fdm).expect("failed to fork pty");
+    lap("after fork_pty");
     std::thread::spawn(move || {
         let code = pty.run(|data| {
             let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
@@ -7162,58 +7328,33 @@ async fn run() {
         .with_blur(transparent)
         .build(&event_loop)
         .unwrap();
+    lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);
 
     let config = Config::load();
+    lap("after config load");
 
-    let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
-        .monospace()
-        .build();
-    let mut mono_fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
-    mono_fonts.dedup();
-    let installed = font_loader::system_fonts::query_all();
+    // Load all font data on a worker thread while the GPU is brought up on
+    // this (main) thread. The two are independent until State::new needs both,
+    // so overlapping them hides whichever finishes first. Font work must hand
+    // back owned bytes (FreeType faces aren't Send); GPU/surface creation must
+    // stay on the main thread (Cocoa isn't thread-safe), hence this split.
+    let config_for_fonts = config.clone();
+    let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    // User override wins over the built-in preference list. Exact-name
-    // match first (so "Iosevka" doesn't pick "Iosevka Term" when the user
-    // typed the bare name), then substring as a forgiving fallback. We
-    // search the full `installed` list so users can opt into a
-    // proportional / display family if they want — monospace isn't
-    // enforced. A `Some(_)` value with no match warns and falls through
-    // to the default selection so a typo in the config doesn't take the
-    // terminal down.
-    let configured_primary = config.font_family.as_deref().and_then(|want| {
-        let hit = installed
-            .iter()
-            .find(|f| f.as_str() == want)
-            .or_else(|| installed.iter().find(|f| f.contains(want)))
-            .cloned();
-        if hit.is_none() {
-            eprintln!(
-                "font: configured font_family {:?} not installed, falling back to defaults",
-                want,
-            );
-        }
-        hit
-    });
+    let gpu = gpu::GpuContext::new(&window).await;
+    lap("after GpuContext::new (concurrent with font load)");
 
-    let primary_name = configured_primary.unwrap_or_else(|| {
-        ["Iosevka Term", "Iosevka", "Fira Code", "Menlo"]
-            .iter()
-            .find_map(|want| mono_fonts.iter().find(|f| f.as_str() == *want))
-            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka Term")))
-            .or_else(|| mono_fonts.iter().find(|f| f.contains("Iosevka")))
-            .expect("no monospace primary font found")
-            .clone()
-    });
-    println!("primary font: {}", primary_name);
-    let primary_data = load_family(&primary_name).expect("failed to load primary font");
+    let fd = font_handle.join().expect("font loader thread panicked");
+    lap("after font data loaded (joined)");
 
     // Install the color scheme before constructing State so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
     // doesn't take the terminal down. With `auto_theme` on, pick the slot for
     // the OS's current appearance up front so we open in the right scheme.
+    // Touches the window, so it stays on the main thread (after the join).
     let initial_dark = window.theme() == Some(winit::window::Theme::Dark);
     install_color_scheme(config.active_scheme(initial_dark));
     // Match the NSAppearance to the palette so the title-bar text the OS
@@ -7221,120 +7362,50 @@ async fn run() {
     // otherwise dark schemes render black "Yutani" text on a dark fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     set_native_window_bg(&window, palette::get().background);
+
     let pt_size = config.font_size;
     let dpi = (window.scale_factor() * 96.0) as u32;
-    // Build the rustybuzz shaper alongside the FreeType font. We keep one
-    // copy of the bytes for shaping (rustybuzz parses tables, doesn't
-    // rasterize) and hand the other to FreeType. Only primary cuts are
-    // shaped — fallbacks aren't asked to ligate.
+
+    // Turn the loaded bytes into FreeType faces + the rustybuzz shaper. This is
+    // the not-Send tail that has to run here. Regular comes from the primary
+    // lookup (face 0); the styled cuts carry their own TTC face index.
     let mut shaper = shaper::Shaper::new();
-    // Regular comes from the primary lookup (no traits requested) so
-    // it's almost always face 0 of whatever Core Text picks; passing
-    // 0 here is correct AND matches `Font::new`'s implicit behavior.
-    shaper.set_variant(font::FaceVariant::Regular, &primary_data, 0);
-    let mut font = font::Font::new(primary_data);
+    shaper.set_variant(font::FaceVariant::Regular, &fd.primary_data, 0);
+    let mut font = font::Font::new(fd.primary_data);
     font.set_char_size(pt_size, dpi);
 
-    // Bold/italic/bold-italic primary cuts of the same family. Each is best-
-    // effort: when a cut isn't installed the styled lookup falls back to the
-    // regular face. Cores like Iosevka ship all four; users without them get
-    // un-styled text rather than synthetic bolding/oblique.
-    //
-    // Iosevka and most large families pack multiple weight/italic cuts
-    // into a single TTC file, so the file Core Text hands us for the
-    // italic descriptor is usually the SAME file as the regular — just
-    // a different face index inside. `find_face_index` scans the TTC
-    // for the face whose style_flags match the requested variant. Pre-
-    // fix, both the FreeType and HarfBuzz loaders opened face 0 of the
-    // TTC, so italic and bold-italic silently rendered as regular.
-    for (variant, bold, italic) in [
-        (font::FaceVariant::Bold, true, false),
-        (font::FaceVariant::Italic, false, true),
-        (font::FaceVariant::BoldItalic, true, true),
-    ] {
-        let Some((data, face_index)) = load_family_styled(&primary_name, bold, italic) else {
-            continue;
-        };
+    for (variant, data, face_index) in fd.styled {
         shaper.set_variant(variant, &data, face_index as u32);
         if font.set_variant(variant, data, face_index, pt_size, dpi) {
-            println!("primary {:?}: {} (face index {})", variant, primary_name, face_index);
+            println!("primary {:?}: {} (face index {})", variant, fd.primary_name, face_index);
         }
     }
 
-    // Pre-shape every candidate ligature sequence for each installed
-    // variant. After this, the render loop only needs prefix-matching
-    // against a small per-variant table — no rustybuzz on the hot path.
+    // Pre-shape every candidate ligature sequence for each installed variant.
     for variant in font::FaceVariant::ALL {
         shaper.precompute(variant);
     }
 
-    // Fallback chain. Each entry is a list of candidate family substrings; the
-    // first installed family wins. Order matters — earlier fallbacks shadow
-    // later ones for any glyph they share.
-    let fallback_categories: &[(&str, &[&str])] = &[
-        // Nerd Font icons (Powerline, Devicons, Font Awesome, …) in the PUA.
-        ("nerd", &[
-            "Iosevka Nerd Font",
-            "FiraCode Nerd Font",
-            "JetBrainsMono Nerd Font",
-            "Hack Nerd Font",
-            "Symbols Nerd Font",
-        ]),
-        // CJK ideographs and kana.
-        ("cjk", &[
-            "PingFang SC",
-            "Hiragino Sans",
-            "Noto Sans CJK SC",
-            "Noto Sans CJK JP",
-            "Sarasa Mono SC",
-        ]),
-        // Long-tail symbols, math, dingbats, geometric shapes.
-        ("symbols", &[
-            "Apple Symbols",
-            "Symbola",
-            "Noto Sans Symbols 2",
-            "Noto Sans Symbols",
-        ]),
-        // Monochrome emoji. (Apple Color Emoji is bitmap-only and currently
-        // unsupported by our atlas pipeline, so we deliberately skip it.)
-        ("emoji", &["Noto Emoji"]),
-    ];
-    // For each fallback category, attach the matching cut to every variant we
-    // managed to install a primary for. A bold CJK glyph still wants the bold
-    // CJK fallback; if no styled CJK is installed, the styled variant is left
-    // without that fallback and Atlas::lookup tumbles down to Regular.
-    let variants_to_fill = [
-        (font::FaceVariant::Regular, false, false),
-        (font::FaceVariant::Bold, true, false),
-        (font::FaceVariant::Italic, false, true),
-        (font::FaceVariant::BoldItalic, true, true),
-    ];
-    for (label, candidates) in fallback_categories {
-        let Some(family) = pick_family(&installed, candidates) else {
+    // Attach the fallback faces. A styled fallback only attaches when its
+    // primary cut actually built (same guard as before — otherwise the chain
+    // is dead weight and Atlas::lookup tumbles to Regular anyway).
+    for (label, family, variant, data, face_index) in fd.fallbacks {
+        if variant != font::FaceVariant::Regular
+            && font.variants[variant as usize].face.is_none()
+        {
             continue;
-        };
-        for (variant, bold, italic) in variants_to_fill {
-            // Regular has no installed primary check — Font::new always
-            // populates it. Styled variants only get fallbacks when their
-            // primary face is installed; otherwise the chain is dead weight.
-            if variant != font::FaceVariant::Regular
-                && font.variants[variant as usize].face.is_none()
-            {
-                continue;
-            }
-            let Some((data, face_index)) = load_family_styled(&family, bold, italic) else {
-                continue;
-            };
-            if font.add_fallback(variant, data, face_index, pt_size, dpi) {
-                println!(
-                    "fallback {} {:?}: {} (face index {})",
-                    label, variant, family, face_index,
-                );
-            }
+        }
+        if font.add_fallback(variant, data, face_index, pt_size, dpi) {
+            println!(
+                "fallback {} {:?}: {} (face index {})",
+                label, variant, family, face_index,
+            );
         }
     }
 
-    let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
+    lap("after font faces + shaper built");
+    let mut state = State::new(fdm, window, gpu, font, shaper, config, dpi).await;
+    lap("after State::new (GPU/atlas/pipelines)");
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     // Size the chrome band to the real native title bar now that the window
     // exists; the field was seeded with the renderer's reserve in State::new.
@@ -7359,6 +7430,7 @@ async fn run() {
     // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
     // at which point we fall back to the cwd.
     let mut manual_title: Option<String> = None;
+    let mut first_frame_done = false;
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
@@ -7488,6 +7560,12 @@ async fn run() {
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
+                            if !first_frame_done {
+                                first_frame_done = true;
+                                if timing {
+                                    eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                                }
+                            }
                             match result {
                                 Ok((surface_wait, fast)) => {
                                     state.perf.note_render(render_dur, surface_wait, fast);

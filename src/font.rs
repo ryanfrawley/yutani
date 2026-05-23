@@ -276,6 +276,36 @@ impl Atlas {
             .expect("primary face has no size metrics");
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
 
+        // Box-drawing & block-element glyphs are synthesized (pixel-aligned
+        // strokes that tile cleanly across cell edges) rather than rasterized
+        // from the font — same as the build-time path. Synthesize into Regular
+        // only; styled lookups for these codepoints fall back through
+        // `Atlas::lookup` to the regular synthesized entry. Done before the
+        // FreeType path so an on-demand box char doesn't clobber the synth
+        // entry with the font's own (un-aligned) glyph.
+        let ascender_px = (metrics.ascender >> 6) as isize;
+        if let Some(bm) = box_drawing::synth(ch, cell_w, cell_h, ascender_px) {
+            if vi == 0 {
+                if let Some(entry) = pack_synth(
+                    &bm,
+                    &mut self.buffer,
+                    self.width,
+                    self.height,
+                    &mut self.pack_x,
+                    &mut self.pack_y,
+                    &mut self.pack_row_height,
+                ) {
+                    self.variants[vi].insert(ch, entry);
+                    self.dirty = true;
+                }
+            } else {
+                // Styled variant: ensure the Regular synth entry exists so
+                // lookup's styled→regular fallback finds it.
+                self.ensure_char(font, FaceVariant::Regular, ch);
+            }
+            return;
+        }
+
         let face = match font.variants[vi].face_for(ch) {
             Some(f) => f,
             None => {
@@ -451,7 +481,6 @@ impl Font {
             .size_metrics()
             .expect("primary face has no size metrics");
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
-        let ascender_px = (metrics.ascender >> 6) as isize;
 
         // Ranges we care about rendering. Control chars are excluded — the
         // terminal model strips them before they ever reach a cell. PUA is
@@ -535,68 +564,39 @@ impl Font {
             HashMap::new(),
         ];
 
-        for variant in FaceVariant::ALL {
-            let vi = variant as usize;
-            if self.variants[vi].face.is_none() {
+        // Pre-pack only Regular printable ASCII — the glyphs the first frame
+        // (a shell prompt) almost always needs, so it paints without an
+        // inline rasterization stutter. Everything else — the rest of the
+        // Unicode ranges above, box-drawing synthesis, and all bold/italic/
+        // bold-italic cuts — is rasterized lazily by `ensure_char` /
+        // `ensure_glyph_id` the first time a glyph actually appears on screen.
+        // The texture is still sized for the full set above so on-demand
+        // packing has room to grow. This trades ~10k up-front FreeType
+        // rasterizations (most never used in a session) for a handful.
+        for c in 0x20u32..=0x7E {
+            let ch = match char::from_u32(c) {
+                Some(ch) => ch,
+                None => continue,
+            };
+            let face = match self.variants[0].face_for(ch) {
+                Some(f) => f,
+                None => continue,
+            };
+            if face.load_char(ch as usize, ft::face::LoadFlag::RENDER).is_err() {
                 continue;
             }
-            for range in ranges {
-                for c in range.clone() {
-                    let ch = match char::from_u32(c) {
-                        Some(ch) => ch,
-                        None => continue,
-                    };
-                    // Box-drawing & block-element ranges are synthesized so
-                    // strokes land on integer pixel boundaries and connecting
-                    // glyphs align across cell boundaries with no half-alpha
-                    // hairlines. Synthesize once into Regular only; bold/
-                    // italic lookups for these codepoints fall back through
-                    // Atlas::lookup to the regular synthesized entry.
-                    if variant == FaceVariant::Regular {
-                        if let Some(bm) = box_drawing::synth(ch, cell_w, cell_h, ascender_px) {
-                            if let Some(entry) = pack_synth(
-                                &bm,
-                                &mut texture,
-                                width,
-                                size,
-                                &mut x,
-                                &mut y,
-                                &mut row_height,
-                            ) {
-                                variants_entries[vi].insert(ch, entry);
-                            }
-                            // Atlas full → leave the slot empty so lookup
-                            // falls back to notdef instead of writing past
-                            // the texture and corrupting earlier glyphs.
-                            continue;
-                        }
-                    } else if box_drawing::synth(ch, cell_w, cell_h, ascender_px).is_some() {
-                        continue;
-                    }
-                    // Walk primary → fallbacks for this variant only. If the
-                    // styled variant has no glyph for a codepoint, leave the
-                    // slot unfilled — Atlas::lookup falls back to Regular.
-                    let face = match self.variants[vi].face_for(ch) {
-                        Some(f) => f,
-                        None => continue,
-                    };
-                    if face.load_char(ch as usize, ft::face::LoadFlag::RENDER).is_err() {
-                        continue;
-                    }
-                    if let Some(entry) = pack_glyph(
-                        face.glyph(),
-                        &mut texture,
-                        width,
-                        size,
-                        &mut x,
-                        &mut y,
-                        &mut row_height,
-                        cell_w,
-                        cell_h,
-                    ) {
-                        variants_entries[vi].insert(ch, entry);
-                    }
-                }
+            if let Some(entry) = pack_glyph(
+                face.glyph(),
+                &mut texture,
+                width,
+                size,
+                &mut x,
+                &mut y,
+                &mut row_height,
+                cell_w,
+                cell_h,
+            ) {
+                variants_entries[0].insert(ch, entry);
             }
         }
 
@@ -1415,5 +1415,142 @@ mod tests {
             "Regular chain also misses → slot stays empty (Atlas::lookup → notdef)",
         );
         assert!(!atlas.dirty, "no pack happened on either variant");
+    }
+
+    // ---------- build_atlas lazy-population tests ----------
+
+    // build_atlas pre-packs Regular printable ASCII so the first frame
+    // (a shell prompt) paints without an inline rasterization stutter.
+    // 'A', 'z', '~' are all in 0x20..=0x7E and every plausible test font
+    // ships them, so lookup must resolve to a real entry — never notdef.
+    #[test]
+    fn build_atlas_prepacks_regular_ascii() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let atlas = font.build_atlas();
+
+        for ch in ['A', 'z', '~'] {
+            assert!(
+                atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+                "build_atlas should pre-pack Regular ASCII {ch:?}",
+            );
+            let g = atlas.lookup(ch, FaceVariant::Regular);
+            assert_ne!(
+                g.x, atlas.notdef.x,
+                "{ch:?} should resolve to a real glyph, not notdef",
+            );
+        }
+    }
+
+    // A non-box codepoint outside printable ASCII (here 'ā' U+0101, Latin
+    // Extended-A) is no longer pre-packed by build_atlas — the rasterization
+    // is deferred to ensure_char. Looking it up before any ensure_char must
+    // fall through to notdef. The texture is still sized for the full set,
+    // but only Regular ASCII is rasterized up front.
+    #[test]
+    fn build_atlas_defers_non_ascii_non_box_codepoint() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let ch = '\u{0101}'; // 'ā', not ASCII, not box-drawing
+        let atlas = font.build_atlas();
+
+        assert!(
+            !atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "{ch:?} must NOT be pre-packed — its rasterization is deferred",
+        );
+        let g = atlas.lookup(ch, FaceVariant::Regular);
+        assert_eq!(
+            g.x, atlas.notdef.x,
+            "deferred {ch:?} should look up as notdef until ensure_char runs",
+        );
+    }
+
+    // After ensure_char rasterizes the deferred non-box codepoint on demand,
+    // it becomes present and the atlas is dirtied for re-upload. Guarded on
+    // the font actually carrying the glyph — coding fonts ship Latin
+    // Extended-A, but skip rather than fail if a candidate font doesn't.
+    #[test]
+    fn ensure_char_populates_deferred_non_box_codepoint() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let ch = '\u{0101}'; // 'ā'
+        if font.variants[FaceVariant::Regular as usize]
+            .face_for(ch)
+            .is_none()
+        {
+            eprintln!("skipping: test font has no glyph for {ch:?}");
+            return;
+        }
+        let mut atlas = font.build_atlas();
+        assert!(
+            !atlas.dirty,
+            "freshly built atlas is clean (pre-pack leaves dirty=false)",
+        );
+        assert!(
+            !atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "precondition: {ch:?} is deferred, not pre-packed",
+        );
+
+        atlas.ensure_char(&mut font, FaceVariant::Regular, ch);
+
+        assert!(
+            atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "ensure_char should populate the deferred glyph {ch:?}",
+        );
+        assert!(atlas.dirty, "on-demand pack must set dirty for re-upload");
+        let g = atlas.lookup(ch, FaceVariant::Regular);
+        assert_ne!(g.x, atlas.notdef.x, "{ch:?} now resolves to a real glyph");
+    }
+
+    // Box-drawing glyphs are synthesized (pixel-aligned strokes), not
+    // rasterized from the font. build_atlas no longer pre-packs them; the
+    // synth happens on demand in ensure_char. '─' U+2500 must be absent
+    // after build_atlas and present (dirty set) after ensure_char(Regular).
+    // Guarded on box_drawing::synth returning Some at the test's cell
+    // metrics — otherwise there's nothing to synthesize and the assertion
+    // wouldn't apply.
+    #[test]
+    fn build_atlas_defers_box_drawing_then_ensure_char_synthesizes() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let ch = '\u{2500}'; // '─' BOX DRAWINGS LIGHT HORIZONTAL
+
+        // Mirror the cell-metric computation ensure_char/build_atlas use so
+        // the synth guard matches what the code under test will see.
+        let cell_w = font.cell_width();
+        let metrics = font
+            .face()
+            .size_metrics()
+            .expect("primary face has no size metrics");
+        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        let ascender_px = (metrics.ascender >> 6) as isize;
+        if box_drawing::synth(ch, cell_w, cell_h, ascender_px).is_none() {
+            eprintln!("skipping: box_drawing::synth gives None for {ch:?} at these metrics");
+            return;
+        }
+
+        let mut atlas = font.build_atlas();
+        assert!(
+            !atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "box-drawing {ch:?} must NOT be pre-packed by build_atlas anymore",
+        );
+
+        atlas.ensure_char(&mut font, FaceVariant::Regular, ch);
+
+        assert!(
+            atlas.variants[FaceVariant::Regular as usize].contains_key(&ch),
+            "ensure_char should synthesize box-drawing {ch:?} on demand",
+        );
+        assert!(atlas.dirty, "synth pack must set dirty for re-upload");
+        let g = atlas.lookup(ch, FaceVariant::Regular);
+        assert_ne!(g.x, atlas.notdef.x, "{ch:?} resolves to the synth entry, not notdef");
     }
 }
