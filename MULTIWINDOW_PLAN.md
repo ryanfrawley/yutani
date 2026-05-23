@@ -26,11 +26,22 @@ process) — that stays as the fallback until Stage 3 lands.
    below). The expensive thing to share is the **font load** (~140ms), which is
    shareable.
 
-## What's shared vs per-window
+## Three-tier model: process → window → tab
 
-The current `State` (~80 fields) splits cleanly:
+Today's `State` (~80 fields) conflates three levels that multi-window — and
+**tabs** — pull apart. Even though the first shipped feature is multi-window
+(one tab per window), the window/tab boundary must be designed in now, because
+a tab shares almost everything a window owns (surface, atlas, camera, buffers)
+*except* the PTY + terminal + the interaction state bound to that shell. Getting
+this boundary wrong means refactoring `State` a third time when tabs land. So:
 
-### Shared once per process (`AppShared`)
+```
+AppShared            (one per process)
+└── WindowState      (one per OS window)   — owns the surface, atlas, renderer
+    └── TabState     (one per shell/PTY)   — owns the terminal + its interaction
+```
+
+### `AppShared` — once per process (`Rc`, shared by all windows)
 - **GPU device + queue** — `Rc<gpu::Gpu>` (split out of today's `GpuContext`).
   Avoids re-initializing the adapter/device.
 - **Font stack** — `Rc<RefCell<font::Font>>` (FreeType faces) and
@@ -42,50 +53,93 @@ The current `State` (~80 fields) splits cleanly:
   `font_bind_group_layout`, `camera_bind_group_layout`, etc. Sharing these
   avoids repeat shader compilation (the cold-start spike).
 
-### Per-window (`WindowState`)
+### `WindowState` — once per OS window
+Everything tied to the surface, the visual size, and the keyboard/pointer focus
+(which are per-window, not per-tab). All tabs in a window share these:
 - **Surface + surface config + size** (split out of `GpuContext`; the surface
   is tied to each `NSView`).
-- **`Window`**, **PTY** (`master` fd + reader thread), **`Terminal`** grid +
-  scrollback.
+- **`Window`**, window chrome (title-bar band), and — later — the **tab bar**.
 - **`pt_size` + `dpi`** — per-window so zoom (Cmd-±) and multi-monitor DPI work
-  independently.
-- **Atlas + `font_texture` + `font_bind_group`** — per-window. Rebuilt per
-  window (~6ms) from the *shared* faces. Keeping the atlas per-window is what
-  lets two windows have different DPI/zoom without fighting over one texture,
-  and avoids shared-mutable-atlas coordination. `ensure_char(&mut atlas,
-  &mut shared_font.borrow_mut(), …)`.
-- **Camera + fade + vertex/index/strip buffers** — sized to the window.
+  independently. All tabs in a window share one zoom/DPI, which is exactly why
+  the atlas can be shared across the window's tabs.
+- **Atlas + `font_texture` + `font_bind_group`** — per-window, **shared across
+  the window's tabs** (same metrics). Rebuilt per window (~6ms) from the
+  *shared* faces. Per-window (not per-process) lets two windows differ in
+  DPI/zoom without fighting over one texture and avoids shared-mutable-atlas
+  coordination. `ensure_char(&mut atlas, &mut shared_font.borrow_mut(), …)`.
+- **Camera + fade + vertex/index/strip buffers** — sized to the window; reused
+  to render whichever tab is active.
 - **`blur` / `glow` / `glow_fg` / `scene_fg` + their bind groups** — they bundle
   pipelines *and* size-dependent textures (see `renderer/{blur,glow}.rs`), so
   initially they stay per-window (rebuilt, ~30ms). Splitting their pipelines out
   to `AppShared` is a possible later optimization, not required.
-- All **input/interaction state**: modifiers, mouse, selection, scroll anim,
-  blink, completions, command palette, hover-url, command history, perf log.
+- **Focus-scoped input**: `modifiers`, `mouse_x/y`, `held_button`, click/drag
+  tracking, `over_toolbar`, the command-palette overlay, blink phase. These
+  belong to the focused window and operate on its **active** tab.
+- **`tabs: Vec<TabState>` + `active: usize`** — the tab list and selection.
+
+### `TabState` — once per shell/PTY
+The shell session and the state that scrolls/selects/completes against it:
+- **PTY** (`master` fd + reader thread) and **`Terminal`** grid + scrollback.
+- **Scroll**: `scroll_y`, `alt_scroll_anim`, `wheel_pty_accum`,
+  `scroll_suppressed`, `last_wheel_at`, `last_reported_cell`.
+- **Selection**: `selection`, `selection_mode`, `press_cell`, `press_pixel`,
+  `last_click`, `click_count`, `hover_url`.
+- **Shell-derived**: `completions*`, `command_history`, per-tab title/cwd, the
+  submitted-command/histfile plumbing.
+- **Per-tab visual transients**: `cursor_anim`, `cursor_ghosts`, `prev_visible`
+  (grid snapshot for diffing) — a tab freezes its animation state when
+  backgrounded and resumes on activation.
+
+Only the **active tab** is rendered: `update_vertices` reads
+`window.tabs[window.active].terminal` and fills the window's buffers. Switching
+tabs repoints to another `TabState`, invalidates, and rebuilds vertices; the
+shared atlas means glyphs already rasterized by one tab are free for the others.
+
+**First-cut scope:** build the `WindowState`/`TabState` split and run with
+exactly one tab per window. The **tab-bar chrome, tab keybindings (new/close/
+next/prev tab), and tab drag/reorder are deferred** to a follow-up — but the
+data model above lands now so that follow-up is additive, not another rewrite.
 
 ## Known constraints / non-goals (first cut)
-- **Palette is process-global** (`palette::install`). All windows share one
-  color scheme initially. Per-window themes would require de-globalizing the
-  palette — a separate effort, explicitly out of scope.
+- **Palette is process-global** (`palette::install`). All windows *and tabs*
+  share one color scheme initially. Per-window/per-tab themes would require
+  de-globalizing the palette — a separate effort, explicitly out of scope.
 - **Uniform surface format** assumed across windows (same GPU/preference). True
   in practice; assert it when creating a window's surface.
-- **Command history / completions** are per-window (each shell is independent).
-  No cross-window history sharing.
+- **Command history / completions are per-tab** (each shell is independent). No
+  cross-tab or cross-window history sharing.
+- **Tab UI is deferred.** This effort builds the `WindowState`/`TabState` data
+  model and runs one tab per window. The tab bar, tab keybindings, and
+  drag/reorder are a follow-up that builds on the model — not in this scope.
+- **Background-tab resize is lazy.** On a window resize only the active tab's
+  grid reflows immediately; background tabs reflow on activation, so dragging a
+  window doesn't reflow N shells at once. (Single-tab today, so this only bites
+  once tabs ship — but the activation path must call `notify_pty_size`.)
 
 ## PTY event routing
 
 Today `CustomEvent::PtyInput(String)` / `PtyExit(i32)` implicitly target the one
-window. Each window gets its own PTY reader thread, so the events must carry the
-target:
+window. With tabs, the unit that owns a PTY is the **tab**, not the window, so
+route by a process-unique `TabId` rather than `WindowId`:
 
 ```rust
+struct TabId(u64);   // process-unique, minted per PTY
+
 enum CustomEvent {
-    PtyInput(WindowId, String),
-    PtyExit(WindowId, i32),
+    PtyInput(TabId, String),
+    PtyExit(TabId, i32),
 }
 ```
 
-Each reader thread clones the `EventLoopProxy` and tags sends with its window's
-`WindowId`. The loop routes to `windows.get_mut(&id)`.
+Each reader thread clones the `EventLoopProxy` and tags sends with its tab's
+`TabId`. The loop resolves `TabId → (WindowId, tab index)` via a small
+`HashMap<TabId, WindowId>` (plus the window's own tab list), then feeds the
+right `TabState` — whether or not that tab is currently foregrounded (a
+background tab still consumes shell output; it just doesn't trigger a redraw
+unless it's the active tab or signals a bell/title change). Routing by `TabId`
+from the start means Stage 1 doesn't bake in a window-only assumption it has to
+unwind later.
 
 ## Staged delivery
 
@@ -104,31 +158,49 @@ extraction is decoupled from the user-visible feature.
 - **Highest-risk, highest-value stage.** Ships nothing new; fully testable
   against current behavior. Do this first and verify with the app + tests.
 
-### Stage 1 — `WindowId`-keyed registry (no behavior change)
-- Replace the single `state` binding in `run()` with
-  `HashMap<WindowId, WindowState>` + the `AppShared`.
-- Add `WindowId` to `CustomEvent`; route `UserEvent` and `WindowEvent` by id.
-- Still exactly one window created at startup. Verify identical behavior.
+### Stage 1 — Split `State` into `WindowState` + `TabState` (no behavior change)
+- Carve the per-tab fields (PTY, terminal, scroll/selection/completions/
+  shell-derived/cursor-anim per the model above) into a `TabState`; the
+  remainder becomes `WindowState` with `tabs: Vec<TabState>` + `active: usize`.
+- All methods that touch terminal/scroll/selection move to `TabState` or take
+  `&mut self.active_tab()`; the render path reads the active tab.
+- Still one window, **one tab**. Pure restructure — verify identical behavior.
+  Doing this before the registry means the `TabId` routing in Stage 2 has a real
+  `TabState` to land on.
 
-### Stage 2 — Window factory
-- Extract `fn create_window(shared, elwt, cwd) -> WindowState` that builds the
-  `NSWindow`, surface, per-window buffers, atlas, and PTY (forking + spawning
-  its reader thread, tagging events with the new `WindowId`), reusing
-  `AppShared`. `run()` calls it once for the initial window.
+### Stage 2 — `WindowId`/`TabId` registry (no behavior change)
+- Replace the single binding in `run()` with `HashMap<WindowId, WindowState>` +
+  `AppShared`, plus a `HashMap<TabId, WindowId>` resolver.
+- Add `TabId` to `CustomEvent`; route `UserEvent` by `TabId` and `WindowEvent`
+  by `WindowId`. Mint a `TabId` per PTY reader thread.
+- Still one window / one tab at startup. Verify identical behavior.
 
-### Stage 3 — Wire Cmd-N to in-process spawn (the feature)
+### Stage 3 — Window + tab factories
+- `fn create_tab(shared, ...) -> (TabId, TabState)` — fork the PTY, spawn its
+  reader thread tagging events with the new `TabId`, build the `Terminal`.
+- `fn create_window(shared, elwt, cwd) -> WindowState` — build the `NSWindow`,
+  surface, per-window buffers + atlas, and an initial tab via `create_tab`,
+  reusing `AppShared`. `run()` calls it once for the initial window.
+
+### Stage 4 — Wire Cmd-N to in-process spawn (the feature)
 - Cmd-N handler and palette `NewWindow` call `create_window` via the
   `EventLoopWindowTarget` available in the event handler, instead of
   `spawn_new_window` (subprocess). Cascade off the spawning window's live
   position directly (drop the `YUTANI_CASCADE_FROM` env-var hack).
-- Lifecycle: `CloseRequested` removes the window from the map; quit when the map
-  empties. `PtyExit` closes just that window per `shell_exit_mode`.
+- Lifecycle: `CloseRequested` removes the window (and frees its tabs' `TabId`s)
+  from the maps; quit when no windows remain. `PtyExit` closes just that tab
+  (and the window if it was the last tab) per `shell_exit_mode`.
 
-### Stage 4 — Cleanup
+### Stage 5 — Cleanup
 - Remove the subprocess path (`spawn_new_window`, `cascade_position`,
   `CASCADE_ENV`, `WINDOW_CASCADE_STEP`).
 - Per-window title/cwd/theme polish; make sure `Cmd-W`/last-window semantics are
   right.
+
+### Follow-up (separate effort, not this scope) — tab UX
+With the model in place: tab-bar chrome + hit-testing, keybindings (new/close/
+next/prev tab), `create_tab` wired to "new tab in this window", tab reorder.
+Each is additive against the Stage 1 data model.
 
 ## Principal risks
 1. **`RefCell` borrow overlaps at runtime.** `ensure_char` borrows the shared
@@ -139,16 +211,25 @@ extraction is decoupled from the user-visible feature.
    reference the soon-to-be-shared fields. Mitigate by doing it as pure
    mechanical extraction with no feature change and leaning on the test suite +
    a manual run.
-3. **Per-window resize/scale changning the shared format** — assert format
+3. **Per-window resize/scale changing the shared format** — assert format
    stability; if a window lands on a different-format surface, fall back to its
    own pipeline set (unlikely; document the assumption).
 4. **wgpu 0.18 `Device` may not be `Clone`** — irrelevant, we share via `Rc`.
+5. **`WindowState`/`TabState` split touches the same ~5,000 lines as Stage 0.**
+   Two wide refactors back to back. Keep them as separate, individually-verified
+   stages (don't interleave) so a regression is bisectable to one of them.
+6. **Method placement churn.** Many `State` methods will move to `TabState` or
+   gain an `active_tab()` hop. Risk of accidentally changing behavior mid-move;
+   mitigate with the test suite and by moving, not rewriting.
 
 ## Rough effort
-- Stage 0: ~1 day (wide, careful).
-- Stages 1–2: ~1 day.
-- Stage 3: ~half day.
-- Stage 4 + polish + tests: ~half day.
+- Stage 0 (AppShared): ~1 day (wide, careful).
+- Stage 1 (WindowState/TabState split): ~1 day (second wide refactor).
+- Stage 2 (registry + TabId routing): ~half day.
+- Stage 3 (factories): ~half day.
+- Stage 4 (wire Cmd-N): ~half day.
+- Stage 5 (cleanup + tests): ~half day.
 
-Total ≈ 2–3 focused days. Stage 0 is the gate; if it lands clean, the rest is
-straightforward.
+Total ≈ 3–4 focused days for the multi-window feature with the tab-ready model.
+The tab UX follow-up is additional. Stages 0 and 1 are the gates; if they land
+clean, the rest is straightforward.
