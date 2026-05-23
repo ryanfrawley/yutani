@@ -4181,6 +4181,24 @@ impl State {
             Key::Named(NamedKey::ArrowRight) => self.command_palette.input.right(),
             Key::Named(NamedKey::Home) => self.command_palette.input.home(),
             Key::Named(NamedKey::End) => self.command_palette.input.end(),
+            // Ctrl-N / Ctrl-P mirror ArrowDown / ArrowUp so the selection can
+            // be moved without leaving the home row.
+            Key::Character(s)
+                if self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && s.eq_ignore_ascii_case("n") =>
+            {
+                self.command_palette.move_down()
+            }
+            Key::Character(s)
+                if self.modifiers.control_key()
+                    && !self.modifiers.super_key()
+                    && !self.modifiers.alt_key()
+                    && s.eq_ignore_ascii_case("p") =>
+            {
+                self.command_palette.move_up()
+            }
             _ => {
                 // Printable text: insert it, unless a Cmd/Ctrl/Alt chord is
                 // held (those aren't text input). winit hands us the composed
