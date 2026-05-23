@@ -278,7 +278,10 @@
     pointer-events: none;
     z-index: 1;
   }
-  .term-fx.glow { mix-blend-mode: screen; }
+  /* The halo carries its own alpha and composites with normal source-over,
+   * matching the renderer's premultiplied-over glow pass (screen blending
+   * saturated on bright text and washed the effect out). Scanlines multiply. */
+  .term-fx.glow { mix-blend-mode: normal; }
   .term-fx.scan { mix-blend-mode: multiply; }
   .term-body .cursor {
     display: inline-block;
@@ -1699,7 +1702,14 @@ function renderContrast() {
  * hue, and saturation behaviour track the shader closely enough to
  * author against.
  * ============================================================ */
-const GLOW_SCALE = 1;  // work resolution = CSS pixels (halo is blurry anyway)
+// Work resolution as a multiple of CSS pixels. Rendering at the device pixel
+// ratio (rather than 1) is what keeps the scanlines crisp: a CSS-resolution
+// canvas shown on a HiDPI screen gets bilinearly upscaled, smearing the 1px
+// scanline knockout into a dim grey gradient. At devicePixelRatio the canvas
+// maps 1:1 to device pixels, so the stripes stay sharp and `scanline_period`
+// (which the renderer measures in framebuffer pixels) lines up. Capped at 2 to
+// bound the per-pixel bright-pass cost on 3x displays.
+let GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
 
 let glowCanvas = null, scanCanvas = null, rasterCanvas = null, haloCanvas = null;
 function ensureGlowCanvases() {
@@ -1786,6 +1796,9 @@ function renderGlowOverlays() {
   scanCanvas.style.display = wantScan ? '' : 'none';
   if (!wantHalo && !wantScan) return;
 
+  // Track the live device pixel ratio (it changes when a window moves between
+  // displays) so the work resolution stays 1:1 with device pixels.
+  GLOW_SCALE = Math.min(window.devicePixelRatio || 1, 2);
   const sw = Math.round(W * GLOW_SCALE), sh = Math.round(H * GLOW_SCALE);
   for (const c of [rasterCanvas, haloCanvas, glowCanvas, scanCanvas]) {
     if (c.width !== sw) c.width = sw;
@@ -1832,27 +1845,30 @@ function renderGlowOverlays() {
         const dist = Math.sqrt(dr*dr + dg*dg + db*db);
         weight = Math.max(weight, 1 - smoothstep(fgLo, fgHi, dist));
       }
-      // Source colour · weight · intensity, on opaque black. Screen-blended,
-      // black is a no-op so only the glowing pixels brighten the scene.
-      const k = weight * g.intensity;
-      hp[i]   = Math.min(255, px[i]   * k);
-      hp[i+1] = Math.min(255, px[i+1] * k);
-      hp[i+2] = Math.min(255, px[i+2] * k);
-      hp[i+3] = 255;
+      // Source colour with alpha = weight·intensity. The renderer composites
+      // the halo premultiplied-over (One / OneMinusSrcAlpha), so we keep the
+      // glyph colour straight and carry the coverage in alpha; drawn with
+      // normal source-over below this reproduces dst = halo·a + scene·(1-a).
+      hp[i]   = px[i];
+      hp[i+1] = px[i+1];
+      hp[i+2] = px[i+2];
+      hp[i+3] = Math.min(255, weight * g.intensity * 255);
     }
     const hctx = haloCanvas.getContext('2d');
     hctx.putImageData(halo, 0, 0);
     // Bloom: Gaussian blur stands in for the Kawase chain; radius grows with
-    // iterations. Then bake in the halo scanline knockout (dark rows dimmed).
+    // iterations. The halo lives on a transparent canvas so it paints over the
+    // DOM text directly.
     const gctx = glowCanvas.getContext('2d');
     gctx.globalCompositeOperation = 'source-over';
     gctx.clearRect(0, 0, sw, sh);
-    gctx.fillStyle = '#000'; gctx.fillRect(0, 0, sw, sh);
     gctx.filter = `blur(${(1 + g.iterations * 2.5) * GLOW_SCALE}px)`;
     gctx.drawImage(haloCanvas, 0, 0);
     gctx.filter = 'none';
     if (g.scanlines && g.scanline_strength > 0) {
-      // Dark rows scaled by (1 - strength); multiply by a grey of that value.
+      // Halo scanline knockout: erase a fraction of the halo's alpha on dark
+      // rows (destination-out), matching the renderer's per-row scanline_factor
+      // applied at composite.
       applyScanlineKnockout(gctx, sw, sh, g);
     }
   }
@@ -1865,17 +1881,17 @@ function renderGlowOverlays() {
   body.append(glowCanvas, scanCanvas);
 }
 
-// Halo scanline knockout: multiply dark rows down by (1 - strength). Bright
-// rows (phase >= 0.5) stay. Period is in canvas pixels here (the renderer's
-// period is in framebuffer pixels — coarser in the preview, but same idea).
+// Halo scanline knockout: erase `strength` of the halo's alpha on dark rows
+// (phase < 0.5) via destination-out, leaving bright rows untouched — the
+// preview equivalent of the renderer's scanline_factor at composite. `period`
+// is in device pixels (canvas is rendered at devicePixelRatio), matching the
+// renderer's framebuffer-pixel period.
 function applyScanlineKnockout(ctx, w, h, g) {
-  const period = Math.max(g.scanline_period * GLOW_SCALE, 1);
-  ctx.globalCompositeOperation = 'multiply';
-  const dim = 1 - g.scanline_strength;
-  const gray = Math.round(dim * 255);
-  ctx.fillStyle = `rgb(${gray},${gray},${gray})`;
+  const period = Math.max(g.scanline_period, 1);
+  ctx.globalCompositeOperation = 'destination-out';
+  ctx.fillStyle = `rgba(0,0,0,${g.scanline_strength})`;
   for (let y = 0; y < h; y++) {
-    if ((((y % period) / period)) < 0.5) ctx.fillRect(0, y, w, 1);  // dark row
+    if (((y % period) / period) < 0.5) ctx.fillRect(0, y, w, 1);  // dark row
   }
   ctx.globalCompositeOperation = 'source-over';
 }
@@ -1888,7 +1904,7 @@ function applyScanlineKnockout(ctx, w, h, g) {
 function drawContentScanlines(ctx, scene, w, h, g, bgLin) {
   const out = ctx.createImageData(w, h);
   const op = out.data, px = scene.data;
-  const period = Math.max(g.scanline_period * GLOW_SCALE, 1);
+  const period = Math.max(g.scanline_period, 1);  // device px (canvas is at dpr)
   const strength = g.scanlines_content_strength;
   const cb = hexToRgb255(g.scanline_color_bright), cd = hexToRgb255(g.scanline_color_dark);
   const atten = g.scanlines_content_attenuation;
