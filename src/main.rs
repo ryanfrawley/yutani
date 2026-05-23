@@ -115,6 +115,29 @@ fn list_scheme_names() -> Vec<String> {
     names
 }
 
+/// Label for the synthetic theme-picker entry that reverts to the built-in
+/// defaults (i.e. clears `color_scheme`). It carries spaces and parens so it
+/// can't collide with a real `.toml` file stem; any on-disk scheme that somehow
+/// matched it is filtered out (see [`theme_picker_choices`]).
+const DEFAULT_THEME_LABEL: &str = "Default (built-in)";
+
+/// The theme picker's full candidate list: the synthetic "Default (built-in)"
+/// entry first, then the real schemes (with any collision against the label
+/// dropped so the entry is unambiguous).
+fn theme_picker_choices(scheme_names: Vec<String>) -> Vec<String> {
+    let mut v = Vec::with_capacity(scheme_names.len() + 1);
+    v.push(DEFAULT_THEME_LABEL.to_string());
+    v.extend(scheme_names.into_iter().filter(|n| n != DEFAULT_THEME_LABEL));
+    v
+}
+
+/// Resolve a theme-picker selection to the scheme name to install: `None` for
+/// the synthetic default entry (revert to built-in defaults), otherwise the
+/// label *is* the scheme name.
+fn scheme_for_pick(label: &str) -> Option<&str> {
+    (label != DEFAULT_THEME_LABEL).then_some(label)
+}
+
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
 /// truth so the `State::new` and `resize_buffers` paths can't drift.
@@ -4046,7 +4069,7 @@ impl State {
     fn palette_choices(&self, action: command_palette::PaletteAction) -> Vec<String> {
         use command_palette::PaletteAction as A;
         match action {
-            A::SetTheme => list_scheme_names(),
+            A::SetTheme => theme_picker_choices(list_scheme_names()),
             _ => Vec::new(),
         }
     }
@@ -4069,7 +4092,13 @@ impl State {
                 .set_window_title(arg.as_deref().unwrap_or("")),
             A::ClearTitle => self.terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
-            A::SetTheme => self.set_color_scheme(arg.as_deref().unwrap_or("")),
+            // The picker hands back a label; "Default (built-in)" maps to None
+            // (clear the scheme), every other label is a real scheme name. An
+            // empty/whitespace name also clears, via set_color_scheme.
+            A::SetTheme => {
+                let arg = arg.unwrap_or_default();
+                self.set_color_scheme(scheme_for_pick(&arg).unwrap_or(""));
+            }
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
@@ -8542,6 +8571,53 @@ mod tests {
         // installing the empty name (which would resolve to a missing file).
         let parsed = Config::parse_str("color_scheme = \"\"\n");
         assert!(parsed.color_scheme.is_none());
+    }
+
+    #[test]
+    fn theme_picker_prepends_default_entry() {
+        // The synthetic default entry leads, then the real schemes follow in
+        // the order given.
+        let choices = theme_picker_choices(vec![
+            "nostromo".to_string(),
+            "spacedust".to_string(),
+        ]);
+        assert_eq!(
+            choices,
+            vec![
+                DEFAULT_THEME_LABEL.to_string(),
+                "nostromo".to_string(),
+                "spacedust".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_picker_with_no_schemes_still_offers_default() {
+        // Even with an empty schemes directory, you can always revert to
+        // built-in defaults from the picker.
+        assert_eq!(theme_picker_choices(Vec::new()), vec![DEFAULT_THEME_LABEL.to_string()]);
+    }
+
+    #[test]
+    fn theme_picker_drops_scheme_colliding_with_default_label() {
+        // A real scheme that happens to match the synthetic label is filtered
+        // out so the default entry stays unambiguous (appears exactly once).
+        let choices = theme_picker_choices(vec![
+            DEFAULT_THEME_LABEL.to_string(),
+            "yutani".to_string(),
+        ]);
+        assert_eq!(
+            choices,
+            vec![DEFAULT_THEME_LABEL.to_string(), "yutani".to_string()]
+        );
+    }
+
+    #[test]
+    fn scheme_for_pick_maps_default_label_to_none() {
+        assert_eq!(scheme_for_pick(DEFAULT_THEME_LABEL), None);
+        assert_eq!(scheme_for_pick("yutani"), Some("yutani"));
+        // A real name is returned verbatim, including ones with spaces.
+        assert_eq!(scheme_for_pick("My Theme"), Some("My Theme"));
     }
 
     #[test]
