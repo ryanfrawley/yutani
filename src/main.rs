@@ -1927,11 +1927,15 @@ impl State {
         config: Config,
         dpi: u32,
     ) -> Self {
+        let _sw = std::time::Instant::now();
+        macro_rules! sub { ($l:expr) => { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } }
         let pt_size = config.font_size;
         let gpu = gpu::GpuContext::new(&window).await;
+        sub!("GpuContext::new (adapter+device)");
 
         // Font texture setup
         let atlas = font.build_atlas();
+        sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
             &gpu.device,
@@ -2138,6 +2142,7 @@ impl State {
         } else {
             None
         };
+        sub!("main render + wireframe pipelines");
 
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
@@ -2196,6 +2201,7 @@ impl State {
         );
         blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
         blur.iterations = config.blur_iterations.max(1);
+        sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
             &gpu.device,
@@ -2226,6 +2232,7 @@ impl State {
             gpu.config.height,
             &scene_fg.view,
         );
+        sub!("Glow::new x2 + scene_fg");
         let initial_overrides = palette::get().glow;
         for g in [&mut glow, &mut glow_fg] {
             apply_glow_config(g, &config, &initial_overrides);
@@ -2284,6 +2291,7 @@ impl State {
             &camera_bind_group_layout,
         );
         let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
+        sub!("ImagePipeline::new + Store");
 
         Self {
             window,
@@ -7115,6 +7123,8 @@ impl State {
 
 async fn run() {
     env_logger::init();
+    let t_start = std::time::Instant::now();
+    let lap = |label: &str| eprintln!("[startup] {:>7.1}ms  {label}", t_start.elapsed().as_secs_f64() * 1000.0);
     let event_loop = EventLoopBuilder::<app_window::CustomEvent>::with_user_event()
         .build()
         .unwrap();
@@ -7132,6 +7142,7 @@ async fn run() {
 
     // Fork before the window is created so we hold the master fd across setup.
     let pty = pty::fork_pty(fdm).expect("failed to fork pty");
+    lap("after fork_pty");
     std::thread::spawn(move || {
         let code = pty.run(|data| {
             let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
@@ -7162,17 +7173,21 @@ async fn run() {
         .with_blur(transparent)
         .build(&event_loop)
         .unwrap();
+    lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);
 
     let config = Config::load();
+    lap("after config load");
 
     let mut mono_prop = font_loader::system_fonts::FontPropertyBuilder::new()
         .monospace()
         .build();
     let mut mono_fonts = font_loader::system_fonts::query_specific(&mut mono_prop);
     mono_fonts.dedup();
+    lap("after query_specific (monospace)");
     let installed = font_loader::system_fonts::query_all();
+    lap("after query_all (installed)");
 
     // User override wins over the built-in preference list. Exact-name
     // match first (so "Iosevka" doesn't pick "Iosevka Term" when the user
@@ -7208,6 +7223,7 @@ async fn run() {
     });
     println!("primary font: {}", primary_name);
     let primary_data = load_family(&primary_name).expect("failed to load primary font");
+    lap("after load_family (primary)");
 
     // Install the color scheme before constructing State so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
@@ -7264,9 +7280,11 @@ async fn run() {
     // Pre-shape every candidate ligature sequence for each installed
     // variant. After this, the render loop only needs prefix-matching
     // against a small per-variant table — no rustybuzz on the hot path.
+    lap("after primary styled cuts loaded");
     for variant in font::FaceVariant::ALL {
         shaper.precompute(variant);
     }
+    lap("after shaper.precompute (4 variants)");
 
     // Fallback chain. Each entry is a list of candidate family substrings; the
     // first installed family wins. Order matters — earlier fallbacks shadow
@@ -7334,7 +7352,9 @@ async fn run() {
         }
     }
 
+    lap("after fallback chain loaded");
     let mut state = State::new(fdm, window, font, shaper, config, dpi).await;
+    lap("after State::new (GPU/atlas/pipelines)");
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     // Size the chrome band to the real native title bar now that the window
     // exists; the field was seeded with the renderer's reserve in State::new.
@@ -7359,6 +7379,7 @@ async fn run() {
     // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
     // at which point we fall back to the cwd.
     let mut manual_title: Option<String> = None;
+    let mut first_frame_done = false;
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
@@ -7488,6 +7509,10 @@ async fn run() {
                             let t0 = std::time::Instant::now();
                             let result = state.render(clear_color(theme));
                             let render_dur = t0.elapsed();
+                            if !first_frame_done {
+                                first_frame_done = true;
+                                eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                            }
                             match result {
                                 Ok((surface_wait, fast)) => {
                                     state.perf.note_render(render_dur, surface_wait, fast);
