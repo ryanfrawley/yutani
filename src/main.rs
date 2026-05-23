@@ -5902,9 +5902,18 @@ async fn run() {
         let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
     });
 
+    // Seed the window title from our own working directory — the shell the
+    // PTY just forked inherits it (no chdir in the child), so this matches
+    // what the first OSC 7 will report, avoiding a bare "Yutani" flash before
+    // the first prompt.
+    let initial_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned));
+    let initial_title = effective_title(None, initial_cwd.as_deref());
+
     let transparent = false; // needed because of a shadow bug
     let window = WindowBuilder::new()
-        .with_title("Yutani")
+        .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
@@ -6101,6 +6110,11 @@ async fn run() {
 
     let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
 
+    // Program-set window title (OSC 0/2). When `Some`, it wins over the
+    // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
+    // at which point we fall back to the cwd.
+    let mut manual_title: Option<String> = None;
+
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::UserEvent(n) => match n {
@@ -6112,10 +6126,20 @@ async fn run() {
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
-                    // A shell that emits OSC 7 just told us its cwd; reflect
-                    // it in the window title (abbreviating $HOME to `~`).
-                    if let Some(cwd) = state.terminal.take_cwd_update() {
-                        state.window.set_title(&title_for_cwd(&cwd));
+                    // Recompute the window title when either the program-set
+                    // title (OSC 0/2) or the shell's cwd (OSC 7) changed. A
+                    // manual title wins; otherwise we show the cwd ($HOME
+                    // collapsed to `~`). Both `take_*` calls must run to clear
+                    // their dirty flags even when the title doesn't change.
+                    let title_changed = state.terminal.take_title_update().map(|t| {
+                        manual_title = t;
+                    });
+                    let cwd_changed = state.terminal.take_cwd_update();
+                    if title_changed.is_some() || cwd_changed.is_some() {
+                        state.window.set_title(&effective_title(
+                            manual_title.as_deref(),
+                            state.terminal.cwd(),
+                        ));
                     }
                     // The shell may have reported its history file (OSC 2124):
                     // read + parse it and merge past commands into the in-memory
@@ -6332,9 +6356,8 @@ fn format_hex_rgb(c: [f32; 4]) -> String {
 /// Paint the native `NSWindow` background to match the terminal's bg color.
 /// The window is opaque, so during AppKit-driven frame changes — most visibly
 /// the title-bar double-click zoom animation — any area exposed before our
-/// Window title for an OSC 7 working directory: the basename prefixed with
-/// "Yutani — ", with `$HOME` collapsed to `~`. An empty/`/` path falls back
-/// to the bare app name.
+/// Window title for an OSC 7 working directory: just the path, with `$HOME`
+/// collapsed to `~`. An empty/`/` path falls back to the bare app name.
 fn title_for_cwd(cwd: &str) -> String {
     let display = if let Some(home) = std::env::var_os("HOME") {
         let home = home.to_string_lossy();
@@ -6351,7 +6374,16 @@ fn title_for_cwd(cwd: &str) -> String {
     if display.is_empty() {
         "Yutani".to_string()
     } else {
-        format!("Yutani — {display}")
+        display
+    }
+}
+
+/// Resolve the effective window title: a program-set title (OSC 0/2) wins;
+/// otherwise fall back to the cwd-derived title, then the bare app name.
+fn effective_title(manual: Option<&str>, cwd: Option<&str>) -> String {
+    match manual {
+        Some(t) => t.to_string(),
+        None => cwd.map(title_for_cwd).unwrap_or_else(|| "Yutani".to_string()),
     }
 }
 
@@ -6445,6 +6477,58 @@ mod tests {
 
     fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
         approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    #[test]
+    fn title_for_cwd_shows_bare_path_without_app_prefix() {
+        // A non-$HOME absolute path is shown verbatim, no "Yutani — " prefix.
+        assert_eq!(title_for_cwd("/var/log"), "/var/log");
+        // Empty path falls back to the bare app name.
+        assert_eq!(title_for_cwd(""), "Yutani");
+    }
+
+    #[test]
+    fn effective_title_prefers_manual_over_cwd() {
+        // A program-set title wins regardless of cwd.
+        assert_eq!(
+            effective_title(Some("vim"), Some("/var/log")),
+            "vim".to_string()
+        );
+        // No manual title: fall back to the cwd-derived title.
+        assert_eq!(
+            effective_title(None, Some("/var/log")),
+            "/var/log".to_string()
+        );
+        // Neither: bare app name.
+        assert_eq!(effective_title(None, None), "Yutani".to_string());
+    }
+
+    #[test]
+    fn effective_title_manual_wins_even_without_a_cwd() {
+        // A program-set title is used regardless of whether the shell has yet
+        // reported a cwd via OSC 7.
+        assert_eq!(effective_title(Some("htop"), None), "htop".to_string());
+    }
+
+    #[test]
+    fn effective_title_treats_a_present_empty_manual_as_set() {
+        // `Some("")` reaches `effective_title` only via the inner Option of
+        // `take_title_update`, but `set_window_title` maps an empty payload to
+        // `None` upstream, so the wiring passes `None` there. Pin the pure
+        // function's own contract: a present manual string (here empty) wins
+        // over the cwd and yields itself verbatim.
+        assert_eq!(effective_title(Some(""), Some("/var/log")), "".to_string());
+    }
+
+    #[test]
+    fn title_for_cwd_passes_through_non_home_absolute_paths() {
+        // Deep paths outside $HOME are shown verbatim (no truncation, no
+        // app-name prefix). Uses a path that cannot be a $HOME prefix on any
+        // realistic machine, so it doesn't depend on the ambient $HOME value.
+        assert_eq!(
+            title_for_cwd("/zzz-not-home/deep/nested/dir"),
+            "/zzz-not-home/deep/nested/dir"
+        );
     }
 
     #[test]

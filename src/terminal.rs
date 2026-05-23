@@ -652,6 +652,12 @@ pub struct Terminal {
     // the window or seed a new tab's cwd) without polling on every feed.
     cwd: Option<String>,
     cwd_dirty: bool,
+    // Manually-set window title from OSC 0/2. `None` means no program has set
+    // one (or it was cleared with an empty string), in which case the front end
+    // falls back to the cwd-derived title. `title_dirty` mirrors `cwd_dirty`:
+    // the front end pulls changes via `take_title_update()` after each feed.
+    title: Option<String>,
+    title_dirty: bool,
     parser: ansi::Parser,
     scrollback: VecDeque<Vec<Cell>>,
     scrollback_limit: usize,
@@ -838,6 +844,8 @@ impl Terminal {
             pending_response: Vec::new(),
             cwd: None,
             cwd_dirty: false,
+            title: None,
+            title_dirty: false,
             parser: ansi::Parser::new(),
             scrollback: VecDeque::new(),
             scrollback_limit,
@@ -2291,8 +2299,13 @@ impl Terminal {
             Err(_) => return,
         };
         match code {
-            // Title setting (0/1/2): ignore.
-            0 | 1 | 2 => {}
+            // Window-title setting. OSC 0 sets both the icon name and the
+            // window title; OSC 2 sets the window title. We map both to the
+            // window title (the only one we display). An empty payload clears
+            // the manual title, falling back to the cwd-derived one.
+            0 | 2 => self.set_window_title(rest),
+            // OSC 1 sets the icon name only, which we don't display: ignore.
+            1 => {}
             10 if rest == "?" => self.reply_color(10, self.default_fg_rgb),
             11 if rest == "?" => self.reply_color(11, self.default_bg_rgb),
             12 if rest == "?" => self.reply_color(12, self.default_cursor_rgb),
@@ -2367,6 +2380,41 @@ impl Terminal {
     #[allow(dead_code)]
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    /// Record (or clear) the manually-set window title from OSC 0/2. An empty
+    /// payload clears it so the front end falls back to the cwd-derived title.
+    /// Re-setting the same title doesn't mark it dirty, so a program that
+    /// re-emits its title every prompt is free for the front end.
+    fn set_window_title(&mut self, title: &str) {
+        let new = if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        };
+        if self.title != new {
+            self.title = new;
+            self.title_dirty = true;
+        }
+    }
+
+    /// Returns the manual window title once if it changed since the last call,
+    /// clearing the dirty flag. The outer `Option` is "did it change?"; the
+    /// inner `Option<String>` is the new title (`None` == cleared, so the
+    /// front end should fall back to the cwd-derived title).
+    pub fn take_title_update(&mut self) -> Option<Option<String>> {
+        if self.title_dirty {
+            self.title_dirty = false;
+            Some(self.title.clone())
+        } else {
+            None
+        }
+    }
+
+    /// The manually-set window title (OSC 0/2), if one is currently active.
+    #[allow(dead_code)]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// The shell's current interactive input line, if the shell is reporting
@@ -6174,6 +6222,156 @@ mod tests {
         let mut t = Terminal::new(5, 3, 100);
         t.feed("\x1b]0;hello\x07");
         assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn osc_2_sets_window_title() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;my title\x07");
+        assert_eq!(t.title(), Some("my title"));
+        assert_eq!(t.take_title_update(), Some(Some("my title".to_string())));
+        // Drained: no further update until it changes again.
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_0_sets_window_title_with_st_terminator() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]0;via osc0\x1b\\");
+        assert_eq!(t.title(), Some("via osc0"));
+        assert_eq!(t.take_title_update(), Some(Some("via osc0".to_string())));
+    }
+
+    #[test]
+    fn osc_1_icon_title_is_ignored() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]1;icon only\x07");
+        assert_eq!(t.title(), None);
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_empty_title_clears_back_to_none() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;set\x07");
+        assert_eq!(t.take_title_update(), Some(Some("set".to_string())));
+        // Empty payload clears the manual title so the front end falls back.
+        t.feed("\x1b]2;\x07");
+        assert_eq!(t.title(), None);
+        assert_eq!(t.take_title_update(), Some(None));
+    }
+
+    #[test]
+    fn osc_same_title_repeated_is_not_dirty() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;same\x07");
+        assert_eq!(t.take_title_update(), Some(Some("same".to_string())));
+        // Re-emitting the identical title doesn't re-flag dirty.
+        t.feed("\x1b]2;same\x07");
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_0_sets_window_title_with_bel_terminator() {
+        // OSC 0 + BEL is the most common form programs emit; the ST-terminated
+        // OSC 0 case is covered separately, so pin the BEL path too.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]0;via osc0\x07");
+        assert_eq!(t.title(), Some("via osc0"));
+        assert_eq!(t.take_title_update(), Some(Some("via osc0".to_string())));
+    }
+
+    #[test]
+    fn osc_sequential_title_changes_each_mark_dirty() {
+        // Distinct successive titles each produce their own pending update.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;first\x07");
+        assert_eq!(t.take_title_update(), Some(Some("first".to_string())));
+        t.feed("\x1b]2;second\x07");
+        assert_eq!(t.title(), Some("second"));
+        assert_eq!(t.take_title_update(), Some(Some("second".to_string())));
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_two_changes_before_drain_coalesce_to_latest() {
+        // The front end only drains once per feed; two changes between drains
+        // collapse to the most recent value, not the intermediate one.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;old\x07");
+        t.feed("\x1b]2;new\x07");
+        assert_eq!(t.take_title_update(), Some(Some("new".to_string())));
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_clear_then_set_again_round_trips() {
+        // Manual title -> cleared (fall back to cwd) -> set again, with each
+        // transition surfacing exactly one update.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;editing\x07");
+        assert_eq!(t.take_title_update(), Some(Some("editing".to_string())));
+        t.feed("\x1b]2;\x07"); // program exits, clears its title
+        assert_eq!(t.title(), None);
+        assert_eq!(t.take_title_update(), Some(None));
+        t.feed("\x1b]2;again\x07"); // a new program sets one
+        assert_eq!(t.title(), Some("again"));
+        assert_eq!(t.take_title_update(), Some(Some("again".to_string())));
+    }
+
+    #[test]
+    fn osc_empty_title_on_fresh_terminal_stays_clean() {
+        // Clearing a title that was never set is a no-op: still None, not dirty.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;\x07");
+        assert_eq!(t.title(), None);
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_repeated_clear_is_not_dirty() {
+        // After a clear is drained, a second empty payload doesn't re-flag dirty.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;set\x07");
+        assert_eq!(t.take_title_update(), Some(Some("set".to_string())));
+        t.feed("\x1b]2;\x07");
+        assert_eq!(t.take_title_update(), Some(None));
+        t.feed("\x1b]2;\x07");
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn osc_title_payload_preserves_embedded_semicolons() {
+        // Only the first ';' splits the OSC code from its payload; the rest of
+        // the title (which legitimately contains ';') is kept verbatim.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;vim: a; b; c\x07");
+        assert_eq!(t.title(), Some("vim: a; b; c"));
+    }
+
+    #[test]
+    fn osc_0_and_2_share_the_same_title_slot() {
+        // OSC 0 (icon+title) and OSC 2 (title) both target the one displayed
+        // title, so a later OSC 0 overrides an earlier OSC 2 with no extra
+        // dirty churn for the no-op case.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;from-2\x07");
+        assert_eq!(t.take_title_update(), Some(Some("from-2".to_string())));
+        t.feed("\x1b]0;from-0\x07");
+        assert_eq!(t.title(), Some("from-0"));
+        assert_eq!(t.take_title_update(), Some(Some("from-0".to_string())));
+    }
+
+    #[test]
+    fn osc_1_does_not_disturb_an_existing_title() {
+        // An OSC 1 (icon name) arriving after a real title leaves the title and
+        // its (already drained) dirty state untouched.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b]2;real title\x07");
+        assert_eq!(t.take_title_update(), Some(Some("real title".to_string())));
+        t.feed("\x1b]1;icon\x07");
+        assert_eq!(t.title(), Some("real title"));
+        assert_eq!(t.take_title_update(), None);
     }
 
     #[test]
