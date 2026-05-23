@@ -2386,7 +2386,11 @@ impl Terminal {
     /// payload clears it so the front end falls back to the cwd-derived title.
     /// Re-setting the same title doesn't mark it dirty, so a program that
     /// re-emits its title every prompt is free for the front end.
-    fn set_window_title(&mut self, title: &str) {
+    ///
+    /// Also called by the command palette's "Set title" action, so a manual
+    /// title set from the palette flows through exactly the same path as one a
+    /// program emits via OSC 0/2.
+    pub fn set_window_title(&mut self, title: &str) {
         let new = if title.is_empty() {
             None
         } else {
