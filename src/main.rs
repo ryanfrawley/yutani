@@ -2,6 +2,7 @@ mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
+mod search;
 mod font;
 mod font_loader;
 mod renderer;
@@ -1091,6 +1092,10 @@ struct State {
     /// its own search/argument text field and selection state; see
     /// `command_palette.rs`.
     command_palette: command_palette::CommandPalette,
+    /// The find-in-scrollback overlay (Cmd-F). While `open`, it owns the
+    /// keyboard like the command palette; holds the query field and the
+    /// list of matches across the buffer. See `search.rs`.
+    search: search::Search,
     /// Past command lines for history-based completion suggestions, most-recent-
     /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
     /// 2124) and grown with this session's submitted commands (captured at OSC
@@ -2243,6 +2248,7 @@ impl State {
             completion_scroll: 0,
             completion_dismissed: false,
             command_palette: command_palette::CommandPalette::default(),
+            search: search::Search::default(),
             command_history: Vec::new(),
             selection: None,
             selection_mode: SelectionMode::Cell,
@@ -3224,6 +3230,71 @@ impl State {
             }
         }
 
+        // 1b. Find-in-scrollback match highlights. Translucent rounded quads
+        //     over each matched run; the current (stepped-to) match gets a
+        //     stronger fill drawn last so it reads as emphasised. Mapped from a
+        //     match's absolute line to a visible row the same way the selection
+        //     strip is, and only drawn for matches inside the phantom range.
+        if self.search.open && !self.search.matches.is_empty() {
+            let pal = palette::get();
+            let strip_pad = (line_height - bg_h) * 0.5;
+            let yellow = pal.ansi[3];
+            let hl_radius = (cell_w * 0.18).min(line_height * 0.25);
+            let all_a = 0.32_f32;
+            let all_color = [
+                yellow[0] * all_a,
+                yellow[1] * all_a,
+                yellow[2] * all_a,
+                all_a,
+            ];
+            let cur_a = 0.62_f32;
+            let cur_color = [
+                yellow[0] * cur_a,
+                yellow[1] * cur_a,
+                yellow[2] * cur_a,
+                cur_a,
+            ];
+            let top_abs = self.terminal.visual_to_abs_line(0);
+            let emit_match = |vertices: &mut Vec<renderer::vertex::Vertex>,
+                              indices: &mut Vec<u32>,
+                              m: &search::Match,
+                              color: [f32; 4]| {
+                let r = m.line - top_abs;
+                if r < r_lo || r >= r_hi {
+                    return;
+                }
+                let from = m.start_col.min(cols.saturating_sub(1));
+                let to = m.end_col.min(cols.saturating_sub(1));
+                if from > to {
+                    return;
+                }
+                let sx = col_x(from);
+                let sw = (to - from + 1) as f32 * cell_w;
+                let sy = row_y(r) - bg_h - descender - strip_pad + row_scroll(r);
+                push_quad(
+                    vertices,
+                    indices,
+                    sx,
+                    sy,
+                    sw,
+                    line_height,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    color,
+                    [hl_radius; 4],
+                );
+            };
+            for (i, m) in self.search.matches.iter().enumerate() {
+                if i == self.search.current {
+                    continue; // drawn last, on top
+                }
+                emit_match(&mut vertices, &mut indices, m, all_color);
+            }
+            if let Some(cur) = self.search.current_match() {
+                emit_match(&mut vertices, &mut indices, &cur, cur_color);
+            }
+        }
+
         // 1c. OSC 133 prompt-status gutter. A short rounded vertical bar in
         //     the left window padding at each prompt's row, colored by the
         //     command's exit status — green for success, red for failure, and
@@ -3766,6 +3837,142 @@ impl State {
             }
         }
 
+        // Find-in-scrollback overlay (Cmd-F). Same centered, palette-styled box:
+        // a dim backdrop, a rounded box, the "Find:" input line with a caret,
+        // and — once there's a query — a separator and a result counter
+        // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
+        if self.search.open {
+            let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
+            let screen_w = self.gpu.config.width as f32;
+            let screen_h = self.gpu.config.height as f32;
+
+            // Dim the terminal behind the box.
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                0.0,
+                0.0,
+                screen_w,
+                screen_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                premul([0.0, 0.0, 0.0], 0.45),
+                [0.0; 4],
+            );
+
+            let box_w = (screen_w * 0.6)
+                .clamp(cell_w * 24.0, cell_w * 72.0)
+                .min(screen_w - WINDOW_PADDING * 2.0);
+            let box_x = ((screen_w - box_w) * 0.5).round();
+            let box_y = (screen_h * 0.12).round();
+            let pad_v = (line_height * 0.45).round();
+            let row_h = line_height;
+            let sep_h = 1.0_f32;
+
+            let query = self.search.input.value.clone();
+            let status = if query.is_empty() {
+                String::new()
+            } else if self.search.matches.is_empty() {
+                "No results".to_string()
+            } else {
+                format!("{} / {}", self.search.current + 1, self.search.matches.len())
+            };
+            let has_status = !status.is_empty();
+
+            let total_h = pad_v * 2.0 + row_h + if has_status { sep_h + row_h } else { 0.0 };
+
+            let bg = pal.background;
+            let box_color = premul([bg[0] * 0.55, bg[1] * 0.55, bg[2] * 0.55], 0.96);
+            let fgc = pal.foreground;
+            let text_color = pal.foreground;
+            let caret_color = premul([fgc[0], fgc[1], fgc[2]], 0.9);
+            let radius = 8.0_f32;
+
+            push_quad(
+                &mut vertices,
+                &mut indices,
+                box_x,
+                box_y,
+                box_w,
+                total_h,
+                [bg_u, bg_v],
+                [bg_u, bg_v],
+                box_color,
+                [radius; 4],
+            );
+
+            let text_x = box_x + cell_w;
+            let max_text_x = box_x + box_w - cell_w;
+
+            // Input line: "Find: " prefix then the query.
+            let prefix = "Find: ";
+            let input_top = box_y + pad_v;
+            let input_text = format!("{prefix}{query}");
+            let baseline = input_top + bg_h + descender + strip_pad;
+            emit_text_run(
+                atlas,
+                &mut vertices,
+                &mut indices,
+                text_x,
+                baseline,
+                &input_text,
+                text_color,
+                atlas_w,
+                atlas_h,
+                cell_w,
+                max_text_x,
+            );
+
+            // Caret after the prefix + chars left of the cursor.
+            let caret_col = prefix.chars().count() + self.search.input.cursor_col();
+            let caret_x = text_x + caret_col as f32 * cell_w;
+            if caret_x + 2.0 <= max_text_x {
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    caret_x,
+                    input_top + strip_pad,
+                    2.0,
+                    bg_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    caret_color,
+                    [0.0; 4],
+                );
+            }
+
+            if has_status {
+                // Separator between the input and the counter.
+                push_quad(
+                    &mut vertices,
+                    &mut indices,
+                    box_x,
+                    input_top + row_h,
+                    box_w,
+                    sep_h,
+                    [bg_u, bg_v],
+                    [bg_u, bg_v],
+                    premul([fgc[0], fgc[1], fgc[2]], 0.18),
+                    [0.0; 4],
+                );
+                let status_top = input_top + row_h + sep_h;
+                let baseline = status_top + bg_h + descender + strip_pad;
+                emit_text_run(
+                    atlas,
+                    &mut vertices,
+                    &mut indices,
+                    text_x,
+                    baseline,
+                    &status,
+                    premul([fgc[0], fgc[1], fgc[2]], 0.7),
+                    atlas_w,
+                    atlas_h,
+                    cell_w,
+                    max_text_x,
+                );
+            }
+        }
+
         // Refresh the visible-grid snapshot with the current frame's cells
         // so the next retarget can spot what just got cleared. Keyed by
         // viewport so a resize / scrollback / alt-screen flip flushes the
@@ -3994,6 +4201,119 @@ impl State {
         }
         self.invalidate();
         true
+    }
+
+    /// Drive the find overlay from a key press while it's open. Always consumes
+    /// the event (returns `true`): like the palette, the overlay owns the
+    /// keyboard so nothing reaches the PTY. Cmd-F (open/close) is handled by the
+    /// caller before this. Enter / Down steps to the next match, Shift-Enter /
+    /// Up to the previous; editing the query re-runs the search live.
+    fn search_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.search.close();
+                self.terminal.scroll_to_bottom();
+                self.scroll_y = 0.0;
+            }
+            Key::Named(NamedKey::Enter) => {
+                if self.modifiers.shift_key() {
+                    self.search.prev();
+                } else {
+                    self.search.next();
+                }
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.search.next();
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.search.prev();
+                self.focus_current_match();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.search.backspace();
+                self.run_search();
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.search.input.delete();
+                self.run_search();
+            }
+            Key::Named(NamedKey::ArrowLeft) => self.search.input.left(),
+            Key::Named(NamedKey::ArrowRight) => self.search.input.right(),
+            Key::Named(NamedKey::Home) => self.search.input.home(),
+            Key::Named(NamedKey::End) => self.search.input.end(),
+            _ => {
+                // Printable text drives the query, unless a Cmd/Ctrl/Alt chord
+                // is held (those aren't text input). winit hands us composed
+                // text in `event.text`.
+                let plain = !self.modifiers.super_key()
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key();
+                if plain {
+                    if let Some(text) = &event.text {
+                        for c in text.chars() {
+                            if !c.is_control() {
+                                self.search.type_char(c);
+                            }
+                        }
+                    }
+                    self.run_search();
+                }
+            }
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Re-scan the whole buffer (scrollback + live grid) for the current query
+    /// and refresh the match list, then jump to the current match. An empty
+    /// query clears the matches. Called on every query edit.
+    fn run_search(&mut self) {
+        let query = self.search.input.value.clone();
+        if query.is_empty() {
+            self.search.set_matches(Vec::new());
+            self.invalidate();
+            return;
+        }
+        let case_sensitive = search::smart_case(&query);
+        let total = self.terminal.scrollback_len() + self.terminal.rows;
+        let mut matches = Vec::new();
+        for abs in 0..total as isize {
+            let Some(cells) = self.terminal.line_at(abs) else {
+                continue;
+            };
+            // One char per column. Drop trailing blanks so padding spaces don't
+            // bloat the scan; leading offsets stay intact so columns line up.
+            let last = cells
+                .iter()
+                .rposition(|c| c.ch != ' ')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if last == 0 {
+                continue;
+            }
+            let line: String = cells[..last].iter().map(|c| c.ch).collect();
+            for (start, end) in search::match_line(&line, &query, case_sensitive) {
+                matches.push(search::Match {
+                    line: abs,
+                    start_col: start,
+                    end_col: end,
+                });
+            }
+        }
+        self.search.set_matches(matches);
+        self.focus_current_match();
+    }
+
+    /// Scroll the viewport so the current match is visible, then redraw.
+    fn focus_current_match(&mut self) {
+        if let Some(m) = self.search.current_match() {
+            self.terminal.scroll_line_into_view(m.line);
+            self.scroll_y = 0.0;
+        }
+        self.invalidate();
     }
 
     /// Execute a command chosen in the palette. Every arm reuses behaviour that
@@ -5740,6 +6060,31 @@ impl State {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
+                    // Cmd-F toggles the find-in-scrollback overlay. Checked
+                    // first (and gated on !shift so it never fires for a
+                    // Cmd-Shift chord) so it both opens the overlay and, while
+                    // open, closes it before the overlay's key handler below
+                    // swallows the keystroke. Closing returns to the bottom.
+                    if self.modifiers.super_key()
+                        && !self.modifiers.shift_key()
+                        && !self.command_palette.open
+                    {
+                        if let winit::keyboard::Key::Character(s) = &event.logical_key {
+                            if s.eq_ignore_ascii_case("f") {
+                                self.search.toggle();
+                                if !self.search.open {
+                                    self.terminal.scroll_to_bottom();
+                                    self.scroll_y = 0.0;
+                                }
+                                self.invalidate();
+                                return true;
+                            }
+                        }
+                    }
+                    // While the find overlay is open it owns the keyboard.
+                    if self.search.open {
+                        return self.search_key(&event);
+                    }
                     // Cmd-Shift-P toggles the command palette. Checked before
                     // everything else so it both opens the palette and, while
                     // it's open, closes it (the palette's own key handler below
