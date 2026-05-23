@@ -622,7 +622,7 @@
       <div class="terminal" id="term">
         <div class="titlebar">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-          <span class="title">~/projects/yutani</span>
+          <span class="title">tmux: yutani — ~/projects/yutani</span>
         </div>
         <div class="term-body" id="term-body"></div>
       </div>
@@ -1552,30 +1552,114 @@ function buildGlowControls() {
 /* ============================================================
  * Pane 2: preview a few terminal frames using the live palette.
  * ============================================================ */
-const PREVIEW_LINES = [
-  // [ {fg, bg?, bold?, text} | string, ... ]
-  [{fg:'green', bold:true, text:'➜  '}, {fg:'cyan', bold:true, text:'~/projects/yutani'}, ' ', {fg:'magenta', text:'git:('}, {fg:'red', text:'main'}, {fg:'magenta', text:') '}, {fg:'yellow', text:'✗'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'ls --color'}],
-  [
-    {fg:'blue', bold:true, text:'src/'}, '       ',
-    {fg:'blue', bold:true, text:'target/'}, '    ',
-    {fg:'foreground', text:'Cargo.toml '},
-    {fg:'green', text:'README.md '},
-    {fg:'cyan', text:'scheme.toml'},
-  ],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'cat src/palette.rs | head'}],
-  [{fg:'magenta', text:'pub '}, {fg:'magenta', text:'fn '}, {fg:'blue', bold:true, text:'parse_toml'}, {fg:'foreground', text:'(src: '}, {fg:'cyan', text:'&str'}, {fg:'foreground', text:') -> '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:' {'}],
-  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'let mut '}, {fg:'foreground', text:'p = '}, {fg:'cyan', text:'Palette'}, {fg:'foreground', text:'::'}, {fg:'blue', text:'defaults'}, {fg:'foreground', text:'();'}],
-  [{fg:'foreground', text:'    '}, {fg:'green', text:'// strip comments, split key = value'}],
-  [{fg:'foreground', text:'    '}, {fg:'magenta', text:'for'}, {fg:'foreground', text:' (lineno, raw) '}, {fg:'magenta', text:'in'}, {fg:'foreground', text:' src.'}, {fg:'blue', text:'lines'}, {fg:'foreground', text:'().'}, {fg:'blue', text:'enumerate'}, {fg:'foreground', text:'() {'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'git status'}],
-  [{fg:'foreground', text:'On branch '}, {fg:'green', text:'main'}],
-  [{sel:true, fg:'red', text:'  modified:   '}, {sel:true, fg:'foreground', text:'src/palette.rs'}],
-  [{sel:true, fg:'green', text:'  new file:   '}, {sel:true, fg:'foreground', text:'tools/scheme-builder/index.html'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'echo '}, {fg:'yellow', text:'"hello, world"'}],
-  [{fg:'yellow', text:'hello, world'}],
-  [{fg:'foreground', text:'$ '}, {fg:'foreground', text:'vim ', cursor:true}],
-];
+/* ============================================================
+ * Preview content — a simulated tmux session with a 3-pane split:
+ * a tall left pane (vim editing a Rust file), a top-right pane
+ * (`cargo test` output), and a bottom-right pane (`git log`), with a
+ * tmux status bar across the bottom.
+ *
+ * Each segment is `{fg, bg?, bold?, text, sel?, cursor?}` (or a bare
+ * string for inert filler). The panes are composed into flat,
+ * column-aligned rows so the single-line-list renderers (DOM +
+ * glow canvas) need no structural change — just per-segment `bg`
+ * support. Layout is built from character columns, which line up
+ * because the preview font is monospace (bold has the same advance).
+ * ============================================================ */
+const PV_LW = 44;          // left (vim) pane width in columns
+const PV_RW = 39;          // right pane width
+const PV_SPLIT = 7;        // row where the right column splits top/bottom
+
+// Segment + row helpers. `S` makes a styled segment; `seglen`/`pad`
+// measure and right-fill a row to an exact column width (with an
+// optional background fill for status bars).
+const S = (text, fg, extra) => ({ text, fg, ...(extra || {}) });
+const seglen = segs => segs.reduce((n, s) =>
+  n + (typeof s === 'string' ? s.length : (s.text || '').length), 0);
+function pad(segs, w, fill) {
+  const n = w - seglen(segs);
+  if (n <= 0) return segs;
+  const sp = ' '.repeat(n);
+  return [...segs, fill ? { text: sp, ...fill } : sp];
+}
+
+function buildPreviewLines() {
+  const fg = 'foreground';
+  const gut = (n, cur) => S((''+n).padStart(3) + '  ', cur ? 'yellow' : 'black', { bold: true });
+
+  // --- Left pane: vim editing src/palette.rs (project_cell) ----------
+  const left = [
+    [gut(31), S('use', 'magenta'), S(' crate::cap::', fg), S('ColorCap', 'cyan'), S('::', fg), S('Mono', 'cyan'), S(';', fg)],
+    [gut(32)],
+    [gut(33), S('/// Project a cell down to the cap.', 'green')],
+    [gut(34), S('pub fn ', 'magenta'), S('project_cell', 'blue', { bold: true }), S('(', fg)],
+    [gut(35), S('    &self', 'magenta'), S(',', fg)],
+    [gut(36), S('    fg', fg), S(': ', fg), S('Rgba', 'cyan'), S(',', fg)],
+    [gut(37), S('    bg', fg), S(': ', fg), S('Rgba', 'cyan'), S(',', fg)],
+    [gut(38), S(') -> (', fg), S('Rgba', 'cyan'), S(', ', fg), S('Rgba', 'cyan'), S(') {', fg)],
+    [gut(39), S('    if ', 'magenta'), S('self', 'magenta'), S('.cap == ', fg), S('Mono', 'cyan', { sel: true }), S(' {', fg)],
+    [gut(40, true), S('        ', fg, { cursor: true }), S('if ', 'magenta'), S('bg', fg), S('.', fg), S('distinct', 'blue'), S('() {', fg)],
+    [gut(41), S('            (', fg), S('self', 'magenta'), S('.bg, ', fg), S('self', 'magenta'), S('.fg)', fg)],
+    [gut(42), S('        } ', fg), S('else', 'magenta'), S(' {', fg)],
+    [gut(43), S('            (', fg), S('self', 'magenta'), S('.fg, ', fg), S('bg', fg), S('.', fg), S('snap', 'blue'), S('())', fg)],
+    [gut(44), S('        }', fg)],
+    [gut(45), S('    } ', fg), S('else', 'magenta'), S(' {', fg)],
+  ];
+  // vim status line (last left row): mode + file, right-aligned info.
+  const vimL = [S(' NORMAL ', 'background', { bg: 'green', bold: true }), S(' src/palette.rs', 'background', { bg: 'blue' })];
+  const vimR = ' rust  40:13  68% ';
+  const vimFill = PV_LW - seglen(vimL) - vimR.length;
+  left.push([...vimL, S(' '.repeat(Math.max(0, vimFill)) + vimR, 'background', { bg: 'blue' })]);
+
+  // --- Right top pane: `cargo test` ----------------------------------
+  const top = [
+    [S('$ ', fg), S('cargo test', fg)],
+    [S('   ', fg), S('Compiling', 'green', { bold: true }), S(' yutani v0.3.1', fg)],
+    [S('    ', fg), S('Finished', 'green', { bold: true }), S(' test target(s)', fg)],
+    [S('     ', fg), S('Running', 'green', { bold: true }), S(' unittests', fg)],
+    [S('running 6 tests', fg)],
+    [S('test mono_flip ... ', fg), S('ok', 'green')],
+    [S('test cap_8 ...    ', fg), S('FAILED', 'red', { bold: true })],
+  ];
+
+  // --- Right bottom pane: `git log --oneline --graph` ----------------
+  const hash = h => S(h, 'yellow');
+  const bottom = [
+    [S('$ ', fg), S('git log --graph', fg)],
+    [S('* ', 'yellow'), hash('a1b9f2c'), S(' (', fg), S('HEAD', 'cyan', { bold: true }), S(' -> ', fg), S('main', 'green', { bold: true }), S(') mono', fg)],
+    [S('* ', 'yellow'), hash('7c3e0d1'), S(' cap-aware strip', fg)],
+    [S('* ', 'yellow'), hash('4f8a2e9'), S(' (', fg), S('origin/main', 'red', { bold: true }), S(') glow', fg)],
+    [S('* ', 'yellow'), hash('2d6b1c4'), S(' scanline pass', fg)],
+    [S('* ', 'yellow'), hash('90af3e2'), S(' docs: readme', fg)],
+    [S('$ ', fg)],
+    [],
+  ];
+
+  // --- Compose: left | divider | right, then the tmux status bar -----
+  const vbar = S('│', 'green', { bold: true });
+  const jbar = S('├', 'green', { bold: true });
+  const hbar = S('─'.repeat(PV_RW), 'black', { bold: true });
+  const rows = [];
+  for (let i = 0; i < left.length; i++) {
+    const L = pad(left[i], PV_LW);
+    if (i === PV_SPLIT) { rows.push([...L, jbar, hbar]); continue; }
+    const r = i < PV_SPLIT ? top[i] : bottom[i - PV_SPLIT - 1];
+    rows.push([...L, vbar, ...pad(r || [], PV_RW)]);
+  }
+
+  // tmux status bar across the full width (green bar, current window inverted).
+  const barBg = { bg: 'green' };
+  const statusL = [
+    S(' yutani ', 'background', { bg: 'green', bold: true }),
+    S(' 1:vim* ', 'green', { bg: 'background', bold: true }),
+    S(' 2:test  3:git ', 'background', barBg),
+  ];
+  const statusR = ' "mbp"  14:32  23-May-26 ';
+  const barFill = PV_LW + 1 + PV_RW - seglen(statusL) - statusR.length;
+  rows.push([...statusL, S(' '.repeat(Math.max(0, barFill)) + statusR, 'background', { bg: 'green', bold: true })]);
+
+  return rows;
+}
+const PREVIEW_LINES = buildPreviewLines();
 
 function resolveFg(name, bold) {
   // Window colors render directly — they're not "cell" colors and skip the
@@ -1596,6 +1680,37 @@ function resolveFg(name, bold) {
   // project(). Skipping the lookup entirely matches what yutani renders.
   const raw = (bold && brightEnabled()) ? pair[1] : pair[0];
   return projectHex(raw);
+}
+
+// Resolve a cell background color (window names direct, ANSI projected).
+function resolveBg(name, bold) {
+  if (name === 'foreground') return state.foreground;
+  if (name === 'background') return state.background;
+  if (name === 'cursor') return state.cursor;
+  if (name === 'selection') return state.selection;
+  const pair = state.ansi[name];
+  if (!pair) return state.background;
+  const raw = (bold && brightEnabled()) ? pair[1] : pair[0];
+  return projectHex(raw);
+}
+
+// Resolve a segment to the {fg, bg} actually drawn, shared by the DOM and
+// glow-canvas renderers. Selection is chrome (not cap-projected). An explicit
+// cell background invokes palette.rs project_cell: in mono a cell that carries
+// a distinct background flips to fg-ink block / bg-color glyph; a background
+// equal to the window background reads as blank (no flip); otherwise both
+// colors project independently. No background → glyph only (mono forces ink).
+function resolveSeg(s) {
+  if (s.sel) return { fg: state.selection_fg || resolveFg(s.fg || 'foreground', s.bold), bg: state.selection };
+  if (s.bg) {
+    const bgc = resolveBg(s.bg, s.bold);
+    if (state.max_colors === 'mono') {
+      if (bgc.toLowerCase() === state.background.toLowerCase()) return { fg: state.foreground, bg: null };
+      return { fg: state.background, bg: state.foreground };
+    }
+    return { fg: resolveFg(s.fg || 'foreground', s.bold), bg: bgc };
+  }
+  return { fg: resolveFg(s.fg || 'foreground', s.bold), bg: null };
 }
 
 function renderPreview() {
@@ -1622,12 +1737,10 @@ function renderPreview() {
       }
       const span = document.createElement('span');
       span.className = 'seg' + (s.sel ? ' sel' : '');
-      const fg = resolveFg(s.fg || 'foreground', s.bold);
+      const { fg, bg } = resolveSeg(s);
       span.style.color = fg;
       if (s.bold) span.style.fontWeight = '600';
-      if (s.sel) {
-        span.style.background = state.selection;
-      }
+      if (bg) span.style.background = bg;
       span.textContent = s.text || '';
       line.append(span);
       if (s.cursor) {
@@ -1831,8 +1944,9 @@ function rasterizeScene(ctx, scale, w, h) {
       const text = s.text || '';
       ctx.font = fontFor(s.bold);
       const tw = ctx.measureText(text).width;
-      if (s.sel) { ctx.fillStyle = state.selection; ctx.fillRect(x, y, tw, lineH); }
-      ctx.fillStyle = (s.sel && state.selection_fg) ? state.selection_fg : resolveFg(s.fg || 'foreground', s.bold);
+      const { fg, bg } = resolveSeg(s);
+      if (bg) { ctx.fillStyle = bg; ctx.fillRect(x, y, tw, lineH); }
+      ctx.fillStyle = fg;
       ctx.fillText(text, x, cy);
       x += tw;
       if (s.cursor) { ctx.fillStyle = state.cursor; ctx.fillRect(x + scale, y, 0.6 * fontPx, lineH); }

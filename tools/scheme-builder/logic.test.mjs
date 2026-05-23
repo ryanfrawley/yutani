@@ -712,4 +712,123 @@ function done() {
   });
 }
 
+/* ============================================================
+ * buildPreviewLines — composes the simulated tmux 3-pane layout into
+ * a flat array of column-aligned rows. It closes over the PV_* layout
+ * constants and the S/seglen/pad row helpers (all top-level in
+ * index.html). It takes no args and reads no `state`.
+ * ============================================================ */
+{
+  // S and seglen are `const` arrows (not `function` decls), so grab() can't
+  // slice them — lift them verbatim from the file as extra const source. pad
+  // is a real function decl, so it's grabbed by name.
+  const S_SRC = html.match(/const S = [^\n]+/)[0];
+  const SEGLEN_SRC = html.match(/const seglen = segs =>[\s\S]*?;/)[0];
+  const { buildPreviewLines } = buildSandbox(
+    ['buildPreviewLines', 'pad'],
+    'const PV_LW = 44, PV_RW = 39, PV_SPLIT = 7;\n' + S_SRC + '\n' + SEGLEN_SRC,
+  );
+  // seglen isn't returned by the sandbox (it's not in fnNames), so build a
+  // local copy for the width measurements.
+  const seglen = new Function(SEGLEN_SRC + '\nreturn seglen;')();
+  const PV_LW = 44, PV_RW = 39, PV_SPLIT = 7;
+  const WIDTH = PV_LW + 1 + PV_RW; // 84
+
+  test('buildPreviewLines returns 17 rows', () => {
+    assert.equal(buildPreviewLines().length, 17);
+  });
+
+  test('buildPreviewLines: every row measures exactly 84 columns', () => {
+    const rows = buildPreviewLines();
+    rows.forEach((row, i) => {
+      assert.equal(seglen(row), WIDTH, `row ${i} width`);
+    });
+  });
+
+  test('buildPreviewLines: the split row carries the junction glyph + a hrule', () => {
+    const row = buildPreviewLines()[PV_SPLIT];
+    const texts = row.map(s => (typeof s === 'string' ? s : s.text));
+    assert.ok(texts.includes('├'), 'split row should contain the junction glyph');
+    assert.ok(texts.some(t => t === '─'.repeat(PV_RW)), 'split row should contain a horizontal rule');
+  });
+
+  test('buildPreviewLines: non-split body rows carry the vertical divider', () => {
+    const rows = buildPreviewLines();
+    rows.forEach((row, i) => {
+      if (i === PV_SPLIT || i === rows.length - 1) return; // split + status bar
+      const texts = row.map(s => (typeof s === 'string' ? s : s.text));
+      assert.ok(texts.includes('│'), `row ${i} should contain the vertical divider`);
+    });
+  });
+
+  test('buildPreviewLines: the final row (status bar) has bg-carrying segments', () => {
+    const rows = buildPreviewLines();
+    const bar = rows[rows.length - 1];
+    assert.ok(bar.some(s => typeof s !== 'string' && s.bg), 'status bar row should carry a bg');
+  });
+}
+
+/* ============================================================
+ * resolveSeg — resolves a preview segment to the {fg, bg} the
+ * renderers draw. Selection is chrome; an explicit cell background
+ * invokes palette.rs project_cell (mono fg-ink flip / blank). It
+ * closes over `state`, resolveFg, resolveBg, brightEnabled and the
+ * projectHex color chain (mirrored from the resolveFg block).
+ * ============================================================ */
+{
+  const sb = buildSandbox([
+    'resolveSeg', 'resolveFg', 'resolveBg', 'brightEnabled', 'projectHex',
+    'srgbToLinear', 'linearToSrgbU8', 'hexToLin', 'linToHex',
+    'lumaDistSq', 'nearestLin', 'ansiLinPalette', 'xterm256Lin',
+  ]);
+  const { resolveSeg, resolveFg, __setState } = sb;
+
+  function freshState(max_colors = '') {
+    return {
+      background: '#000000', foreground: '#e0e0e0',
+      cursor: '#1a00cc', selection: '#3366d9', selection_fg: null,
+      ansi: {
+        black:   ['#000000', '#808080'],
+        red:     ['#ab0000', '#ff5555'],
+        green:   ['#00ab00', '#55ff55'],
+        yellow:  ['#abab00', '#ffff55'],
+        blue:    ['#0000ab', '#5555ff'],
+        magenta: ['#ab00ab', '#ff55ff'],
+        cyan:    ['#00abab', '#55ffff'],
+        white:   ['#ababab', '#ffffff'],
+      },
+      max_colors,
+    };
+  }
+
+  test('resolveSeg: non-mono projects fg and bg independently', () => {
+    __setState(freshState(''));
+    const got = resolveSeg({ fg: 'green', bg: 'blue' });
+    assert.equal(got.fg, resolveFg('green', false));
+    assert.equal(got.bg, '#0000ab'); // projected blue (truecolor: no snapping)
+  });
+
+  test('resolveSeg: mono flips a distinct bg to fg-ink block / bg-color glyph', () => {
+    // The bg must resolve to a color distinct from the window background;
+    // in mono, ANSI hues nearest-snap to bg/fg, so use a window-color bg
+    // (mirrors the vim status segments, which carry `bg: 'blue'` etc.).
+    __setState(freshState('mono'));
+    const got = resolveSeg({ fg: 'red', bg: 'foreground' });
+    assert.deepEqual(got, { fg: '#000000', bg: '#e0e0e0' }); // {bg, fg} flip
+  });
+
+  test('resolveSeg: mono reads a window-background bg as blank (no flip)', () => {
+    __setState(freshState('mono'));
+    const got = resolveSeg({ fg: 'foreground', bg: 'background' });
+    assert.deepEqual(got, { fg: '#e0e0e0', bg: null });
+  });
+
+  test('resolveSeg: a selection segment paints bg === state.selection in either cap', () => {
+    __setState(freshState(''));
+    assert.equal(resolveSeg({ sel: true, fg: 'red' }).bg, '#3366d9');
+    __setState(freshState('mono'));
+    assert.equal(resolveSeg({ sel: true, fg: 'red' }).bg, '#3366d9');
+  });
+}
+
 done();
