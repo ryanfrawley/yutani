@@ -154,8 +154,8 @@
     padding: 0;
   }
   .swatch input[type=text].invalid { color: #ff6666; }
-  .row.disabled .swatch { opacity: 0.35; pointer-events: none; }
-  .row.disabled > label { opacity: 0.5; }
+  .row.disabled .swatch { opacity: 0.15; pointer-events: none; }
+  .row.disabled > label { opacity: 0.3; }
   .row .cap-note {
     font: 10px var(--mono);
     color: var(--muted);
@@ -207,14 +207,14 @@
   .ctl-row .val { font: 11px var(--mono); color: var(--muted); text-align: right; }
   .glow-note { font: 10px var(--mono); color: var(--muted); padding: 2px 0 8px; line-height: 1.5; }
   .glow-note code { background: #0c0c0c; padding: 1px 4px; border-radius: 3px; color: #c5c8c6; }
-  .glow-body.disabled { opacity: 0.4; pointer-events: none; filter: grayscale(0.4); }
+  .glow-body.disabled { opacity: 0.2; pointer-events: none; filter: grayscale(0.6); }
   .subhead {
     font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); margin: 12px 0 4px; font-weight: 600;
   }
   .opt-row { display: grid; grid-template-columns: 88px auto 1fr; align-items: center; gap: 6px; padding: 4px 0; }
   .opt-row > label { font: 12px var(--mono); color: var(--text); }
-  .opt-row .swatch.off { opacity: 0.35; pointer-events: none; }
+  .opt-row .swatch.off { opacity: 0.15; pointer-events: none; }
 
   /* ---------- Pane 2: preview ---------- */
   .preview-wrap { padding: 14px; display: flex; flex-direction: column; gap: 14px; align-items: stretch; flex: 1; }
@@ -626,8 +626,8 @@
         </div>
         <div class="term-body" id="term-body"></div>
       </div>
-      <div>
-        <div style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
+      <div id="ansi-strip">
+        <div id="ansi-strip-head" style="font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;">ANSI 0-15</div>
         <div class="swatch-grid" id="ansi-grid"></div>
       </div>
       <div class="contrast">
@@ -1583,6 +1583,12 @@ function resolveFg(name, bold) {
   if (name === 'foreground') return state.foreground;
   if (name === 'background') return state.background;
   if (name === 'cursor') return state.cursor;
+  // Mono is special (palette.rs project_cell): with only two ink levels a
+  // glyph is never nearest-color quantised — a dim/grey text color could
+  // land closer to the background and vanish. The preview's cells carry no
+  // distinct cell-background, so every glyph paints as foreground ink,
+  // regardless of which ANSI color was requested.
+  if (state.max_colors === 'mono') return state.foreground;
   const pair = state.ansi[name];
   if (!pair) return state.foreground;
   // Under an 8-color cap, the bright slot is unreachable: bold cells still
@@ -1636,33 +1642,33 @@ function renderPreview() {
   }
 
   // ANSI swatch row — render each entry through the active color cap so the
-  // strip mirrors what yutani would actually paint. Slots that the cap
-  // disables (e.g. brights under `8`) get a strikethrough overlay.
+  // strip mirrors what yutani would actually paint. Mono hides the strip
+  // entirely: every cell collapses to fg/bg ink, so there's no palette to
+  // show. The 8-color cap drops the bright half (8-15 fold onto their
+  // normal siblings), leaving just 0-7.
+  const mono = state.max_colors === 'mono';
+  document.getElementById('ansi-strip').style.display = mono ? 'none' : '';
   const grid = document.getElementById('ansi-grid');
   grid.innerHTML = '';
-  const all = [];
-  for (const hue of HUES) all.push(state.ansi[hue][0]);
-  for (const hue of HUES) all.push(state.ansi[hue][1]);
-  const brightOn = brightEnabled();
-  const normalOn = normalAnsiEnabled();
-  for (let i = 0; i < all.length; i++) {
-    const isBright = i >= 8;
-    const reachable = isBright ? brightOn : normalOn;
-    const shown = reachable ? projectHex(all[i]) : all[i];
-    const c = document.createElement('div');
-    c.className = 'cell';
-    c.style.background = shown;
-    c.style.color = luma(shown) > 0.55 ? '#000' : '#fff';
-    c.style.textShadow = 'none';
-    c.textContent = i;
-    if (!reachable) {
-      c.style.opacity = '0.3';
-      c.style.textDecoration = 'line-through';
+  if (!mono) {
+    const all = [];
+    for (const hue of HUES) all.push(state.ansi[hue][0]);
+    for (const hue of HUES) all.push(state.ansi[hue][1]);
+    const count = brightEnabled() ? 16 : 8;
+    document.getElementById('ansi-strip-head').textContent = count === 16 ? 'ANSI 0-15' : 'ANSI 0-7';
+    for (let i = 0; i < count; i++) {
+      const c = document.createElement('div');
+      c.className = 'cell';
+      c.style.textShadow = 'none';
+      c.textContent = i;
+      const label = i < 8 ? HUES[i] : HUES[i-8] + ' bright';
+      const shown = projectHex(all[i]);
+      c.style.background = shown;
+      c.style.color = luma(shown) > 0.55 ? '#000' : '#fff';
+      const note = shown !== all[i] ? ` (snaps to ${shown})` : '';
+      c.title = `${label} — ${all[i]}${note}`;
+      grid.append(c);
     }
-    const label = i < 8 ? HUES[i] : HUES[i-8] + ' bright';
-    const note = reachable && shown !== all[i] ? ` (snaps to ${shown})` : (reachable ? '' : ' — unreachable under cap');
-    c.title = `${label} — ${all[i]}${note}`;
-    grid.append(c);
   }
 
   renderContrast();
@@ -1702,15 +1708,35 @@ function renderContrast() {
   const grid = document.getElementById('contrast-grid');
   grid.innerHTML = '';
   const bg = state.background;
+  // Each row is [label, fg, bgOverride?] — contrast of fg against its row
+  // background (the window background unless overridden).
   const pairs = [['foreground', state.foreground]];
-  for (const hue of HUES) pairs.push([hue, projectHex(state.ansi[hue][0])]);
-  for (const [label, fg] of pairs) {
-    const r = contrastRatio(fg, bg);
+  // Mono collapses every cell glyph to foreground ink (palette.rs
+  // project_cell), so the only meaningful readability check is fg vs bg —
+  // listing each ANSI hue would just repeat it (or mislead, since a hue
+  // that nearest-snaps to bg never actually paints as text).
+  if (state.max_colors !== 'mono') {
+    for (const hue of HUES) pairs.push([hue, projectHex(state.ansi[hue][0])]);
+    // Bright variants are only reachable at 16+ colors (the 8-color cap folds
+    // them onto their normal siblings), so list them only when they render.
+    if (brightEnabled()) {
+      for (const hue of HUES) pairs.push([hue + ' bright', projectHex(state.ansi[hue][1])]);
+    }
+  }
+  // Cursor visibility: the block sits on the terminal background, so check
+  // the cursor color against it. Selection readability: selected text draws
+  // in selection_fg (or the foreground when unset) over the selection block,
+  // so check that text color against the selection background.
+  pairs.push(['cursor', state.cursor]);
+  pairs.push(['selection', state.selection_fg || state.foreground, state.selection]);
+  for (const [label, fg, bgOverride] of pairs) {
+    const rowBg = bgOverride || bg;
+    const r = contrastRatio(fg, rowBg);
     const [gradeText, gradeClass] = gradeOf(r);
     const cell = document.createElement('div');
     cell.className = 'cpair';
     cell.innerHTML =
-      `<span class="chip" style="background:${bg};color:${fg}">Ag</span>` +
+      `<span class="chip" style="background:${rowBg};color:${fg}">Ag</span>` +
       `<span class="ratio">${label}: ${r.toFixed(1)}:1</span>` +
       `<span class="grade ${gradeClass}">${gradeText}</span>`;
     grid.append(cell);
