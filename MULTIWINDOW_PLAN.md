@@ -245,15 +245,19 @@ Each stage builds, passes `cargo test`, and (except the last two) is a
 behavior-preserving refactor — so regressions are caught early and the risky
 extraction is decoupled from the user-visible feature.
 
-### Pre-flight — prove mid-loop window creation works (≈1 hour)
+### Pre-flight — prove mid-loop window creation works ✅ VERIFIED (2026-05-23)
 Before any extraction, throwaway-prototype the one assumption the whole plan
 rests on: that a second `NSWindow` can be built **from inside the event
-callback** via the `EventLoopWindowTarget` (winit 0.29). Wire Cmd-N to
-`WindowBuilder::new()…build(elwt)` opening a bare empty window and discard it.
-Our cocoa-extension builder calls (`with_titlebar_transparent`,
-`with_fullsize_content_view`, `with_blur`) are exactly the kind Cocoa
-occasionally no-ops or deadlocks on when invoked mid-loop. If it balks, the plan
-changes shape — find out in an hour, not at Stage 4. Revert the prototype after.
+callback** via the `EventLoopWindowTarget` (winit 0.29), including our
+cocoa-extension builder calls (`with_titlebar_transparent`,
+`with_fullsize_content_view`, `with_has_shadow`, `with_decorations`,
+`with_blur`) — exactly the kind Cocoa occasionally no-ops or deadlocks on.
+
+**Result:** two windows built mid-loop via `build(elwt)` both returned `Ok`
+with valid `WindowId`s and the correct scale factor (2.0, Retina); no panic, no
+deadlock, and the event loop kept running and stayed responsive afterward. The
+full cocoa-extension builder went through cleanly. **The assumption holds — the
+plan proceeds as written.** (Prototype reverted; it was throwaway.)
 
 ### Stage 0 — Split `GpuContext`; extract `AppShared` (no behavior change)
 - Split `gpu::GpuContext` into `gpu::Gpu { device, queue }` (shared) and a
