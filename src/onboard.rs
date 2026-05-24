@@ -201,7 +201,7 @@ fn finish(scheme: Option<String>, crt: CrtLevel, font_size: f32, autocomplete: b
     osc("reload");
     print!("{CLEAR}{BANNER}\r\n  \x1b[1mAll set — launching your shell…\x1b[0m\r\n\r\n");
     let _ = std::io::stdout().flush();
-    crate::pty::exec_login_shell();
+    crate::pty::exec_login_shell(crate::shell_integration::prepare_zdotdir().as_deref());
 }
 
 /// Skip path: revert any live preview to the on-disk config and start the shell
@@ -213,7 +213,7 @@ fn skip() -> ! {
         "{CLEAR}{BANNER}\r\n  \x1b[1mSetup skipped.\x1b[0m \x1b[2mRun \"Run first-time setup…\" from the command palette (Cmd-Shift-P) to try again.\x1b[0m\r\n\r\n"
     );
     let _ = std::io::stdout().flush();
-    crate::pty::exec_login_shell();
+    crate::pty::exec_login_shell(crate::shell_integration::prepare_zdotdir().as_deref());
 }
 
 /// Discovered scheme names under `~/.config/yutani/schemes/`, sorted, capped at

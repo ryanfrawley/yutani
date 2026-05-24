@@ -20,12 +20,41 @@ pub enum ChildProgram {
     Onboard { exe: std::path::PathBuf },
 }
 
+/// Set an environment variable from raw bytes in the current (post-fork,
+/// single-threaded) process. Mirrors the `setenv` use for `TERM`.
+unsafe fn set_env(key: &str, val: &std::ffi::OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(k) = CString::new(key) else { return };
+    let Ok(v) = CString::new(val.as_bytes()) else { return };
+    setenv(k.as_ptr(), v.as_ptr(), 1);
+}
+
 /// Replace the current process with the user's shell, started as a *login*
 /// shell (argv[0] = `-<basename>`) so the profile scripts that set PATH (brew
 /// shellenv, etc.) run. Never returns; on exec failure it exits 127. Callable
 /// from the forked child here and from the onboarding program once it finishes.
-pub fn exec_login_shell() -> ! {
+///
+/// When `zdotdir` is `Some` and the shell is zsh, redirect `$ZDOTDIR` at it so
+/// Yutani's shell integration loads automatically (see
+/// [`crate::shell_integration`]). The user's original `$ZDOTDIR` (or `$HOME`)
+/// is preserved in `YUTANI_USER_ZDOTDIR` for the wrapper dotfiles to chain to.
+pub fn exec_login_shell(zdotdir: Option<&std::path::Path>) -> ! {
     let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Some(dir) = zdotdir {
+        if crate::shell_integration::is_zsh(&shell_path) {
+            // Capture where the user's real dotfiles live before we move
+            // ZDOTDIR: their own ZDOTDIR if set, else $HOME.
+            let user_zdotdir = std::env::var_os("ZDOTDIR")
+                .filter(|v| !v.is_empty())
+                .or_else(|| std::env::var_os("HOME"))
+                .unwrap_or_default();
+            unsafe {
+                set_env("YUTANI_USER_ZDOTDIR", &user_zdotdir);
+                set_env("YUTANI_ZDOTDIR", dir.as_os_str());
+                set_env("ZDOTDIR", dir.as_os_str());
+            }
+        }
+    }
     let shell_c = CString::new(shell_path.clone()).unwrap();
     let basename = std::path::Path::new(&shell_path)
         .file_name()
@@ -42,7 +71,16 @@ pub fn exec_login_shell() -> ! {
 /// Forks and execs `program` on the slave side of `fdm`. Returns in the parent
 /// once `fork` has completed, without blocking on child output. Drive I/O by
 /// calling `run` on the returned handle (typically from a worker thread).
-pub fn fork_pty(fdm: i32, program: ChildProgram) -> Result<Pty, String> {
+///
+/// `zdotdir` is the Yutani shell-integration directory (see
+/// [`crate::shell_integration::prepare_zdotdir`]); it's forwarded to the shell
+/// exec so zsh auto-loads the integration. Only used for the `Shell` program —
+/// the onboarding child resolves its own when it execs the shell.
+pub fn fork_pty(
+    fdm: i32,
+    program: ChildProgram,
+    zdotdir: Option<std::path::PathBuf>,
+) -> Result<Pty, String> {
     let fds: i32;
 
     unsafe {
@@ -88,7 +126,7 @@ pub fn fork_pty(fdm: i32, program: ChildProgram) -> Result<Pty, String> {
                     // ~/.zprofile run. When launched from Finder we inherit only
                     // the launchd PATH, so brew shellenv — typically sourced from
                     // ~/.zprofile — is what puts /opt/homebrew/bin on PATH.
-                    ChildProgram::Shell => exec_login_shell(),
+                    ChildProgram::Shell => exec_login_shell(zdotdir.as_deref()),
                     // First run: become the onboarding console program. It execs
                     // the login shell itself once done. If the re-exec fails for
                     // any reason, fall back to the shell so a broken onboarding
@@ -101,7 +139,7 @@ pub fn fork_pty(fdm: i32, program: ChildProgram) -> Result<Pty, String> {
                             exe_c.as_c_str(),
                             &[exe_c.as_c_str(), flag.as_c_str()],
                         );
-                        exec_login_shell();
+                        exec_login_shell(zdotdir.as_deref());
                     }
                 }
             }

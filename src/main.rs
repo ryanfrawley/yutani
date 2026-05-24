@@ -14,6 +14,7 @@ mod input;
 mod onboard;
 mod palette;
 mod shaper;
+mod shell_integration;
 mod style;
 mod terminal;
 
@@ -7665,8 +7666,13 @@ async fn run() {
         pty::ChildProgram::Shell
     };
 
+    // Materialize the zsh shell-integration ZDOTDIR (no-op when opted out or
+    // $SHELL isn't zsh) so the forked shell auto-loads it — no manual
+    // `source …` in the user's rc required.
+    let zdotdir = shell_integration::prepare_zdotdir();
+
     // Fork before the window is created so we hold the master fd across setup.
-    let pty = pty::fork_pty(fdm, child_program).expect("failed to fork pty");
+    let pty = pty::fork_pty(fdm, child_program, zdotdir).expect("failed to fork pty");
     lap("after fork_pty");
     std::thread::spawn(move || {
         let code = pty.run(|data| {
