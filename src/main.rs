@@ -7542,7 +7542,6 @@ impl State {
 /// `Send`, but the raw font data is). The main thread turns this into FreeType
 /// faces + the rustybuzz shaper after the GPU has been brought up concurrently.
 struct FontData {
-    primary_name: String,
     primary_data: Vec<u8>,
     /// Bold / Italic / BoldItalic primary cuts that loaded, as
     /// `(variant, bytes, face_index)`. Missing cuts are simply absent.
@@ -7591,7 +7590,6 @@ fn load_font_data(config: &Config) -> FontData {
             .expect("no monospace primary font found")
             .clone()
     });
-    println!("primary font: {}", primary_name);
 
     let styled_specs = [
         (font::FaceVariant::Bold, true, false),
@@ -7681,7 +7679,7 @@ fn load_font_data(config: &Config) -> FontData {
         (primary_data, styled, fallbacks)
     });
 
-    FontData { primary_name, primary_data, styled, fallbacks }
+    FontData { primary_data, styled, fallbacks }
 }
 
 async fn run() {
@@ -7815,9 +7813,7 @@ async fn run() {
 
     for (variant, data, face_index) in fd.styled {
         shaper.set_variant(variant, &data, face_index as u32);
-        if font.set_variant(variant, data, face_index, pt_size, dpi) {
-            println!("primary {:?}: {} (face index {})", variant, fd.primary_name, face_index);
-        }
+        font.set_variant(variant, data, face_index, pt_size, dpi);
     }
 
     // Pre-shape every candidate ligature sequence for each installed variant.
@@ -7828,18 +7824,13 @@ async fn run() {
     // Attach the fallback faces. A styled fallback only attaches when its
     // primary cut actually built (same guard as before — otherwise the chain
     // is dead weight and Atlas::lookup tumbles to Regular anyway).
-    for (label, family, variant, data, face_index) in fd.fallbacks {
+    for (_label, _family, variant, data, face_index) in fd.fallbacks {
         if variant != font::FaceVariant::Regular
             && font.variants[variant as usize].face.is_none()
         {
             continue;
         }
-        if font.add_fallback(variant, data, face_index, pt_size, dpi) {
-            println!(
-                "fallback {} {:?}: {} (face index {})",
-                label, variant, family, face_index,
-            );
-        }
+        font.add_fallback(variant, data, face_index, pt_size, dpi);
     }
 
     lap("after font faces + shaper built");
