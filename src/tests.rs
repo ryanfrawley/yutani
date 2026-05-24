@@ -12,6 +12,28 @@ fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
 }
 
 #[test]
+fn next_tab_id_is_strictly_increasing_and_distinct() {
+    use std::collections::HashSet;
+    // The minter must hand out unique ids; tabs are routed by TabId, so a
+    // repeat would misroute a PTY's events to the wrong tab.
+    let ids: Vec<_> = (0..8).map(|_| next_tab_id()).collect();
+
+    // All distinct.
+    let unique: HashSet<_> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), ids.len(), "next_tab_id() returned a duplicate");
+
+    // Strictly increasing across successive calls.
+    for pair in ids.windows(2) {
+        assert!(
+            pair[1].0 > pair[0].0,
+            "next_tab_id() not strictly increasing: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+#[test]
 fn title_for_cwd_shows_bare_path_without_app_prefix() {
     // A non-$HOME absolute path is shown verbatim, no "Yutani — " prefix.
     assert_eq!(title_for_cwd("/var/log"), "/var/log");
@@ -137,12 +159,12 @@ fn get_viewport_size_floors_rows_at_min_grid_rows() {
     // 1–2 row grid, which spills the prompt into scrollback on resize.
     // The row count must never drop below MIN_GRID_ROWS no matter how
     // short the window. cell 8px wide, 18px line height.
-    let tiny = State::get_viewport_size(800.0, 0.0, 8, 18);
+    let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18);
     assert_eq!(tiny.char_height, MIN_GRID_ROWS);
-    let short = State::get_viewport_size(800.0, 60.0, 8, 18);
+    let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18);
     assert_eq!(short.char_height, MIN_GRID_ROWS);
     // A normally-sized window is unaffected — the floor doesn't clamp it.
-    let normal = State::get_viewport_size(800.0, 600.0, 8, 18);
+    let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18);
     assert!(normal.char_height > MIN_GRID_ROWS);
 }
 
@@ -797,7 +819,7 @@ fn halfblock_decision_pending_decode_never_renders() {
         for &oi in &[true, false] {
             for &gpu in &[true, false] {
                 assert!(
-                    !State::should_halfblock(en, oi, /*pending*/ true, gpu),
+                    !WindowState::should_halfblock(en, oi, /*pending*/ true, gpu),
                     "pending should suppress halfblock (en={en} oi={oi} gpu={gpu})"
                 );
             }
@@ -813,7 +835,7 @@ fn halfblock_decision_disabled_always_renders_when_not_pending() {
     for &oi in &[true, false] {
         for &gpu in &[true, false] {
             assert!(
-                State::should_halfblock(/*en*/ false, oi, false, gpu),
+                WindowState::should_halfblock(/*en*/ false, oi, false, gpu),
                 "disabled should always halfblock (oi={oi} gpu={gpu})"
             );
         }
@@ -824,16 +846,16 @@ fn halfblock_decision_disabled_always_renders_when_not_pending() {
 fn halfblock_decision_enabled_with_gpu_image_never_renders() {
     // GPU has the texture, GPU path draws → don't double-emit a
     // half-block on top.
-    assert!(!State::should_halfblock(true, false, false, true));
-    assert!(!State::should_halfblock(true, true, false, true));
+    assert!(!WindowState::should_halfblock(true, false, false, true));
+    assert!(!WindowState::should_halfblock(true, true, false, true));
 }
 
 #[test]
 fn halfblock_decision_enabled_missing_image_needs_opt_in() {
     // images_enabled=true, peek=None, !pending → decode failed and
     // cleanup hasn't fired. Only honored when the user opts in.
-    assert!(!State::should_halfblock(true, false, false, false));
-    assert!(State::should_halfblock(true, true, false, false));
+    assert!(!WindowState::should_halfblock(true, false, false, false));
+    assert!(WindowState::should_halfblock(true, true, false, false));
 }
 
 //
@@ -849,21 +871,21 @@ fn suppress_deferred_placement_cmd_shift_i_keeps_deferred_place_active() {
     // Cmd-Shift-I debug-paste: no Kitty id, no up-front display.
     // Caller stores `None` so the on-decode-success branch creates
     // the Placement at the cursor.
-    assert!(!State::suppress_deferred_placement(false, None));
+    assert!(!WindowState::suppress_deferred_placement(false, None));
 }
 
 #[test]
 fn suppress_deferred_placement_a_t_capital_already_placed_skips_deferred_place() {
     // `a=T` without `U=1`: `insert_placement_kitty` already ran.
     // No second Placement should be auto-created.
-    assert!(State::suppress_deferred_placement(true, Some(42)));
+    assert!(WindowState::suppress_deferred_placement(true, Some(42)));
 }
 
 #[test]
 fn suppress_deferred_placement_a_t_capital_with_virtual_placement_skips_deferred_place() {
     // `a=T,U=1`: placeholder cells own the placement. A deferred
     // auto-place would produce the "ghost image" regression.
-    assert!(State::suppress_deferred_placement(false, Some(42)));
+    assert!(WindowState::suppress_deferred_placement(false, Some(42)));
 }
 
 #[test]
@@ -871,7 +893,7 @@ fn suppress_deferred_placement_a_t_transmit_only_skips_deferred_place() {
     // `a=t`: client will issue `a=p` later. Auto-placing at
     // cursor would beat the client's explicit placement to the
     // screen and end up double-drawn after `a=p` arrives.
-    assert!(State::suppress_deferred_placement(false, Some(7)));
+    assert!(WindowState::suppress_deferred_placement(false, Some(7)));
 }
 
 //
@@ -887,16 +909,16 @@ fn suppress_deferred_placement_a_t_transmit_only_skips_deferred_place() {
 fn live_placement_viewport_row_passes_through_with_no_offset() {
     // The no-scrollback-in-view common case — image at grid row 5 in
     // a 24-row viewport renders at viewport row 5.
-    assert_eq!(State::live_placement_viewport_row(5, 0, 24), 5);
+    assert_eq!(WindowState::live_placement_viewport_row(5, 0, 24), 5);
 }
 
 #[test]
 fn live_placement_viewport_row_shifts_down_by_view_offset() {
     // 3 scrollback rows pulled into view → live content shifts down 3.
-    assert_eq!(State::live_placement_viewport_row(5, 3, 24), 8);
+    assert_eq!(WindowState::live_placement_viewport_row(5, 3, 24), 8);
     // Negative grid rows (placement straddling above the viewport)
     // shift the same way — clipping happens downstream.
-    assert_eq!(State::live_placement_viewport_row(-2, 3, 24), 1);
+    assert_eq!(WindowState::live_placement_viewport_row(-2, 3, 24), 1);
 }
 
 #[test]
@@ -909,11 +931,11 @@ fn live_placement_viewport_row_does_not_clamp_at_rows() {
     // (viewport_row hadn't moved). Without the clamp, viewport_row
     // moves in lockstep with view_offset and scroll_y, giving a
     // continuous slide as the image enters from below.
-    assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 100);
-    assert_eq!(State::live_placement_viewport_row(0, 50, 24), 50);
+    assert_eq!(WindowState::live_placement_viewport_row(5, 100, 24), 5 + 100);
+    assert_eq!(WindowState::live_placement_viewport_row(0, 50, 24), 50);
     // Sanity: at view_offset <= rows, behavior is unchanged from
     // the pre-clamp version.
-    assert_eq!(State::live_placement_viewport_row(5, 20, 24), 25);
+    assert_eq!(WindowState::live_placement_viewport_row(5, 20, 24), 25);
 }
 
 //
@@ -925,7 +947,7 @@ fn placeholder_run_uv_full_row_spans_full_width_one_row_height() {
     // 3 cells wide, image_row 0, total (3, 2) →
     //   u: 0..3/3 = 0..1
     //   v: 0..1/2 = 0..0.5
-    let uv = State::placeholder_run_uv(0, 3, 0, 3, 2);
+    let uv = WindowState::placeholder_run_uv(0, 3, 0, 3, 2);
     assert_eq!(uv, (0.0, 0.0, 1.0, 0.5));
 }
 
@@ -933,7 +955,7 @@ fn placeholder_run_uv_full_row_spans_full_width_one_row_height() {
 fn placeholder_run_uv_partial_row_samples_proper_strip() {
     // Cells image_col 1..3 of a 4-col tile, image_row 1 of 2
     // rows → upper-left at (0.25, 0.5), lower-right at (0.75, 1.0).
-    let uv = State::placeholder_run_uv(1, 3, 1, 4, 2);
+    let uv = WindowState::placeholder_run_uv(1, 3, 1, 4, 2);
     assert_eq!(uv, (0.25, 0.5, 0.75, 1.0));
 }
 
@@ -941,7 +963,7 @@ fn placeholder_run_uv_partial_row_samples_proper_strip() {
 fn placeholder_run_uv_clamps_out_of_range_to_unit_square() {
     // image_col_end past the right edge, image_row past the
     // bottom — both clamp to 1.0 rather than wrap or NaN.
-    let uv = State::placeholder_run_uv(5, 10, 7, 4, 2);
+    let uv = WindowState::placeholder_run_uv(5, 10, 7, 4, 2);
     assert_eq!(uv, (1.0, 1.0, 1.0, 1.0));
 }
 
@@ -951,7 +973,7 @@ fn placeholder_run_uv_zero_total_dims_treated_as_one() {
     // (the renderer skips runs without a recorded extent), but
     // guard the denominator so we never NaN. With cols=0 →
     // denom 1, image_col_end=0 → u1=0.0 clamped from 0 itself.
-    let uv = State::placeholder_run_uv(0, 0, 0, 0, 0);
+    let uv = WindowState::placeholder_run_uv(0, 0, 0, 0, 0);
     assert_eq!(uv, (0.0, 0.0, 0.0, 1.0));
 }
 
@@ -966,7 +988,7 @@ fn glyph_quad_uv_insets_both_axes_for_a_cell_filling_glyph() {
     // atlas origin (0, 0), sampling cols 0..8 / rows 0..16 of a
     // 128x128 atlas.
     let (u0, v0, u1, v1) =
-        State::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
+        WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
     assert!(approx_pair((u0, u1), (0.5 / 128.0, 7.5 / 128.0)));
     assert!(approx_pair((v0, v1), (0.5 / 128.0, 15.5 / 128.0)));
 }
@@ -981,7 +1003,7 @@ fn glyph_quad_uv_insets_a_trimmed_half_block_on_its_narrow_axis() {
     // cell_filling, so the horizontal extent IS pulled in here. Glyph
     // at (10, 20), sampling cols 0..8 / rows 0..16 of a 256x256 atlas.
     let (u0, v0, u1, v1) =
-        State::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
+        WindowState::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
     assert!(approx_pair((u0, u1), (10.5 / 256.0, 17.5 / 256.0)));
     assert!(approx_pair((v0, v1), (20.5 / 256.0, 35.5 / 256.0)));
 }
@@ -992,7 +1014,7 @@ fn glyph_quad_uv_no_inset_for_a_non_filling_glyph() {
     // the UV is the raw sample rect, so ordinary antialiased glyphs
     // aren't thinned or shifted.
     let (u0, v0, u1, v1) =
-        State::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
+        WindowState::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
     assert!(approx_pair((u0, u1), (5.0 / 64.0, 11.0 / 64.0)));
     assert!(approx_pair((v0, v1), (6.0 / 64.0, 18.0 / 64.0)));
 }
@@ -1005,9 +1027,9 @@ fn glyph_quad_uv_inset_shrinks_each_sampled_span_by_one_texel() {
     // that in atlas-texel units so a regression to a different inset is
     // caught.
     let raw =
-        State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
+        WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
     let inset =
-        State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
+        WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
     assert!(approx_eq((raw.2 - raw.0) * 100.0 - (inset.2 - inset.0) * 100.0, 1.0));
     assert!(approx_eq((raw.3 - raw.1) * 100.0 - (inset.3 - inset.1) * 100.0, 1.0));
 }
@@ -2138,7 +2160,8 @@ fn try_make_test_glow() -> Option<(wgpu::Device, wgpu::Queue, renderer::glow::Gl
         view_formats: &[],
     });
     let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
-    let glow = renderer::glow::Glow::new(&device, format, 16, 16, &scene_view);
+    let pipelines = renderer::glow::GlowPipelines::new(&device, format);
+    let glow = renderer::glow::Glow::new(&device, &pipelines, 16, 16, &scene_view);
     Some((device, queue, glow))
 }
 

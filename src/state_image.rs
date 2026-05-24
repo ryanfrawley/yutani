@@ -1,9 +1,9 @@
-//! `State` methods for inline image placements: anchoring a decode at a
-//! cell, polling async decodes, draining GPU uploads, and cell-size sync.
+//! `WindowState` methods for inline image placements: anchoring a decode at
+//! a cell, polling async decodes, draining GPU uploads, and cell-size sync.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// Read the system clipboard and write it to the PTY, wrapped in
     /// bracketed-paste markers if the host has enabled them.
     /// Read `path` from disk and fire a decode job. The placement on the
@@ -25,13 +25,13 @@ impl State {
         // extent was specified — `poll_pending_images` computes it from
         // the decoded image's pixel dimensions. The pre-allocated
         // ImageId is therefore discarded here; the OSC 1337 path uses it.
-        let (pending, _image_id) = self.image_store.request_insert(
+        let (pending, _image_id) = self.tabs[self.active].image_store.request_insert(
             bytes,
             self.config.images_max_pixels,
             std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
             Some(label.to_string()),
         );
-        self.pending_placements.push(PendingImagePlacement {
+        self.active_tab_mut().pending_placements.push(PendingImagePlacement {
             request: pending,
             row,
             col,
@@ -58,14 +58,14 @@ impl State {
         // base image's PendingImagePlacement finalizes and
         // `pending_placements` empties — and the animation stays
         // pinned on its first frame forever.
-        if self.pending_placements.is_empty() && self.image_store.pending_count() == 0 {
+        if self.tabs[self.active].pending_placements.is_empty() && self.tabs[self.active].image_store.pending_count() == 0 {
             return;
         }
         let nearest = self.config.images_filter == "nearest";
-        let results = self.image_store.poll(
+        let results = self.tabs[self.active].image_store.poll(
             &self.image_pipeline,
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             nearest,
         );
         // CRITICAL: must request_redraw if there are still pending decodes,
@@ -86,21 +86,21 @@ impl State {
         // whole `cat`/`icat` in one burst and reliably lose this race;
         // slower debug builds spread ingest across events and win it.)
         if should_rearm_image_poll(
-            self.pending_placements.is_empty(),
+            self.active_tab().pending_placements.is_empty(),
             results.is_empty(),
-            self.image_store.pending_count(),
+            self.active_tab().image_store.pending_count(),
         ) {
             self.window.request_redraw();
         }
         if results.is_empty() {
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let mut any_placed = false;
         for (pending_id, outcome) in results {
-            let Some(i) = self
+            let Some(i) = self.active_tab()
                 .pending_placements
                 .iter()
                 .position(|p| p.request == pending_id)
@@ -110,12 +110,12 @@ impl State {
                 // current code paths). Drop the GPU upload on the floor.
                 continue;
             };
-            let pp = self.pending_placements.remove(i);
+            let pp = self.active_tab_mut().pending_placements.remove(i);
             match (outcome, pp.preplaced_image_id) {
                 // Deferred path success: compute extent from pixel dims
                 // and create the placement now.
                 (Ok(image_id), None) => {
-                    let img = self
+                    let img = self.active_tab()
                         .image_store
                         .peek(image_id)
                         .expect("just-inserted image");
@@ -123,7 +123,7 @@ impl State {
                     let cols = (img.width_px + cell_w - 1) / cell_w;
                     let rows = rows.clamp(1, u16::MAX as u32) as u16;
                     let cols = cols.clamp(1, u16::MAX as u32) as u16;
-                    self.terminal
+                    self.active_tab_mut().terminal
                         .insert_placement(image_id, pp.row, pp.col, rows, cols, 0);
                     any_placed = true;
                 }
@@ -140,7 +140,7 @@ impl State {
                 // the user doesn't stare at a blank space forever.
                 (Err(e), Some(image_id)) => {
                     eprintln!("image decode failed: {e}");
-                    let removed = self.terminal.remove_placements_with_image(image_id);
+                    let removed = self.active_tab_mut().terminal.remove_placements_with_image(image_id);
                     if removed > 0 {
                         any_placed = true; // grid changed; redraw
                     }
@@ -167,7 +167,7 @@ impl State {
     /// advance and placement insertion — leaving the placement at a
     /// stale anchor. See sub-slice P2.4 design notes.
     pub(crate) fn feed_terminal(&mut self, bytes: &str) {
-        self.terminal.feed(bytes);
+        self.active_tab_mut().terminal.feed(bytes);
         self.maybe_start_alt_scroll();
         self.drain_pending_image_uploads();
     }
@@ -182,10 +182,10 @@ impl State {
         if !self.config.images_enabled {
             // Drain anyway so the queue doesn't grow unboundedly if the
             // config is toggled at runtime.
-            let _ = self.terminal.take_pending_image_uploads();
+            let _ = self.active_tab_mut().terminal.take_pending_image_uploads();
             return;
         }
-        let uploads = self.terminal.take_pending_image_uploads();
+        let uploads = self.active_tab_mut().terminal.take_pending_image_uploads();
         if uploads.is_empty() {
             return;
         }
@@ -194,10 +194,10 @@ impl State {
             // straight into the store's playback-state mutation.
             if let Some(ctrl) = up.animation_control.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(image_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(image_id) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
-                self.image_store.apply_animation_control(
+                self.active_tab_mut().image_store.apply_animation_control(
                     image_id,
                     ctrl.control,
                     ctrl.loop_count,
@@ -218,11 +218,11 @@ impl State {
             // payloads go through the worker.
             if let Some(frame_spec) = up.animation_frame.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(parent) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(parent) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
                 if let Some((w, h)) = up.raw_rgba_dims {
-                    let _ = self.image_store.request_insert_frame_rgba(
+                    let _ = self.active_tab_mut().image_store.request_insert_frame_rgba(
                         parent,
                         up.bytes,
                         w,
@@ -235,7 +235,7 @@ impl State {
                         frame_spec.dst_y,
                     );
                 } else {
-                    let _ = self.image_store.request_insert_frame(
+                    let _ = self.tabs[self.active].image_store.request_insert_frame(
                         parent,
                         up.bytes,
                         self.config.images_max_pixels,
@@ -261,21 +261,21 @@ impl State {
             // payloads (signaled by `raw_rgba_dims`) skip the decode
             // worker entirely; PNG-style payloads go through it.
             let (pending, image_id) = if let Some((w, h)) = up.raw_rgba_dims {
-                self.image_store.request_insert_animatable_rgba(
+                self.active_tab_mut().image_store.request_insert_animatable_rgba(
                     up.bytes,
                     w,
                     h,
                     up.label,
                 )
             } else if up.kitty_image_id.is_some() {
-                self.image_store.request_insert_animatable(
+                self.tabs[self.active].image_store.request_insert_animatable(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
                     up.label,
                 )
             } else {
-                self.image_store.request_insert(
+                self.tabs[self.active].image_store.request_insert(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
@@ -287,7 +287,7 @@ impl State {
             // (delete). Register the mapping immediately so those ops
             // resolve even before the decode completes.
             if let Some(client_id) = up.kitty_image_id {
-                self.terminal.register_kitty_image_id(client_id, image_id);
+                self.active_tab_mut().terminal.register_kitty_image_id(client_id, image_id);
             }
             let (rows, cols) = up.cell_extent;
             let (row, col) = up.cell_anchor;
@@ -300,7 +300,7 @@ impl State {
                 // ids all thread onto the Placement. For iTerm OSCs all
                 // the Kitty-only fields are at their defaults so this
                 // produces the same result as `insert_placement`.
-                self.terminal.insert_placement_kitty(
+                self.active_tab_mut().terminal.insert_placement_kitty(
                     image_id,
                     row,
                     col,
@@ -313,7 +313,7 @@ impl State {
                     up.kitty_placement_id,
                 );
             }
-            self.pending_placements.push(PendingImagePlacement {
+            self.active_tab_mut().pending_placements.push(PendingImagePlacement {
                 request: pending,
                 row,
                 col,
@@ -336,10 +336,10 @@ impl State {
     /// sizing math can resolve `Npx` / `N%` / `Auto` specs. Called on
     /// init and on every font-size change.
     pub(crate) fn sync_terminal_cell_size(&mut self) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
-        self.terminal.set_cell_size_px(cell_w, line_h);
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
+        self.active_tab_mut().terminal.set_cell_size_px(cell_w, line_h);
     }
 
     /// Path used by the Cmd-Shift-I keybind. Env var override beats the

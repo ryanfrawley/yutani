@@ -1,5 +1,5 @@
-//! The winit event loop: window + GPU bring-up, font worker, and the
-//! per-event dispatch into `State`. Driven by `main()`.
+//! The winit event loop: window + GPU bring-up, font worker, tab/window
+//! lifecycle, and the per-event dispatch into `WindowState`. Driven by `main()`.
 
 use crate::*;
 
@@ -23,16 +23,6 @@ pub(crate) async fn run() {
         .unwrap();
     let event_loop_proxy = event_loop.create_proxy();
 
-    // create the pty before forking so we have the handle available
-    let fdm: i32;
-    unsafe {
-        fdm = posix_openpt(O_RDWR);
-        println!("fdm: {fdm}");
-        if fdm < 0 {
-            panic!("Error on posix_openpt()");
-        }
-    }
-
     // On first run (or after a "Run first-time setup…" re-arm), the PTY child
     // becomes the onboarding console program instead of the shell; it execs the
     // shell in-place when done. Resolve our own path here, in the parent, so the
@@ -50,21 +40,9 @@ pub(crate) async fn run() {
 
     // Materialize the zsh shell-integration ZDOTDIR (no-op when opted out or
     // $SHELL isn't zsh) so the forked shell auto-loads it — no manual
-    // `source …` in the user's rc required.
+    // `source …` in the user's rc required. The PTY itself is forked by
+    // `create_tab` once the window/font exist and the grid size is known.
     let zdotdir = shell_integration::prepare_zdotdir();
-
-    // Fork before the window is created so we hold the master fd across setup.
-    let pty = pty::fork_pty(fdm, child_program, zdotdir).expect("failed to fork pty");
-    lap("after fork_pty");
-    std::thread::spawn(move || {
-        let code = pty.run(|data| {
-            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
-        });
-        // `run` returns once the shell has exited and been reaped. Wake the
-        // event loop so it can react instead of leaving a frozen window —
-        // queued after every PtyInput, so any final shell output lands first.
-        let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
-    });
 
     // Seed the window title from our own working directory — the shell the
     // PTY just forked inherits it (no chdir in the child), so this matches
@@ -76,20 +54,18 @@ pub(crate) async fn run() {
     let initial_title = effective_title(None, initial_cwd.as_deref());
 
     let transparent = false; // needed because of a shadow bug
-    let mut window_builder = WindowBuilder::new()
+    // The first window takes the OS default position; subsequent (Cmd-N)
+    // windows cascade off their spawner in `spawn_window_in_process`.
+    let window = WindowBuilder::new()
         .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
         .with_decorations(true)
-        .with_blur(transparent);
-    // When spawned via Cmd-N the parent forwards its position; cascade off it
-    // so the new window steps down-and-right instead of stacking exactly atop.
-    if let Some(pos) = cascade_position() {
-        window_builder = window_builder.with_position(pos);
-    }
-    let window = window_builder.build(&event_loop).unwrap();
+        .with_blur(transparent)
+        .build(&event_loop)
+        .unwrap();
     lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);
@@ -98,20 +74,20 @@ pub(crate) async fn run() {
     lap("after config load");
 
     // Load all font data on a worker thread while the GPU is brought up on
-    // this (main) thread. The two are independent until State::new needs both,
+    // this (main) thread. The two are independent until WindowState::new needs both,
     // so overlapping them hides whichever finishes first. Font work must hand
     // back owned bytes (FreeType faces aren't Send); GPU/surface creation must
     // stay on the main thread (Cocoa isn't thread-safe), hence this split.
     let config_for_fonts = config.clone();
     let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    let gpu = gpu::GpuContext::new(&window).await;
-    lap("after GpuContext::new (concurrent with font load)");
+    let (gpu, surface) = gpu::Gpu::new(&window).await;
+    lap("after Gpu::new (concurrent with font load)");
 
     let fd = font_handle.join().expect("font loader thread panicked");
     lap("after font data loaded (joined)");
 
-    // Install the color scheme before constructing State so style.rs and the
+    // Install the color scheme before constructing WindowState so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
     // doesn't take the terminal down. With `auto_theme` on, pick the slot for
@@ -138,9 +114,7 @@ pub(crate) async fn run() {
 
     for (variant, data, face_index) in fd.styled {
         shaper.set_variant(variant, &data, face_index as u32);
-        if font.set_variant(variant, data, face_index, pt_size, dpi) {
-            println!("primary {:?}: {} (face index {})", variant, fd.primary_name, face_index);
-        }
+        font.set_variant(variant, data, face_index, pt_size, dpi);
     }
 
     // Pre-shape every candidate ligature sequence for each installed variant.
@@ -151,30 +125,58 @@ pub(crate) async fn run() {
     // Attach the fallback faces. A styled fallback only attaches when its
     // primary cut actually built (same guard as before — otherwise the chain
     // is dead weight and Atlas::lookup tumbles to Regular anyway).
-    for (label, family, variant, data, face_index) in fd.fallbacks {
+    for (_label, _family, variant, data, face_index) in fd.fallbacks {
         if variant != font::FaceVariant::Regular
             && font.variants[variant as usize].face.is_none()
         {
             continue;
         }
-        if font.add_fallback(variant, data, face_index, pt_size, dpi) {
-            println!(
-                "fallback {} {:?}: {} (face index {})",
-                label, variant, family, face_index,
-            );
-        }
+        font.add_fallback(variant, data, face_index, pt_size, dpi);
     }
 
     lap("after font faces + shaper built");
-    let mut state = State::new(fdm, window, gpu, font, shaper, config, dpi).await;
-    lap("after State::new (GPU/atlas/pipelines)");
-    state.notify_pty_size(state.terminal.cols, state.terminal.rows);
+
+    // Build the once-per-process shared resources (device/queue/font/shaper +
+    // pipelines), then the initial tab + window against them. `shared` is kept
+    // (cloned per window) so Cmd-N can spawn further windows in-process.
+    let shared = Rc::new(AppShared::new(gpu, surface.config.format, font, shaper));
+    lap("after AppShared::new");
+
+    // Size the initial tab's grid to this window's viewport so the vertex
+    // buffers create_window allocates match the terminal dimensions.
+    let (cols, rows) = {
+        let (cell_w, line_h) = shared.with_font(|f| {
+            let m = f.face().size_metrics().unwrap();
+            (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
+        });
+        let vp = WindowState::get_viewport_size(
+            surface.config.width as f32,
+            surface.config.height as f32,
+            cell_w,
+            line_h,
+        );
+        (vp.char_width, vp.char_height)
+    };
+    let (tab_id, initial_tab) = create_tab(
+        &event_loop_proxy,
+        child_program,
+        zdotdir.clone(),
+        None, // first window inherits our process cwd, as before
+        cols,
+        rows,
+        config.images_memory_cap_mb * 1024 * 1024,
+    );
+    lap("after create_tab (fork)");
+    let mut state =
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, initial_tab);
+    lap("after create_window (GPU/atlas/pipelines)");
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window
-    // exists; the field was seeded with the renderer's reserve in State::new.
+    // exists; the field was seeded with the renderer's reserve in WindowState::new.
     state.refresh_chrome_band();
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
-    state
+    state.tabs[state.active]
         .terminal
         .set_keep_placements_in_scrollback(state.config.images_in_scrollback);
     state.sync_terminal_cell_size();
@@ -186,22 +188,38 @@ pub(crate) async fn run() {
     }
     state.invalidate();
 
-    let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
-
-    // Program-set window title (OSC 0/2). When `Some`, it wins over the
-    // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
-    // at which point we fall back to the cwd.
-    let mut manual_title: Option<String> = None;
+    // `manual_title` and `theme` are now per-window (`WindowState` fields), so
+    // each window tracks its own OSC-0 title and appearance.
     let mut first_frame_done = false;
+
+    // The window registry. One process owns every window; events are routed
+    // here rather than against a single `state` binding. `tab_to_window`
+    // resolves a `TabId` (carried on every PtyInput/PtyExit) to its window.
+    // First cut: exactly one window with one tab.
+    let initial_window_id = state.window.id();
+    let mut windows: std::collections::HashMap<winit::window::WindowId, WindowState> =
+        std::collections::HashMap::new();
+    windows.insert(initial_window_id, state);
+    let mut tab_to_window: std::collections::HashMap<app_window::TabId, winit::window::WindowId> =
+        std::collections::HashMap::new();
+    tab_to_window.insert(tab_id, initial_window_id);
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::UserEvent(n) => match n {
-                app_window::CustomEvent::PtyInput(z) => {
+                app_window::CustomEvent::PtyInput(ev_tab, z) => {
+                    // Resolve the tab's window. A just-closed tab can still
+                    // deliver one last event — treat an unknown id as a no-op.
+                    let Some(state) = tab_to_window
+                        .get(&ev_tab)
+                        .and_then(|wid| windows.get_mut(wid))
+                    else {
+                        return;
+                    };
                     let bytes = z.len();
                     let t0 = std::time::Instant::now();
                     state.feed_terminal(&z);
-                    let reply = state.terminal.take_response();
+                    let reply = state.active_tab_mut().terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
@@ -210,40 +228,40 @@ pub(crate) async fn run() {
                     // manual title wins; otherwise we show the cwd ($HOME
                     // collapsed to `~`). Both `take_*` calls must run to clear
                     // their dirty flags even when the title doesn't change.
-                    let title_changed = state.terminal.take_title_update().map(|t| {
-                        manual_title = t;
+                    let title_changed = state.active_tab_mut().terminal.take_title_update().map(|t| {
+                        state.manual_title = t;
                     });
-                    let cwd_changed = state.terminal.take_cwd_update();
+                    let cwd_changed = state.active_tab_mut().terminal.take_cwd_update();
                     if title_changed.is_some() || cwd_changed.is_some() {
                         state.window.set_title(&effective_title(
-                            manual_title.as_deref(),
-                            state.terminal.cwd(),
+                            state.manual_title.as_deref(),
+                            state.active_tab().terminal.cwd(),
                         ));
                     }
                     // The shell may have reported its history file (OSC 2124):
                     // read + parse it and merge past commands into the in-memory
                     // history (most-recent-first), behind any already-captured
                     // session commands so those stay at the front.
-                    if let Some(path) = state.terminal.take_histfile_update() {
+                    if let Some(path) = state.active_tab_mut().terminal.take_histfile_update() {
                         if let Ok(contents) = std::fs::read_to_string(&path) {
                             let parsed = completion::parse_zsh_history(&contents);
                             for cmd in parsed.iter().rev() {
-                                if !state.command_history.iter().any(|c| c == cmd) {
-                                    state.command_history.push(cmd.clone());
+                                if !state.active_tab().command_history.iter().any(|c| c == cmd) {
+                                    state.active_tab_mut().command_history.push(cmd.clone());
                                 }
                             }
-                            state.command_history.truncate(COMMAND_HISTORY_CAP);
+                            state.active_tab_mut().command_history.truncate(COMMAND_HISTORY_CAP);
                         }
                     }
                     // A command just submitted at the prompt (OSC 133 C): fold
                     // it into the front of the history (deduped).
-                    if let Some(cmd) = state.terminal.take_submitted_command() {
-                        dedup_prepend(&mut state.command_history, cmd);
+                    if let Some(cmd) = state.active_tab_mut().terminal.take_submitted_command() {
+                        dedup_prepend(&mut state.active_tab_mut().command_history, cmd);
                     }
                     // First-run onboarding (running as the PTY child) may have
                     // emitted OSC 2125 live-preview requests in this chunk —
                     // apply each to the running renderer.
-                    for req in state.terminal.take_preview_requests() {
+                    for req in state.active_tab_mut().terminal.take_preview_requests() {
                         state.apply_preview(req);
                     }
                     // The chunk may have carried an OSC 2122 input report;
@@ -257,15 +275,29 @@ pub(crate) async fn run() {
                     // sits under the pointer.
                     state.update_hover_url();
                 }
-                app_window::CustomEvent::PtyExit(code) => {
-                    let close = match state.config.shell_exit_mode {
-                        ShellExitMode::Always => true,
-                        ShellExitMode::Never => false,
-                        ShellExitMode::OnSuccess => code == 0,
+                app_window::CustomEvent::PtyExit(ev_tab, code) => {
+                    let Some(&wid) = tab_to_window.get(&ev_tab) else { return };
+                    let close = match windows.get(&wid).map(|s| s.config.shell_exit_mode) {
+                        Some(ShellExitMode::Always) => true,
+                        Some(ShellExitMode::Never) => false,
+                        Some(ShellExitMode::OnSuccess) => code == 0,
+                        None => return,
                     };
                     if close {
-                        elwt.exit();
-                    } else {
+                        // Drop this window and free every tab it owned from the
+                        // resolver. Quit once the last window is gone. (With one
+                        // window this is the old `exit()`; the registry
+                        // generalizes it.)
+                        if let Some(state) = windows.remove(&wid) {
+                            for t in &state.tabs {
+                                close_tab_pty(t);
+                                tab_to_window.remove(&t.tab_id);
+                            }
+                        }
+                        if windows.is_empty() {
+                            elwt.exit();
+                        }
+                    } else if let Some(state) = windows.get_mut(&wid) {
                         // Keep the window so the user can read the final
                         // output / a crash's exit code, then dismiss it
                         // themselves. The PTY master is closed, so typed
@@ -280,110 +312,162 @@ pub(crate) async fn run() {
                     }
                 }
             },
-            Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
-                let consumed = state.input(&event, elwt);
-                // The palette's Set/Clear title actions set the title through
-                // the same terminal path OSC 0/2 uses, but a keystroke isn't
-                // followed by PtyInput, so poll the title update here too.
-                // Mirrors the OSC-driven poll in the PtyInput arm above.
-                if let Some(t) = state.terminal.take_title_update() {
-                    manual_title = t;
-                    state.window.set_title(&effective_title(
-                        manual_title.as_deref(),
-                        state.terminal.cwd(),
-                    ));
+            Event::WindowEvent { window_id, event } => {
+                // A new-window request (cwd, origin) raised by Cmd-N / palette
+                // during `input()`, and whether this window asked to close —
+                // both acted on after the `state` borrow is released, since
+                // they mutate the window registry.
+                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>)> = None;
+                let mut close_this = false;
+                if let Some(state) = windows.get_mut(&window_id) {
+                    let consumed = state.input(&event, elwt);
+                    // The palette's Set/Clear title actions set the title
+                    // through the same terminal path OSC 0/2 uses, but a
+                    // keystroke isn't followed by PtyInput, so poll the title
+                    // update here too. Mirrors the PtyInput arm above.
+                    if let Some(t) = state.active_tab_mut().terminal.take_title_update() {
+                        state.manual_title = t;
+                        state.window.set_title(&effective_title(
+                            state.manual_title.as_deref(),
+                            state.active_tab().terminal.cwd(),
+                        ));
+                    }
+                    if !consumed {
+                        match event {
+                            WindowEvent::ThemeChanged(new_theme) => {
+                                state.theme = new_theme;
+                                // Following the system appearance? Swap to the
+                                // scheme slot for the new mode. Otherwise just
+                                // keep the OSC color reports in sync as before —
+                                // the active scheme doesn't track the OS.
+                                if state.config.auto_theme {
+                                    state.apply_active_scheme();
+                                } else {
+                                    state.sync_theme_colors();
+                                    state.invalidate();
+                                }
+                            }
+                            WindowEvent::CloseRequested => {
+                                close_this = true;
+                            }
+                            WindowEvent::Resized(size) => {
+                                state.resize(size);
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::ScaleFactorChanged {
+                                scale_factor: _scale_factor,
+                                ..
+                            } => {
+                                state.refresh_chrome_band();
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::RedrawRequested => {
+                                state.update();
+                                state.prepare_frame();
+                                let t0 = std::time::Instant::now();
+                                let result = state.render(clear_color(state.theme));
+                                let render_dur = t0.elapsed();
+                                if !first_frame_done {
+                                    first_frame_done = true;
+                                    if timing {
+                                        eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                                    }
+                                }
+                                match result {
+                                    Ok((surface_wait, fast)) => {
+                                        state.perf.note_render(render_dur, surface_wait, fast);
+                                    }
+                                    Err(wgpu::SurfaceError::Lost) => state.resize(state.surface.size),
+                                    Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                                    Err(e) => eprintln!("{:?}", e),
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    // Drain a new-window request raised during `input()`.
+                    if std::mem::take(&mut state.pending_new_window) {
+                        spawn_req = Some((
+                            state.active_tab().terminal.cwd().map(str::to_owned),
+                            state.window_origin(),
+                        ));
+                    }
                 }
-                if !consumed {
-                    match event {
-                        WindowEvent::ThemeChanged(new_theme) => {
-                            theme = new_theme;
-                            // Following the system appearance? Swap to the
-                            // scheme slot for the new mode. Otherwise just keep
-                            // the OSC color reports in sync as before — the
-                            // active scheme doesn't track the OS.
-                            if state.config.auto_theme {
-                                state.apply_active_scheme();
-                            } else {
-                                state.sync_theme_colors();
-                                state.invalidate();
-                            }
+                if let Some((cwd, origin)) = spawn_req {
+                    spawn_window_in_process(
+                        elwt,
+                        &shared,
+                        &event_loop_proxy,
+                        &mut windows,
+                        &mut tab_to_window,
+                        &config,
+                        &zdotdir,
+                        cwd,
+                        origin,
+                    );
+                }
+                if close_this {
+                    // Tear down this window: kill + reap each tab's shell and
+                    // free its TabId, then drop the window. Quit when the last
+                    // window is gone.
+                    if let Some(state) = windows.remove(&window_id) {
+                        for t in &state.tabs {
+                            close_tab_pty(t);
+                            tab_to_window.remove(&t.tab_id);
                         }
-                        WindowEvent::CloseRequested => {
-                            elwt.exit();
-                        }
-                        WindowEvent::Resized(size) => {
-                            state.resize(size);
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            scale_factor: _scale_factor,
-                            ..
-                        } => {
-                            state.refresh_chrome_band();
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::RedrawRequested => {
-                            state.update();
-                            state.prepare_frame();
-                            let t0 = std::time::Instant::now();
-                            let result = state.render(clear_color(theme));
-                            let render_dur = t0.elapsed();
-                            if !first_frame_done {
-                                first_frame_done = true;
-                                if timing {
-                                    eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
-                                }
-                            }
-                            match result {
-                                Ok((surface_wait, fast)) => {
-                                    state.perf.note_render(render_dur, surface_wait, fast);
-                                }
-                                Err(wgpu::SurfaceError::Lost) => state.resize(state.gpu.size),
-                                Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                                Err(e) => eprintln!("{:?}", e),
-                            }
-                        }
-                        _ => (),
+                    }
+                    if windows.is_empty() {
+                        elwt.exit();
                     }
                 }
             }
             Event::AboutToWait => {
-                if state.maybe_blink_tick() {
-                    state.invalidate();
+                // Each window animates independently; collect the earliest
+                // wake-up across all of them and arm the loop for that.
+                let mut next_wake: Option<std::time::Instant> = None;
+                for state in windows.values_mut() {
+                    if state.maybe_blink_tick() {
+                        state.invalidate();
+                    }
+                    // Edge-fade and cursor-position eases: keep ticking frames
+                    // as long as either is still chasing its target.
+                    let animating = state.is_top_fade_animating()
+                        || state.is_cursor_animating()
+                        || state.is_alt_scroll_animating();
+                    if animating {
+                        state.invalidate();
+                    }
+                    state.perf.maybe_flush();
+                    let next_anim = if animating {
+                        Some(std::time::Instant::now() + ANIM_FRAME)
+                    } else {
+                        None
+                    };
+                    // Image-animation deadline (Kitty `a=a` playback). The
+                    // store returns `None` if no animated image is
+                    // currently advancing; otherwise it returns the
+                    // earliest moment a frame swap is due.
+                    let next_image_anim = state
+                        .active_tab()
+                        .image_store
+                        .next_frame_deadline(std::time::Instant::now());
+                    if next_image_anim.is_some() {
+                        state.invalidate();
+                    }
+                    let this = [
+                        state.next_blink_wake(),
+                        next_anim,
+                        next_image_anim,
+                        state.perf.next_wake(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    next_wake = match (next_wake, this) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
-                // Edge-fade and cursor-position eases: keep ticking frames
-                // as long as either is still chasing its target.
-                let animating = state.is_top_fade_animating()
-                    || state.is_cursor_animating()
-                    || state.is_alt_scroll_animating();
-                if animating {
-                    state.invalidate();
-                }
-                state.perf.maybe_flush();
-                let next_anim = if animating {
-                    Some(std::time::Instant::now() + ANIM_FRAME)
-                } else {
-                    None
-                };
-                // Image-animation deadline (Kitty `a=a` playback). The
-                // store returns `None` if no animated image is
-                // currently advancing; otherwise it returns the
-                // earliest moment a frame swap is due.
-                let next_image_anim = state
-                    .image_store
-                    .next_frame_deadline(std::time::Instant::now());
-                if next_image_anim.is_some() {
-                    state.invalidate();
-                }
-                let next_wake = [
-                    state.next_blink_wake(),
-                    next_anim,
-                    next_image_anim,
-                    state.perf.next_wake(),
-                ]
-                .into_iter()
-                .flatten()
-                .min();
                 match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),

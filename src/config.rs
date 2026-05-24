@@ -7,7 +7,7 @@ use crate::{config_path, format_hex_rgb, images, palette, renderer, DECORATOR_HE
 /// Coarse CRT-glow presets the onboarding offers, mapped to the underlying
 /// `glow_*` config knobs by [`Config::apply_glow_level`]. Shared by the
 /// onboarding writer (which persists the choice) and the live-preview path in
-/// `State::apply_preview` (which mirrors it onto the running renderer), so the
+/// `WindowState::apply_preview` (which mirrors it onto the running renderer), so the
 /// preview can never drift from what actually gets saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlowLevel {

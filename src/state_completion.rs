@@ -1,9 +1,9 @@
-//! `State` methods for the shell-input completion popup: recomputing
+//! `WindowState` methods for the shell-input completion popup: recomputing
 //! suggestions, opening the menu, and accepting a selection.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// Refresh the cached completion-popup suggestions, but only when the
     /// shell's reported input (`OSC 2122`) actually changed since last time —
     /// `completion::complete_path` does a `read_dir`, so it must never run per
@@ -11,25 +11,25 @@ impl State {
     /// doesn't dump the whole cwd. Returns true if the cache changed (so the
     /// caller can request a redraw).
     pub(crate) fn recompute_completions(&mut self) -> bool {
-        let cur = self.terminal.current_input().cloned();
+        let cur = self.active_tab().terminal.current_input().cloned();
         let key = cur.as_ref().map(|c| (c.buffer.clone(), c.cursor));
-        if key == self.completions_input {
+        if key == self.active_tab().completions_input {
             return false;
         }
-        self.completions_input = key;
+        self.active_tab_mut().completions_input = key;
         // A dismissed popup (Enter/Esc) must not reopen when the shell re-emits
         // OSC 2122 after an accepted suffix — keep it empty until a real
         // keystroke clears the flag. The `autocomplete` config gate works the
         // same way: when the feature is off, never run `completion::complete`,
         // just keep the cache empty (read live so config reload toggles it).
-        self.completions = if self.completion_dismissed || !self.config.autocomplete {
+        self.active_tab_mut().completions = if self.active_tab().completion_dismissed || !self.config.autocomplete {
             Vec::new()
         } else {
             match &cur {
                 // `complete` returns empty for empty/whitespace input on its own
                 // (no history match, empty token skipped), so no separate gate.
                 Some(c) => {
-                    let cwd = self.terminal.cwd().map(std::path::Path::new);
+                    let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
                     let path = std::env::var_os("PATH");
                     let home = std::env::var_os("HOME");
                     completion::complete(
@@ -38,7 +38,7 @@ impl State {
                         cwd,
                         path.as_deref(),
                         home.as_deref().map(std::path::Path::new),
-                        &self.command_history,
+                        &self.active_tab().command_history,
                         false,
                     )
                 }
@@ -47,8 +47,8 @@ impl State {
         };
         // The cache was replaced: restart selection at the top and reset the
         // scroll window so navigation state never points past a shorter list.
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         true
     }
 
@@ -65,29 +65,29 @@ impl State {
         if !self.config.autocomplete {
             return;
         }
-        self.completion_dismissed = false;
+        self.active_tab_mut().completion_dismissed = false;
         // Clone the buffer/cursor out of the immutable `current_input()` borrow so
         // it ends before we take `cwd()` and then mutably write `self.*` fields.
-        if let Some((buffer, cursor)) = self
+        if let Some((buffer, cursor)) = self.active_tab()
             .terminal
             .current_input()
             .map(|c| (c.buffer.clone(), c.cursor))
         {
-            let cwd = self.terminal.cwd().map(std::path::Path::new);
+            let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
             let path = std::env::var_os("PATH");
             let home = std::env::var_os("HOME");
-            self.completions = completion::complete(
+            self.active_tab_mut().completions = completion::complete(
                 &buffer,
                 cursor,
                 cwd,
                 path.as_deref(),
                 home.as_deref().map(std::path::Path::new),
-                &self.command_history,
+                &self.active_tab().command_history,
                 true,
             );
-            self.completions_input = Some((buffer, cursor));
-            self.selected_completion = 0;
-            self.completion_scroll = 0;
+            self.active_tab_mut().completions_input = Some((buffer, cursor));
+            self.active_tab_mut().selected_completion = 0;
+            self.active_tab_mut().completion_scroll = 0;
         }
         self.invalidate();
     }
@@ -110,16 +110,16 @@ impl State {
     /// submits as-typed). `submit` implies not-keep-open and always closes the
     /// popup (the command is running, so the popup must go).
     pub(crate) fn accept_selected_completion(&mut self, keep_open: bool, submit: bool) {
-        let Some(sug) = self.completions.get(self.selected_completion) else {
+        let Some(sug) = self.active_tab().completions.get(self.active_tab().selected_completion) else {
             return;
         };
         // Clone the suggestion so the byte payload below can hold the immutable
-        // `self.terminal` borrow without also borrowing `self.completions`.
+        // `self.active_tab().terminal` borrow without also borrowing `self.active_tab().completions`.
         let sug = sug.clone();
         // Build the byte payload (cloning the suffix) while holding the
-        // immutable `self.terminal` borrow, then drop it before the &self
+        // immutable `self.active_tab().terminal` borrow, then drop it before the &self
         // `write_pty` call below.
-        let bytes: Option<Vec<u8>> = self.terminal.current_input().map(|c| {
+        let bytes: Option<Vec<u8>> = self.active_tab().terminal.current_input().map(|c| {
             let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &sug) {
                 Some(suffix) => suffix.as_bytes().to_vec(),
                 // A stale / non-extending suggestion: no suffix to insert, but
@@ -139,22 +139,22 @@ impl State {
         if submit {
             // Submitting: the command is running, so the popup must close and
             // stay closed until the user types again.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         } else if keep_open {
             // Drilling into a directory: force a fresh recompute on the next
             // OSC 2122 report, but leave the popup open and undismissed so the
             // round-trip refilters to the subdirectory's contents.
-            self.completions_input = None;
+            self.active_tab_mut().completions_input = None;
         } else {
             // Finishing: close and keep closed until the user types.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         }
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         self.invalidate();
     }
 }

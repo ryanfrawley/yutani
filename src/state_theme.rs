@@ -1,10 +1,10 @@
-//! `State` methods for font-size changes and color-scheme / theme handling:
-//! config reload+persist, active-scheme resolution, palette-derived colours,
-//! live preview, and theme-color sync.
+//! `WindowState` methods for font-size changes and color-scheme / theme
+//! handling: config reload+persist, active-scheme resolution, palette-derived
+//! colours, live preview, and theme-color sync.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// Bump (or shrink) the font by `delta_pt` points and persist the new size.
     /// Thin wrapper over [`set_font_size`]; the zoom command saves, the
     /// onboarding live-preview path calls `set_font_size` directly so it
@@ -27,19 +27,19 @@ impl State {
         }
         self.pt_size = new_pt;
         self.config.font_size = self.pt_size;
-        self.font.set_char_size(self.pt_size, self.dpi);
-        self.atlas = self.font.build_atlas();
+        self.shared.font.borrow_mut().set_char_size(self.pt_size, self.dpi);
+        self.atlas = self.shared.font.borrow_mut().build_atlas();
         self.font_texture = renderer::texture::Texture::from_memory(
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             &self.atlas.buffer,
             self.atlas.width as u32,
             self.atlas.height as u32,
             wgpu::TextureFormat::R8Unorm,
             Some("font texture"),
         );
-        self.font_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.font_bind_group_layout,
+        self.font_bind_group = self.shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.shared.font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -54,18 +54,18 @@ impl State {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let viewport = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
-        self.terminal.resize(viewport.char_width, viewport.char_height);
+        self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.sync_terminal_cell_size();
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
         true
     }
@@ -131,10 +131,10 @@ impl State {
         ];
         for g in [&mut self.glow, &mut self.glow_fg] {
             apply_glow_config(g, &self.config, &p.glow);
-            g.set_bright_palette(&self.gpu.queue, &bright);
+            g.set_bright_palette(&self.shared.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
-            g.write_glow_params(&self.gpu.queue);
+            g.write_glow_params(&self.shared.gpu.queue);
         }
 
         // Already-painted cells carry pre-resolved RGBA from when their
@@ -142,7 +142,7 @@ impl State {
         // up the new scheme so the visible viewport actually changes
         // color, not just any new output printed after this point.
         // Truecolor cells (absolute RGB from the app) are left alone.
-        self.terminal.reresolve_palette();
+        self.active_tab_mut().terminal.reresolve_palette();
         // Cell vertex buffer caches bg colors and glyph fg colors per
         // cell; the sweep above just changed those values, so the
         // cached vertices are stale.
@@ -205,6 +205,6 @@ impl State {
             palette::linear_to_srgb_u8(c[1]),
             palette::linear_to_srgb_u8(c[2]),
         ];
-        self.terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
+        self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
     }
 }

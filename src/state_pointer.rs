@@ -1,10 +1,10 @@
-//! `State` pointer handling: pixel<->cell mapping, the title-bar chrome
-//! band, mouse reporting to the PTY, hover-URL tracking, and local text
-//! selection (word/line granularity, copy).
+//! `WindowState` pointer handling: pixel<->cell mapping, the title-bar
+//! chrome band, mouse reporting to the PTY, hover-URL tracking, and local
+//! text selection (word/line granularity, copy).
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// 1-based (col, row) form of `pixel_to_visual_cell` for mouse reporting.
     pub(crate) fn pixel_to_cell(&self, px: f64, py: f64) -> (u16, u16) {
         let (c, r) = self.pixel_to_visual_cell(px, py);
@@ -47,7 +47,7 @@ impl State {
     /// Forward a mouse event to the PTY in the host's preferred encoding,
     /// if any tracking mode is enabled. `motion` is set for drag/move events.
     pub(crate) fn report_mouse(&mut self, button: input::MouseButton, press: bool, motion: bool) {
-        let mp = self.terminal.mouse_protocol();
+        let mp = self.active_tab().terminal.mouse_protocol();
         if !mp.enabled() {
             return;
         }
@@ -60,10 +60,10 @@ impl State {
         let (col, row) = self.pixel_to_cell(self.mouse_x, self.mouse_y);
         if motion {
             // Coalesce: only report when the cell changes.
-            if self.last_reported_cell == Some((col, row)) {
+            if self.active_tab().last_reported_cell == Some((col, row)) {
                 return;
             }
-            self.last_reported_cell = Some((col, row));
+            self.active_tab_mut().last_reported_cell = Some((col, row));
         }
         let bytes = input::encode_mouse(button, col, row, press, motion, mp.sgr, self.modifiers);
         self.write_pty(&bytes);
@@ -78,24 +78,24 @@ impl State {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     pub(crate) fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;
         let bg_h = ascender - descender;
-        let cell_w = self.font.cell_width() as f64;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f64;
         // Mirror the renderer's dynamic decorator offset: full DECORATOR_HEIGHT
         // at both scroll-range boundaries (live grid and top of scrollback),
         // easing to 0 over one line in either direction. Out-of-sync formulas
         // here would drift the hit-test by a row vs. what's actually drawn.
-        let view_offset = self.terminal.view_offset() as f64;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let view_offset = self.active_tab().terminal.view_offset() as f64;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f64
+            self.active_tab().terminal.scrollback_len() as f64
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
@@ -106,16 +106,16 @@ impl State {
         let row_strip_top =
             WINDOW_PADDING as f64 + chrome_offset + line_height - ascender - strip_pad;
         let col = ((px - WINDOW_PADDING as f64) / cell_w).floor() as i64;
-        let row = ((py - row_strip_top - self.scroll_y) / line_height).floor() as i64;
-        let col = col.clamp(0, self.terminal.cols as i64 - 1) as usize;
-        let row = row.clamp(0, self.terminal.rows as i64 - 1) as isize;
+        let row = ((py - row_strip_top - self.active_tab().scroll_y) / line_height).floor() as i64;
+        let col = col.clamp(0, self.active_tab().terminal.cols as i64 - 1) as usize;
+        let row = row.clamp(0, self.active_tab().terminal.rows as i64 - 1) as isize;
         (col, row)
     }
 
     /// Pixel coord → absolute (line, col) selection point.
     pub(crate) fn pixel_to_selection_point(&self, px: f64, py: f64) -> (isize, usize) {
         let (col, vrow) = self.pixel_to_visual_cell(px, py);
-        (self.terminal.visual_to_abs_line(vrow), col)
+        (self.active_tab().terminal.visual_to_abs_line(vrow), col)
     }
 
     /// Recompute the URL under the mouse pointer. Tracks Cmd state so the
@@ -135,12 +135,12 @@ impl State {
         }
         let new = if self.modifiers.super_key() {
             let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
-            let abs_line = self.terminal.visual_to_abs_line(vrow);
-            find_url_at(&self.terminal, abs_line, col)
+            let abs_line = self.active_tab().terminal.visual_to_abs_line(vrow);
+            find_url_at(&self.active_tab().terminal, abs_line, col)
         } else {
             None
         };
-        if new == self.hover_url {
+        if new == self.active_tab().hover_url {
             return;
         }
         let icon = if new.is_some() {
@@ -149,7 +149,7 @@ impl State {
             winit::window::CursorIcon::Text
         };
         self.window.set_cursor_icon(icon);
-        self.hover_url = new;
+        self.active_tab_mut().hover_url = new;
         self.invalidate();
     }
 
@@ -159,23 +159,23 @@ impl State {
     pub(crate) fn handle_mouse_press(&mut self) {
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
         let now = std::time::Instant::now();
-        let continued = self
+        let continued = self.active_tab()
             .last_click
             .map(|(t, c)| c == p && now.duration_since(t) < DOUBLE_CLICK_THRESHOLD)
             .unwrap_or(false);
-        self.click_count = if continued { (self.click_count % 3) + 1 } else { 1 };
-        self.last_click = Some((now, p));
-        self.selection_mode = match self.click_count {
+        self.active_tab_mut().click_count = if continued { (self.active_tab().click_count % 3) + 1 } else { 1 };
+        self.active_tab_mut().last_click = Some((now, p));
+        self.active_tab_mut().selection_mode = match self.active_tab().click_count {
             1 => SelectionMode::Cell,
             2 => SelectionMode::Word,
             _ => SelectionMode::Line,
         };
-        self.press_cell = Some(p);
-        self.press_pixel = Some((self.mouse_x, self.mouse_y));
+        self.active_tab_mut().press_cell = Some(p);
+        self.active_tab_mut().press_pixel = Some((self.mouse_x, self.mouse_y));
         // Word and Line modes show their selection on click. Cell mode waits
         // until the drag exceeds DRAG_THRESHOLD_PX so a plain click doesn't
         // briefly highlight a single character.
-        self.selection = match self.selection_mode {
+        self.active_tab_mut().selection = match self.active_tab().selection_mode {
             SelectionMode::Cell => None,
             _ => self.compute_selection(p, p),
         };
@@ -183,9 +183,9 @@ impl State {
 
     /// Update the head of the active selection from the current mouse pos.
     pub(crate) fn handle_mouse_drag(&mut self) {
-        let Some(p0) = self.press_cell else { return };
-        if self.selection_mode == SelectionMode::Cell && self.selection.is_none() {
-            let Some((px, py)) = self.press_pixel else { return };
+        let Some(p0) = self.active_tab().press_cell else { return };
+        if self.active_tab().selection_mode == SelectionMode::Cell && self.active_tab().selection.is_none() {
+            let Some((px, py)) = self.active_tab().press_pixel else { return };
             let dx = self.mouse_x - px;
             let dy = self.mouse_y - py;
             if dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
@@ -193,23 +193,23 @@ impl State {
             }
         }
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
-        self.selection = self.compute_selection(p0, p);
+        self.active_tab_mut().selection = self.compute_selection(p0, p);
     }
 
     pub(crate) fn handle_mouse_release(&mut self) {
-        self.press_cell = None;
-        self.press_pixel = None;
+        self.active_tab_mut().press_cell = None;
+        self.active_tab_mut().press_pixel = None;
     }
 
     /// Build a selection from two cells under the current `selection_mode`.
     /// In Word / Line mode, each end snaps outward to the word or line edge.
     pub(crate) fn compute_selection(&self, a: (isize, usize), b: (isize, usize)) -> Option<Selection> {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let (start, end) = match self.selection_mode {
+        let (start, end) = match self.active_tab().selection_mode {
             SelectionMode::Cell => (start, end),
             SelectionMode::Word => (self.word_start(start), self.word_end(end)),
             SelectionMode::Line => {
-                let last = self.terminal.cols.saturating_sub(1);
+                let last = self.active_tab().terminal.cols.saturating_sub(1);
                 ((start.0, 0), (end.0, last))
             }
         };
@@ -218,7 +218,7 @@ impl State {
 
     /// Walk left from `p` while the previous cell is a word char.
     pub(crate) fn word_start(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -231,7 +231,7 @@ impl State {
 
     /// Walk right from `p` while the next cell is a word char.
     pub(crate) fn word_end(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -245,10 +245,10 @@ impl State {
     pub(crate) fn clear_selection(&mut self) -> bool {
         // Reset multi-click bookkeeping too — typing should make the next
         // click count as a fresh single-click.
-        self.last_click = None;
-        self.click_count = 0;
-        if self.selection.is_some() {
-            self.selection = None;
+        self.active_tab_mut().last_click = None;
+        self.active_tab_mut().click_count = 0;
+        if self.active_tab().selection.is_some() {
+            self.active_tab_mut().selection = None;
             true
         } else {
             false
@@ -258,11 +258,11 @@ impl State {
     /// Materialize the current selection as plain text, trimming trailing
     /// whitespace per line and joining with '\n'.
     pub(crate) fn selection_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
+        let sel = self.active_tab().selection.as_ref()?;
         let (start, end) = sel.range();
         let mut out = String::new();
         for line in start.0..=end.0 {
-            let Some(cells) = self.terminal.line_at(line) else { continue };
+            let Some(cells) = self.active_tab().terminal.line_at(line) else { continue };
             let from = if line == start.0 { start.1 } else { 0 };
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
@@ -294,15 +294,15 @@ impl State {
     /// `OutputStart`..`CommandEnd`). Returns false (no-op) when no completed
     /// command has any output. Drives the Cmd-Shift-O keybinding.
     pub(crate) fn select_last_command_output(&mut self) -> bool {
-        let Some((start_line, end_line)) = self.terminal.last_command_output_span() else {
+        let Some((start_line, end_line)) = self.active_tab().terminal.last_command_output_span() else {
             return false;
         };
-        let last_col = self.terminal.cols.saturating_sub(1);
-        self.selection = Some(Selection {
+        let last_col = self.active_tab().terminal.cols.saturating_sub(1);
+        self.active_tab_mut().selection = Some(Selection {
             anchor: (start_line, 0),
             head: (end_line, last_col),
         });
-        self.selection_mode = SelectionMode::Cell;
+        self.active_tab_mut().selection_mode = SelectionMode::Cell;
         self.copy_selection();
         self.invalidate();
         true

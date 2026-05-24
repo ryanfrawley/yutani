@@ -1,10 +1,10 @@
-//! `State` rendering: building the per-frame vertex/index buffers
+//! `WindowState` rendering: building the per-frame vertex/index buffers
 //! (`update_vertices`) and the wgpu pass orchestration (`render`), plus the
 //! glyph/half-block UV and edge-fade helpers they rely on.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
     // and the top/bottom edge fades.
@@ -12,44 +12,60 @@ impl State {
         // Advance any alt-screen scroll slide first so this frame reads the
         // freshly-eased `scroll_y`.
         self.update_alt_scroll();
-        let cols = self.terminal.cols;
-        let rows = self.terminal.rows;
+        let cols = self.active_tab().terminal.cols;
+        let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let face = self.font.face();
-        let metrics = face.size_metrics().unwrap();
-        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
-        let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let descender = (metrics.descender >> 6) as f32;
-        // Underline metrics from the font's `post` table. The face values are
-        // in font design units; `y_scale` (16.16 fixed) converts to 26.6 px
-        // for this size, matching how `ascender` / `descender` above land in
-        // 26.6 — divide by 64 once for actual pixels.
-        //   - `underline_position`: vertical center of the stem, in font
-        //     units. Negative ⇒ below the baseline (the usual case).
-        //   - `underline_thickness`: stem height in font units.
-        // Kept as floats; the rasterizer can render a sub-pixel quad
-        // across two rows of fragments which reads as a softer-than-1px
-        // line and lets the stripe grow smoothly with point size.
-        // Fallbacks cover fonts whose `post` table is empty (some
-        // bitmap-style monospace TTFs report 0).
-        let y_scale = metrics.y_scale as f32 / 65536.0;
-        let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
-        let underline_thickness_px = if raw_thick_px > 0.0 {
-            raw_thick_px
-        } else {
-            line_height * 0.06
-        };
-        let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
-        let underline_pos_px = if face.underline_position() != 0 {
-            raw_pos_px
-        } else {
-            descender * 0.5
-        };
+        // All face-derived metrics are pulled in one borrow so the shared
+        // font's `Ref` is dropped before the `ensure_*` fill calls below
+        // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
+        let (line_height, cell_w, bg_h, descender, underline_thickness_px, underline_pos_px) =
+            self.shared.with_font(|font| {
+                let face = font.face();
+                let metrics = face.size_metrics().unwrap();
+                let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let cell_w = font.cell_width() as f32;
+                let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let descender = (metrics.descender >> 6) as f32;
+                // Underline metrics from the font's `post` table. The face
+                // values are in font design units; `y_scale` (16.16 fixed)
+                // converts to 26.6 px for this size, matching how `ascender` /
+                // `descender` above land in 26.6 — divide by 64 once for
+                // actual pixels.
+                //   - `underline_position`: vertical center of the stem, in
+                //     font units. Negative ⇒ below the baseline (the usual
+                //     case).
+                //   - `underline_thickness`: stem height in font units.
+                // Kept as floats; the rasterizer can render a sub-pixel quad
+                // across two rows of fragments which reads as a softer-than-1px
+                // line and lets the stripe grow smoothly with point size.
+                // Fallbacks cover fonts whose `post` table is empty (some
+                // bitmap-style monospace TTFs report 0).
+                let y_scale = metrics.y_scale as f32 / 65536.0;
+                let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
+                let underline_thickness_px = if raw_thick_px > 0.0 {
+                    raw_thick_px
+                } else {
+                    line_height * 0.06
+                };
+                let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
+                let underline_pos_px = if face.underline_position() != 0 {
+                    raw_pos_px
+                } else {
+                    descender * 0.5
+                };
+                (
+                    line_height,
+                    cell_w,
+                    bg_h,
+                    descender,
+                    underline_thickness_px,
+                    underline_pos_px,
+                )
+            });
 
         let pal = palette::get();
         let default_fg = pal.foreground;
@@ -63,7 +79,7 @@ impl State {
         let atlas_h = self.atlas.height as f32;
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
@@ -123,13 +139,13 @@ impl State {
         // toolbar. Mid-scroll the offset is 0 so older content can flow
         // behind the title bar smoothly. Eases linearly over one line at
         // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
-        let view_offset = self.terminal.view_offset() as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
         // Alt screen has no scrollback to fade toward — pin both distances
         // to zero so the top/bottom edge fades stay invisible.
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
@@ -145,7 +161,7 @@ impl State {
         // both for shaping (below) and the main emit loop further down. During
         // an alt-screen scroll slide `scroll_y` can exceed a line, so widen the
         // band to cover the departing rows being slid in from the edge.
-        let anim_extra = if self.terminal.on_alt_screen() {
+        let anim_extra = if self.active_tab().terminal.on_alt_screen() {
             (scroll_y.abs() / line_height).ceil() as isize
         } else {
             0
@@ -170,10 +186,14 @@ impl State {
         > = std::collections::HashMap::new();
         // Reused across rows — refilled in place to avoid per-row allocation.
         let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        // Borrow the shared shaper once for the whole pass. `match_at` returns
+        // a `&Ligature` into it, so the borrow must outlive each match's use;
+        // it's disjoint from the `font`/`atlas` fills below (different fields).
+        let shaper = self.shared.shaper.borrow();
         for r in r_lo..r_hi {
             row_chars.clear();
             for c in 0..cols {
-                let cell = self.terminal.extended_cell(r, c);
+                let cell = self.active_tab().terminal.extended_cell(r, c);
                 let ch = cell.map(|cell| cell.ch).unwrap_or(' ');
                 // Pre-pack any char outside build_atlas's fixed ranges
                 // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
@@ -184,20 +204,20 @@ impl State {
                         cell.style.bold,
                         cell.style.italic,
                     );
-                    self.atlas.ensure_char(&mut self.font, variant, ch);
+                    self.atlas.ensure_char(&mut *self.shared.font.borrow_mut(), variant, ch);
                 }
                 row_chars.push(ch);
             }
             let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
             let mut c = 0;
             while c < cols {
-                let Some(start_cell) = self.terminal.extended_cell(r, c) else {
+                let Some(start_cell) = self.active_tab().terminal.extended_cell(r, c) else {
                     c += 1;
                     continue;
                 };
                 let variant =
                     font::FaceVariant::from_flags(start_cell.style.bold, start_cell.style.italic);
-                let lig = match self.shaper.match_at(&row_chars[c..], variant) {
+                let lig = match shaper.match_at(&row_chars[c..], variant) {
                     Some(l) => l,
                     None => {
                         c += 1;
@@ -209,7 +229,7 @@ impl State {
                 // style — a colored or weight-changing split breaks the
                 // visual cohesion that contextual-alternate halves rely on.
                 let style_uniform = (1..span).all(|i| {
-                    self.terminal
+                    self.active_tab().terminal
                         .extended_cell(r, c + i)
                         .map(|cell| cell.style == start_cell.style)
                         .unwrap_or(false)
@@ -224,7 +244,7 @@ impl State {
                 // span (better to render the chars than render half a
                 // ligature).
                 let all_ok = lig.output_glyphs.iter().all(|gid| {
-                    self.atlas.ensure_glyph_id(&mut self.font, variant, *gid)
+                    self.atlas.ensure_glyph_id(&mut *self.shared.font.borrow_mut(), variant, *gid)
                 });
                 if !all_ok {
                     c += 1;
@@ -247,9 +267,10 @@ impl State {
         // didn't already pack this frame, so the immutable-`atlas` lookup in
         // `emit_text_run` below is a hit (and the dirty flag triggers the
         // re-upload right after). Done here, before the `&self.atlas` borrow,
-        // because `ensure_char` needs `&mut self.atlas`/`&mut self.font`.
-        if !self.completions.is_empty() {
-            let chars: Vec<char> = self
+        // because `ensure_char` needs `&mut self.atlas` and a `&mut Font`
+        // (taken as a single-statement `borrow_mut` per the AppShared rule).
+        if !self.active_tab().completions.is_empty() {
+            let chars: Vec<char> = self.active_tab()
                 .completions
                 .iter()
                 .flat_map(|s| s.text.chars())
@@ -257,7 +278,7 @@ impl State {
                 .collect();
             for ch in chars {
                 self.atlas
-                    .ensure_char(&mut self.font, font::FaceVariant::Regular, ch);
+                    .ensure_char(&mut *self.shared.font.borrow_mut(), font::FaceVariant::Regular, ch);
             }
         }
 
@@ -265,7 +286,7 @@ impl State {
         // new glyphs. write_texture reuses the existing GPU texture and
         // bind group — no need to recreate either.
         if self.atlas.dirty {
-            self.gpu.queue.write_texture(
+            self.shared.gpu.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.font_texture.texture,
                     mip_level: 0,
@@ -315,7 +336,7 @@ impl State {
         // departing content slides *under* the static status line instead of
         // bleeding glyphs over it; for a full-height region it sits below the
         // window and clips nothing.
-        let (anim_lo, anim_hi, clip_bottom_px) = match &self.alt_scroll_anim {
+        let (anim_lo, anim_hi, clip_bottom_px) = match &self.active_tab().alt_scroll_anim {
             Some(a) => {
                 let d = a.rows as isize;
                 // Up-scroll departing rows sit above the region top (off-grid
@@ -332,7 +353,7 @@ impl State {
             }
             None => (0, 0, f32::INFINITY),
         };
-        let anim_active = self.alt_scroll_anim.is_some();
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
         let row_moving = move |r: isize| anim_active && r >= anim_lo && r <= anim_hi;
         // Per-row vertical offset. When no slide is active this is the global
         // `scroll_y` for every row (unchanged scrollback behavior).
@@ -524,7 +545,7 @@ impl State {
             sel[2] * selection_alpha,
             selection_alpha,
         ];
-        let selection = self.selection;
+        let selection = self.active_tab().selection;
 
         // 0b. Half-block fallback overrides for image placements that
         // the GPU image pipeline can't draw this frame (config-disabled
@@ -562,7 +583,7 @@ impl State {
             // row falls outside the selection. Mirrors `strip_at` further
             // down where the overlay quads are emitted.
             let sel_strip = selection_range.and_then(|(start, end)| {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 if abs_line < start.0 || abs_line > end.0 {
                     return None;
                 }
@@ -595,7 +616,7 @@ impl State {
                     });
                     continue;
                 }
-                let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
+                let Some(cell) = self.active_tab().terminal.extended_cell(r, c) else { continue };
                 // Kitty unicode-placeholder cells (`U+10EEEE` + image-id
                 // encoded in fg). The image quad draws over this cell on
                 // its own pipeline pass — emitting the U+10EEEE glyph
@@ -667,9 +688,9 @@ impl State {
         // overlay (1b) so a selected URL still reads as selected. Walks the
         // phantom-row range like the cell loop so the underline follows the
         // text through smooth scroll.
-        if let Some(hu) = &self.hover_url {
+        if let Some(hu) = &self.active_tab().hover_url {
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 // Underline every segment that lands on this line. Most links
                 // have one per line; an OSC 8 link with an `id=` shared across
                 // non-contiguous spans can have several, so don't stop early.
@@ -699,7 +720,7 @@ impl State {
                     }
                     // Match the cell's foreground color so the underline tracks
                     // theme overrides; fall back to the default fg.
-                    let fg = self
+                    let fg = self.active_tab()
                         .terminal
                         .extended_cell(r, from)
                         .map(|cell| {
@@ -758,7 +779,7 @@ impl State {
             // Match the cell loop's phantom range so a partially-scrolled
             // row keeps its selection strip drawn through the slide.
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((from, to)) = strip_at(abs_line) else { continue };
                 let prev = strip_at(abs_line - 1);
                 let next = strip_at(abs_line + 1);
@@ -887,7 +908,7 @@ impl State {
                 yellow[2] * cur_a,
                 cur_a,
             ];
-            let top_abs = self.terminal.visual_to_abs_line(0);
+            let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
             let emit_match = |vertices: &mut Vec<renderer::vertex::Vertex>,
                               indices: &mut Vec<u32>,
                               m: &search::Match,
@@ -937,7 +958,7 @@ impl State {
         let status_markers = if self.config.prompt_gutter == PromptGutter::None {
             Vec::new()
         } else {
-            self.terminal.prompt_status_markers()
+            self.active_tab().terminal.prompt_status_markers()
         };
         if !status_markers.is_empty() {
             let pal = palette::get();
@@ -946,7 +967,7 @@ impl State {
             let strip_pad = (line_height - bg_h) * 0.5;
             let bar_radius = bar_w * 0.5;
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((_, status)) = status_markers.iter().find(|(l, _)| *l == abs_line)
                 else {
                     continue;
@@ -991,20 +1012,20 @@ impl State {
         let viewport_key = ViewportKey {
             rows,
             cols,
-            view_offset: self.terminal.view_offset(),
-            on_alt_screen: self.terminal.on_alt_screen(),
+            view_offset: self.active_tab().terminal.view_offset(),
+            on_alt_screen: self.active_tab().terminal.on_alt_screen(),
         };
         // A viewport change (resize, scrollback, alt-screen toggle) makes
         // last frame's snapshot non-comparable cell-for-cell, so we drop
         // any in-flight ghosts and skip detection until we have a fresh
         // matching snapshot to compare against.
-        let key_matches = self
+        let key_matches = self.active_tab()
             .prev_visible
             .as_ref()
             .map(|s| s.key == viewport_key)
             .unwrap_or(false);
         if !key_matches {
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // The cursor and its ghosts animate in BUFFER coordinates so changes
@@ -1013,18 +1034,18 @@ impl State {
         // grid. `live_grid_offset` is the integer visual-row delta to apply
         // when converting buffer rows back to viewport pixel space; equal
         // to `scrollback_visible` on the primary screen, 0 on alt screen.
-        let live_grid_offset_i = if self.terminal.on_alt_screen() {
+        let live_grid_offset_i = if self.active_tab().terminal.on_alt_screen() {
             0usize
         } else {
-            self.terminal.view_offset().min(rows)
+            self.active_tab().terminal.view_offset().min(rows)
         };
         let live_grid_offset = live_grid_offset_i as f32;
 
         // Cursor anchor for the completion popup, captured while the cursor is
         // drawn (same row/col→pixel mapping). `(anchor_x, cursor_row_top)`.
         let mut popup_anchor: Option<(f32, f32)> = None;
-        if let Some(_cur_visual_row) = self.terminal.cursor_visual_row() {
-            let cur = self.terminal.cursor();
+        if let Some(_cur_visual_row) = self.active_tab().terminal.cursor_visual_row() {
+            let cur = self.active_tab().terminal.cursor();
             let cur_col = cur.col.min(cols.saturating_sub(1));
             let target = (cur_col as f32, cur.row as f32);
             let anim_secs = self.config.cursor_anim_secs;
@@ -1035,10 +1056,14 @@ impl State {
             // buffer coords; prev_visible uses visual rows, so translate via
             // `live_grid_offset` (consistent because key_matches implies
             // view_offset hasn't changed since the snapshot).
+            // Collected into a local Vec, then appended after the `snap`
+            // borrow below is dropped — pushing straight into the tab would
+            // borrow it mutably while `snap` holds the same tab immutably.
+            let mut new_ghosts: Vec<CursorGhost> = Vec::new();
             if anim_secs > 0.0 && key_matches {
                 if let (Some(prev_anim), Some(snap)) = (
-                    self.cursor_anim.as_ref(),
-                    self.prev_visible.as_ref(),
+                    self.active_tab().cursor_anim.as_ref(),
+                    self.active_tab().prev_visible.as_ref(),
                 ) {
                     let (pcol, prow) = prev_anim.to;
                     let moved = (pcol - target.0).abs() > f32::EPSILON
@@ -1067,11 +1092,11 @@ impl State {
                                 if is_blank_cell(&prev) {
                                     continue;
                                 }
-                                let now_cell = self.terminal.visible_cell(vis_r, c);
+                                let now_cell = self.active_tab().terminal.visible_cell(vis_r, c);
                                 if !is_blank_cell(&now_cell) {
                                     continue;
                                 }
-                                self.cursor_ghosts.push(CursorGhost {
+                                new_ghosts.push(CursorGhost {
                                     ch: prev.ch,
                                     style: prev.style,
                                     buffer_row: buf_r,
@@ -1084,24 +1109,35 @@ impl State {
                 }
             }
 
+            // Now that `snap`'s immutable borrow has ended, fold in the ghosts
+            // captured above.
+            self.tabs[self.active].cursor_ghosts.append(&mut new_ghosts);
+
             // Drop ghosts whose underlying cell got rewritten with new
             // content (e.g. user typed a replacement after the backspace),
             // or whose fade has run out.
             let now = std::time::Instant::now();
-            let terminal = &self.terminal;
-            self.cursor_ghosts.retain(|g| {
-                let elapsed = now.duration_since(g.started_at).as_secs_f32();
-                if anim_secs <= 0.0 || elapsed >= anim_secs {
-                    return false;
-                }
-                let vis_r = g.buffer_row + live_grid_offset_i;
-                is_blank_cell(&terminal.visible_cell(vis_r, g.col))
-            });
+            {
+                // Scoped so the `&mut tab` (which borrows `self.tabs`) is
+                // released before the ghost-emit loop reads the active tab.
+                // `cursor_ghosts` (mut) and `terminal` (read) split-borrow the
+                // one tab.
+                let tab = &mut self.tabs[self.active];
+                let terminal = &tab.terminal;
+                tab.cursor_ghosts.retain(|g| {
+                    let elapsed = now.duration_since(g.started_at).as_secs_f32();
+                    if anim_secs <= 0.0 || elapsed >= anim_secs {
+                        return false;
+                    }
+                    let vis_r = g.buffer_row + live_grid_offset_i;
+                    is_blank_cell(&terminal.visible_cell(vis_r, g.col))
+                });
+            }
 
             // Emit ghost glyphs as foreground-only quads with linearly
             // decaying alpha. Drawn before the cursor box so the cursor
             // visually consumes the ghost as it slides over.
-            for ghost in &self.cursor_ghosts {
+            for ghost in &self.active_tab().cursor_ghosts {
                 let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
                 let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
                 let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
@@ -1124,7 +1160,7 @@ impl State {
                 );
             }
 
-            let anim = self.cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
+            let anim = self.tabs[self.active].cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
             anim.retarget(target, anim_secs);
 
             if visible {
@@ -1143,7 +1179,7 @@ impl State {
                 let cursor_color = palette::get().cursor;
                 // Underline / bar use a 2-px stripe; block fills the full cell.
                 let stripe = 2.0_f32;
-                let (cx, cy, cw, ch) = match self.terminal.cursor_shape() {
+                let (cx, cy, cw, ch) = match self.active_tab().terminal.cursor_shape() {
                     terminal::CursorShape::Block => (block_x, block_y, cell_w, line_height),
                     terminal::CursorShape::Underline => {
                         (block_x, block_y + line_height - stripe, cell_w, stripe)
@@ -1167,8 +1203,8 @@ impl State {
             // Cursor scrolled out of view. Drop the ease so the next time it
             // returns we snap to the new position instead of sliding in from
             // a stale one. Ghosts are tied to the cursor's motion so go with it.
-            self.cursor_anim = None;
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_anim = None;
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // Completion popup overlay (autocomplete slice K10). Drawn AFTER the
@@ -1180,14 +1216,14 @@ impl State {
         // TODO(K11+): consider excluding the popup from bloom. Appending into
         // the FG index range means it participates in the glow/bloom pass when
         // glow is on; acceptable for K10.
-        let popup_visible = !self.completions.is_empty() && self.terminal.view_offset() == 0;
+        let popup_visible = !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
         if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
-            let len = self.completions.len();
+            let len = self.active_tab().completions.len();
             // The visible window: `COMPLETION_MAX_VISIBLE` rows starting at the
             // scroll offset, clamped to the list. `n` is how many rows render.
-            let start = self.completion_scroll.min(len);
+            let start = self.active_tab().completion_scroll.min(len);
             let end = (start + COMPLETION_MAX_VISIBLE).min(len);
-            let visible = &self.completions[start..end];
+            let visible = &self.active_tab().completions[start..end];
             let n = visible.len();
             let item_h = line_height;
             // Box width: longest visible suggestion (chars) plus a little
@@ -1201,8 +1237,8 @@ impl State {
             let box_w = (longest as f32 * cell_w + text_pad * 2.0).min(cell_w * 48.0);
 
             let anchor_below_y = cursor_row_top + line_height;
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
             let layout = completion::popup_layout(
                 anchor_x,
                 anchor_below_y,
@@ -1253,7 +1289,7 @@ impl State {
             // visible window. Round the highlight's top corners only when it's
             // the box's first visible row, and its bottom corners only when it's
             // the last — so the highlight's rounding tracks the box's edges.
-            let hl_row = self.selected_completion.saturating_sub(start);
+            let hl_row = self.active_tab().selected_completion.saturating_sub(start);
             if hl_row < n {
                 let hl_y = layout.y + hl_row as f32 * item_h;
                 let round_top = if hl_row == 0 { radius } else { 0.0 };
@@ -1305,8 +1341,8 @@ impl State {
             use command_palette::{Mode, PALETTE_MAX_VISIBLE};
             let cp = &self.command_palette;
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the palette to pull focus.
             push_quad(
@@ -1485,8 +1521,8 @@ impl State {
         // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
         if self.search.open {
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the box.
             push_quad(
@@ -1623,11 +1659,11 @@ impl State {
         for r in 0..rows {
             let mut row_cells: Vec<style::Cell> = Vec::with_capacity(cols);
             for c in 0..cols {
-                row_cells.push(self.terminal.visible_cell(r, c));
+                row_cells.push(self.active_tab().terminal.visible_cell(r, c));
             }
             snap_cells.push(row_cells);
         }
-        self.prev_visible = Some(GridSnapshot {
+        self.tabs[self.active].prev_visible = Some(GridSnapshot {
             cells: snap_cells,
             key: viewport_key,
         });
@@ -1638,8 +1674,8 @@ impl State {
         // phantom row sliding into / out of the bottom edge dissolves rather
         // than clipping abruptly. Drawn last so they overlay every cell. RGB
         // is premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
-        let win_w = self.gpu.config.width as f32;
-        let win_h = self.gpu.config.height as f32;
+        let win_w = self.surface.config.width as f32;
+        let win_h = self.surface.config.height as f32;
         // Top fade is taller than the bottom: the title bar + toolbar takes
         // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
         // below that gives content a soft runway as it scrolls into view
@@ -1751,10 +1787,10 @@ impl State {
             );
         }
 
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
@@ -1764,12 +1800,12 @@ impl State {
         // foreground text toward the bg color near each edge; the blur sits
         // on top to soften whatever's still visible in the gradient region.
         if !strip_indices.is_empty() {
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
                 0,
                 bytemuck::cast_slice(&strip_vertices),
             );
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_index_buffer,
                 0,
                 bytemuck::cast_slice(&strip_indices),
@@ -1786,7 +1822,7 @@ impl State {
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
         ];
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.fade_buffer,
             0,
             bytemuck::cast_slice(&fade_data),
@@ -1806,7 +1842,7 @@ impl State {
         scrollback_len: f32,
         line_height: f32,
     ) -> (f32, f32) {
-        if self.terminal.on_alt_screen() {
+        if self.active_tab().terminal.on_alt_screen() {
             (0.0, 0.0)
         } else {
             (
@@ -1819,15 +1855,15 @@ impl State {
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     pub(crate) fn is_top_fade_animating(&self) -> bool {
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let view_offset = self.terminal.view_offset() as f32;
-        let metrics = self.font.face().size_metrics().unwrap();
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
         let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
@@ -2016,16 +2052,16 @@ impl State {
         if images_enabled && !opted_in {
             return out;
         }
-        let cols = self.terminal.cols;
-        let view_offset = self.terminal.view_offset();
-        let rows = self.terminal.rows;
-        for p in self.terminal.live_placements() {
-            let is_pending = self.image_store.is_pending(p.image);
-            let gpu_ok = self.image_store.peek(p.image).is_some();
+        let cols = self.active_tab().terminal.cols;
+        let view_offset = self.active_tab().terminal.view_offset();
+        let rows = self.active_tab().terminal.rows;
+        for p in self.active_tab().terminal.live_placements() {
+            let is_pending = self.active_tab().image_store.is_pending(p.image);
+            let gpu_ok = self.active_tab().image_store.peek(p.image).is_some();
             if !Self::should_halfblock(images_enabled, opted_in, is_pending, gpu_ok) {
                 continue;
             }
-            let Some(preview) = self.image_store.preview(p.image) else {
+            let Some(preview) = self.active_tab().image_store.preview(p.image) else {
                 // Disabled-but-no-preview: nothing to draw with. The
                 // empty space is the right behaviour here; users who
                 // want a placeholder would have to wait for a future
@@ -2063,13 +2099,27 @@ impl State {
         clear: wgpu::Color,
     ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
         let surface_t0 = std::time::Instant::now();
-        let output = self.gpu.surface.get_current_texture().unwrap();
+        let output = match self.surface.surface.get_current_texture() {
+            Ok(o) => o,
+            // A backgrounded / occluded / just-resized surface returns
+            // `Outdated` (and `Lost`) routinely once there's more than one
+            // window — reconfigure and skip this frame rather than panicking;
+            // the next redraw re-acquires. (With one window this only tripped
+            // on resize, which is why the old `unwrap` survived.)
+            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                self.surface
+                    .surface
+                    .configure(&self.shared.gpu.device, &self.surface.config);
+                return Ok((surface_t0.elapsed(), true));
+            }
+            Err(e) => return Err(e),
+        };
         let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("terminal"),
@@ -2109,22 +2159,22 @@ impl State {
         // anchor → pixel rect uses the same font metrics + decorator_offset
         // + scroll_y that `update_vertices` applies to cell quads, so
         // images scroll smoothly alongside text.
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
-        let view_offset = self.terminal.view_offset() as f32;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y as f32;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y as f32;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y as f32;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y as f32;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         // Resolve store entries up front so the borrow can live alongside
         // the upcoming `&mut encoder` calls. Placements whose image was
@@ -2147,20 +2197,20 @@ impl State {
         // in.
         let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
         if self.config.images_enabled {
-            let view_offset = self.terminal.view_offset();
-            let rows = self.terminal.rows;
-            let scrollback_draws = self
+            let view_offset = self.active_tab().terminal.view_offset();
+            let rows = self.active_tab().terminal.rows;
+            let scrollback_draws = self.active_tab()
                 .terminal
-                .scrollback_placements_in_view(self.terminal.rows);
+                .scrollback_placements_in_view(self.active_tab().terminal.rows);
             image_draws.reserve(
-                self.terminal.live_placements().len() + scrollback_draws.len(),
+                self.active_tab().terminal.live_placements().len() + scrollback_draws.len(),
             );
             // `(viewport_row, placement)` tuples — by the time the pixel
             // math runs, the row index is in viewport coords. Live
             // placements get the same shift `extended_cell` applies to
             // cells (history rows push live content down); scrollback
             // placements arrive pre-shifted from `scrollback_placements_in_view`.
-            let live_iter = self.terminal.live_placements().iter().map(|p| {
+            let live_iter = self.active_tab().terminal.live_placements().iter().map(|p| {
                 (
                     Self::live_placement_viewport_row(p.top_row, view_offset, rows),
                     p,
@@ -2172,7 +2222,7 @@ impl State {
                 // peek_at picks the current animation frame for animated
                 // images; for static images it returns the same texture
                 // as peek().
-                let Some(gpu_img) = self.image_store.peek_at(p.image, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(p.image, now) else { continue };
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
@@ -2220,19 +2270,19 @@ impl State {
             // halfway through the image — visibly clips at the
             // surviving cells instead of distorting the image into
             // whatever shrinking rect remained.
-            for run in self.terminal.kitty_placeholder_runs() {
-                let Some(store_id) = self.terminal.kitty_image_id_lookup(run.client_id)
+            for run in self.active_tab().terminal.kitty_placeholder_runs() {
+                let Some(store_id) = self.active_tab().terminal.kitty_image_id_lookup(run.client_id)
                 else {
                     continue;
                 };
                 let Some((total_cols, total_rows)) =
-                    self.terminal.kitty_image_cell_extent(run.client_id)
+                    self.active_tab().terminal.kitty_image_cell_extent(run.client_id)
                 else {
                     // No `c=`/`r=` on the transmission — no honest
                     // UV denominator. Skip rather than guess.
                     continue;
                 };
-                let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(store_id, now) else { continue };
                 // `run.screen_row` is already in the same visual-row
                 // frame `update_vertices` uses (the scanner walks
                 // `extended_cell(-2..rows+2, ..)`), so plug it
@@ -2266,9 +2316,9 @@ impl State {
         let has_images = !image_draws.is_empty();
 
         let grid_pipeline = if self.wireframe {
-            self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
+            self.shared.wireframe_pipeline.as_ref().unwrap_or(&self.shared.render_pipeline)
         } else {
-            &self.render_pipeline
+            &self.shared.render_pipeline
         };
 
         // Helper to issue a draw of part of the cell vertex buffer into
@@ -2317,7 +2367,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &view,
                     wgpu::LoadOp::Load,
@@ -2358,7 +2408,7 @@ impl State {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -2378,7 +2428,7 @@ impl State {
             if has_images {
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -2396,13 +2446,13 @@ impl State {
             );
             // Pass 3: glow each layer against its own un-blurred scene
             // so the bright pass extracts crisp colour, not post-blur smear.
-            self.glow.run(&mut encoder);
-            self.glow_fg.run(&mut encoder);
+            self.glow.run(&mut encoder, &self.shared.glow_pipelines);
+            self.glow_fg.run(&mut encoder, &self.shared.glow_pipelines);
             // Strip blur still samples the bg scene — strips live near
             // the window edges where there's rarely text, so a bg-only
             // blur source reads close to the legacy combined-scene blur.
             if needs_strips {
-                self.blur.run(&mut encoder);
+                self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
             // Pass 4: composite to swapchain. Order is bg → bg glow →
@@ -2424,7 +2474,7 @@ impl State {
             });
 
             // bg scene (opaque blit).
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -2432,13 +2482,13 @@ impl State {
             // halo over colored cells so the bg's own pixels aren't
             // re-tinted by their bloom; the halo still appears in
             // transparent areas adjacent to colored cells.
-            pass.set_pipeline(&self.glow.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_bg_mask, &[]);
             pass.draw(0..3, 0..1);
 
             // fg scene (alpha-blended on top of bg + bg glow).
-            pass.set_pipeline(&self.blur.blit_alpha_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_alpha_pipeline);
             pass.set_bind_group(0, &self.scene_fg_blit_bg, &[]);
             pass.draw(0..3, 0..1);
 
@@ -2446,7 +2496,7 @@ impl State {
             // the bloom paints over adjacent cells' colored backgrounds
             // and visually shifts them; this keeps the halo only in
             // areas where bg is transparent.
-            pass.set_pipeline(&self.glow_fg.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow_fg.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_fg_mask, &[]);
             pass.draw(0..3, 0..1);
@@ -2462,18 +2512,18 @@ impl State {
                     // Layered path has both scene textures — mask
                     // samples bg + fg so glyphs on default-bg cells
                     // still get scanlines.
-                    pass.set_pipeline(&self.glow.scanline_overlay_masked_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_masked_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                     pass.set_bind_group(1, &self.scanline_overlay_mask, &[]);
                 } else {
-                    pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 }
                 pass.draw(0..3, 0..1);
             }
 
             if needs_strips {
-                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
                 pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
                 pass.set_bind_group(1, &self.camera_bind_group, &[]);
                 pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -2499,7 +2549,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -2521,7 +2571,7 @@ impl State {
                     "scene pass",
                 );
             }
-            self.blur.run(&mut encoder);
+            self.blur.run(&mut encoder, &self.shared.blur_pipelines);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
@@ -2538,7 +2588,7 @@ impl State {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -2549,12 +2599,12 @@ impl State {
             // content, producing artifacts. `skip_primary_bg` therefore
             // only takes effect in the layered (glow-on) path.
             if content_overlay_on {
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
 
-            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
             pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
             pass.set_bind_group(1, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -2566,7 +2616,7 @@ impl State {
             pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
-        self.gpu.queue.submit(std::iter::once(encoder.finish()));
+        self.shared.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok((surface_wait, !needs_offscreen))

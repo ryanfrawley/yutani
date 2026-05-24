@@ -19,9 +19,9 @@ mod style;
 mod terminal;
 
 mod pty;
+mod config;
 mod url;
 mod font_data;
-mod config;
 mod paths;
 mod state_completion;
 mod state_anim;
@@ -44,15 +44,18 @@ use winit::{
 extern crate libc;
 use nix::libc::*;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 // use rand_distr::{Distribution, Normal};
 // use rand::thread_rng;
 
 use wgpu::util::DeviceExt;
-use font_data::*;
 use config::*;
+use url::*;
+use font_data::*;
 use paths::*;
 use event_loop::run;
-use url::*;
 
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
@@ -68,7 +71,7 @@ const DEFAULT_FONT_SIZE: f32 = 10.0;
 
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
-/// truth so the `State::new` and `resize_buffers` paths can't drift.
+/// truth so the `WindowState::new` and `resize_buffers` paths can't drift.
 ///
 /// Capacity model: each cell emits two quads (background + glyph), so
 /// `area = cols * rows` cells contribute `2 * area` quads. The slack
@@ -276,19 +279,336 @@ fn should_rearm_image_poll(
     !pending_placements_empty || !results_empty || store_pending > 0
 }
 
-struct State {
-    gpu: gpu::GpuContext,
-
-    // Must be declared after `gpu` so it gets dropped after the surface —
-    // the surface holds unsafe references to the window's resources.
-    window: Window,
-
+/// Resources shared by every window in the process: the GPU device/queue, the
+/// font stack, and the pipelines/layouts that depend only on the device (and
+/// the shared surface format). Built once at startup; future windows borrow
+/// this instead of re-initializing the adapter, re-loading fonts, or
+/// recompiling shaders. Single-threaded (the winit event loop), so the
+/// not-`Send` font lives behind `Rc<RefCell>` rather than `Arc<Mutex>`.
+struct AppShared {
+    gpu: Rc<gpu::Gpu>,
+    /// FreeType faces. `Rc<RefCell>` because faces aren't `Send` but every
+    /// window lives on the one event-loop thread. Borrow discipline is
+    /// load-bearing: read through [`AppShared::with_font`], and fill via a
+    /// single-statement `atlas.ensure_*(&mut shared.font.borrow_mut(), …)` so
+    /// no `Ref`/`RefMut` is held across the overlapping borrow in
+    /// `update_vertices` (which would panic at runtime — and the test suite,
+    /// using `Font` directly, wouldn't catch it).
+    font: Rc<RefCell<font::Font>>,
+    /// rustybuzz shaper, used during update_vertices to detect programming
+    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
+    /// single wide glyph instead of two adjacent characters. Read-only after
+    /// startup; shared like the font.
+    shaper: Rc<RefCell<shaper::Shaper>>,
     render_pipeline: wgpu::RenderPipeline,
     /// Wireframe debug pipeline — same vertex shader but PolygonMode::Line
     /// and a flat-color fragment. `None` if the adapter doesn't expose
     /// POLYGON_MODE_LINE; the toggle becomes a no-op there.
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    /// Toggled by Cmd-Shift-W. When true, render() picks wireframe_pipeline.
+    /// Layout for the font texture + sampler. Kept so each window can build
+    /// its own `font_bind_group` (and rebind after a font-size change).
+    font_bind_group_layout: wgpu::BindGroupLayout,
+    /// Layouts shared by the render pipeline (above) and each window's
+    /// per-window camera / fade bind groups, so a window can build those
+    /// against the same layout the pipeline expects.
+    camera_bind_group_layout: wgpu::BindGroupLayout,
+    fade_bind_group_layout: wgpu::BindGroupLayout,
+    /// Dual-Kawase blur pipelines (shader compiled once per process). The
+    /// per-window textures/bind-groups live in `WindowState::blur`.
+    blur_pipelines: renderer::blur::BlurPipelines,
+    /// Glow/bloom pipelines (shared by both the bg and fg `Glow` instances of
+    /// every window). The per-window/per-layer resources live in `WindowState::glow`
+    /// / `WindowState::glow_fg`.
+    glow_pipelines: renderer::glow::GlowPipelines,
+}
+
+impl AppShared {
+    /// Build the once-per-process resources: device/queue (already created),
+    /// the font stack, the bind-group layouts, and every shader pipeline that
+    /// depends only on the device + surface format. Windows are then built by
+    /// [`WindowState::create_window`] against the returned `Rc<AppShared>`.
+    fn new(
+        gpu: gpu::Gpu,
+        surface_format: wgpu::TextureFormat,
+        font: font::Font,
+        shaper: shaper::Shaper,
+    ) -> Self {
+        let gpu = Rc::new(gpu);
+
+        let font_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("font texture bind group layout"),
+            });
+
+        let camera_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera bind group layout"),
+            });
+
+        let fade_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("fade bind group layout"),
+            });
+
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
+
+        let render_pipeline_layout =
+            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("render pipeline layout"),
+                bind_group_layouts: &[
+                    &font_bind_group_layout,
+                    &camera_bind_group_layout,
+                    &fade_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("render pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[renderer::vertex::Vertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        let wireframe_pipeline = if gpu
+            .device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE)
+        {
+            Some(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wireframe pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[renderer::vertex::Vertex::desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_wire",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Line,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            }))
+        } else {
+            None
+        };
+
+        let blur_pipelines = renderer::blur::BlurPipelines::new(
+            &gpu.device,
+            surface_format,
+            &camera_bind_group_layout,
+            renderer::vertex::Vertex::desc(),
+        );
+        let glow_pipelines = renderer::glow::GlowPipelines::new(&gpu.device, surface_format);
+
+        Self {
+            gpu,
+            font: Rc::new(RefCell::new(font)),
+            shaper: Rc::new(RefCell::new(shaper)),
+            render_pipeline,
+            wireframe_pipeline,
+            font_bind_group_layout,
+            camera_bind_group_layout,
+            fade_bind_group_layout,
+            blur_pipelines,
+            glow_pipelines,
+        }
+    }
+
+    /// Borrow the shared font for the duration of `f` and no longer. Callers
+    /// receive a `&Font`, never the `Ref`, so the borrow scope can't be
+    /// widened past the call — the structural guard against the borrow-overlap
+    /// panic described on the `font` field.
+    fn with_font<R>(&self, f: impl FnOnce(&font::Font) -> R) -> R {
+        f(&self.font.borrow())
+    }
+}
+
+/// One shell session and the interaction state bound to it. Everything here
+/// scrolls, selects, or completes against a single PTY + `Terminal`; none of
+/// it is coupled to the window's GPU surface, atlas, or buffers (so a tab can
+/// later move between windows — see MULTIWINDOW_PLAN.md). A window owns a
+/// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
+/// per window; the tab UI is a later follow-up.
+struct TabState {
+    /// Process-unique id this tab's PTY reader thread tags its events with.
+    /// The event loop resolves it to the owning window via `tab_to_window`.
+    tab_id: app_window::TabId,
+    /// PTY master fd. The reader thread owns its own copy (reads + reaps);
+    /// this copy lets the main thread `close()` it to unblock that read on
+    /// tab close.
+    master: i32,
+    /// Forked child pid. Kept so tab close can `kill(child, SIGHUP)` — the
+    /// blocking `read(master)` only returns once the child exits, so closing a
+    /// tab running e.g. `vim` needs both `close(master)` and the signal. See
+    /// [`close_tab_pty`].
+    child: i32,
+    terminal: terminal::Terminal,
+    /// Decode + GPU residency cache for this tab's images. Per-tab: each shell
+    /// has its own placements + scrollback. Mark-and-sweep eviction keyed on
+    /// the live + scrollback placement set runs at the start of each `render`.
+    image_store: images::Store,
+    /// Cell anchors waiting on async decode, matched back to the tab's
+    /// `Terminal` by `PendingId` when `Store::poll` yields the result.
+    pending_placements: Vec<PendingImagePlacement>,
+    scroll_y: f64,
+    /// In-flight smooth slide for an explicit alt-screen scroll captured from
+    /// the running app (`Terminal::take_alt_scroll`).
+    alt_scroll_anim: Option<AltScrollAnim>,
+    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
+    /// less, htop). Drained per `line_height` like `scroll_y`.
+    wheel_pty_accum: f64,
+    /// Drop in-flight trackpad momentum once a newer command has overridden
+    /// the user's scroll intent. See `last_wheel_at`.
+    scroll_suppressed: bool,
+    last_wheel_at: Option<std::time::Instant>,
+    /// Last cell a motion event was reported for — coalesces per-pixel motion
+    /// down to per-cell transitions for the host.
+    last_reported_cell: Option<(u16, u16)>,
+    /// Smooth cursor motion: eases the rendered cursor quad toward the logical
+    /// cursor over `config.cursor_anim_secs`. `None` off-screen / pre-first-frame.
+    cursor_anim: Option<CursorAnim>,
+    /// Snapshot of the previous frame's visible cells (+ a viewport key) used
+    /// to spawn fade-out ghosts when the cursor retargets across deleted glyphs.
+    prev_visible: Option<GridSnapshot>,
+    /// Glyphs fading out at their old cell position after the cursor moved off.
+    cursor_ghosts: Vec<CursorGhost>,
+    /// Completion popup suggestions, recomputed only when the shell's reported
+    /// input changes (path completion does disk I/O).
+    completions: Vec<completion::Suggestion>,
+    /// The (buffer, cursor) the cached `completions` were computed from.
+    completions_input: Option<(String, usize)>,
+    /// Highlighted row in the completion popup (index into `completions`).
+    selected_completion: usize,
+    /// First visible popup row when `completions` exceeds MAX_VISIBLE.
+    completion_scroll: usize,
+    /// When true the popup stays closed as the shell re-reports input — set by
+    /// Enter/Esc, cleared by the next real keystroke.
+    completion_dismissed: bool,
+    /// Past command lines for history-based completion, most-recent-first and
+    /// deduped. Seeded from $HISTFILE (OSC 2124), grown at OSC 133 `C`.
+    command_history: Vec<String>,
+    /// Active local text selection in (absolute_line, col) coordinates so it
+    /// stays anchored to content as the grid scrolls.
+    selection: Option<Selection>,
+    /// Granularity for the active drag (set on press from click_count).
+    selection_mode: SelectionMode,
+    /// Cell where the current drag started; recomputes word/line selections as
+    /// the head moves. `None` when no button is being dragged.
+    press_cell: Option<(isize, usize)>,
+    /// Pixel position of the mouse-down — suppresses a Cell-mode selection
+    /// until the cursor moves at least DRAG_THRESHOLD_PX.
+    press_pixel: Option<(f64, f64)>,
+    /// Last left-button press, for multi-click detection (cell + time window).
+    last_click: Option<(std::time::Instant, (isize, usize))>,
+    click_count: u32,
+    /// URL under the mouse while Cmd is held. Drives the underline overlay and
+    /// the Cmd-click open behavior.
+    hover_url: Option<HoverUrl>,
+}
+
+struct WindowState {
+    /// Per-window GPU surface. Declared first so it drops before `window` —
+    /// the surface holds unsafe references to the window's resources.
+    surface: gpu::WindowSurface,
+
+    window: Window,
+
+    /// Process-shared GPU device/queue, font stack, and pipelines. Held via
+    /// `Rc` so every window shares one instance; declared after `surface` so
+    /// the shared device outlives the surface configured against it.
+    shared: Rc<AppShared>,
+
+    /// Toggled by Cmd-Shift-W. When true, render() picks
+    /// `shared.wireframe_pipeline`.
     wireframe: bool,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -309,16 +629,6 @@ struct State {
     /// vertex/index buffers and is invoked once per frame between the bg
     /// and fg cell passes (when there are placements to draw).
     image_pipeline: renderer::images::ImagePipeline,
-    /// Decode + GPU residency cache for images. Populated by parsers and
-    /// the debug-keybind path; queried by the renderer via `Store::peek`.
-    /// Mark-and-sweep eviction keyed on the live + scrollback placement
-    /// set runs at the start of each `render()`.
-    image_store: images::Store,
-    /// Cell anchors waiting on async decode. When the worker finishes a
-    /// decode and `Store::poll` yields the result, we match it back by
-    /// `PendingId` and call `Terminal::insert_placement` at the stored row
-    /// / col. Survives the in-flight decode interval — typically <100ms.
-    pending_placements: Vec<PendingImagePlacement>,
     blur: renderer::blur::BlurChain,
     /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
     /// always rendered to the offscreen `blur.scene` texture so the glow
@@ -352,19 +662,11 @@ struct State {
     /// the overlay there. Rebuilt on resize when either texture is
     /// recreated.
     scanline_overlay_mask: wgpu::BindGroup,
-    font: font::Font,
-    /// rustybuzz shaper, used during update_vertices to detect programming
-    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
-    /// single wide glyph instead of two adjacent characters.
-    shaper: shaper::Shaper,
     font_bind_group: wgpu::BindGroup,
     /// The actual font atlas texture. Kept around so on-demand-rasterized
     /// ligature glyphs can be uploaded incrementally via queue.write_texture
     /// without recreating the texture or bind group.
     font_texture: renderer::texture::Texture,
-    /// Layout for the font texture + sampler. Kept around so we can rebind
-    /// after a font-size change rebuilds the atlas texture.
-    font_bind_group_layout: wgpu::BindGroupLayout,
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
@@ -376,33 +678,14 @@ struct State {
     fade_buffer: wgpu::Buffer,
     fade_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
-    terminal: terminal::Terminal,
+    /// The window's tabs and which one is active. Per-tab state (shell,
+    /// scroll, selection, completions, images) lives in `TabState`; the
+    /// window renders only `tabs[active]`. First cut: always exactly one tab.
+    tabs: Vec<TabState>,
+    active: usize,
     modifiers: winit::keyboard::ModifiersState,
-    scroll_y: f64,
-    /// In-flight smooth slide for an explicit alt-screen scroll captured from
-    /// the running app (`Terminal::take_alt_scroll`). Drives `scroll_y` on the
-    /// alt screen while active; the departing rows it slides over live on the
-    /// terminal until `finish_alt_scroll` clears them.
-    alt_scroll_anim: Option<AltScrollAnim>,
-    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
-    /// less, htop). Trackpads stream small PixelDelta events — without
-    /// accumulation, every event truncates to 0 lines and slow scrolls
-    /// produce no wheel reports at all until one event finally crosses the
-    /// line-height threshold and emits a burst. Drained per `line_height`
-    /// just like `scroll_y` so the rate matches the local-scrollback path.
-    wheel_pty_accum: f64,
-    /// Drop in-flight trackpad momentum once a newer command (a keystroke
-    /// that snaps to the bottom) has overridden the user's scroll intent.
-    /// Cleared when momentum runs out OR a fresh gesture begins after a
-    /// real idle gap — see `last_wheel_at` for how we tell the two apart
-    /// (momentum's Started arrives ~one frame after the prior Ended).
-    scroll_suppressed: bool,
-    last_wheel_at: Option<std::time::Instant>,
     mouse_x: f64,
     mouse_y: f64,
-    // Last cell we reported a motion event for. Mouse motion fires per pixel,
-    // but the host only cares about per-cell transitions — coalesce.
-    last_reported_cell: Option<(u16, u16)>,
     // Currently-held mouse button (in xterm code). `None` when no button down.
     held_button: Option<input::MouseButton>,
     // Cursor blink. `blink_on` is the visible phase; `last_blink` anchors the
@@ -416,44 +699,6 @@ struct State {
     top_fade_phase: f32,
     bottom_fade_phase: f32,
     last_anim_tick: std::time::Instant,
-    /// Smooth cursor motion: when the logical cursor moves, the rendered
-    /// quad eases from the previous displayed position toward the new
-    /// target over `config.cursor_anim_secs`. `None` while the cursor is
-    /// off-screen (scrollback) or before the first frame; the next visible
-    /// frame snaps to the target without animating.
-    cursor_anim: Option<CursorAnim>,
-    /// Snapshot of the previous frame's visible cells, plus a viewport key
-    /// (rows / cols / view_offset / alt-screen). Compared on retarget to
-    /// spot cells that just went non-blank → blank so the deleted glyph can
-    /// fade out as a ghost while the cursor slides over it. A key mismatch
-    /// (resize, scrollback, alt-screen toggle) skips ghost detection that
-    /// frame so a wholesale grid shift doesn't spawn ghosts everywhere.
-    prev_visible: Option<GridSnapshot>,
-    /// Glyphs being faded out at their old cell position, captured from
-    /// `prev_visible` when the cursor retargets across them. Each fades to
-    /// alpha 0 over `cursor_anim_secs`; the entry is dropped early if the
-    /// underlying cell becomes non-blank again (a follow-up keystroke).
-    cursor_ghosts: Vec<CursorGhost>,
-    /// Suggestions for the completion popup, recomputed only when the shell's
-    /// reported input changes (path completion does disk I/O — never recompute
-    /// per frame). Drawn by `update_vertices`; display-only in K10 (K11 adds
-    /// keyboard nav + accept).
-    completions: Vec<completion::Suggestion>,
-    /// The (buffer, cursor) the cached `completions` were computed from, so we
-    /// can skip the recompute (and the `read_dir`) when nothing changed.
-    completions_input: Option<(String, usize)>,
-    /// Highlighted row in the completion popup (index into `completions`). Reset
-    /// to 0 whenever the list is recomputed. Only meaningful while `completions`
-    /// is non-empty.
-    selected_completion: usize,
-    /// First visible row when `completions` exceeds the popup's MAX_VISIBLE
-    /// rows; scrolls to keep `selected_completion` on screen.
-    completion_scroll: usize,
-    /// When true, the popup stays closed even as the shell re-reports input —
-    /// set by Enter (finish) and Esc (dismiss), cleared by the next real
-    /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
-    /// close the menu.
-    completion_dismissed: bool,
     /// The command palette overlay (Cmd-Shift-P). While `open`, it owns the
     /// keyboard: keystrokes filter/drive it instead of reaching the PTY. Holds
     /// its own search/argument text field and selection state; see
@@ -463,29 +708,6 @@ struct State {
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
     search: search::Search,
-    /// Past command lines for history-based completion suggestions, most-recent-
-    /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
-    /// 2124) and grown with this session's submitted commands (captured at OSC
-    /// 133 `C`). Capped to bound memory.
-    command_history: Vec<String>,
-    // Active local text selection, in (absolute_line, col) coordinates so it
-    // stays anchored to content as the grid scrolls. `None` when nothing is
-    // selected. The two endpoints are anchor (mouse-down cell) and head
-    // (latest cell under the cursor); they may be in either order.
-    selection: Option<Selection>,
-    // Granularity for the active drag (set on press from click_count).
-    selection_mode: SelectionMode,
-    // Cell where the current drag started; used to recompute word/line
-    // selections as the head moves. `None` when no button is being dragged.
-    press_cell: Option<(isize, usize)>,
-    // Pixel position of the mouse-down. In Cell mode we suppress the
-    // selection until the cursor has moved at least DRAG_THRESHOLD_PX from
-    // here, so a plain click doesn't briefly highlight a single character.
-    press_pixel: Option<(f64, f64)>,
-    // Last left-button press, for multi-click detection (must match cell and
-    // be within the threshold window).
-    last_click: Option<(std::time::Instant, (isize, usize))>,
-    click_count: u32,
     // Time of the last left-press in the title-bar band, for double-click
     // detection there. Separate from `last_click` (which keys on a grid cell)
     // since toolbar clicks have no cell. A double-click toggles window zoom.
@@ -500,11 +722,19 @@ struct State {
     /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
     /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
     chrome_band_px: f64,
-    /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
-    /// the pointer isn't over a URL. Drives the underline overlay and the
-    /// Cmd-click open behavior.
-    hover_url: Option<HoverUrl>,
-    master: i32,
+    /// Program-set window title (OSC 0/2). When `Some` it wins over the
+    /// cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload.
+    /// Per-window so each window tracks its own shell's title.
+    manual_title: Option<String>,
+    /// This window's current appearance, from `WindowEvent::ThemeChanged`.
+    /// Per-window so windows on differently-themed monitors (or after an
+    /// independent override) clear/redraw to their own background.
+    theme: winit::window::Theme,
+    /// Set by Cmd-N / the palette's "New window" action; drained by the event
+    /// loop, which owns the registry + `AppShared` and actually spawns the
+    /// window in-process. (A window can't build its sibling itself — it has no
+    /// handle to the shared resources or the window map.)
+    pending_new_window: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -746,60 +976,9 @@ enum HorizSide {
 
 /// Logical-point offset applied to each cascaded window, matching the macOS
 /// convention of stepping a new window down-and-right from its parent. Roughly
-/// a title-bar height so successive windows stack like a fanned deck.
+/// a title-bar height so successive windows stack like a fanned deck. Applied
+/// by [`spawn_window_in_process`] off the spawning window's live position.
 const WINDOW_CASCADE_STEP: f64 = 28.0;
-
-/// Env var carrying the parent window's top-left, in logical points, to a
-/// freshly spawned child (`"x,y"`). The child reads it in `run()` and places
-/// its window one `WINDOW_CASCADE_STEP` down-and-right so new windows cascade
-/// instead of landing exactly atop the one that spawned them. Absent for the
-/// first window (launched from Finder/CLI), which keeps the OS default spot.
-const CASCADE_ENV: &str = "YUTANI_CASCADE_FROM";
-
-/// Launch a fresh Yutani window. Each window is its own process (the app is
-/// single-window per process), so a new window is just another instance of our
-/// own executable. `cwd` — the running shell's working directory from OSC 7 —
-/// becomes the child's working directory so the new window opens where the
-/// current one is, falling back to inheriting ours when it's unknown.
-/// `origin` is the spawning window's top-left in logical points; when present
-/// it's forwarded so the child can cascade off it. Failures are logged rather
-/// than fatal: a missing exe path shouldn't kill the window the user is in.
-fn spawn_new_window(cwd: Option<&str>, origin: Option<(f64, f64)>) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("new window: cannot resolve current exe: {e}");
-            return;
-        }
-    };
-    let mut cmd = std::process::Command::new(exe);
-    if let Some(dir) = cwd {
-        if !dir.is_empty() {
-            cmd.current_dir(dir);
-        }
-    }
-    if let Some((x, y)) = origin {
-        cmd.env(CASCADE_ENV, format!("{x},{y}"));
-    }
-    if let Err(e) = cmd.spawn() {
-        eprintln!("new window: failed to spawn: {e}");
-    }
-}
-
-/// Parse the cascade hint set by a parent window (see [`CASCADE_ENV`]) into the
-/// child's target top-left, stepped one [`WINDOW_CASCADE_STEP`] down-and-right.
-/// Returns `None` when the var is absent or malformed so the window falls back
-/// to the OS-chosen position.
-fn cascade_position() -> Option<winit::dpi::LogicalPosition<f64>> {
-    let raw = std::env::var(CASCADE_ENV).ok()?;
-    let (x, y) = raw.split_once(',')?;
-    let x: f64 = x.trim().parse().ok()?;
-    let y: f64 = y.trim().parse().ok()?;
-    Some(winit::dpi::LogicalPosition::new(
-        x + WINDOW_CASCADE_STEP,
-        y + WINDOW_CASCADE_STEP,
-    ))
-}
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
@@ -940,29 +1119,33 @@ impl Selection {
 
 }
 
-impl State {
-    async fn new(
-        master: i32,
+impl WindowState {
+    /// Build one window against the shared, already-constructed `AppShared`,
+    /// adopting `initial_tab` as its (sole, for now) tab. Builds only the
+    /// per-window resources: the glyph atlas + font texture/bind-group, camera
+    /// + fade uniforms/bind-groups, vertex/index buffers, and the blur/glow
+    /// textures. Reused verbatim by Cmd-N (Stage 4) and tab tear-off (later).
+    fn create_window(
+        shared: Rc<AppShared>,
         window: Window,
-        gpu: gpu::GpuContext,
-        mut font: font::Font,
-        shaper: shaper::Shaper,
+        surface: gpu::WindowSurface,
         config: Config,
         dpi: u32,
+        initial_tab: TabState,
     ) -> Self {
         let _sw = std::time::Instant::now();
         let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
-        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
+        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... create_window {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         let pt_size = config.font_size;
-        sub!("GpuContext (passed in, built concurrently)");
+        let window_theme = window.theme().unwrap_or(winit::window::Theme::Light);
 
-        // Font texture setup
-        let atlas = font.build_atlas();
+        // Per-window glyph atlas, rasterized on demand from the shared faces.
+        let atlas = shared.font.borrow_mut().build_atlas();
         sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
-            &gpu.device,
-            &gpu.queue,
+            &shared.gpu.device,
+            &shared.gpu.queue,
             &atlas.buffer,
             atlas.width as u32,
             atlas.height as u32,
@@ -970,31 +1153,8 @@ impl State {
             Some("font texture"),
         );
 
-        let font_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("font texture bind group layout"),
-            });
-
-        let font_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &font_bind_group_layout,
+        let font_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1010,31 +1170,16 @@ impl State {
 
         let camera = renderer::camera::Camera {};
         let mut camera_uniform = renderer::camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, gpu.config.width as f32, gpu.config.height as f32);
+        camera_uniform.update_view_proj(&camera, surface.config.width as f32, surface.config.height as f32);
 
-        let camera_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let camera_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera bind group layout"),
-            });
-
-        let camera_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
+        let camera_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.camera_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buffer.as_entire_binding(),
@@ -1044,28 +1189,14 @@ impl State {
 
         // Edge-fade uniform: layout matches FadeUniform in shader.wgsl —
         // top.xy + bottom.xy + viewport.xy + bg_uv.xy = 4*vec4 = 64 bytes.
-        let fade_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let fade_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade uniform"),
             size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let fade_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("fade bind group layout"),
-            });
-        let fade_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &fade_bind_group_layout,
+        let fade_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.fade_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: fade_buffer.as_entire_binding(),
@@ -1073,108 +1204,12 @@ impl State {
             label: Some("fade bind group"),
         });
 
-        let shader = gpu
-            .device
-            .create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
-
-        let render_pipeline_layout =
-            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("render pipeline layout"),
-                bind_group_layouts: &[
-                    &font_bind_group_layout,
-                    &camera_bind_group_layout,
-                    &fade_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[renderer::vertex::Vertex::desc()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: gpu.config.format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        });
-
-        let wireframe_pipeline = if gpu
-            .device
-            .features()
-            .contains(wgpu::Features::POLYGON_MODE_LINE)
-        {
-            Some(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("wireframe pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[renderer::vertex::Vertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_wire",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: gpu.config.format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Cw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Line,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-            }))
-        } else {
-            None
-        };
-        sub!("main render + wireframe pipelines");
-
-        // Calculate console viewport & buffer sizes
-        let metrics = font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            gpu.config.width as f32,
-            gpu.config.height as f32,
-            font.cell_width(),
-            ((metrics.ascender - metrics.descender) >> 6) as usize,
-        );
+        // Buffers are sized to the adopted tab's grid so the vertex builder
+        // (which iterates `terminal.cols/rows`) can't overrun them. The tab
+        // was created at this window's computed viewport (see `run()` /
+        // Cmd-N), so these dims match.
+        let cols = initial_tab.terminal.cols;
+        let rows = initial_tab.terminal.rows;
         // Each cell contributes two quads (background + glyph) = 8 verts.
         // Slack covers four phantom rows (two top + two bottom) used during
         // smooth scrolling, the cursor quad, and the two edge-fade quads.
@@ -1185,15 +1220,15 @@ impl State {
         // panicked with a "Copy ... would end up overrunning" validation
         // error).
         let (vbuf_bytes, ibuf_bytes) =
-            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
+            grid_buffer_byte_sizes(cols, rows);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
-        let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
             contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let index_buf: Vec<u8> = vec![0; ibuf_bytes];
-        let index_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("index buffer"),
             contents: &bytemuck::cast_slice(&index_buf),
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
@@ -1201,13 +1236,13 @@ impl State {
 
         // Three strip quads max (top opaque, top gradient, bottom gradient) ⇒
         // 12 vertices, 18 indices. Sized generously so resize never reallocs.
-        let strip_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let strip_vertex_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip vertex buffer"),
             size: (32 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let strip_index_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let strip_index_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip index buffer"),
             size: (64 * std::mem::size_of::<u16>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
@@ -1215,44 +1250,42 @@ impl State {
         });
 
         let mut blur = renderer::blur::BlurChain::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
-            &camera_bind_group_layout,
-            renderer::vertex::Vertex::desc(),
+            &shared.gpu.device,
+            &shared.blur_pipelines,
+            surface.config.width,
+            surface.config.height,
         );
-        blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        blur.write_uniforms(&shared.gpu.queue, surface.config.width, surface.config.height);
         blur.iterations = config.blur_iterations.max(1);
         sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            &shared.glow_pipelines,
+            surface.config.width,
+            surface.config.height,
             &blur.scene.view,
         );
         // Second offscreen scene for the FG layer (glyphs + cursor + overlays).
         // Same format/size as `blur.scene` so the same blit and glow shaders
         // can sample either one without pipeline divergence.
         let scene_fg = SceneTarget::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             "scene fg",
         );
         let scene_fg_blit_bg =
-            blur.make_blit_bind_group(&gpu.device, &scene_fg.view, "scene fg blit bg");
+            shared.blur_pipelines.make_blit_bind_group(&shared.gpu.device, &scene_fg.view, "scene fg blit bg");
 
         // Two Glow instances — one bound to the BG scene, one to the FG
         // scene. Identical params/palette/foreground, written below.
         let mut glow_fg = renderer::glow::Glow::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            &shared.glow_pipelines,
+            surface.config.width,
+            surface.config.height,
             &scene_fg.view,
         );
         sub!("Glow::new x2 + scene_fg");
@@ -1262,7 +1295,7 @@ impl State {
         }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
-        // State::new (see `run()`), so this reads the active scheme — or
+        // WindowState::new (see `run()`), so this reads the active scheme — or
         // the defaults if no scheme was configured.
         {
             let p = palette::get();
@@ -1271,7 +1304,7 @@ impl State {
                 p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
             ];
             for g in [&mut glow, &mut glow_fg] {
-                g.set_bright_palette(&gpu.queue, &bright);
+                g.set_bright_palette(&shared.gpu.queue, &bright);
                 g.set_foreground(p.foreground);
                 // Masked composite needs the window bg colour to detect
                 // colored cells in the mask texture.
@@ -1279,27 +1312,27 @@ impl State {
             }
         }
         for g in [&glow, &glow_fg] {
-            g.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
-            g.write_glow_params(&gpu.queue);
+            g.write_uniforms(&shared.gpu.queue, surface.config.width, surface.config.height);
+            g.write_glow_params(&shared.gpu.queue);
         }
         // Both glows mask against the bg scene: the halo only appears
         // where bg is transparent (the window's default background), so
         // it can't paint over colored cell backgrounds and visually
         // shift their apparent colour.
-        let glow_bg_mask = glow.make_mask_bind_group(
-            &gpu.device,
+        let glow_bg_mask = shared.glow_pipelines.make_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             "glow bg mask (bg scene)",
         );
-        let glow_fg_mask = glow_fg.make_mask_bind_group(
-            &gpu.device,
+        let glow_fg_mask = shared.glow_pipelines.make_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             "glow fg mask (bg scene)",
         );
         // Scanline overlay's masked mask samples both layers so it can
         // tell glyphs on default-bg cells from truly empty pixels.
-        let scanline_overlay_mask = glow.make_overlay_mask_bind_group(
-            &gpu.device,
+        let scanline_overlay_mask = shared.glow_pipelines.make_overlay_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             &scene_fg.view,
             "scanline overlay mask (bg + fg)",
@@ -1309,19 +1342,17 @@ impl State {
         // fg layer, so images participate in glow + edge blur the same way
         // colored bg cells do.
         let image_pipeline = renderer::images::ImagePipeline::new(
-            &gpu.device,
-            gpu.config.format,
-            &camera_bind_group_layout,
+            &shared.gpu.device,
+            surface.config.format,
+            &shared.camera_bind_group_layout,
         );
-        let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
-        sub!("ImagePipeline::new + Store");
+        sub!("ImagePipeline::new");
 
         Self {
+            surface,
             window,
-            gpu,
+            shared,
             atlas,
-            render_pipeline,
-            wireframe_pipeline,
             wireframe: false,
             vertex_buffer,
             index_buffer,
@@ -1331,8 +1362,6 @@ impl State {
             strip_index_buffer,
             num_strip_indices: 0,
             image_pipeline,
-            image_store,
-            pending_placements: Vec::new(),
             blur,
             glow,
             glow_fg,
@@ -1341,11 +1370,8 @@ impl State {
             glow_bg_mask,
             glow_fg_mask,
             scanline_overlay_mask,
-            font,
-            shaper,
             font_bind_group,
             font_texture,
-            font_bind_group_layout,
             pt_size,
             dpi,
             config,
@@ -1355,54 +1381,43 @@ impl State {
             camera_bind_group,
             fade_buffer,
             fade_bind_group,
-            terminal: terminal::Terminal::new(
-                viewport.char_width,
-                viewport.char_height,
-                10000,
-            ),
+            tabs: vec![initial_tab],
+            active: 0,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            scroll_y: 0.0,
-            alt_scroll_anim: None,
-            wheel_pty_accum: 0.0,
-            scroll_suppressed: false,
-            last_wheel_at: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
-            last_reported_cell: None,
             held_button: None,
             blink_on: true,
             last_blink: std::time::Instant::now(),
             top_fade_phase: 0.0,
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
-            cursor_anim: None,
-            prev_visible: None,
-            cursor_ghosts: Vec::new(),
-            completions: Vec::new(),
-            completions_input: None,
-            selected_completion: 0,
-            completion_scroll: 0,
-            completion_dismissed: false,
             command_palette: command_palette::CommandPalette::default(),
             search: search::Search::default(),
-            command_history: Vec::new(),
-            selection: None,
-            selection_mode: SelectionMode::Cell,
-            press_cell: None,
-            press_pixel: None,
-            last_click: None,
-            click_count: 0,
             last_toolbar_click: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
             // DPI-scaled native title-bar height.
             chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
-            hover_url: None,
-            master,
+            manual_title: None,
+            theme: window_theme,
+            pending_new_window: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
         }
+    }
+
+    /// The active tab (read-only). First cut: always `tabs[0]`.
+    #[inline]
+    fn active_tab(&self) -> &TabState {
+        &self.tabs[self.active]
+    }
+
+    /// The active tab (mutable).
+    #[inline]
+    fn active_tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active]
     }
 
     /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls
@@ -1441,8 +1456,8 @@ impl State {
         // Mark-and-sweep AFTER poll so a freshly-landed image referenced
         // by a placement created in this same `poll_pending_images` call
         // is kept alive.
-        let referenced = self.terminal.referenced_image_ids();
-        self.image_store.retain(&referenced);
+        let referenced = self.active_tab().terminal.referenced_image_ids();
+        self.active_tab_mut().image_store.retain(&referenced);
         self.flush_vertices();
     }
 
@@ -1496,18 +1511,18 @@ impl State {
 
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let viewport = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         let (vbuf_bytes, ibuf_bytes) =
             grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         self.vertex_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("vertex buffer"),
@@ -1516,7 +1531,7 @@ impl State {
                 });
         let index_buf: Vec<u8> = vec![0; ibuf_bytes];
         self.index_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("index buffer"),
@@ -1529,21 +1544,26 @@ impl State {
         // A move to a display with a different scale factor changes the native
         // title bar's physical height; keep the chrome band in step.
         self.refresh_chrome_band();
-        self.gpu.resize(size);
+        self.surface.resize(&self.shared.gpu.device, size);
         if size.width > 0 && size.height > 0 {
-            self.blur
-                .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
+            self.blur.resize(
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.blur_pipelines,
+                size.width,
+                size.height,
+            );
             // FG scene mirrors the BG scene's size/format. Recreate the
             // texture and rebuild every bind group that samples it.
             self.scene_fg = SceneTarget::new(
-                &self.gpu.device,
-                self.gpu.config.format,
+                &self.shared.gpu.device,
+                self.surface.config.format,
                 size.width,
                 size.height,
                 "scene fg",
             );
-            self.scene_fg_blit_bg = self.blur.make_blit_bind_group(
-                &self.gpu.device,
+            self.scene_fg_blit_bg = self.shared.blur_pipelines.make_blit_bind_group(
+                &self.shared.gpu.device,
                 &self.scene_fg.view,
                 "scene fg blit bg",
             );
@@ -1551,33 +1571,35 @@ impl State {
             // scene view — resize rebuilds it against the (potentially
             // recreated) texture handle.
             self.glow.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.blur.scene.view,
             );
             self.glow_fg.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.scene_fg.view,
             );
             // Mask bind groups sample the (just-recreated) bg scene
             // texture, so they have to be rebuilt against the new view.
-            self.glow_bg_mask = self.glow.make_mask_bind_group(
-                &self.gpu.device,
+            self.glow_bg_mask = self.shared.glow_pipelines.make_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow bg mask (bg scene)",
             );
-            self.glow_fg_mask = self.glow_fg.make_mask_bind_group(
-                &self.gpu.device,
+            self.glow_fg_mask = self.shared.glow_pipelines.make_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow fg mask (bg scene)",
             );
-            self.scanline_overlay_mask = self.glow.make_overlay_mask_bind_group(
-                &self.gpu.device,
+            self.scanline_overlay_mask = self.shared.glow_pipelines.make_overlay_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 &self.scene_fg.view,
                 "scanline overlay mask (bg + fg)",
@@ -1585,16 +1607,16 @@ impl State {
         }
         self.camera_uniform
             .update_view_proj(&self.camera, size.width as f32, size.height as f32);
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.font.face().size_metrics().unwrap();
-        let size = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let size = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         // Only touch the PTY winsize when the character grid actually
@@ -1606,14 +1628,14 @@ impl State {
         // fresh prompt per frame, so growing the window appears to push the
         // prompt downward. Gating on rows/cols collapses a drag back to one
         // signal per row boundary crossed.
-        let grid_changed = size.char_width != self.terminal.cols
-            || size.char_height != self.terminal.rows;
-        self.terminal.resize(size.char_width, size.char_height);
+        let grid_changed = size.char_width != self.active_tab().terminal.cols
+            || size.char_height != self.active_tab().terminal.rows;
+        self.active_tab_mut().terminal.resize(size.char_width, size.char_height);
         if grid_changed {
             self.notify_pty_size(size.char_width, size.char_height);
         }
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
     }
 
@@ -1623,8 +1645,8 @@ impl State {
         // discover the cell-pixel size. Zero here would make those
         // tools refuse to send images with "Terminal does not support
         // reporting screen sizes in pixels."
-        let metrics = self.font.face().size_metrics().unwrap();
-        let cell_w = self.font.cell_width() as u32;
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
         let ypixel = (rows as u32).saturating_mul(line_h).min(u16::MAX as u32) as u16;
@@ -1635,12 +1657,12 @@ impl State {
             ws_ypixel: ypixel,
         };
         unsafe {
-            libc::ioctl(self.master, libc::TIOCSWINSZ, &ws);
+            libc::ioctl(self.active_tab().master, libc::TIOCSWINSZ, &ws);
         }
     }
 
     fn write_pty(&self, bytes: &[u8]) {
-        if let Err(e) = nix::unistd::write(self.master, bytes) {
+        if let Err(e) = nix::unistd::write(self.active_tab().master, bytes) {
             eprintln!("pty write failed: {e}");
         }
     }
@@ -1653,7 +1675,7 @@ impl State {
                 return;
             }
         };
-        if self.terminal.bracketed_paste() {
+        if self.active_tab().terminal.bracketed_paste() {
             self.write_pty(b"\x1b[200~");
             self.write_pty(text.as_bytes());
             self.write_pty(b"\x1b[201~");
@@ -1664,6 +1686,183 @@ impl State {
 
     fn update(&mut self) {}
 
+}
+
+/// Mint the next process-unique `TabId`. Monotonic; never reused, so a freed
+/// tab's id can't collide with a later one (a just-closed tab's reader thread
+/// may still deliver one final event — the resolver treats unknown ids as a
+/// no-op).
+fn next_tab_id() -> app_window::TabId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    app_window::TabId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create a new tab: open a PTY, fork `program` onto it, spawn the reader
+/// thread (tagging every event with the new `TabId`), and build the
+/// `TabState`. The grid is sized to `cols`×`rows` — the caller passes the
+/// owning window's viewport so the window's vertex buffers match. The reader
+/// thread takes the `Pty` by value (it reads + reaps the child); `TabState`
+/// keeps copies of `master`+`child` so the tab can be closed cleanly later
+/// (`close(master)` + `kill(child, SIGHUP)`).
+fn create_tab(
+    proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+    program: pty::ChildProgram,
+    zdotdir: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    cols: usize,
+    rows: usize,
+    image_mem_cap_bytes: usize,
+) -> (app_window::TabId, TabState) {
+    let fdm = unsafe { posix_openpt(O_RDWR) };
+    if fdm < 0 {
+        panic!("Error on posix_openpt()");
+    }
+    let pty = pty::fork_pty(fdm, program, zdotdir, cwd).expect("failed to fork pty");
+    let tab_id = next_tab_id();
+    let master = pty.master;
+    let child = pty.child;
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let code = pty.run(|data| {
+            let _ = proxy
+                .send_event(app_window::CustomEvent::PtyInput(tab_id, data.to_owned()));
+        });
+        // `run` returns once the shell has exited and been reaped; tell the
+        // loop so it reacts instead of leaving a frozen tab.
+        let _ = proxy.send_event(app_window::CustomEvent::PtyExit(tab_id, code));
+    });
+    let tab = TabState {
+        tab_id,
+        master,
+        child,
+        terminal: terminal::Terminal::new(cols, rows, 10000),
+        image_store: images::Store::new(image_mem_cap_bytes),
+        pending_placements: Vec::new(),
+        scroll_y: 0.0,
+        alt_scroll_anim: None,
+        wheel_pty_accum: 0.0,
+        scroll_suppressed: false,
+        last_wheel_at: None,
+        last_reported_cell: None,
+        cursor_anim: None,
+        prev_visible: None,
+        cursor_ghosts: Vec::new(),
+        completions: Vec::new(),
+        completions_input: None,
+        selected_completion: 0,
+        completion_scroll: 0,
+        completion_dismissed: false,
+        command_history: Vec::new(),
+        selection: None,
+        selection_mode: SelectionMode::Cell,
+        press_cell: None,
+        press_pixel: None,
+        last_click: None,
+        click_count: 0,
+        hover_url: None,
+    };
+    (tab_id, tab)
+}
+
+/// Tear down a tab's PTY. The reader thread's `read(master)` only returns once
+/// the child exits, so we `kill(child, SIGHUP)` to end the shell *and*
+/// `close(master)` to unblock the read — the thread then reaps the child and
+/// exits, firing a final `PtyExit` for this (now-unmapped) tab that the
+/// resolver drops. Safe on an already-exited child (the `kill` just returns
+/// `ESRCH`).
+fn close_tab_pty(tab: &TabState) {
+    unsafe {
+        libc::kill(tab.child, libc::SIGHUP);
+        libc::close(tab.master);
+    }
+}
+
+/// Open a new window in this process (Cmd-N / palette "New window"). Builds the
+/// `NSWindow` from the live event loop, a sibling surface from the shared
+/// instance, and a fresh tab, then registers both in the window/tab maps. The
+/// new window cascades down-and-right off `origin` (the spawner's top-left, in
+/// logical points) and its shell opens in `cwd` (the spawner's shell cwd).
+#[allow(clippy::too_many_arguments)]
+fn spawn_window_in_process(
+    elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    shared: &Rc<AppShared>,
+    proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+    windows: &mut std::collections::HashMap<winit::window::WindowId, WindowState>,
+    tab_to_window: &mut std::collections::HashMap<app_window::TabId, winit::window::WindowId>,
+    config: &Config,
+    zdotdir: &Option<std::path::PathBuf>,
+    cwd: Option<String>,
+    origin: Option<(f64, f64)>,
+) {
+    let title = effective_title(None, cwd.as_deref());
+    let transparent = false; // matches the first window (shadow bug)
+    let mut builder = WindowBuilder::new()
+        .with_title(&title)
+        .with_titlebar_transparent(true)
+        .with_transparent(transparent)
+        .with_has_shadow(!transparent)
+        .with_fullsize_content_view(true)
+        .with_decorations(true)
+        .with_blur(transparent);
+    if let Some((x, y)) = origin {
+        builder = builder.with_position(winit::dpi::LogicalPosition::new(
+            x + WINDOW_CASCADE_STEP,
+            y + WINDOW_CASCADE_STEP,
+        ));
+    }
+    let window = match builder.build(elwt) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("new window: build failed: {e}");
+            return;
+        }
+    };
+    // Match the OS title-bar appearance + native bg to the active palette,
+    // exactly as the first window does, so it doesn't flash a wrong fill.
+    window.set_theme(Some(theme_for_bg(palette::get().background)));
+    set_native_window_bg(&window, palette::get().background);
+    window.set_cursor_icon(winit::window::CursorIcon::Text);
+
+    let surface = shared.gpu.create_surface(&window);
+    let dpi = (window.scale_factor() * 96.0) as u32;
+    let (cols, rows) = {
+        let (cell_w, line_h) = shared.with_font(|f| {
+            let m = f.face().size_metrics().unwrap();
+            (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
+        });
+        let vp = WindowState::get_viewport_size(
+            surface.config.width as f32,
+            surface.config.height as f32,
+            cell_w,
+            line_h,
+        );
+        (vp.char_width, vp.char_height)
+    };
+    // New windows always get a normal shell — onboarding is first-run only.
+    let (tab_id, tab) = create_tab(
+        proxy,
+        pty::ChildProgram::Shell,
+        zdotdir.clone(),
+        cwd.map(std::path::PathBuf::from),
+        cols,
+        rows,
+        config.images_memory_cap_mb * 1024 * 1024,
+    );
+    let mut state =
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, tab);
+    // Mirror the post-construction setup `run()` does for the first window.
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
+    state.refresh_chrome_band();
+    state.sync_theme_colors();
+    let keep = state.config.images_in_scrollback;
+    state.active_tab_mut().terminal.set_keep_placements_in_scrollback(keep);
+    state.sync_terminal_cell_size();
+    state.invalidate();
+
+    let wid = state.window.id();
+    windows.insert(wid, state);
+    tab_to_window.insert(tab_id, wid);
 }
 
 /// Serialize a linear-space RGBA back to a `0xRRGGBB` literal so the
@@ -1868,7 +2067,7 @@ fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
 
 /// Window-relative `py` (physical pixels) falls inside the title bar / toolbar
 /// chrome band of height `band_px`. Free function so the boundary is
-/// unit-testable without standing up a full `State`; `State::in_top_toolbar`
+/// unit-testable without standing up a full `WindowState`; `WindowState::in_top_toolbar`
 /// delegates here, passing the live `chrome_band_px`. See `in_top_toolbar` for
 /// why the band tracks the native title-bar height rather than the
 /// scroll-animated decorator offset.
@@ -1878,7 +2077,7 @@ fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
 
 /// Choose the chrome band height from the live native title-bar height (if
 /// queryable) and the renderer's fixed `reserve`. Extracted from
-/// `State::refresh_chrome_band` so the selection arithmetic is unit-testable
+/// `WindowState::refresh_chrome_band` so the selection arithmetic is unit-testable
 /// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
 /// but never go below the reserve (and fall back to the reserve when the query
 /// failed). See `refresh_chrome_band` for the rationale.

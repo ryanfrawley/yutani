@@ -1,26 +1,26 @@
-//! `State` animation/timing methods: cursor blink phase and the alt-screen
-//! smooth-scroll slide.
+//! `WindowState` animation/timing methods: cursor blink phase and the
+//! alt-screen smooth-scroll slide.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// Effective blink state: DECSCUSR's request is gated by the user's
     /// `cursor_blink` config so opting out disables blinking globally.
     pub(crate) fn cursor_blink_enabled(&self) -> bool {
-        self.config.cursor_blink && self.terminal.cursor_blink()
+        self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
     }
 
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the
     /// cursor exists at all; blink only suppresses it on the "off" half-phase
     /// of the cycle when DECSCUSR has selected a blinking variant.
     pub(crate) fn cursor_currently_visible(&self) -> bool {
-        self.terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
+        self.active_tab().terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
     }
 
     /// If a blink half-cycle has elapsed, flip the phase and request a redraw.
     /// Returns true when the cursor visibility actually changed.
     pub(crate) fn maybe_blink_tick(&mut self) -> bool {
-        if !self.cursor_blink_enabled() || !self.terminal.cursor_visible() {
+        if !self.cursor_blink_enabled() || !self.active_tab().terminal.cursor_visible() {
             return false;
         }
         if self.last_blink.elapsed() < BLINK_INTERVAL {
@@ -34,7 +34,7 @@ impl State {
     /// Next instant the event loop should wake to flip the blink phase, or
     /// `None` if the cursor isn't blinking right now.
     pub(crate) fn next_blink_wake(&self) -> Option<std::time::Instant> {
-        if self.cursor_blink_enabled() && self.terminal.cursor_visible() {
+        if self.cursor_blink_enabled() && self.active_tab().terminal.cursor_visible() {
             Some(self.last_blink + BLINK_INTERVAL)
         } else {
             None
@@ -52,11 +52,11 @@ impl State {
     /// still fading. Keeps the event loop ticking until both finish so
     /// the redraw isn't held up waiting for the next PTY/blink event.
     pub(crate) fn is_cursor_animating(&self) -> bool {
-        let anim_active = match &self.cursor_anim {
+        let anim_active = match &self.active_tab().cursor_anim {
             Some(a) => a.animating(self.config.cursor_anim_secs),
             None => false,
         };
-        anim_active || !self.cursor_ghosts.is_empty()
+        anim_active || !self.active_tab().cursor_ghosts.is_empty()
     }
 
     /// If the just-fed output scrolled the alt screen (an explicit SU/SD or
@@ -67,7 +67,7 @@ impl State {
         if ALT_SCROLL_ANIM_SECS <= 0.0 {
             return;
         }
-        let Some(scroll) = self.terminal.take_alt_scroll() else {
+        let Some(scroll) = self.active_tab_mut().terminal.take_alt_scroll() else {
             return;
         };
         // The renderer slides the region and clips its bottom edge, so the
@@ -77,13 +77,13 @@ impl State {
         // bleed past its top edge, so skip the slide there; the scroll has
         // already been applied to the grid, it just snaps instead of animating.
         if scroll.region_top != 0 {
-            self.terminal.clear_alt_anim();
+            self.active_tab_mut().terminal.clear_alt_anim();
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let total_px = scroll.rows as f32 * line_height;
-        self.alt_scroll_anim = Some(AltScrollAnim {
+        self.active_tab_mut().alt_scroll_anim = Some(AltScrollAnim {
             up: scroll.up,
             rows: scroll.rows,
             region_top: scroll.region_top,
@@ -93,7 +93,7 @@ impl State {
         });
         // Start displaying the pre-scroll frame: shift the (already-scrolled)
         // grid back by the full distance so the departing rows fill the gap.
-        self.scroll_y = if scroll.up { total_px } else { -total_px } as f64;
+        self.active_tab_mut().scroll_y = if scroll.up { total_px } else { -total_px } as f64;
         self.invalidate();
     }
 
@@ -101,12 +101,12 @@ impl State {
     /// toward zero. Finishes (and releases the frozen rows) when the slide
     /// completes or the alt screen is no longer active. No-op when idle.
     pub(crate) fn update_alt_scroll(&mut self) {
-        let Some(anim) = self.alt_scroll_anim else {
+        let Some(anim) = self.active_tab().alt_scroll_anim else {
             return;
         };
-        if !self.terminal.on_alt_screen() {
+        if !self.active_tab().terminal.on_alt_screen() {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
         let t = (anim.started.elapsed().as_secs_f32() / ALT_SCROLL_ANIM_SECS).clamp(0.0, 1.0);
@@ -115,24 +115,24 @@ impl State {
         let remaining = anim.total_px * (1.0 - eased);
         if t >= 1.0 || remaining <= 0.5 {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
-        self.scroll_y = if anim.up { remaining } else { -remaining } as f64;
+        self.active_tab_mut().scroll_y = if anim.up { remaining } else { -remaining } as f64;
     }
 
     /// End any alt-screen scroll slide and drop the terminal's frozen rows.
     /// Leaves `scroll_y` untouched — callers that cancel mid-slide (a keystroke
     /// snapping the view) zero it themselves.
     pub(crate) fn finish_alt_scroll(&mut self) {
-        if self.alt_scroll_anim.take().is_some() {
-            self.terminal.clear_alt_anim();
+        if self.active_tab_mut().alt_scroll_anim.take().is_some() {
+            self.active_tab_mut().terminal.clear_alt_anim();
         }
     }
 
     /// True while an alt-screen scroll slide is mid-flight — keeps the event
     /// loop ticking frames until it settles.
     pub(crate) fn is_alt_scroll_animating(&self) -> bool {
-        self.alt_scroll_anim.is_some()
+        self.active_tab().alt_scroll_anim.is_some()
     }
 }

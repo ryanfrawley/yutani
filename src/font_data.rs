@@ -5,7 +5,6 @@
 use crate::{font, font_loader, Config};
 
 pub(crate) struct FontData {
-    pub(crate) primary_name: String,
     pub(crate) primary_data: Vec<u8>,
     /// Bold / Italic / BoldItalic primary cuts that loaded, as
     /// `(variant, bytes, face_index)`. Missing cuts are simply absent.
@@ -54,7 +53,6 @@ pub(crate) fn load_font_data(config: &Config) -> FontData {
             .expect("no monospace primary font found")
             .clone()
     });
-    println!("primary font: {}", primary_name);
 
     let styled_specs = [
         (font::FaceVariant::Bold, true, false),
@@ -144,9 +142,8 @@ pub(crate) fn load_font_data(config: &Config) -> FontData {
         (primary_data, styled, fallbacks)
     });
 
-    FontData { primary_name, primary_data, styled, fallbacks }
+    FontData { primary_data, styled, fallbacks }
 }
-
 // Pick the first installed family whose name contains one of the candidate
 // substrings, in candidate order. Substring matching is forgiving across
 // platform-specific naming variants (e.g. "FiraCode" vs "Fira Code").

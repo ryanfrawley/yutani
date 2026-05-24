@@ -1,9 +1,10 @@
-//! `State` keyboard input: the main key dispatcher plus the command-palette
-//! and find-in-scrollback overlays that capture the keyboard while open.
+//! `WindowState` keyboard input: the main key dispatcher plus the
+//! command-palette and find-in-scrollback overlays that capture the keyboard
+//! while open.
 
 use crate::*;
 
-impl State {
+impl WindowState {
     /// Drive the command palette from a key press while it's open. Always
     /// consumes the event (returns `true`): the palette owns the keyboard, so
     /// nothing here reaches the PTY. Cmd-Shift-P (open/close) is handled by the
@@ -171,10 +172,10 @@ impl State {
             return;
         }
         let case_sensitive = search::smart_case(&query);
-        let total = self.terminal.scrollback_len() + self.terminal.rows;
+        let total = self.active_tab().terminal.scrollback_len() + self.active_tab().terminal.rows;
         let mut matches = Vec::new();
         for abs in 0..total as isize {
-            let Some(cells) = self.terminal.line_at(abs) else {
+            let Some(cells) = self.active_tab().terminal.line_at(abs) else {
                 continue;
             };
             // One char per column. Drop trailing blanks so padding spaces don't
@@ -203,15 +204,15 @@ impl State {
     /// Scroll the viewport so the current match is visible, then redraw.
     pub(crate) fn focus_current_match(&mut self) {
         if let Some(m) = self.search.current_match() {
-            self.terminal.scroll_line_into_view(m.line);
-            self.scroll_y = 0.0;
+            self.active_tab_mut().terminal.scroll_line_into_view(m.line);
+            self.active_tab_mut().scroll_y = 0.0;
         }
         self.invalidate();
     }
 
-    /// This window's top-left in logical points, for handing to a child window
-    /// to cascade off (see [`spawn_new_window`]). `None` if the platform can't
-    /// report the position — the child then keeps the OS default spot.
+    /// This window's top-left in logical points, for a Cmd-N window to cascade
+    /// off (see [`spawn_window_in_process`]). `None` if the platform can't
+    /// report the position — the new window then keeps the OS default spot.
     pub(crate) fn window_origin(&self) -> Option<(f64, f64)> {
         let phys = self.window.outer_position().ok()?;
         let logical: winit::dpi::LogicalPosition<f64> =
@@ -232,10 +233,10 @@ impl State {
             // Route through the OSC-0/2 path so the existing title plumbing
             // (take_title_update -> effective_title) applies uniformly; the
             // event loop picks the change up after this returns.
-            A::SetTitle => self
+            A::SetTitle => self.active_tab_mut()
                 .terminal
                 .set_window_title(arg.as_deref().unwrap_or("")),
-            A::ClearTitle => self.terminal.set_window_title(""),
+            A::ClearTitle => self.active_tab_mut().terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
             // The picker hands back a label; map it to a scheme slot value
             // ("Default (built-in)" / empty -> None, revert to built-in).
@@ -270,14 +271,14 @@ impl State {
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
-                if self.wireframe_pipeline.is_some() {
+                if self.shared.wireframe_pipeline.is_some() {
                     self.wireframe = !self.wireframe;
                 }
             }
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
-            A::NewWindow => spawn_new_window(self.terminal.cwd(), self.window_origin()),
+            A::NewWindow => self.pending_new_window = true,
             // Re-arm first-run and relaunch into it. Each window owns a single
             // PTY (forked at startup, already attached to a shell), so there's
             // no in-place way to swap the running shell for onboarding —
@@ -325,7 +326,7 @@ impl State {
                     self.window
                         .set_cursor_icon(winit::window::CursorIcon::Default);
                     force_native_arrow_cursor(&self.window);
-                    if self.hover_url.take().is_some() {
+                    if self.active_tab_mut().hover_url.take().is_some() {
                         self.invalidate();
                     }
                     return true;
@@ -341,11 +342,11 @@ impl State {
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.
                 let mouse_mode_active =
-                    self.terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
+                    self.active_tab().terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
                 if mouse_mode_active {
                     if let Some(b) = self.held_button {
                         self.report_mouse(b, true, true);
-                    } else if self.terminal.mouse_protocol().any_motion {
+                    } else if self.active_tab().terminal.mouse_protocol().any_motion {
                         // Per xterm, "no button" motion uses code 3 (release-ish).
                         self.report_mouse(3, true, true);
                     }
@@ -414,7 +415,7 @@ impl State {
                         && code == input::MOUSE_LEFT
                         && self.modifiers.super_key()
                     {
-                        if let Some(hu) = self.hover_url.clone() {
+                        if let Some(hu) = self.active_tab().hover_url.clone() {
                             if is_safe_url(&hu.url) {
                                 open_url(&hu.url);
                             }
@@ -423,7 +424,7 @@ impl State {
                             return true;
                         }
                     }
-                    let mouse_mode_active = self.terminal.mouse_protocol().enabled()
+                    let mouse_mode_active = self.active_tab().terminal.mouse_protocol().enabled()
                         && !self.modifiers.shift_key();
                     if mouse_mode_active {
                         self.report_mouse(code, press, false);
@@ -450,7 +451,7 @@ impl State {
                 if self.in_top_toolbar(self.mouse_y) {
                     return true;
                 }
-                let m = self.font.face().size_metrics().unwrap();
+                let m = self.shared.with_font(|f| f.face().size_metrics().unwrap());
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // A `Started` after a real idle gap is the user putting fingers
                 // back on the trackpad — that supersedes any prior suppression.
@@ -461,24 +462,24 @@ impl State {
                 const FRESH_GESTURE_GAP: std::time::Duration =
                     std::time::Duration::from_millis(100);
                 let now = std::time::Instant::now();
-                let gap = self.last_wheel_at.map(|t| now.duration_since(t));
+                let gap = self.active_tab().last_wheel_at.map(|t| now.duration_since(t));
                 if matches!(phase, TouchPhase::Started)
                     && gap.map_or(true, |g| g >= FRESH_GESTURE_GAP)
                 {
-                    self.scroll_suppressed = false;
+                    self.active_tab_mut().scroll_suppressed = false;
                 }
-                if self.scroll_suppressed {
+                if self.active_tab().scroll_suppressed {
                     // Don't advance `last_wheel_at` on suppressed events —
                     // otherwise the steady stream of momentum ticks keeps
                     // resetting the idle gap, and a real fresh gesture that
                     // arrives mid-momentum still looks like a 16ms follow-up.
                     return true;
                 }
-                self.last_wheel_at = Some(now);
+                self.active_tab_mut().last_wheel_at = Some(now);
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
-                if self.terminal.mouse_protocol().enabled() {
+                if self.active_tab().terminal.mouse_protocol().enabled() {
                     // Accumulate pixels so a slow trackpad gesture (many
                     // sub-line events) still produces wheel reports instead
                     // of truncating every event to 0. LineDelta synthesizes
@@ -488,7 +489,7 @@ impl State {
                         MouseScrollDelta::PixelDelta(p) => p.y,
                     };
                     let notches = input::drain_wheel_accum(
-                        &mut self.wheel_pty_accum,
+                        &mut self.active_tab_mut().wheel_pty_accum,
                         pixels,
                         line_height,
                     );
@@ -508,18 +509,18 @@ impl State {
                 // disabled, swallow the wheel: full-screen apps provide their
                 // own keyboard motion, and without this guard trackpad pixels
                 // would accumulate in scroll_y and drift the grid past bounds.
-                if self.terminal.on_alt_screen() {
-                    if self.terminal.alternate_scroll() {
+                if self.active_tab().terminal.on_alt_screen() {
+                    if self.active_tab().terminal.alternate_scroll() {
                         let pixels = match delta {
                             MouseScrollDelta::LineDelta(_, d) => *d as f64 * line_height,
                             MouseScrollDelta::PixelDelta(p) => p.y,
                         };
                         let notches = input::drain_wheel_accum(
-                            &mut self.wheel_pty_accum,
+                            &mut self.active_tab_mut().wheel_pty_accum,
                             pixels,
                             line_height,
                         );
-                        let app_cursor = self.terminal.app_cursor_keys();
+                        let app_cursor = self.active_tab().terminal.app_cursor_keys();
                         for _ in 0..notches.up {
                             self.write_pty(&input::alt_scroll_key(true, app_cursor));
                         }
@@ -534,7 +535,7 @@ impl State {
                         // No alternate scroll and no scrollback to navigate —
                         // swallow the wheel so trackpad pixels can't drift the
                         // grid via an accumulated offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     return true;
                 }
@@ -542,39 +543,39 @@ impl State {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
                         if *d > 0.0 {
-                            self.terminal.scroll_up(n);
+                            self.active_tab_mut().terminal.scroll_up(n);
                         } else if *d < 0.0 {
-                            self.terminal.scroll_down(n);
+                            self.active_tab_mut().terminal.scroll_down(n);
                         }
                         // Discrete scrolls snap — don't leave a sub-line offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     MouseScrollDelta::PixelDelta(p) => {
-                        self.scroll_y += p.y;
+                        self.active_tab_mut().scroll_y += p.y;
                         // Drain accumulated pixels into discrete line scrolls.
                         // Zero the residue if scroll_up/down refused so scroll_y
                         // can't accumulate past a viewport boundary regardless
                         // of what at_top/at_bottom report.
-                        while self.scroll_y >= line_height {
-                            if !self.terminal.scroll_up(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y >= line_height {
+                            if !self.active_tab_mut().terminal.scroll_up(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y -= line_height;
+                            self.active_tab_mut().scroll_y -= line_height;
                         }
-                        while self.scroll_y <= -line_height {
-                            if !self.terminal.scroll_down(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y <= -line_height {
+                            if !self.active_tab_mut().terminal.scroll_down(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y += line_height;
+                            self.active_tab_mut().scroll_y += line_height;
                         }
                         // Hard-stop at viewport boundaries: no elastic overscroll.
-                        if self.scroll_y > 0.0 && self.terminal.at_top() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y > 0.0 && self.active_tab().terminal.at_top() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
-                        if self.scroll_y < 0.0 && self.terminal.at_bottom() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y < 0.0 && self.active_tab().terminal.at_bottom() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
                     }
                 }
@@ -644,16 +645,16 @@ impl State {
                         if self.modifiers.shift_key() {
                             use winit::keyboard::{Key, NamedKey};
                             if event.logical_key == Key::Named(NamedKey::ArrowUp) {
-                                if self.terminal.scroll_to_prev_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_prev_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
                                 return true;
                             }
                             if event.logical_key == Key::Named(NamedKey::ArrowDown) {
-                                if self.terminal.scroll_to_next_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_next_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
@@ -675,7 +676,10 @@ impl State {
                             // !shift so Cmd-Shift-N stays free for a future
                             // binding.
                             if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
-                                spawn_new_window(self.terminal.cwd(), self.window_origin());
+                                // Request an in-process window; the event loop
+                                // (which owns AppShared + the window map) does
+                                // the actual spawn after `input` returns.
+                                self.pending_new_window = true;
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -695,7 +699,7 @@ impl State {
                             if self.modifiers.shift_key()
                                 && (s.eq_ignore_ascii_case("w"))
                             {
-                                if self.wireframe_pipeline.is_some() {
+                                if self.shared.wireframe_pipeline.is_some() {
                                     self.wireframe = !self.wireframe;
                                     self.window.request_redraw();
                                 }
@@ -719,7 +723,7 @@ impl State {
                                 && (s.eq_ignore_ascii_case("i"))
                             {
                                 if let Some(path) = Self::debug_image_path() {
-                                    let cur = self.terminal.cursor();
+                                    let cur = self.active_tab().terminal.cursor();
                                     let row = cur.row as isize;
                                     let col = cur.col as isize;
                                     let path_str = path.to_string_lossy().to_string();
@@ -790,20 +794,20 @@ impl State {
                     // means these keys reach the shell normally when no popup is
                     // open, and only steer the popup while it is.
                     let popup_active =
-                        !self.completions.is_empty() && self.terminal.view_offset() == 0;
+                        !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
                     let plain = !self.modifiers.control_key()
                         && !self.modifiers.alt_key()
                         && !self.modifiers.super_key();
                     if popup_active && plain {
                         use winit::keyboard::{Key, NamedKey};
-                        let len = self.completions.len();
+                        let len = self.active_tab().completions.len();
                         match &event.logical_key {
                             Key::Named(NamedKey::ArrowDown) => {
-                                self.selected_completion =
-                                    (self.selected_completion + 1).min(len - 1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    (self.active_tab().selected_completion + 1).min(len - 1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -811,22 +815,22 @@ impl State {
                             }
                             // ArrowUp, and Shift-Tab, move the selection up.
                             Key::Named(NamedKey::ArrowUp) => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
                                 return true;
                             }
                             Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -836,9 +840,9 @@ impl State {
                             // in (popup stays open and refilters to the dir's
                             // contents); on a file it accepts and closes.
                             Key::Named(NamedKey::Tab) => {
-                                let keep = self
+                                let keep = self.active_tab()
                                     .completions
-                                    .get(self.selected_completion)
+                                    .get(self.active_tab().selected_completion)
                                     .map(|s| s.is_dir)
                                     .unwrap_or(false);
                                 self.accept_selected_completion(keep, false);
@@ -865,9 +869,9 @@ impl State {
                                 // set the dismissed flag so the popup stays
                                 // closed even when the shell re-reports input,
                                 // until the user types more.
-                                self.completions.clear();
-                                self.completions_input = None;
-                                self.completion_dismissed = true;
+                                self.active_tab_mut().completions.clear();
+                                self.active_tab_mut().completions_input = None;
+                                self.active_tab_mut().completion_dismissed = true;
                                 self.invalidate();
                                 return true;
                             }
@@ -893,28 +897,28 @@ impl State {
                         logical_key,
                         text,
                         self.modifiers,
-                        self.terminal.app_cursor_keys(),
+                        self.active_tab().terminal.app_cursor_keys(),
                     );
                     if let Some(bytes) = bytes {
                         // A keystroke we're sending to the PTY snaps the view
                         // back to the live grid; passive modifiers (Cmd+C etc.)
                         // returned None and don't touch the scroll state.
-                        self.terminal.scroll_to_bottom();
+                        self.active_tab_mut().terminal.scroll_to_bottom();
                         // A keystroke cancels any alt-screen scroll slide —
                         // snap straight to the settled frame.
                         self.finish_alt_scroll();
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                         // Drop any in-flight trackpad momentum so the snap
                         // sticks — otherwise the tail of the flick keeps
                         // scrolling the view away from the bottom.
-                        self.scroll_suppressed = true;
+                        self.active_tab_mut().scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
                         // A genuine keystroke re-enables the popup after a
                         // finish/dismiss. The auto-inserted accept suffix goes
                         // through `write_pty` directly (not this path), so
                         // accepting never clears the flag — only real input does.
-                        self.completion_dismissed = false;
+                        self.active_tab_mut().completion_dismissed = false;
                         self.write_pty(&bytes);
                         self.invalidate();
                         return true;
