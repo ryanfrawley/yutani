@@ -1252,6 +1252,13 @@ struct AppShared {
     /// Layout for the font texture + sampler. Kept so a window can rebind
     /// after a font-size change rebuilds its atlas texture.
     font_bind_group_layout: wgpu::BindGroupLayout,
+    /// Dual-Kawase blur pipelines (shader compiled once per process). The
+    /// per-window textures/bind-groups live in `State::blur`.
+    blur_pipelines: renderer::blur::BlurPipelines,
+    /// Glow/bloom pipelines (shared by both the bg and fg `Glow` instances of
+    /// every window). The per-window/per-layer resources live in `State::glow`
+    /// / `State::glow_fg`.
+    glow_pipelines: renderer::glow::GlowPipelines,
 }
 
 impl AppShared {
@@ -2496,13 +2503,23 @@ impl State {
             mapped_at_creation: false,
         });
 
-        let mut blur = renderer::blur::BlurChain::new(
+        // Shared blur/glow pipelines (shader compiled once). They move into
+        // AppShared below; the per-window textures/bind-groups built here
+        // borrow them.
+        let blur_pipelines = renderer::blur::BlurPipelines::new(
             &gpu.device,
             surface.config.format,
-            surface.config.width,
-            surface.config.height,
             &camera_bind_group_layout,
             renderer::vertex::Vertex::desc(),
+        );
+        let glow_pipelines = renderer::glow::GlowPipelines::new(&gpu.device, surface.config.format);
+        sub!("Blur/Glow pipelines");
+
+        let mut blur = renderer::blur::BlurChain::new(
+            &gpu.device,
+            &blur_pipelines,
+            surface.config.width,
+            surface.config.height,
         );
         blur.write_uniforms(&gpu.queue, surface.config.width, surface.config.height);
         blur.iterations = config.blur_iterations.max(1);
@@ -2510,7 +2527,7 @@ impl State {
 
         let mut glow = renderer::glow::Glow::new(
             &gpu.device,
-            surface.config.format,
+            &glow_pipelines,
             surface.config.width,
             surface.config.height,
             &blur.scene.view,
@@ -2526,13 +2543,13 @@ impl State {
             "scene fg",
         );
         let scene_fg_blit_bg =
-            blur.make_blit_bind_group(&gpu.device, &scene_fg.view, "scene fg blit bg");
+            blur_pipelines.make_blit_bind_group(&gpu.device, &scene_fg.view, "scene fg blit bg");
 
         // Two Glow instances — one bound to the BG scene, one to the FG
         // scene. Identical params/palette/foreground, written below.
         let mut glow_fg = renderer::glow::Glow::new(
             &gpu.device,
-            surface.config.format,
+            &glow_pipelines,
             surface.config.width,
             surface.config.height,
             &scene_fg.view,
@@ -2568,19 +2585,19 @@ impl State {
         // where bg is transparent (the window's default background), so
         // it can't paint over colored cell backgrounds and visually
         // shift their apparent colour.
-        let glow_bg_mask = glow.make_mask_bind_group(
+        let glow_bg_mask = glow_pipelines.make_mask_bind_group(
             &gpu.device,
             &blur.scene.view,
             "glow bg mask (bg scene)",
         );
-        let glow_fg_mask = glow_fg.make_mask_bind_group(
+        let glow_fg_mask = glow_pipelines.make_mask_bind_group(
             &gpu.device,
             &blur.scene.view,
             "glow fg mask (bg scene)",
         );
         // Scanline overlay's masked mask samples both layers so it can
         // tell glyphs on default-bg cells from truly empty pixels.
-        let scanline_overlay_mask = glow.make_overlay_mask_bind_group(
+        let scanline_overlay_mask = glow_pipelines.make_overlay_mask_bind_group(
             &gpu.device,
             &blur.scene.view,
             &scene_fg.view,
@@ -2605,6 +2622,8 @@ impl State {
             render_pipeline,
             wireframe_pipeline,
             font_bind_group_layout,
+            blur_pipelines,
+            glow_pipelines,
         };
 
         Self {
@@ -4988,8 +5007,13 @@ impl State {
         self.refresh_chrome_band();
         self.surface.resize(&self.shared.gpu.device, size);
         if size.width > 0 && size.height > 0 {
-            self.blur
-                .resize(&self.shared.gpu.device, &self.shared.gpu.queue, size.width, size.height);
+            self.blur.resize(
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.blur_pipelines,
+                size.width,
+                size.height,
+            );
             // FG scene mirrors the BG scene's size/format. Recreate the
             // texture and rebuild every bind group that samples it.
             self.scene_fg = SceneTarget::new(
@@ -4999,7 +5023,7 @@ impl State {
                 size.height,
                 "scene fg",
             );
-            self.scene_fg_blit_bg = self.blur.make_blit_bind_group(
+            self.scene_fg_blit_bg = self.shared.blur_pipelines.make_blit_bind_group(
                 &self.shared.gpu.device,
                 &self.scene_fg.view,
                 "scene fg blit bg",
@@ -5010,6 +5034,7 @@ impl State {
             self.glow.resize(
                 &self.shared.gpu.device,
                 &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.blur.scene.view,
@@ -5017,23 +5042,24 @@ impl State {
             self.glow_fg.resize(
                 &self.shared.gpu.device,
                 &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.scene_fg.view,
             );
             // Mask bind groups sample the (just-recreated) bg scene
             // texture, so they have to be rebuilt against the new view.
-            self.glow_bg_mask = self.glow.make_mask_bind_group(
+            self.glow_bg_mask = self.shared.glow_pipelines.make_mask_bind_group(
                 &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow bg mask (bg scene)",
             );
-            self.glow_fg_mask = self.glow_fg.make_mask_bind_group(
+            self.glow_fg_mask = self.shared.glow_pipelines.make_mask_bind_group(
                 &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow fg mask (bg scene)",
             );
-            self.scanline_overlay_mask = self.glow.make_overlay_mask_bind_group(
+            self.scanline_overlay_mask = self.shared.glow_pipelines.make_overlay_mask_bind_group(
                 &self.shared.gpu.device,
                 &self.blur.scene.view,
                 &self.scene_fg.view,
@@ -7389,7 +7415,7 @@ impl State {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -7427,13 +7453,13 @@ impl State {
             );
             // Pass 3: glow each layer against its own un-blurred scene
             // so the bright pass extracts crisp colour, not post-blur smear.
-            self.glow.run(&mut encoder);
-            self.glow_fg.run(&mut encoder);
+            self.glow.run(&mut encoder, &self.shared.glow_pipelines);
+            self.glow_fg.run(&mut encoder, &self.shared.glow_pipelines);
             // Strip blur still samples the bg scene — strips live near
             // the window edges where there's rarely text, so a bg-only
             // blur source reads close to the legacy combined-scene blur.
             if needs_strips {
-                self.blur.run(&mut encoder);
+                self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
             // Pass 4: composite to swapchain. Order is bg → bg glow →
@@ -7455,7 +7481,7 @@ impl State {
             });
 
             // bg scene (opaque blit).
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -7463,13 +7489,13 @@ impl State {
             // halo over colored cells so the bg's own pixels aren't
             // re-tinted by their bloom; the halo still appears in
             // transparent areas adjacent to colored cells.
-            pass.set_pipeline(&self.glow.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_bg_mask, &[]);
             pass.draw(0..3, 0..1);
 
             // fg scene (alpha-blended on top of bg + bg glow).
-            pass.set_pipeline(&self.blur.blit_alpha_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_alpha_pipeline);
             pass.set_bind_group(0, &self.scene_fg_blit_bg, &[]);
             pass.draw(0..3, 0..1);
 
@@ -7477,7 +7503,7 @@ impl State {
             // the bloom paints over adjacent cells' colored backgrounds
             // and visually shifts them; this keeps the halo only in
             // areas where bg is transparent.
-            pass.set_pipeline(&self.glow_fg.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow_fg.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_fg_mask, &[]);
             pass.draw(0..3, 0..1);
@@ -7493,18 +7519,18 @@ impl State {
                     // Layered path has both scene textures — mask
                     // samples bg + fg so glyphs on default-bg cells
                     // still get scanlines.
-                    pass.set_pipeline(&self.glow.scanline_overlay_masked_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_masked_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                     pass.set_bind_group(1, &self.scanline_overlay_mask, &[]);
                 } else {
-                    pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 }
                 pass.draw(0..3, 0..1);
             }
 
             if needs_strips {
-                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
                 pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
                 pass.set_bind_group(1, &self.camera_bind_group, &[]);
                 pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -7552,7 +7578,7 @@ impl State {
                     "scene pass",
                 );
             }
-            self.blur.run(&mut encoder);
+            self.blur.run(&mut encoder, &self.shared.blur_pipelines);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
@@ -7569,7 +7595,7 @@ impl State {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -7580,12 +7606,12 @@ impl State {
             // content, producing artifacts. `skip_primary_bg` therefore
             // only takes effect in the layered (glow-on) path.
             if content_overlay_on {
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
 
-            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
             pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
             pass.set_bind_group(1, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -10576,7 +10602,8 @@ mod tests {
             view_formats: &[],
         });
         let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let glow = renderer::glow::Glow::new(&device, format, 16, 16, &scene_view);
+        let pipelines = renderer::glow::GlowPipelines::new(&device, format);
+        let glow = renderer::glow::Glow::new(&device, &pipelines, 16, 16, &scene_view);
         Some((device, queue, glow))
     }
 

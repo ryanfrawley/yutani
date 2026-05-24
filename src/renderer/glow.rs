@@ -140,19 +140,16 @@ struct Target {
     height: u32,
 }
 
-pub struct Glow {
+/// Shader, layouts, samplers, and render pipelines for the glow / bloom
+/// effect. Depend only on the device + surface format, so one instance is
+/// shared by every window (and by both the bg and fg [`Glow`] instances in a
+/// window) through `AppShared` — the glow shader is compiled once per process.
+/// The size-dependent textures, bind groups, uniforms, and per-instance
+/// parameters live in [`Glow`].
+pub struct GlowPipelines {
     format: wgpu::TextureFormat,
     sampler: wgpu::Sampler,
     fs_bgl: wgpu::BindGroupLayout,
-
-    bright: Target,
-    scratch: Target,
-
-    glow_uniform: wgpu::Buffer,
-    bright_hues_uniform: wgpu::Buffer,
-    bright_blur_uniform: wgpu::Buffer, // texel_size = 1 / scene dims
-    down_uniform: wgpu::Buffer,         // texel_size = 1 / bright dims
-    up_uniform: wgpu::Buffer,           // texel_size = 1 / scratch dims
 
     bright_pipeline: wgpu::RenderPipeline,
     down_pipeline: wgpu::RenderPipeline,
@@ -184,6 +181,21 @@ pub struct Glow {
     /// over glyphs drawn on default-bg cells.
     overlay_mask_bgl: wgpu::BindGroupLayout,
     mask_sampler: wgpu::Sampler,
+}
+
+/// Per-window, per-layer glow resources: the bright + scratch targets, the
+/// bind groups feeding each pass, the uniforms, and the mutable match
+/// parameters. Two instances per window (bg + fg), each rendered against the
+/// shared [`GlowPipelines`].
+pub struct Glow {
+    bright: Target,
+    scratch: Target,
+
+    glow_uniform: wgpu::Buffer,
+    bright_hues_uniform: wgpu::Buffer,
+    bright_blur_uniform: wgpu::Buffer, // texel_size = 1 / scene dims
+    down_uniform: wgpu::Buffer,         // texel_size = 1 / bright dims
+    up_uniform: wgpu::Buffer,           // texel_size = 1 / scratch dims
 
     // Bind groups (group 0). All share the same layout: texture + sampler +
     // BlurParams + GlowParams + BrightHues.
@@ -235,14 +247,8 @@ pub struct Glow {
     pub iterations: usize,
 }
 
-impl Glow {
-    pub fn new(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
-        scene_view: &wgpu::TextureView,
-    ) -> Self {
+impl GlowPipelines {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("glow sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -494,6 +500,90 @@ impl Glow {
                 multiview: None,
             });
 
+        Self {
+            format,
+            sampler,
+            fs_bgl,
+            bright_pipeline,
+            down_pipeline,
+            up_pipeline,
+            composite_masked_pipeline,
+            scanline_overlay_pipeline,
+            scanline_overlay_masked_pipeline,
+            mask_bgl,
+            overlay_mask_bgl,
+            mask_sampler,
+        }
+    }
+
+    /// Bind group for `composite_masked_pipeline`'s group(1). Caller
+    /// supplies the mask texture view (typically the bg scene, so
+    /// halo gets suppressed wherever the bg has a colored cell). Must
+    /// be rebuilt whenever the mask view is invalidated, e.g. by a
+    /// swapchain resize that recreates the bg scene.
+    pub fn make_mask_bind_group(
+        &self,
+        device: &wgpu::Device,
+        mask_view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.mask_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
+                },
+            ],
+        })
+    }
+
+    /// Bind group for `scanline_overlay_masked_pipeline`'s group(1).
+    /// Caller supplies the bg-layer view (compared against bg_color to
+    /// detect default cells) and the fg-layer view (its alpha tells us
+    /// whether anything is drawn on top). Both views should be the
+    /// scene textures used by the layered render path.
+    pub fn make_overlay_mask_bind_group(
+        &self,
+        device: &wgpu::Device,
+        bg_view: &wgpu::TextureView,
+        fg_view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.overlay_mask_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(bg_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(fg_view),
+                },
+            ],
+        })
+    }
+}
+
+impl Glow {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &GlowPipelines,
+        width: u32,
+        height: u32,
+        scene_view: &wgpu::TextureView,
+    ) -> Self {
         let glow_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glow params uniform"),
             contents: bytemuck::cast_slice(&[GlowParams {
@@ -539,12 +629,12 @@ impl Glow {
 
         let (bright, scratch, bright_bg, down_bg, up_bg, composite_bg) = build_resources(
             device,
-            format,
+            pipelines.format,
             width,
             height,
             scene_view,
-            &sampler,
-            &fs_bgl,
+            &pipelines.sampler,
+            &pipelines.fs_bgl,
             &glow_uniform,
             &bright_hues_uniform,
             &bright_blur_uniform,
@@ -553,9 +643,6 @@ impl Glow {
         );
 
         Self {
-            format,
-            sampler,
-            fs_bgl,
             bright,
             scratch,
             glow_uniform,
@@ -563,15 +650,6 @@ impl Glow {
             bright_blur_uniform,
             down_uniform,
             up_uniform,
-            bright_pipeline,
-            down_pipeline,
-            up_pipeline,
-            composite_masked_pipeline,
-            scanline_overlay_pipeline,
-            scanline_overlay_masked_pipeline,
-            mask_bgl,
-            overlay_mask_bgl,
-            mask_sampler,
             bright_bg,
             down_bg,
             up_bg,
@@ -614,18 +692,19 @@ impl Glow {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipelines: &GlowPipelines,
         width: u32,
         height: u32,
         scene_view: &wgpu::TextureView,
     ) {
         let (bright, scratch, bright_bg, down_bg, up_bg, composite_bg) = build_resources(
             device,
-            self.format,
+            pipelines.format,
             width,
             height,
             scene_view,
-            &self.sampler,
-            &self.fs_bgl,
+            &pipelines.sampler,
+            &pipelines.fs_bgl,
             &self.glow_uniform,
             &self.bright_hues_uniform,
             &self.bright_blur_uniform,
@@ -725,65 +804,6 @@ impl Glow {
         self.bg_color = bg;
     }
 
-    /// Bind group for `composite_masked_pipeline`'s group(1). Caller
-    /// supplies the mask texture view (typically the bg scene, so
-    /// halo gets suppressed wherever the bg has a colored cell). Must
-    /// be rebuilt whenever the mask view is invalidated, e.g. by a
-    /// swapchain resize that recreates the bg scene.
-    pub fn make_mask_bind_group(
-        &self,
-        device: &wgpu::Device,
-        mask_view: &wgpu::TextureView,
-        label: &str,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout: &self.mask_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(mask_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
-                },
-            ],
-        })
-    }
-
-    /// Bind group for `scanline_overlay_masked_pipeline`'s group(1).
-    /// Caller supplies the bg-layer view (compared against bg_color to
-    /// detect default cells) and the fg-layer view (its alpha tells us
-    /// whether anything is drawn on top). Both views should be the
-    /// scene textures used by the layered render path.
-    pub fn make_overlay_mask_bind_group(
-        &self,
-        device: &wgpu::Device,
-        bg_view: &wgpu::TextureView,
-        fg_view: &wgpu::TextureView,
-        label: &str,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout: &self.overlay_mask_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(bg_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.mask_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(fg_view),
-                },
-            ],
-        })
-    }
-
     /// Install the 8 bright ANSI variants (linear RGB, alpha ignored).
     /// Each slot is converted to (hue, sat) on the host; slots whose own
     /// saturation falls below [`Self::min_palette_sat`] are marked inactive
@@ -807,11 +827,11 @@ impl Glow {
 
     /// Run bright pass + blur. After this, the blurred glow lives in
     /// `bright` and is sampled by `composite_bg`.
-    pub fn run(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, pipelines: &GlowPipelines) {
         // Bright pass: scene → bright (full/2 res).
         self.fullscreen_pass(
             encoder,
-            &self.bright_pipeline,
+            &pipelines.bright_pipeline,
             &self.bright_bg,
             &self.bright.view,
             "glow bright",
@@ -821,14 +841,14 @@ impl Glow {
         for _ in 0..self.iterations.max(1) {
             self.fullscreen_pass(
                 encoder,
-                &self.down_pipeline,
+                &pipelines.down_pipeline,
                 &self.down_bg,
                 &self.scratch.view,
                 "glow down",
             );
             self.fullscreen_pass(
                 encoder,
-                &self.up_pipeline,
+                &pipelines.up_pipeline,
                 &self.up_bg,
                 &self.bright.view,
                 "glow up",
