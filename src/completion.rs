@@ -111,8 +111,15 @@ pub fn complete_path(
         });
     }
 
-    // Directories first, then lexicographic by replacement text.
-    suggestions.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.text.cmp(&b.text)));
+    // Directories first, then lexicographic by replacement text. Compare with
+    // the trailing `/` stripped so a directory's slash (ASCII 47) doesn't sort
+    // it after a sibling whose name continues with a lower byte — e.g.
+    // `terminal/` must precede `terminal-overscroll/` ('-' is ASCII 45).
+    suggestions.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.text.trim_end_matches('/').cmp(b.text.trim_end_matches('/')))
+    });
     suggestions.truncate(MAX_SUGGESTIONS);
     suggestions
 }
@@ -689,6 +696,19 @@ mod tests {
         assert_eq!(texts(&s), vec!["zeta_dir/", "aaa_file"]);
         assert!(s[0].is_dir);
         assert!(!s[1].is_dir);
+    }
+
+    #[test]
+    fn dir_trailing_slash_does_not_skew_sort() {
+        let tmp = TempDir::new();
+        tmp.mkdir("terminal");
+        tmp.mkdir("terminal-overscroll");
+
+        // Both are directories matching `terminal`. The trailing `/` must not
+        // make `terminal/` sort after `terminal-overscroll/` ('/' is 47, '-'
+        // is 45): the comparison ignores the trailing slash.
+        let s = complete_path("ls terminal", 11, Some(tmp.path.as_path()), None);
+        assert_eq!(texts(&s), vec!["terminal/", "terminal-overscroll/"]);
     }
 
     #[test]
