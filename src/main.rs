@@ -32,6 +32,9 @@ use winit::{
 extern crate libc;
 use nix::libc::*;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 // use rand_distr::{Distribution, Normal};
 // use rand::thread_rng;
 
@@ -1220,19 +1223,61 @@ fn should_rearm_image_poll(
     !pending_placements_empty || !results_empty || store_pending > 0
 }
 
-struct State {
-    gpu: gpu::GpuContext,
-
-    // Must be declared after `gpu` so it gets dropped after the surface —
-    // the surface holds unsafe references to the window's resources.
-    window: Window,
-
+/// Resources shared by every window in the process: the GPU device/queue, the
+/// font stack, and the pipelines/layouts that depend only on the device (and
+/// the shared surface format). Built once at startup; future windows borrow
+/// this instead of re-initializing the adapter, re-loading fonts, or
+/// recompiling shaders. Single-threaded (the winit event loop), so the
+/// not-`Send` font lives behind `Rc<RefCell>` rather than `Arc<Mutex>`.
+struct AppShared {
+    gpu: Rc<gpu::Gpu>,
+    /// FreeType faces. `Rc<RefCell>` because faces aren't `Send` but every
+    /// window lives on the one event-loop thread. Borrow discipline is
+    /// load-bearing: read through [`AppShared::with_font`], and fill via a
+    /// single-statement `atlas.ensure_*(&mut shared.font.borrow_mut(), …)` so
+    /// no `Ref`/`RefMut` is held across the overlapping borrow in
+    /// `update_vertices` (which would panic at runtime — and the test suite,
+    /// using `Font` directly, wouldn't catch it).
+    font: Rc<RefCell<font::Font>>,
+    /// rustybuzz shaper, used during update_vertices to detect programming
+    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
+    /// single wide glyph instead of two adjacent characters. Read-only after
+    /// startup; shared like the font.
+    shaper: Rc<RefCell<shaper::Shaper>>,
     render_pipeline: wgpu::RenderPipeline,
     /// Wireframe debug pipeline — same vertex shader but PolygonMode::Line
     /// and a flat-color fragment. `None` if the adapter doesn't expose
     /// POLYGON_MODE_LINE; the toggle becomes a no-op there.
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    /// Toggled by Cmd-Shift-W. When true, render() picks wireframe_pipeline.
+    /// Layout for the font texture + sampler. Kept so a window can rebind
+    /// after a font-size change rebuilds its atlas texture.
+    font_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl AppShared {
+    /// Borrow the shared font for the duration of `f` and no longer. Callers
+    /// receive a `&Font`, never the `Ref`, so the borrow scope can't be
+    /// widened past the call — the structural guard against the borrow-overlap
+    /// panic described on the `font` field.
+    fn with_font<R>(&self, f: impl FnOnce(&font::Font) -> R) -> R {
+        f(&self.font.borrow())
+    }
+}
+
+struct State {
+    /// Per-window GPU surface. Declared first so it drops before `window` —
+    /// the surface holds unsafe references to the window's resources.
+    surface: gpu::WindowSurface,
+
+    window: Window,
+
+    /// Process-shared GPU device/queue, font stack, and pipelines. Declared
+    /// after `surface` so the shared device (held via `Rc` inside) outlives
+    /// the surface configured against it.
+    shared: AppShared,
+
+    /// Toggled by Cmd-Shift-W. When true, render() picks
+    /// `shared.wireframe_pipeline`.
     wireframe: bool,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -1296,19 +1341,11 @@ struct State {
     /// the overlay there. Rebuilt on resize when either texture is
     /// recreated.
     scanline_overlay_mask: wgpu::BindGroup,
-    font: font::Font,
-    /// rustybuzz shaper, used during update_vertices to detect programming
-    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
-    /// single wide glyph instead of two adjacent characters.
-    shaper: shaper::Shaper,
     font_bind_group: wgpu::BindGroup,
     /// The actual font atlas texture. Kept around so on-demand-rasterized
     /// ligature glyphs can be uploaded incrementally via queue.write_texture
     /// without recreating the texture or bind group.
     font_texture: renderer::texture::Texture,
-    /// Layout for the font texture + sampler. Kept around so we can rebind
-    /// after a font-size change rebuilds the atlas texture.
-    font_bind_group_layout: wgpu::BindGroupLayout,
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
@@ -2185,7 +2222,8 @@ impl State {
     async fn new(
         master: i32,
         window: Window,
-        gpu: gpu::GpuContext,
+        gpu: gpu::Gpu,
+        surface: gpu::WindowSurface,
         mut font: font::Font,
         shaper: shaper::Shaper,
         config: Config,
@@ -2194,8 +2232,11 @@ impl State {
         let _sw = std::time::Instant::now();
         let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
         macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
+        // Share the device/queue/instance behind an `Rc` so future windows
+        // reuse them. `gpu.device` / `gpu.queue` below deref through the `Rc`.
+        let gpu = Rc::new(gpu);
         let pt_size = config.font_size;
-        sub!("GpuContext (passed in, built concurrently)");
+        sub!("Gpu (passed in, built concurrently)");
 
         // Font texture setup
         let atlas = font.build_atlas();
@@ -2251,7 +2292,7 @@ impl State {
 
         let camera = renderer::camera::Camera {};
         let mut camera_uniform = renderer::camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, gpu.config.width as f32, gpu.config.height as f32);
+        camera_uniform.update_view_proj(&camera, surface.config.width as f32, surface.config.height as f32);
 
         let camera_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
@@ -2341,7 +2382,7 @@ impl State {
                 module: &shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: gpu.config.format,
+                    format: surface.config.format,
                     blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2381,7 +2422,7 @@ impl State {
                     module: &shader,
                     entry_point: "fs_wire",
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: gpu.config.format,
+                        format: surface.config.format,
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
@@ -2411,8 +2452,8 @@ impl State {
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
         let viewport = State::get_viewport_size(
-            gpu.config.width as f32,
-            gpu.config.height as f32,
+            surface.config.width as f32,
+            surface.config.height as f32,
             font.cell_width(),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
@@ -2457,21 +2498,21 @@ impl State {
 
         let mut blur = renderer::blur::BlurChain::new(
             &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             &camera_bind_group_layout,
             renderer::vertex::Vertex::desc(),
         );
-        blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        blur.write_uniforms(&gpu.queue, surface.config.width, surface.config.height);
         blur.iterations = config.blur_iterations.max(1);
         sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
             &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             &blur.scene.view,
         );
         // Second offscreen scene for the FG layer (glyphs + cursor + overlays).
@@ -2479,9 +2520,9 @@ impl State {
         // can sample either one without pipeline divergence.
         let scene_fg = SceneTarget::new(
             &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             "scene fg",
         );
         let scene_fg_blit_bg =
@@ -2491,9 +2532,9 @@ impl State {
         // scene. Identical params/palette/foreground, written below.
         let mut glow_fg = renderer::glow::Glow::new(
             &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             &scene_fg.view,
         );
         sub!("Glow::new x2 + scene_fg");
@@ -2520,7 +2561,7 @@ impl State {
             }
         }
         for g in [&glow, &glow_fg] {
-            g.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+            g.write_uniforms(&gpu.queue, surface.config.width, surface.config.height);
             g.write_glow_params(&gpu.queue);
         }
         // Both glows mask against the bg scene: the halo only appears
@@ -2551,18 +2592,26 @@ impl State {
         // colored bg cells do.
         let image_pipeline = renderer::images::ImagePipeline::new(
             &gpu.device,
-            gpu.config.format,
+            surface.config.format,
             &camera_bind_group_layout,
         );
         let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
         sub!("ImagePipeline::new + Store");
 
-        Self {
-            window,
-            gpu,
-            atlas,
+        let shared = AppShared {
+            gpu: gpu.clone(),
+            font: Rc::new(RefCell::new(font)),
+            shaper: Rc::new(RefCell::new(shaper)),
             render_pipeline,
             wireframe_pipeline,
+            font_bind_group_layout,
+        };
+
+        Self {
+            surface,
+            window,
+            shared,
+            atlas,
             wireframe: false,
             vertex_buffer,
             index_buffer,
@@ -2582,11 +2631,8 @@ impl State {
             glow_bg_mask,
             glow_fg_mask,
             scanline_overlay_mask,
-            font,
-            shaper,
             font_bind_group,
             font_texture,
-            font_bind_group_layout,
             pt_size,
             dpi,
             config,
@@ -2737,18 +2783,18 @@ impl State {
 
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         let (vbuf_bytes, ibuf_bytes) =
             grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         self.vertex_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("vertex buffer"),
@@ -2757,7 +2803,7 @@ impl State {
                 });
         let index_buf: Vec<u8> = vec![0; ibuf_bytes];
         self.index_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("index buffer"),
@@ -2780,37 +2826,53 @@ impl State {
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let face = self.font.face();
-        let metrics = face.size_metrics().unwrap();
-        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
-        let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let descender = (metrics.descender >> 6) as f32;
-        // Underline metrics from the font's `post` table. The face values are
-        // in font design units; `y_scale` (16.16 fixed) converts to 26.6 px
-        // for this size, matching how `ascender` / `descender` above land in
-        // 26.6 — divide by 64 once for actual pixels.
-        //   - `underline_position`: vertical center of the stem, in font
-        //     units. Negative ⇒ below the baseline (the usual case).
-        //   - `underline_thickness`: stem height in font units.
-        // Kept as floats; the rasterizer can render a sub-pixel quad
-        // across two rows of fragments which reads as a softer-than-1px
-        // line and lets the stripe grow smoothly with point size.
-        // Fallbacks cover fonts whose `post` table is empty (some
-        // bitmap-style monospace TTFs report 0).
-        let y_scale = metrics.y_scale as f32 / 65536.0;
-        let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
-        let underline_thickness_px = if raw_thick_px > 0.0 {
-            raw_thick_px
-        } else {
-            line_height * 0.06
-        };
-        let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
-        let underline_pos_px = if face.underline_position() != 0 {
-            raw_pos_px
-        } else {
-            descender * 0.5
-        };
+        // All face-derived metrics are pulled in one borrow so the shared
+        // font's `Ref` is dropped before the `ensure_*` fill calls below
+        // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
+        let (line_height, cell_w, bg_h, descender, underline_thickness_px, underline_pos_px) =
+            self.shared.with_font(|font| {
+                let face = font.face();
+                let metrics = face.size_metrics().unwrap();
+                let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let cell_w = font.cell_width() as f32;
+                let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let descender = (metrics.descender >> 6) as f32;
+                // Underline metrics from the font's `post` table. The face
+                // values are in font design units; `y_scale` (16.16 fixed)
+                // converts to 26.6 px for this size, matching how `ascender` /
+                // `descender` above land in 26.6 — divide by 64 once for
+                // actual pixels.
+                //   - `underline_position`: vertical center of the stem, in
+                //     font units. Negative ⇒ below the baseline (the usual
+                //     case).
+                //   - `underline_thickness`: stem height in font units.
+                // Kept as floats; the rasterizer can render a sub-pixel quad
+                // across two rows of fragments which reads as a softer-than-1px
+                // line and lets the stripe grow smoothly with point size.
+                // Fallbacks cover fonts whose `post` table is empty (some
+                // bitmap-style monospace TTFs report 0).
+                let y_scale = metrics.y_scale as f32 / 65536.0;
+                let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
+                let underline_thickness_px = if raw_thick_px > 0.0 {
+                    raw_thick_px
+                } else {
+                    line_height * 0.06
+                };
+                let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
+                let underline_pos_px = if face.underline_position() != 0 {
+                    raw_pos_px
+                } else {
+                    descender * 0.5
+                };
+                (
+                    line_height,
+                    cell_w,
+                    bg_h,
+                    descender,
+                    underline_thickness_px,
+                    underline_pos_px,
+                )
+            });
 
         let pal = palette::get();
         let default_fg = pal.foreground;
@@ -2931,6 +2993,10 @@ impl State {
         > = std::collections::HashMap::new();
         // Reused across rows — refilled in place to avoid per-row allocation.
         let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        // Borrow the shared shaper once for the whole pass. `match_at` returns
+        // a `&Ligature` into it, so the borrow must outlive each match's use;
+        // it's disjoint from the `font`/`atlas` fills below (different fields).
+        let shaper = self.shared.shaper.borrow();
         for r in r_lo..r_hi {
             row_chars.clear();
             for c in 0..cols {
@@ -2945,7 +3011,7 @@ impl State {
                         cell.style.bold,
                         cell.style.italic,
                     );
-                    self.atlas.ensure_char(&mut self.font, variant, ch);
+                    self.atlas.ensure_char(&mut *self.shared.font.borrow_mut(), variant, ch);
                 }
                 row_chars.push(ch);
             }
@@ -2958,7 +3024,7 @@ impl State {
                 };
                 let variant =
                     font::FaceVariant::from_flags(start_cell.style.bold, start_cell.style.italic);
-                let lig = match self.shaper.match_at(&row_chars[c..], variant) {
+                let lig = match shaper.match_at(&row_chars[c..], variant) {
                     Some(l) => l,
                     None => {
                         c += 1;
@@ -2985,7 +3051,7 @@ impl State {
                 // span (better to render the chars than render half a
                 // ligature).
                 let all_ok = lig.output_glyphs.iter().all(|gid| {
-                    self.atlas.ensure_glyph_id(&mut self.font, variant, *gid)
+                    self.atlas.ensure_glyph_id(&mut *self.shared.font.borrow_mut(), variant, *gid)
                 });
                 if !all_ok {
                     c += 1;
@@ -3008,7 +3074,8 @@ impl State {
         // didn't already pack this frame, so the immutable-`atlas` lookup in
         // `emit_text_run` below is a hit (and the dirty flag triggers the
         // re-upload right after). Done here, before the `&self.atlas` borrow,
-        // because `ensure_char` needs `&mut self.atlas`/`&mut self.font`.
+        // because `ensure_char` needs `&mut self.atlas` and a `&mut Font`
+        // (taken as a single-statement `borrow_mut` per the AppShared rule).
         if !self.completions.is_empty() {
             let chars: Vec<char> = self
                 .completions
@@ -3018,7 +3085,7 @@ impl State {
                 .collect();
             for ch in chars {
                 self.atlas
-                    .ensure_char(&mut self.font, font::FaceVariant::Regular, ch);
+                    .ensure_char(&mut *self.shared.font.borrow_mut(), font::FaceVariant::Regular, ch);
             }
         }
 
@@ -3026,7 +3093,7 @@ impl State {
         // new glyphs. write_texture reuses the existing GPU texture and
         // bind group — no need to recreate either.
         if self.atlas.dirty {
-            self.gpu.queue.write_texture(
+            self.shared.gpu.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.font_texture.texture,
                     mip_level: 0,
@@ -3962,8 +4029,8 @@ impl State {
             let box_w = (longest as f32 * cell_w + text_pad * 2.0).min(cell_w * 48.0);
 
             let anchor_below_y = cursor_row_top + line_height;
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
             let layout = completion::popup_layout(
                 anchor_x,
                 anchor_below_y,
@@ -4066,8 +4133,8 @@ impl State {
             use command_palette::{Mode, PALETTE_MAX_VISIBLE};
             let cp = &self.command_palette;
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the palette to pull focus.
             push_quad(
@@ -4246,8 +4313,8 @@ impl State {
         // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
         if self.search.open {
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the box.
             push_quad(
@@ -4399,8 +4466,8 @@ impl State {
         // phantom row sliding into / out of the bottom edge dissolves rather
         // than clipping abruptly. Drawn last so they overlay every cell. RGB
         // is premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
-        let win_w = self.gpu.config.width as f32;
-        let win_h = self.gpu.config.height as f32;
+        let win_w = self.surface.config.width as f32;
+        let win_h = self.surface.config.height as f32;
         // Top fade is taller than the bottom: the title bar + toolbar takes
         // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
         // below that gives content a soft runway as it scrolls into view
@@ -4512,10 +4579,10 @@ impl State {
             );
         }
 
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
@@ -4525,12 +4592,12 @@ impl State {
         // foreground text toward the bg color near each edge; the blur sits
         // on top to soften whatever's still visible in the gradient region.
         if !strip_indices.is_empty() {
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
                 0,
                 bytemuck::cast_slice(&strip_vertices),
             );
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_index_buffer,
                 0,
                 bytemuck::cast_slice(&strip_indices),
@@ -4547,7 +4614,7 @@ impl State {
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
         ];
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.fade_buffer,
             0,
             bytemuck::cast_slice(&fade_data),
@@ -4820,7 +4887,7 @@ impl State {
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
-                if self.wireframe_pipeline.is_some() {
+                if self.shared.wireframe_pipeline.is_some() {
                     self.wireframe = !self.wireframe;
                 }
             }
@@ -4872,19 +4939,19 @@ impl State {
         }
         self.pt_size = new_pt;
         self.config.font_size = self.pt_size;
-        self.font.set_char_size(self.pt_size, self.dpi);
-        self.atlas = self.font.build_atlas();
+        self.shared.font.borrow_mut().set_char_size(self.pt_size, self.dpi);
+        self.atlas = self.shared.font.borrow_mut().build_atlas();
         self.font_texture = renderer::texture::Texture::from_memory(
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             &self.atlas.buffer,
             self.atlas.width as u32,
             self.atlas.height as u32,
             wgpu::TextureFormat::R8Unorm,
             Some("font texture"),
         );
-        self.font_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.font_bind_group_layout,
+        self.font_bind_group = self.shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.shared.font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -4899,11 +4966,11 @@ impl State {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         self.terminal.resize(viewport.char_width, viewport.char_height);
@@ -4919,21 +4986,21 @@ impl State {
         // A move to a display with a different scale factor changes the native
         // title bar's physical height; keep the chrome band in step.
         self.refresh_chrome_band();
-        self.gpu.resize(size);
+        self.surface.resize(&self.shared.gpu.device, size);
         if size.width > 0 && size.height > 0 {
             self.blur
-                .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
+                .resize(&self.shared.gpu.device, &self.shared.gpu.queue, size.width, size.height);
             // FG scene mirrors the BG scene's size/format. Recreate the
             // texture and rebuild every bind group that samples it.
             self.scene_fg = SceneTarget::new(
-                &self.gpu.device,
-                self.gpu.config.format,
+                &self.shared.gpu.device,
+                self.surface.config.format,
                 size.width,
                 size.height,
                 "scene fg",
             );
             self.scene_fg_blit_bg = self.blur.make_blit_bind_group(
-                &self.gpu.device,
+                &self.shared.gpu.device,
                 &self.scene_fg.view,
                 "scene fg blit bg",
             );
@@ -4941,15 +5008,15 @@ impl State {
             // scene view — resize rebuilds it against the (potentially
             // recreated) texture handle.
             self.glow.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
                 size.width,
                 size.height,
                 &self.blur.scene.view,
             );
             self.glow_fg.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
                 size.width,
                 size.height,
                 &self.scene_fg.view,
@@ -4957,17 +5024,17 @@ impl State {
             // Mask bind groups sample the (just-recreated) bg scene
             // texture, so they have to be rebuilt against the new view.
             self.glow_bg_mask = self.glow.make_mask_bind_group(
-                &self.gpu.device,
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow bg mask (bg scene)",
             );
             self.glow_fg_mask = self.glow_fg.make_mask_bind_group(
-                &self.gpu.device,
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow fg mask (bg scene)",
             );
             self.scanline_overlay_mask = self.glow.make_overlay_mask_bind_group(
-                &self.gpu.device,
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 &self.scene_fg.view,
                 "scanline overlay mask (bg + fg)",
@@ -4975,16 +5042,16 @@ impl State {
         }
         self.camera_uniform
             .update_view_proj(&self.camera, size.width as f32, size.height as f32);
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let size = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         // Only touch the PTY winsize when the character grid actually
@@ -5013,8 +5080,8 @@ impl State {
         // discover the cell-pixel size. Zero here would make those
         // tools refuse to send images with "Terminal does not support
         // reporting screen sizes in pixels."
-        let metrics = self.font.face().size_metrics().unwrap();
-        let cell_w = self.font.cell_width() as u32;
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
         let ypixel = (rows as u32).saturating_mul(line_h).min(u16::MAX as u32) as u16;
@@ -5122,7 +5189,7 @@ impl State {
             self.terminal.scrollback_len() as f32
         };
         let view_offset = self.terminal.view_offset() as f32;
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let scroll_y = self.scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
@@ -5194,10 +5261,10 @@ impl State {
         ];
         for g in [&mut self.glow, &mut self.glow_fg] {
             apply_glow_config(g, &self.config, &p.glow);
-            g.set_bright_palette(&self.gpu.queue, &bright);
+            g.set_bright_palette(&self.shared.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
-            g.write_glow_params(&self.gpu.queue);
+            g.write_glow_params(&self.shared.gpu.queue);
         }
 
         // Already-painted cells carry pre-resolved RGBA from when their
@@ -5344,12 +5411,12 @@ impl State {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;
         let bg_h = ascender - descender;
-        let cell_w = self.font.cell_width() as f64;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f64;
         // Mirror the renderer's dynamic decorator offset: full DECORATOR_HEIGHT
         // at both scroll-range boundaries (live grid and top of scrollback),
         // easing to 0 over one line in either direction. Out-of-sync formulas
@@ -5634,8 +5701,8 @@ impl State {
         let nearest = self.config.images_filter == "nearest";
         let results = self.image_store.poll(
             &self.image_pipeline,
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             nearest,
         );
         // CRITICAL: must request_redraw if there are still pending decodes,
@@ -5665,9 +5732,9 @@ impl State {
         if results.is_empty() {
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let mut any_placed = false;
         for (pending_id, outcome) in results {
             let Some(i) = self
@@ -5985,7 +6052,7 @@ impl State {
             self.terminal.clear_alt_anim();
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let total_px = scroll.rows as f32 * line_height;
         self.alt_scroll_anim = Some(AltScrollAnim {
@@ -6359,9 +6426,9 @@ impl State {
     /// sizing math can resolve `Npx` / `N%` / `Auto` specs. Called on
     /// init and on every font-size change.
     fn sync_terminal_cell_size(&mut self) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         self.terminal.set_cell_size_px(cell_w, line_h);
     }
 
@@ -6544,7 +6611,7 @@ impl State {
                 if self.in_top_toolbar(self.mouse_y) {
                     return true;
                 }
-                let m = self.font.face().size_metrics().unwrap();
+                let m = self.shared.with_font(|f| f.face().size_metrics().unwrap());
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // A `Started` after a real idle gap is the user putting fingers
                 // back on the trackpad — that supersedes any prior suppression.
@@ -6789,7 +6856,7 @@ impl State {
                             if self.modifiers.shift_key()
                                 && (s.eq_ignore_ascii_case("w"))
                             {
-                                if self.wireframe_pipeline.is_some() {
+                                if self.shared.wireframe_pipeline.is_some() {
                                     self.wireframe = !self.wireframe;
                                     self.window.request_redraw();
                                 }
@@ -7027,13 +7094,13 @@ impl State {
         clear: wgpu::Color,
     ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
         let surface_t0 = std::time::Instant::now();
-        let output = self.gpu.surface.get_current_texture().unwrap();
+        let output = self.surface.surface.get_current_texture().unwrap();
         let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("terminal"),
@@ -7073,9 +7140,9 @@ impl State {
         // anchor → pixel rect uses the same font metrics + decorator_offset
         // + scroll_y that `update_vertices` applies to cell quads, so
         // images scroll smoothly alongside text.
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
         let view_offset = self.terminal.view_offset() as f32;
         let scrollback_len = if self.terminal.on_alt_screen() {
             0.0
@@ -7230,9 +7297,9 @@ impl State {
         let has_images = !image_draws.is_empty();
 
         let grid_pipeline = if self.wireframe {
-            self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
+            self.shared.wireframe_pipeline.as_ref().unwrap_or(&self.shared.render_pipeline)
         } else {
-            &self.render_pipeline
+            &self.shared.render_pipeline
         };
 
         // Helper to issue a draw of part of the cell vertex buffer into
@@ -7281,7 +7348,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &view,
                     wgpu::LoadOp::Load,
@@ -7342,7 +7409,7 @@ impl State {
             if has_images {
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -7463,7 +7530,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -7530,7 +7597,7 @@ impl State {
             pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
-        self.gpu.queue.submit(std::iter::once(encoder.finish()));
+        self.shared.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok((surface_wait, !needs_offscreen))
@@ -7780,8 +7847,8 @@ async fn run() {
     let config_for_fonts = config.clone();
     let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    let gpu = gpu::GpuContext::new(&window).await;
-    lap("after GpuContext::new (concurrent with font load)");
+    let (gpu, surface) = gpu::Gpu::new(&window).await;
+    lap("after Gpu::new (concurrent with font load)");
 
     let fd = font_handle.join().expect("font loader thread panicked");
     lap("after font data loaded (joined)");
@@ -7834,7 +7901,7 @@ async fn run() {
     }
 
     lap("after font faces + shaper built");
-    let mut state = State::new(fdm, window, gpu, font, shaper, config, dpi).await;
+    let mut state = State::new(fdm, window, gpu, surface, font, shaper, config, dpi).await;
     lap("after State::new (GPU/atlas/pipelines)");
     state.notify_pty_size(state.terminal.cols, state.terminal.rows);
     // Size the chrome band to the real native title bar now that the window
@@ -8006,7 +8073,7 @@ async fn run() {
                                 Ok((surface_wait, fast)) => {
                                     state.perf.note_render(render_dur, surface_wait, fast);
                                 }
-                                Err(wgpu::SurfaceError::Lost) => state.resize(state.gpu.size),
+                                Err(wgpu::SurfaceError::Lost) => state.resize(state.surface.size),
                                 Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                                 Err(e) => eprintln!("{:?}", e),
                             }
