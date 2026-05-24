@@ -297,6 +297,13 @@ impl WindowState {
                     Err(e) => eprintln!("onboarding: failed to relaunch: {e}"),
                 }
             }
+            // The popup gate (`config.autocomplete`) is read live on every
+            // keystroke, so flipping it takes effect immediately; we only need
+            // to persist so the choice survives a restart.
+            A::ToggleAutocomplete => {
+                self.config.autocomplete = !self.config.autocomplete;
+                self.config.save();
+            }
         }
         self.invalidate();
     }
