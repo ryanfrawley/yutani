@@ -32,6 +32,9 @@ use winit::{
 extern crate libc;
 use nix::libc::*;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 // use rand_distr::{Distribution, Normal};
 // use rand::thread_rng;
 
@@ -160,7 +163,7 @@ fn rearm_onboarding() {
 /// Coarse CRT-glow presets the onboarding offers, mapped to the underlying
 /// `glow_*` config knobs by [`Config::apply_glow_level`]. Shared by the
 /// onboarding writer (which persists the choice) and the live-preview path in
-/// `State::apply_preview` (which mirrors it onto the running renderer), so the
+/// `WindowState::apply_preview` (which mirrors it onto the running renderer), so the
 /// preview can never drift from what actually gets saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlowLevel {
@@ -269,7 +272,7 @@ fn scheme_value_from_pick(arg: Option<String>) -> Option<String> {
 
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
-/// truth so the `State::new` and `resize_buffers` paths can't drift.
+/// truth so the `WindowState::new` and `resize_buffers` paths can't drift.
 ///
 /// Capacity model: each cell emits two quads (background + glyph), so
 /// `area = cols * rows` cells contribute `2 * area` quads. The slack
@@ -1220,19 +1223,336 @@ fn should_rearm_image_poll(
     !pending_placements_empty || !results_empty || store_pending > 0
 }
 
-struct State {
-    gpu: gpu::GpuContext,
-
-    // Must be declared after `gpu` so it gets dropped after the surface —
-    // the surface holds unsafe references to the window's resources.
-    window: Window,
-
+/// Resources shared by every window in the process: the GPU device/queue, the
+/// font stack, and the pipelines/layouts that depend only on the device (and
+/// the shared surface format). Built once at startup; future windows borrow
+/// this instead of re-initializing the adapter, re-loading fonts, or
+/// recompiling shaders. Single-threaded (the winit event loop), so the
+/// not-`Send` font lives behind `Rc<RefCell>` rather than `Arc<Mutex>`.
+struct AppShared {
+    gpu: Rc<gpu::Gpu>,
+    /// FreeType faces. `Rc<RefCell>` because faces aren't `Send` but every
+    /// window lives on the one event-loop thread. Borrow discipline is
+    /// load-bearing: read through [`AppShared::with_font`], and fill via a
+    /// single-statement `atlas.ensure_*(&mut shared.font.borrow_mut(), …)` so
+    /// no `Ref`/`RefMut` is held across the overlapping borrow in
+    /// `update_vertices` (which would panic at runtime — and the test suite,
+    /// using `Font` directly, wouldn't catch it).
+    font: Rc<RefCell<font::Font>>,
+    /// rustybuzz shaper, used during update_vertices to detect programming
+    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
+    /// single wide glyph instead of two adjacent characters. Read-only after
+    /// startup; shared like the font.
+    shaper: Rc<RefCell<shaper::Shaper>>,
     render_pipeline: wgpu::RenderPipeline,
     /// Wireframe debug pipeline — same vertex shader but PolygonMode::Line
     /// and a flat-color fragment. `None` if the adapter doesn't expose
     /// POLYGON_MODE_LINE; the toggle becomes a no-op there.
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    /// Toggled by Cmd-Shift-W. When true, render() picks wireframe_pipeline.
+    /// Layout for the font texture + sampler. Kept so each window can build
+    /// its own `font_bind_group` (and rebind after a font-size change).
+    font_bind_group_layout: wgpu::BindGroupLayout,
+    /// Layouts shared by the render pipeline (above) and each window's
+    /// per-window camera / fade bind groups, so a window can build those
+    /// against the same layout the pipeline expects.
+    camera_bind_group_layout: wgpu::BindGroupLayout,
+    fade_bind_group_layout: wgpu::BindGroupLayout,
+    /// Dual-Kawase blur pipelines (shader compiled once per process). The
+    /// per-window textures/bind-groups live in `WindowState::blur`.
+    blur_pipelines: renderer::blur::BlurPipelines,
+    /// Glow/bloom pipelines (shared by both the bg and fg `Glow` instances of
+    /// every window). The per-window/per-layer resources live in `WindowState::glow`
+    /// / `WindowState::glow_fg`.
+    glow_pipelines: renderer::glow::GlowPipelines,
+}
+
+impl AppShared {
+    /// Build the once-per-process resources: device/queue (already created),
+    /// the font stack, the bind-group layouts, and every shader pipeline that
+    /// depends only on the device + surface format. Windows are then built by
+    /// [`WindowState::create_window`] against the returned `Rc<AppShared>`.
+    fn new(
+        gpu: gpu::Gpu,
+        surface_format: wgpu::TextureFormat,
+        font: font::Font,
+        shaper: shaper::Shaper,
+    ) -> Self {
+        let gpu = Rc::new(gpu);
+
+        let font_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+                label: Some("font texture bind group layout"),
+            });
+
+        let camera_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("camera bind group layout"),
+            });
+
+        let fade_bind_group_layout =
+            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("fade bind group layout"),
+            });
+
+        let shader = gpu
+            .device
+            .create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
+
+        let render_pipeline_layout =
+            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("render pipeline layout"),
+                bind_group_layouts: &[
+                    &font_bind_group_layout,
+                    &camera_bind_group_layout,
+                    &fade_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("render pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[renderer::vertex::Vertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Cw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
+        let wireframe_pipeline = if gpu
+            .device
+            .features()
+            .contains(wgpu::Features::POLYGON_MODE_LINE)
+        {
+            Some(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wireframe pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    buffers: &[renderer::vertex::Vertex::desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_wire",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Line,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            }))
+        } else {
+            None
+        };
+
+        let blur_pipelines = renderer::blur::BlurPipelines::new(
+            &gpu.device,
+            surface_format,
+            &camera_bind_group_layout,
+            renderer::vertex::Vertex::desc(),
+        );
+        let glow_pipelines = renderer::glow::GlowPipelines::new(&gpu.device, surface_format);
+
+        Self {
+            gpu,
+            font: Rc::new(RefCell::new(font)),
+            shaper: Rc::new(RefCell::new(shaper)),
+            render_pipeline,
+            wireframe_pipeline,
+            font_bind_group_layout,
+            camera_bind_group_layout,
+            fade_bind_group_layout,
+            blur_pipelines,
+            glow_pipelines,
+        }
+    }
+
+    /// Borrow the shared font for the duration of `f` and no longer. Callers
+    /// receive a `&Font`, never the `Ref`, so the borrow scope can't be
+    /// widened past the call — the structural guard against the borrow-overlap
+    /// panic described on the `font` field.
+    fn with_font<R>(&self, f: impl FnOnce(&font::Font) -> R) -> R {
+        f(&self.font.borrow())
+    }
+}
+
+/// One shell session and the interaction state bound to it. Everything here
+/// scrolls, selects, or completes against a single PTY + `Terminal`; none of
+/// it is coupled to the window's GPU surface, atlas, or buffers (so a tab can
+/// later move between windows — see MULTIWINDOW_PLAN.md). A window owns a
+/// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
+/// per window; the tab UI is a later follow-up.
+struct TabState {
+    /// Process-unique id this tab's PTY reader thread tags its events with.
+    /// The event loop resolves it to the owning window via `tab_to_window`.
+    tab_id: app_window::TabId,
+    /// PTY master fd. The reader thread owns its own copy (reads + reaps);
+    /// this copy lets the main thread `close()` it to unblock that read on
+    /// tab close.
+    master: i32,
+    /// Forked child pid. Kept so tab close can `kill(child, SIGHUP)` — the
+    /// blocking `read(master)` only returns once the child exits, so closing a
+    /// tab running e.g. `vim` needs both `close(master)` and the signal. See
+    /// [`close_tab_pty`].
+    child: i32,
+    terminal: terminal::Terminal,
+    /// Decode + GPU residency cache for this tab's images. Per-tab: each shell
+    /// has its own placements + scrollback. Mark-and-sweep eviction keyed on
+    /// the live + scrollback placement set runs at the start of each `render`.
+    image_store: images::Store,
+    /// Cell anchors waiting on async decode, matched back to the tab's
+    /// `Terminal` by `PendingId` when `Store::poll` yields the result.
+    pending_placements: Vec<PendingImagePlacement>,
+    scroll_y: f64,
+    /// In-flight smooth slide for an explicit alt-screen scroll captured from
+    /// the running app (`Terminal::take_alt_scroll`).
+    alt_scroll_anim: Option<AltScrollAnim>,
+    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
+    /// less, htop). Drained per `line_height` like `scroll_y`.
+    wheel_pty_accum: f64,
+    /// Drop in-flight trackpad momentum once a newer command has overridden
+    /// the user's scroll intent. See `last_wheel_at`.
+    scroll_suppressed: bool,
+    last_wheel_at: Option<std::time::Instant>,
+    /// Last cell a motion event was reported for — coalesces per-pixel motion
+    /// down to per-cell transitions for the host.
+    last_reported_cell: Option<(u16, u16)>,
+    /// Smooth cursor motion: eases the rendered cursor quad toward the logical
+    /// cursor over `config.cursor_anim_secs`. `None` off-screen / pre-first-frame.
+    cursor_anim: Option<CursorAnim>,
+    /// Snapshot of the previous frame's visible cells (+ a viewport key) used
+    /// to spawn fade-out ghosts when the cursor retargets across deleted glyphs.
+    prev_visible: Option<GridSnapshot>,
+    /// Glyphs fading out at their old cell position after the cursor moved off.
+    cursor_ghosts: Vec<CursorGhost>,
+    /// Completion popup suggestions, recomputed only when the shell's reported
+    /// input changes (path completion does disk I/O).
+    completions: Vec<completion::Suggestion>,
+    /// The (buffer, cursor) the cached `completions` were computed from.
+    completions_input: Option<(String, usize)>,
+    /// Highlighted row in the completion popup (index into `completions`).
+    selected_completion: usize,
+    /// First visible popup row when `completions` exceeds MAX_VISIBLE.
+    completion_scroll: usize,
+    /// When true the popup stays closed as the shell re-reports input — set by
+    /// Enter/Esc, cleared by the next real keystroke.
+    completion_dismissed: bool,
+    /// Past command lines for history-based completion, most-recent-first and
+    /// deduped. Seeded from $HISTFILE (OSC 2124), grown at OSC 133 `C`.
+    command_history: Vec<String>,
+    /// Active local text selection in (absolute_line, col) coordinates so it
+    /// stays anchored to content as the grid scrolls.
+    selection: Option<Selection>,
+    /// Granularity for the active drag (set on press from click_count).
+    selection_mode: SelectionMode,
+    /// Cell where the current drag started; recomputes word/line selections as
+    /// the head moves. `None` when no button is being dragged.
+    press_cell: Option<(isize, usize)>,
+    /// Pixel position of the mouse-down — suppresses a Cell-mode selection
+    /// until the cursor moves at least DRAG_THRESHOLD_PX.
+    press_pixel: Option<(f64, f64)>,
+    /// Last left-button press, for multi-click detection (cell + time window).
+    last_click: Option<(std::time::Instant, (isize, usize))>,
+    click_count: u32,
+    /// URL under the mouse while Cmd is held. Drives the underline overlay and
+    /// the Cmd-click open behavior.
+    hover_url: Option<HoverUrl>,
+}
+
+struct WindowState {
+    /// Per-window GPU surface. Declared first so it drops before `window` —
+    /// the surface holds unsafe references to the window's resources.
+    surface: gpu::WindowSurface,
+
+    window: Window,
+
+    /// Process-shared GPU device/queue, font stack, and pipelines. Held via
+    /// `Rc` so every window shares one instance; declared after `surface` so
+    /// the shared device outlives the surface configured against it.
+    shared: Rc<AppShared>,
+
+    /// Toggled by Cmd-Shift-W. When true, render() picks
+    /// `shared.wireframe_pipeline`.
     wireframe: bool,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -1253,16 +1573,6 @@ struct State {
     /// vertex/index buffers and is invoked once per frame between the bg
     /// and fg cell passes (when there are placements to draw).
     image_pipeline: renderer::images::ImagePipeline,
-    /// Decode + GPU residency cache for images. Populated by parsers and
-    /// the debug-keybind path; queried by the renderer via `Store::peek`.
-    /// Mark-and-sweep eviction keyed on the live + scrollback placement
-    /// set runs at the start of each `render()`.
-    image_store: images::Store,
-    /// Cell anchors waiting on async decode. When the worker finishes a
-    /// decode and `Store::poll` yields the result, we match it back by
-    /// `PendingId` and call `Terminal::insert_placement` at the stored row
-    /// / col. Survives the in-flight decode interval — typically <100ms.
-    pending_placements: Vec<PendingImagePlacement>,
     blur: renderer::blur::BlurChain,
     /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
     /// always rendered to the offscreen `blur.scene` texture so the glow
@@ -1296,19 +1606,11 @@ struct State {
     /// the overlay there. Rebuilt on resize when either texture is
     /// recreated.
     scanline_overlay_mask: wgpu::BindGroup,
-    font: font::Font,
-    /// rustybuzz shaper, used during update_vertices to detect programming
-    /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
-    /// single wide glyph instead of two adjacent characters.
-    shaper: shaper::Shaper,
     font_bind_group: wgpu::BindGroup,
     /// The actual font atlas texture. Kept around so on-demand-rasterized
     /// ligature glyphs can be uploaded incrementally via queue.write_texture
     /// without recreating the texture or bind group.
     font_texture: renderer::texture::Texture,
-    /// Layout for the font texture + sampler. Kept around so we can rebind
-    /// after a font-size change rebuilds the atlas texture.
-    font_bind_group_layout: wgpu::BindGroupLayout,
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
@@ -1320,33 +1622,14 @@ struct State {
     fade_buffer: wgpu::Buffer,
     fade_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
-    terminal: terminal::Terminal,
+    /// The window's tabs and which one is active. Per-tab state (shell,
+    /// scroll, selection, completions, images) lives in `TabState`; the
+    /// window renders only `tabs[active]`. First cut: always exactly one tab.
+    tabs: Vec<TabState>,
+    active: usize,
     modifiers: winit::keyboard::ModifiersState,
-    scroll_y: f64,
-    /// In-flight smooth slide for an explicit alt-screen scroll captured from
-    /// the running app (`Terminal::take_alt_scroll`). Drives `scroll_y` on the
-    /// alt screen while active; the departing rows it slides over live on the
-    /// terminal until `finish_alt_scroll` clears them.
-    alt_scroll_anim: Option<AltScrollAnim>,
-    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
-    /// less, htop). Trackpads stream small PixelDelta events — without
-    /// accumulation, every event truncates to 0 lines and slow scrolls
-    /// produce no wheel reports at all until one event finally crosses the
-    /// line-height threshold and emits a burst. Drained per `line_height`
-    /// just like `scroll_y` so the rate matches the local-scrollback path.
-    wheel_pty_accum: f64,
-    /// Drop in-flight trackpad momentum once a newer command (a keystroke
-    /// that snaps to the bottom) has overridden the user's scroll intent.
-    /// Cleared when momentum runs out OR a fresh gesture begins after a
-    /// real idle gap — see `last_wheel_at` for how we tell the two apart
-    /// (momentum's Started arrives ~one frame after the prior Ended).
-    scroll_suppressed: bool,
-    last_wheel_at: Option<std::time::Instant>,
     mouse_x: f64,
     mouse_y: f64,
-    // Last cell we reported a motion event for. Mouse motion fires per pixel,
-    // but the host only cares about per-cell transitions — coalesce.
-    last_reported_cell: Option<(u16, u16)>,
     // Currently-held mouse button (in xterm code). `None` when no button down.
     held_button: Option<input::MouseButton>,
     // Cursor blink. `blink_on` is the visible phase; `last_blink` anchors the
@@ -1360,44 +1643,6 @@ struct State {
     top_fade_phase: f32,
     bottom_fade_phase: f32,
     last_anim_tick: std::time::Instant,
-    /// Smooth cursor motion: when the logical cursor moves, the rendered
-    /// quad eases from the previous displayed position toward the new
-    /// target over `config.cursor_anim_secs`. `None` while the cursor is
-    /// off-screen (scrollback) or before the first frame; the next visible
-    /// frame snaps to the target without animating.
-    cursor_anim: Option<CursorAnim>,
-    /// Snapshot of the previous frame's visible cells, plus a viewport key
-    /// (rows / cols / view_offset / alt-screen). Compared on retarget to
-    /// spot cells that just went non-blank → blank so the deleted glyph can
-    /// fade out as a ghost while the cursor slides over it. A key mismatch
-    /// (resize, scrollback, alt-screen toggle) skips ghost detection that
-    /// frame so a wholesale grid shift doesn't spawn ghosts everywhere.
-    prev_visible: Option<GridSnapshot>,
-    /// Glyphs being faded out at their old cell position, captured from
-    /// `prev_visible` when the cursor retargets across them. Each fades to
-    /// alpha 0 over `cursor_anim_secs`; the entry is dropped early if the
-    /// underlying cell becomes non-blank again (a follow-up keystroke).
-    cursor_ghosts: Vec<CursorGhost>,
-    /// Suggestions for the completion popup, recomputed only when the shell's
-    /// reported input changes (path completion does disk I/O — never recompute
-    /// per frame). Drawn by `update_vertices`; display-only in K10 (K11 adds
-    /// keyboard nav + accept).
-    completions: Vec<completion::Suggestion>,
-    /// The (buffer, cursor) the cached `completions` were computed from, so we
-    /// can skip the recompute (and the `read_dir`) when nothing changed.
-    completions_input: Option<(String, usize)>,
-    /// Highlighted row in the completion popup (index into `completions`). Reset
-    /// to 0 whenever the list is recomputed. Only meaningful while `completions`
-    /// is non-empty.
-    selected_completion: usize,
-    /// First visible row when `completions` exceeds the popup's MAX_VISIBLE
-    /// rows; scrolls to keep `selected_completion` on screen.
-    completion_scroll: usize,
-    /// When true, the popup stays closed even as the shell re-reports input —
-    /// set by Enter (finish) and Esc (dismiss), cleared by the next real
-    /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
-    /// close the menu.
-    completion_dismissed: bool,
     /// The command palette overlay (Cmd-Shift-P). While `open`, it owns the
     /// keyboard: keystrokes filter/drive it instead of reaching the PTY. Holds
     /// its own search/argument text field and selection state; see
@@ -1407,29 +1652,6 @@ struct State {
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
     search: search::Search,
-    /// Past command lines for history-based completion suggestions, most-recent-
-    /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
-    /// 2124) and grown with this session's submitted commands (captured at OSC
-    /// 133 `C`). Capped to bound memory.
-    command_history: Vec<String>,
-    // Active local text selection, in (absolute_line, col) coordinates so it
-    // stays anchored to content as the grid scrolls. `None` when nothing is
-    // selected. The two endpoints are anchor (mouse-down cell) and head
-    // (latest cell under the cursor); they may be in either order.
-    selection: Option<Selection>,
-    // Granularity for the active drag (set on press from click_count).
-    selection_mode: SelectionMode,
-    // Cell where the current drag started; used to recompute word/line
-    // selections as the head moves. `None` when no button is being dragged.
-    press_cell: Option<(isize, usize)>,
-    // Pixel position of the mouse-down. In Cell mode we suppress the
-    // selection until the cursor has moved at least DRAG_THRESHOLD_PX from
-    // here, so a plain click doesn't briefly highlight a single character.
-    press_pixel: Option<(f64, f64)>,
-    // Last left-button press, for multi-click detection (must match cell and
-    // be within the threshold window).
-    last_click: Option<(std::time::Instant, (isize, usize))>,
-    click_count: u32,
     // Time of the last left-press in the title-bar band, for double-click
     // detection there. Separate from `last_click` (which keys on a grid cell)
     // since toolbar clicks have no cell. A double-click toggles window zoom.
@@ -1444,11 +1666,19 @@ struct State {
     /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
     /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
     chrome_band_px: f64,
-    /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
-    /// the pointer isn't over a URL. Drives the underline overlay and the
-    /// Cmd-click open behavior.
-    hover_url: Option<HoverUrl>,
-    master: i32,
+    /// Program-set window title (OSC 0/2). When `Some` it wins over the
+    /// cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload.
+    /// Per-window so each window tracks its own shell's title.
+    manual_title: Option<String>,
+    /// This window's current appearance, from `WindowEvent::ThemeChanged`.
+    /// Per-window so windows on differently-themed monitors (or after an
+    /// independent override) clear/redraw to their own background.
+    theme: winit::window::Theme,
+    /// Set by Cmd-N / the palette's "New window" action; drained by the event
+    /// loop, which owns the registry + `AppShared` and actually spawns the
+    /// window in-process. (A window can't build its sibling itself — it has no
+    /// handle to the shared resources or the window map.)
+    pending_new_window: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -1987,60 +2217,9 @@ fn open_url(_url: &str) {}
 
 /// Logical-point offset applied to each cascaded window, matching the macOS
 /// convention of stepping a new window down-and-right from its parent. Roughly
-/// a title-bar height so successive windows stack like a fanned deck.
+/// a title-bar height so successive windows stack like a fanned deck. Applied
+/// by [`spawn_window_in_process`] off the spawning window's live position.
 const WINDOW_CASCADE_STEP: f64 = 28.0;
-
-/// Env var carrying the parent window's top-left, in logical points, to a
-/// freshly spawned child (`"x,y"`). The child reads it in `run()` and places
-/// its window one `WINDOW_CASCADE_STEP` down-and-right so new windows cascade
-/// instead of landing exactly atop the one that spawned them. Absent for the
-/// first window (launched from Finder/CLI), which keeps the OS default spot.
-const CASCADE_ENV: &str = "YUTANI_CASCADE_FROM";
-
-/// Launch a fresh Yutani window. Each window is its own process (the app is
-/// single-window per process), so a new window is just another instance of our
-/// own executable. `cwd` — the running shell's working directory from OSC 7 —
-/// becomes the child's working directory so the new window opens where the
-/// current one is, falling back to inheriting ours when it's unknown.
-/// `origin` is the spawning window's top-left in logical points; when present
-/// it's forwarded so the child can cascade off it. Failures are logged rather
-/// than fatal: a missing exe path shouldn't kill the window the user is in.
-fn spawn_new_window(cwd: Option<&str>, origin: Option<(f64, f64)>) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("new window: cannot resolve current exe: {e}");
-            return;
-        }
-    };
-    let mut cmd = std::process::Command::new(exe);
-    if let Some(dir) = cwd {
-        if !dir.is_empty() {
-            cmd.current_dir(dir);
-        }
-    }
-    if let Some((x, y)) = origin {
-        cmd.env(CASCADE_ENV, format!("{x},{y}"));
-    }
-    if let Err(e) = cmd.spawn() {
-        eprintln!("new window: failed to spawn: {e}");
-    }
-}
-
-/// Parse the cascade hint set by a parent window (see [`CASCADE_ENV`]) into the
-/// child's target top-left, stepped one [`WINDOW_CASCADE_STEP`] down-and-right.
-/// Returns `None` when the var is absent or malformed so the window falls back
-/// to the OS-chosen position.
-fn cascade_position() -> Option<winit::dpi::LogicalPosition<f64>> {
-    let raw = std::env::var(CASCADE_ENV).ok()?;
-    let (x, y) = raw.split_once(',')?;
-    let x: f64 = x.trim().parse().ok()?;
-    let y: f64 = y.trim().parse().ok()?;
-    Some(winit::dpi::LogicalPosition::new(
-        x + WINDOW_CASCADE_STEP,
-        y + WINDOW_CASCADE_STEP,
-    ))
-}
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
@@ -2181,29 +2360,33 @@ impl Selection {
 
 }
 
-impl State {
-    async fn new(
-        master: i32,
+impl WindowState {
+    /// Build one window against the shared, already-constructed `AppShared`,
+    /// adopting `initial_tab` as its (sole, for now) tab. Builds only the
+    /// per-window resources: the glyph atlas + font texture/bind-group, camera
+    /// + fade uniforms/bind-groups, vertex/index buffers, and the blur/glow
+    /// textures. Reused verbatim by Cmd-N (Stage 4) and tab tear-off (later).
+    fn create_window(
+        shared: Rc<AppShared>,
         window: Window,
-        gpu: gpu::GpuContext,
-        mut font: font::Font,
-        shaper: shaper::Shaper,
+        surface: gpu::WindowSurface,
         config: Config,
         dpi: u32,
+        initial_tab: TabState,
     ) -> Self {
         let _sw = std::time::Instant::now();
         let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
-        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
+        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... create_window {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         let pt_size = config.font_size;
-        sub!("GpuContext (passed in, built concurrently)");
+        let window_theme = window.theme().unwrap_or(winit::window::Theme::Light);
 
-        // Font texture setup
-        let atlas = font.build_atlas();
+        // Per-window glyph atlas, rasterized on demand from the shared faces.
+        let atlas = shared.font.borrow_mut().build_atlas();
         sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
-            &gpu.device,
-            &gpu.queue,
+            &shared.gpu.device,
+            &shared.gpu.queue,
             &atlas.buffer,
             atlas.width as u32,
             atlas.height as u32,
@@ -2211,31 +2394,8 @@ impl State {
             Some("font texture"),
         );
 
-        let font_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-                label: Some("font texture bind group layout"),
-            });
-
-        let font_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &font_bind_group_layout,
+        let font_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -2251,31 +2411,16 @@ impl State {
 
         let camera = renderer::camera::Camera {};
         let mut camera_uniform = renderer::camera::CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, gpu.config.width as f32, gpu.config.height as f32);
+        camera_uniform.update_view_proj(&camera, surface.config.width as f32, surface.config.height as f32);
 
-        let camera_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let camera_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let camera_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera bind group layout"),
-            });
-
-        let camera_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
+        let camera_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.camera_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: camera_buffer.as_entire_binding(),
@@ -2285,28 +2430,14 @@ impl State {
 
         // Edge-fade uniform: layout matches FadeUniform in shader.wgsl —
         // top.xy + bottom.xy + viewport.xy + bg_uv.xy = 4*vec4 = 64 bytes.
-        let fade_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let fade_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade uniform"),
             size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let fade_bind_group_layout =
-            gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("fade bind group layout"),
-            });
-        let fade_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &fade_bind_group_layout,
+        let fade_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shared.fade_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: fade_buffer.as_entire_binding(),
@@ -2314,108 +2445,12 @@ impl State {
             label: Some("fade bind group"),
         });
 
-        let shader = gpu
-            .device
-            .create_shader_module(wgpu::include_wgsl!("renderer/shader.wgsl"));
-
-        let render_pipeline_layout =
-            gpu.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("render pipeline layout"),
-                bind_group_layouts: &[
-                    &font_bind_group_layout,
-                    &camera_bind_group_layout,
-                    &fade_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[renderer::vertex::Vertex::desc()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: gpu.config.format,
-                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Cw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        });
-
-        let wireframe_pipeline = if gpu
-            .device
-            .features()
-            .contains(wgpu::Features::POLYGON_MODE_LINE)
-        {
-            Some(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("wireframe pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[renderer::vertex::Vertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_wire",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: gpu.config.format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Cw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Line,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-            }))
-        } else {
-            None
-        };
-        sub!("main render + wireframe pipelines");
-
-        // Calculate console viewport & buffer sizes
-        let metrics = font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            gpu.config.width as f32,
-            gpu.config.height as f32,
-            font.cell_width(),
-            ((metrics.ascender - metrics.descender) >> 6) as usize,
-        );
+        // Buffers are sized to the adopted tab's grid so the vertex builder
+        // (which iterates `terminal.cols/rows`) can't overrun them. The tab
+        // was created at this window's computed viewport (see `run()` /
+        // Cmd-N), so these dims match.
+        let cols = initial_tab.terminal.cols;
+        let rows = initial_tab.terminal.rows;
         // Each cell contributes two quads (background + glyph) = 8 verts.
         // Slack covers four phantom rows (two top + two bottom) used during
         // smooth scrolling, the cursor quad, and the two edge-fade quads.
@@ -2426,15 +2461,15 @@ impl State {
         // panicked with a "Copy ... would end up overrunning" validation
         // error).
         let (vbuf_bytes, ibuf_bytes) =
-            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
+            grid_buffer_byte_sizes(cols, rows);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
-        let vertex_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
             contents: &bytemuck::cast_slice(&vertex_buf),
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         let index_buf: Vec<u8> = vec![0; ibuf_bytes];
-        let index_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("index buffer"),
             contents: &bytemuck::cast_slice(&index_buf),
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
@@ -2442,13 +2477,13 @@ impl State {
 
         // Three strip quads max (top opaque, top gradient, bottom gradient) ⇒
         // 12 vertices, 18 indices. Sized generously so resize never reallocs.
-        let strip_vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let strip_vertex_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip vertex buffer"),
             size: (32 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let strip_index_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let strip_index_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip index buffer"),
             size: (64 * std::mem::size_of::<u16>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
@@ -2456,44 +2491,42 @@ impl State {
         });
 
         let mut blur = renderer::blur::BlurChain::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
-            &camera_bind_group_layout,
-            renderer::vertex::Vertex::desc(),
+            &shared.gpu.device,
+            &shared.blur_pipelines,
+            surface.config.width,
+            surface.config.height,
         );
-        blur.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
+        blur.write_uniforms(&shared.gpu.queue, surface.config.width, surface.config.height);
         blur.iterations = config.blur_iterations.max(1);
         sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            &shared.glow_pipelines,
+            surface.config.width,
+            surface.config.height,
             &blur.scene.view,
         );
         // Second offscreen scene for the FG layer (glyphs + cursor + overlays).
         // Same format/size as `blur.scene` so the same blit and glow shaders
         // can sample either one without pipeline divergence.
         let scene_fg = SceneTarget::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            surface.config.format,
+            surface.config.width,
+            surface.config.height,
             "scene fg",
         );
         let scene_fg_blit_bg =
-            blur.make_blit_bind_group(&gpu.device, &scene_fg.view, "scene fg blit bg");
+            shared.blur_pipelines.make_blit_bind_group(&shared.gpu.device, &scene_fg.view, "scene fg blit bg");
 
         // Two Glow instances — one bound to the BG scene, one to the FG
         // scene. Identical params/palette/foreground, written below.
         let mut glow_fg = renderer::glow::Glow::new(
-            &gpu.device,
-            gpu.config.format,
-            gpu.config.width,
-            gpu.config.height,
+            &shared.gpu.device,
+            &shared.glow_pipelines,
+            surface.config.width,
+            surface.config.height,
             &scene_fg.view,
         );
         sub!("Glow::new x2 + scene_fg");
@@ -2503,7 +2536,7 @@ impl State {
         }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
-        // State::new (see `run()`), so this reads the active scheme — or
+        // WindowState::new (see `run()`), so this reads the active scheme — or
         // the defaults if no scheme was configured.
         {
             let p = palette::get();
@@ -2512,7 +2545,7 @@ impl State {
                 p.ansi[12], p.ansi[13], p.ansi[14], p.ansi[15],
             ];
             for g in [&mut glow, &mut glow_fg] {
-                g.set_bright_palette(&gpu.queue, &bright);
+                g.set_bright_palette(&shared.gpu.queue, &bright);
                 g.set_foreground(p.foreground);
                 // Masked composite needs the window bg colour to detect
                 // colored cells in the mask texture.
@@ -2520,27 +2553,27 @@ impl State {
             }
         }
         for g in [&glow, &glow_fg] {
-            g.write_uniforms(&gpu.queue, gpu.config.width, gpu.config.height);
-            g.write_glow_params(&gpu.queue);
+            g.write_uniforms(&shared.gpu.queue, surface.config.width, surface.config.height);
+            g.write_glow_params(&shared.gpu.queue);
         }
         // Both glows mask against the bg scene: the halo only appears
         // where bg is transparent (the window's default background), so
         // it can't paint over colored cell backgrounds and visually
         // shift their apparent colour.
-        let glow_bg_mask = glow.make_mask_bind_group(
-            &gpu.device,
+        let glow_bg_mask = shared.glow_pipelines.make_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             "glow bg mask (bg scene)",
         );
-        let glow_fg_mask = glow_fg.make_mask_bind_group(
-            &gpu.device,
+        let glow_fg_mask = shared.glow_pipelines.make_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             "glow fg mask (bg scene)",
         );
         // Scanline overlay's masked mask samples both layers so it can
         // tell glyphs on default-bg cells from truly empty pixels.
-        let scanline_overlay_mask = glow.make_overlay_mask_bind_group(
-            &gpu.device,
+        let scanline_overlay_mask = shared.glow_pipelines.make_overlay_mask_bind_group(
+            &shared.gpu.device,
             &blur.scene.view,
             &scene_fg.view,
             "scanline overlay mask (bg + fg)",
@@ -2550,19 +2583,17 @@ impl State {
         // fg layer, so images participate in glow + edge blur the same way
         // colored bg cells do.
         let image_pipeline = renderer::images::ImagePipeline::new(
-            &gpu.device,
-            gpu.config.format,
-            &camera_bind_group_layout,
+            &shared.gpu.device,
+            surface.config.format,
+            &shared.camera_bind_group_layout,
         );
-        let image_store = images::Store::new(config.images_memory_cap_mb * 1024 * 1024);
-        sub!("ImagePipeline::new + Store");
+        sub!("ImagePipeline::new");
 
         Self {
+            surface,
             window,
-            gpu,
+            shared,
             atlas,
-            render_pipeline,
-            wireframe_pipeline,
             wireframe: false,
             vertex_buffer,
             index_buffer,
@@ -2572,8 +2603,6 @@ impl State {
             strip_index_buffer,
             num_strip_indices: 0,
             image_pipeline,
-            image_store,
-            pending_placements: Vec::new(),
             blur,
             glow,
             glow_fg,
@@ -2582,11 +2611,8 @@ impl State {
             glow_bg_mask,
             glow_fg_mask,
             scanline_overlay_mask,
-            font,
-            shaper,
             font_bind_group,
             font_texture,
-            font_bind_group_layout,
             pt_size,
             dpi,
             config,
@@ -2596,54 +2622,43 @@ impl State {
             camera_bind_group,
             fade_buffer,
             fade_bind_group,
-            terminal: terminal::Terminal::new(
-                viewport.char_width,
-                viewport.char_height,
-                10000,
-            ),
+            tabs: vec![initial_tab],
+            active: 0,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            scroll_y: 0.0,
-            alt_scroll_anim: None,
-            wheel_pty_accum: 0.0,
-            scroll_suppressed: false,
-            last_wheel_at: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
-            last_reported_cell: None,
             held_button: None,
             blink_on: true,
             last_blink: std::time::Instant::now(),
             top_fade_phase: 0.0,
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
-            cursor_anim: None,
-            prev_visible: None,
-            cursor_ghosts: Vec::new(),
-            completions: Vec::new(),
-            completions_input: None,
-            selected_completion: 0,
-            completion_scroll: 0,
-            completion_dismissed: false,
             command_palette: command_palette::CommandPalette::default(),
             search: search::Search::default(),
-            command_history: Vec::new(),
-            selection: None,
-            selection_mode: SelectionMode::Cell,
-            press_cell: None,
-            press_pixel: None,
-            last_click: None,
-            click_count: 0,
             last_toolbar_click: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
             // DPI-scaled native title-bar height.
             chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
-            hover_url: None,
-            master,
+            manual_title: None,
+            theme: window_theme,
+            pending_new_window: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
         }
+    }
+
+    /// The active tab (read-only). First cut: always `tabs[0]`.
+    #[inline]
+    fn active_tab(&self) -> &TabState {
+        &self.tabs[self.active]
+    }
+
+    /// The active tab (mutable).
+    #[inline]
+    fn active_tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active]
     }
 
     /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls
@@ -2682,8 +2697,8 @@ impl State {
         // Mark-and-sweep AFTER poll so a freshly-landed image referenced
         // by a placement created in this same `poll_pending_images` call
         // is kept alive.
-        let referenced = self.terminal.referenced_image_ids();
-        self.image_store.retain(&referenced);
+        let referenced = self.active_tab().terminal.referenced_image_ids();
+        self.active_tab_mut().image_store.retain(&referenced);
         self.flush_vertices();
     }
 
@@ -2737,18 +2752,18 @@ impl State {
 
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let viewport = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         let (vbuf_bytes, ibuf_bytes) =
             grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         self.vertex_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("vertex buffer"),
@@ -2757,7 +2772,7 @@ impl State {
                 });
         let index_buf: Vec<u8> = vec![0; ibuf_bytes];
         self.index_buffer =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("index buffer"),
@@ -2773,44 +2788,60 @@ impl State {
         // Advance any alt-screen scroll slide first so this frame reads the
         // freshly-eased `scroll_y`.
         self.update_alt_scroll();
-        let cols = self.terminal.cols;
-        let rows = self.terminal.rows;
+        let cols = self.active_tab().terminal.cols;
+        let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
         let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
-        let face = self.font.face();
-        let metrics = face.size_metrics().unwrap();
-        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
-        let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let descender = (metrics.descender >> 6) as f32;
-        // Underline metrics from the font's `post` table. The face values are
-        // in font design units; `y_scale` (16.16 fixed) converts to 26.6 px
-        // for this size, matching how `ascender` / `descender` above land in
-        // 26.6 — divide by 64 once for actual pixels.
-        //   - `underline_position`: vertical center of the stem, in font
-        //     units. Negative ⇒ below the baseline (the usual case).
-        //   - `underline_thickness`: stem height in font units.
-        // Kept as floats; the rasterizer can render a sub-pixel quad
-        // across two rows of fragments which reads as a softer-than-1px
-        // line and lets the stripe grow smoothly with point size.
-        // Fallbacks cover fonts whose `post` table is empty (some
-        // bitmap-style monospace TTFs report 0).
-        let y_scale = metrics.y_scale as f32 / 65536.0;
-        let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
-        let underline_thickness_px = if raw_thick_px > 0.0 {
-            raw_thick_px
-        } else {
-            line_height * 0.06
-        };
-        let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
-        let underline_pos_px = if face.underline_position() != 0 {
-            raw_pos_px
-        } else {
-            descender * 0.5
-        };
+        // All face-derived metrics are pulled in one borrow so the shared
+        // font's `Ref` is dropped before the `ensure_*` fill calls below
+        // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
+        let (line_height, cell_w, bg_h, descender, underline_thickness_px, underline_pos_px) =
+            self.shared.with_font(|font| {
+                let face = font.face();
+                let metrics = face.size_metrics().unwrap();
+                let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let cell_w = font.cell_width() as f32;
+                let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
+                let descender = (metrics.descender >> 6) as f32;
+                // Underline metrics from the font's `post` table. The face
+                // values are in font design units; `y_scale` (16.16 fixed)
+                // converts to 26.6 px for this size, matching how `ascender` /
+                // `descender` above land in 26.6 — divide by 64 once for
+                // actual pixels.
+                //   - `underline_position`: vertical center of the stem, in
+                //     font units. Negative ⇒ below the baseline (the usual
+                //     case).
+                //   - `underline_thickness`: stem height in font units.
+                // Kept as floats; the rasterizer can render a sub-pixel quad
+                // across two rows of fragments which reads as a softer-than-1px
+                // line and lets the stripe grow smoothly with point size.
+                // Fallbacks cover fonts whose `post` table is empty (some
+                // bitmap-style monospace TTFs report 0).
+                let y_scale = metrics.y_scale as f32 / 65536.0;
+                let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
+                let underline_thickness_px = if raw_thick_px > 0.0 {
+                    raw_thick_px
+                } else {
+                    line_height * 0.06
+                };
+                let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
+                let underline_pos_px = if face.underline_position() != 0 {
+                    raw_pos_px
+                } else {
+                    descender * 0.5
+                };
+                (
+                    line_height,
+                    cell_w,
+                    bg_h,
+                    descender,
+                    underline_thickness_px,
+                    underline_pos_px,
+                )
+            });
 
         let pal = palette::get();
         let default_fg = pal.foreground;
@@ -2824,7 +2855,7 @@ impl State {
         let atlas_h = self.atlas.height as f32;
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
@@ -2884,13 +2915,13 @@ impl State {
         // toolbar. Mid-scroll the offset is 0 so older content can flow
         // behind the title bar smoothly. Eases linearly over one line at
         // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
-        let view_offset = self.terminal.view_offset() as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
         // Alt screen has no scrollback to fade toward — pin both distances
         // to zero so the top/bottom edge fades stay invisible.
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
@@ -2906,7 +2937,7 @@ impl State {
         // both for shaping (below) and the main emit loop further down. During
         // an alt-screen scroll slide `scroll_y` can exceed a line, so widen the
         // band to cover the departing rows being slid in from the edge.
-        let anim_extra = if self.terminal.on_alt_screen() {
+        let anim_extra = if self.active_tab().terminal.on_alt_screen() {
             (scroll_y.abs() / line_height).ceil() as isize
         } else {
             0
@@ -2931,10 +2962,14 @@ impl State {
         > = std::collections::HashMap::new();
         // Reused across rows — refilled in place to avoid per-row allocation.
         let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        // Borrow the shared shaper once for the whole pass. `match_at` returns
+        // a `&Ligature` into it, so the borrow must outlive each match's use;
+        // it's disjoint from the `font`/`atlas` fills below (different fields).
+        let shaper = self.shared.shaper.borrow();
         for r in r_lo..r_hi {
             row_chars.clear();
             for c in 0..cols {
-                let cell = self.terminal.extended_cell(r, c);
+                let cell = self.active_tab().terminal.extended_cell(r, c);
                 let ch = cell.map(|cell| cell.ch).unwrap_or(' ');
                 // Pre-pack any char outside build_atlas's fixed ranges
                 // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
@@ -2945,20 +2980,20 @@ impl State {
                         cell.style.bold,
                         cell.style.italic,
                     );
-                    self.atlas.ensure_char(&mut self.font, variant, ch);
+                    self.atlas.ensure_char(&mut *self.shared.font.borrow_mut(), variant, ch);
                 }
                 row_chars.push(ch);
             }
             let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
             let mut c = 0;
             while c < cols {
-                let Some(start_cell) = self.terminal.extended_cell(r, c) else {
+                let Some(start_cell) = self.active_tab().terminal.extended_cell(r, c) else {
                     c += 1;
                     continue;
                 };
                 let variant =
                     font::FaceVariant::from_flags(start_cell.style.bold, start_cell.style.italic);
-                let lig = match self.shaper.match_at(&row_chars[c..], variant) {
+                let lig = match shaper.match_at(&row_chars[c..], variant) {
                     Some(l) => l,
                     None => {
                         c += 1;
@@ -2970,7 +3005,7 @@ impl State {
                 // style — a colored or weight-changing split breaks the
                 // visual cohesion that contextual-alternate halves rely on.
                 let style_uniform = (1..span).all(|i| {
-                    self.terminal
+                    self.active_tab().terminal
                         .extended_cell(r, c + i)
                         .map(|cell| cell.style == start_cell.style)
                         .unwrap_or(false)
@@ -2985,7 +3020,7 @@ impl State {
                 // span (better to render the chars than render half a
                 // ligature).
                 let all_ok = lig.output_glyphs.iter().all(|gid| {
-                    self.atlas.ensure_glyph_id(&mut self.font, variant, *gid)
+                    self.atlas.ensure_glyph_id(&mut *self.shared.font.borrow_mut(), variant, *gid)
                 });
                 if !all_ok {
                     c += 1;
@@ -3008,9 +3043,10 @@ impl State {
         // didn't already pack this frame, so the immutable-`atlas` lookup in
         // `emit_text_run` below is a hit (and the dirty flag triggers the
         // re-upload right after). Done here, before the `&self.atlas` borrow,
-        // because `ensure_char` needs `&mut self.atlas`/`&mut self.font`.
-        if !self.completions.is_empty() {
-            let chars: Vec<char> = self
+        // because `ensure_char` needs `&mut self.atlas` and a `&mut Font`
+        // (taken as a single-statement `borrow_mut` per the AppShared rule).
+        if !self.active_tab().completions.is_empty() {
+            let chars: Vec<char> = self.active_tab()
                 .completions
                 .iter()
                 .flat_map(|s| s.text.chars())
@@ -3018,7 +3054,7 @@ impl State {
                 .collect();
             for ch in chars {
                 self.atlas
-                    .ensure_char(&mut self.font, font::FaceVariant::Regular, ch);
+                    .ensure_char(&mut *self.shared.font.borrow_mut(), font::FaceVariant::Regular, ch);
             }
         }
 
@@ -3026,7 +3062,7 @@ impl State {
         // new glyphs. write_texture reuses the existing GPU texture and
         // bind group — no need to recreate either.
         if self.atlas.dirty {
-            self.gpu.queue.write_texture(
+            self.shared.gpu.queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture: &self.font_texture.texture,
                     mip_level: 0,
@@ -3076,7 +3112,7 @@ impl State {
         // departing content slides *under* the static status line instead of
         // bleeding glyphs over it; for a full-height region it sits below the
         // window and clips nothing.
-        let (anim_lo, anim_hi, clip_bottom_px) = match &self.alt_scroll_anim {
+        let (anim_lo, anim_hi, clip_bottom_px) = match &self.active_tab().alt_scroll_anim {
             Some(a) => {
                 let d = a.rows as isize;
                 // Up-scroll departing rows sit above the region top (off-grid
@@ -3093,7 +3129,7 @@ impl State {
             }
             None => (0, 0, f32::INFINITY),
         };
-        let anim_active = self.alt_scroll_anim.is_some();
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
         let row_moving = move |r: isize| anim_active && r >= anim_lo && r <= anim_hi;
         // Per-row vertical offset. When no slide is active this is the global
         // `scroll_y` for every row (unchanged scrollback behavior).
@@ -3285,7 +3321,7 @@ impl State {
             sel[2] * selection_alpha,
             selection_alpha,
         ];
-        let selection = self.selection;
+        let selection = self.active_tab().selection;
 
         // 0b. Half-block fallback overrides for image placements that
         // the GPU image pipeline can't draw this frame (config-disabled
@@ -3323,7 +3359,7 @@ impl State {
             // row falls outside the selection. Mirrors `strip_at` further
             // down where the overlay quads are emitted.
             let sel_strip = selection_range.and_then(|(start, end)| {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 if abs_line < start.0 || abs_line > end.0 {
                     return None;
                 }
@@ -3356,7 +3392,7 @@ impl State {
                     });
                     continue;
                 }
-                let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
+                let Some(cell) = self.active_tab().terminal.extended_cell(r, c) else { continue };
                 // Kitty unicode-placeholder cells (`U+10EEEE` + image-id
                 // encoded in fg). The image quad draws over this cell on
                 // its own pipeline pass — emitting the U+10EEEE glyph
@@ -3428,9 +3464,9 @@ impl State {
         // overlay (1b) so a selected URL still reads as selected. Walks the
         // phantom-row range like the cell loop so the underline follows the
         // text through smooth scroll.
-        if let Some(hu) = &self.hover_url {
+        if let Some(hu) = &self.active_tab().hover_url {
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 // Underline every segment that lands on this line. Most links
                 // have one per line; an OSC 8 link with an `id=` shared across
                 // non-contiguous spans can have several, so don't stop early.
@@ -3460,7 +3496,7 @@ impl State {
                     }
                     // Match the cell's foreground color so the underline tracks
                     // theme overrides; fall back to the default fg.
-                    let fg = self
+                    let fg = self.active_tab()
                         .terminal
                         .extended_cell(r, from)
                         .map(|cell| {
@@ -3519,7 +3555,7 @@ impl State {
             // Match the cell loop's phantom range so a partially-scrolled
             // row keeps its selection strip drawn through the slide.
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((from, to)) = strip_at(abs_line) else { continue };
                 let prev = strip_at(abs_line - 1);
                 let next = strip_at(abs_line + 1);
@@ -3648,7 +3684,7 @@ impl State {
                 yellow[2] * cur_a,
                 cur_a,
             ];
-            let top_abs = self.terminal.visual_to_abs_line(0);
+            let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
             let emit_match = |vertices: &mut Vec<renderer::vertex::Vertex>,
                               indices: &mut Vec<u32>,
                               m: &search::Match,
@@ -3698,7 +3734,7 @@ impl State {
         let status_markers = if self.config.prompt_gutter == PromptGutter::None {
             Vec::new()
         } else {
-            self.terminal.prompt_status_markers()
+            self.active_tab().terminal.prompt_status_markers()
         };
         if !status_markers.is_empty() {
             let pal = palette::get();
@@ -3707,7 +3743,7 @@ impl State {
             let strip_pad = (line_height - bg_h) * 0.5;
             let bar_radius = bar_w * 0.5;
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((_, status)) = status_markers.iter().find(|(l, _)| *l == abs_line)
                 else {
                     continue;
@@ -3752,20 +3788,20 @@ impl State {
         let viewport_key = ViewportKey {
             rows,
             cols,
-            view_offset: self.terminal.view_offset(),
-            on_alt_screen: self.terminal.on_alt_screen(),
+            view_offset: self.active_tab().terminal.view_offset(),
+            on_alt_screen: self.active_tab().terminal.on_alt_screen(),
         };
         // A viewport change (resize, scrollback, alt-screen toggle) makes
         // last frame's snapshot non-comparable cell-for-cell, so we drop
         // any in-flight ghosts and skip detection until we have a fresh
         // matching snapshot to compare against.
-        let key_matches = self
+        let key_matches = self.active_tab()
             .prev_visible
             .as_ref()
             .map(|s| s.key == viewport_key)
             .unwrap_or(false);
         if !key_matches {
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // The cursor and its ghosts animate in BUFFER coordinates so changes
@@ -3774,18 +3810,18 @@ impl State {
         // grid. `live_grid_offset` is the integer visual-row delta to apply
         // when converting buffer rows back to viewport pixel space; equal
         // to `scrollback_visible` on the primary screen, 0 on alt screen.
-        let live_grid_offset_i = if self.terminal.on_alt_screen() {
+        let live_grid_offset_i = if self.active_tab().terminal.on_alt_screen() {
             0usize
         } else {
-            self.terminal.view_offset().min(rows)
+            self.active_tab().terminal.view_offset().min(rows)
         };
         let live_grid_offset = live_grid_offset_i as f32;
 
         // Cursor anchor for the completion popup, captured while the cursor is
         // drawn (same row/col→pixel mapping). `(anchor_x, cursor_row_top)`.
         let mut popup_anchor: Option<(f32, f32)> = None;
-        if let Some(_cur_visual_row) = self.terminal.cursor_visual_row() {
-            let cur = self.terminal.cursor();
+        if let Some(_cur_visual_row) = self.active_tab().terminal.cursor_visual_row() {
+            let cur = self.active_tab().terminal.cursor();
             let cur_col = cur.col.min(cols.saturating_sub(1));
             let target = (cur_col as f32, cur.row as f32);
             let anim_secs = self.config.cursor_anim_secs;
@@ -3796,10 +3832,14 @@ impl State {
             // buffer coords; prev_visible uses visual rows, so translate via
             // `live_grid_offset` (consistent because key_matches implies
             // view_offset hasn't changed since the snapshot).
+            // Collected into a local Vec, then appended after the `snap`
+            // borrow below is dropped — pushing straight into the tab would
+            // borrow it mutably while `snap` holds the same tab immutably.
+            let mut new_ghosts: Vec<CursorGhost> = Vec::new();
             if anim_secs > 0.0 && key_matches {
                 if let (Some(prev_anim), Some(snap)) = (
-                    self.cursor_anim.as_ref(),
-                    self.prev_visible.as_ref(),
+                    self.active_tab().cursor_anim.as_ref(),
+                    self.active_tab().prev_visible.as_ref(),
                 ) {
                     let (pcol, prow) = prev_anim.to;
                     let moved = (pcol - target.0).abs() > f32::EPSILON
@@ -3828,11 +3868,11 @@ impl State {
                                 if is_blank_cell(&prev) {
                                     continue;
                                 }
-                                let now_cell = self.terminal.visible_cell(vis_r, c);
+                                let now_cell = self.active_tab().terminal.visible_cell(vis_r, c);
                                 if !is_blank_cell(&now_cell) {
                                     continue;
                                 }
-                                self.cursor_ghosts.push(CursorGhost {
+                                new_ghosts.push(CursorGhost {
                                     ch: prev.ch,
                                     style: prev.style,
                                     buffer_row: buf_r,
@@ -3845,24 +3885,35 @@ impl State {
                 }
             }
 
+            // Now that `snap`'s immutable borrow has ended, fold in the ghosts
+            // captured above.
+            self.tabs[self.active].cursor_ghosts.append(&mut new_ghosts);
+
             // Drop ghosts whose underlying cell got rewritten with new
             // content (e.g. user typed a replacement after the backspace),
             // or whose fade has run out.
             let now = std::time::Instant::now();
-            let terminal = &self.terminal;
-            self.cursor_ghosts.retain(|g| {
-                let elapsed = now.duration_since(g.started_at).as_secs_f32();
-                if anim_secs <= 0.0 || elapsed >= anim_secs {
-                    return false;
-                }
-                let vis_r = g.buffer_row + live_grid_offset_i;
-                is_blank_cell(&terminal.visible_cell(vis_r, g.col))
-            });
+            {
+                // Scoped so the `&mut tab` (which borrows `self.tabs`) is
+                // released before the ghost-emit loop reads the active tab.
+                // `cursor_ghosts` (mut) and `terminal` (read) split-borrow the
+                // one tab.
+                let tab = &mut self.tabs[self.active];
+                let terminal = &tab.terminal;
+                tab.cursor_ghosts.retain(|g| {
+                    let elapsed = now.duration_since(g.started_at).as_secs_f32();
+                    if anim_secs <= 0.0 || elapsed >= anim_secs {
+                        return false;
+                    }
+                    let vis_r = g.buffer_row + live_grid_offset_i;
+                    is_blank_cell(&terminal.visible_cell(vis_r, g.col))
+                });
+            }
 
             // Emit ghost glyphs as foreground-only quads with linearly
             // decaying alpha. Drawn before the cursor box so the cursor
             // visually consumes the ghost as it slides over.
-            for ghost in &self.cursor_ghosts {
+            for ghost in &self.active_tab().cursor_ghosts {
                 let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
                 let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
                 let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
@@ -3885,7 +3936,7 @@ impl State {
                 );
             }
 
-            let anim = self.cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
+            let anim = self.tabs[self.active].cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
             anim.retarget(target, anim_secs);
 
             if visible {
@@ -3904,7 +3955,7 @@ impl State {
                 let cursor_color = palette::get().cursor;
                 // Underline / bar use a 2-px stripe; block fills the full cell.
                 let stripe = 2.0_f32;
-                let (cx, cy, cw, ch) = match self.terminal.cursor_shape() {
+                let (cx, cy, cw, ch) = match self.active_tab().terminal.cursor_shape() {
                     terminal::CursorShape::Block => (block_x, block_y, cell_w, line_height),
                     terminal::CursorShape::Underline => {
                         (block_x, block_y + line_height - stripe, cell_w, stripe)
@@ -3928,8 +3979,8 @@ impl State {
             // Cursor scrolled out of view. Drop the ease so the next time it
             // returns we snap to the new position instead of sliding in from
             // a stale one. Ghosts are tied to the cursor's motion so go with it.
-            self.cursor_anim = None;
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_anim = None;
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // Completion popup overlay (autocomplete slice K10). Drawn AFTER the
@@ -3941,14 +3992,14 @@ impl State {
         // TODO(K11+): consider excluding the popup from bloom. Appending into
         // the FG index range means it participates in the glow/bloom pass when
         // glow is on; acceptable for K10.
-        let popup_visible = !self.completions.is_empty() && self.terminal.view_offset() == 0;
+        let popup_visible = !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
         if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
-            let len = self.completions.len();
+            let len = self.active_tab().completions.len();
             // The visible window: `COMPLETION_MAX_VISIBLE` rows starting at the
             // scroll offset, clamped to the list. `n` is how many rows render.
-            let start = self.completion_scroll.min(len);
+            let start = self.active_tab().completion_scroll.min(len);
             let end = (start + COMPLETION_MAX_VISIBLE).min(len);
-            let visible = &self.completions[start..end];
+            let visible = &self.active_tab().completions[start..end];
             let n = visible.len();
             let item_h = line_height;
             // Box width: longest visible suggestion (chars) plus a little
@@ -3962,8 +4013,8 @@ impl State {
             let box_w = (longest as f32 * cell_w + text_pad * 2.0).min(cell_w * 48.0);
 
             let anchor_below_y = cursor_row_top + line_height;
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
             let layout = completion::popup_layout(
                 anchor_x,
                 anchor_below_y,
@@ -4014,7 +4065,7 @@ impl State {
             // visible window. Round the highlight's top corners only when it's
             // the box's first visible row, and its bottom corners only when it's
             // the last — so the highlight's rounding tracks the box's edges.
-            let hl_row = self.selected_completion.saturating_sub(start);
+            let hl_row = self.active_tab().selected_completion.saturating_sub(start);
             if hl_row < n {
                 let hl_y = layout.y + hl_row as f32 * item_h;
                 let round_top = if hl_row == 0 { radius } else { 0.0 };
@@ -4066,8 +4117,8 @@ impl State {
             use command_palette::{Mode, PALETTE_MAX_VISIBLE};
             let cp = &self.command_palette;
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the palette to pull focus.
             push_quad(
@@ -4246,8 +4297,8 @@ impl State {
         // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
         if self.search.open {
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
-            let screen_w = self.gpu.config.width as f32;
-            let screen_h = self.gpu.config.height as f32;
+            let screen_w = self.surface.config.width as f32;
+            let screen_h = self.surface.config.height as f32;
 
             // Dim the terminal behind the box.
             push_quad(
@@ -4384,11 +4435,11 @@ impl State {
         for r in 0..rows {
             let mut row_cells: Vec<style::Cell> = Vec::with_capacity(cols);
             for c in 0..cols {
-                row_cells.push(self.terminal.visible_cell(r, c));
+                row_cells.push(self.active_tab().terminal.visible_cell(r, c));
             }
             snap_cells.push(row_cells);
         }
-        self.prev_visible = Some(GridSnapshot {
+        self.tabs[self.active].prev_visible = Some(GridSnapshot {
             cells: snap_cells,
             key: viewport_key,
         });
@@ -4399,8 +4450,8 @@ impl State {
         // phantom row sliding into / out of the bottom edge dissolves rather
         // than clipping abruptly. Drawn last so they overlay every cell. RGB
         // is premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
-        let win_w = self.gpu.config.width as f32;
-        let win_h = self.gpu.config.height as f32;
+        let win_w = self.surface.config.width as f32;
+        let win_h = self.surface.config.height as f32;
         // Top fade is taller than the bottom: the title bar + toolbar takes
         // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
         // below that gives content a soft runway as it scrolls into view
@@ -4512,10 +4563,10 @@ impl State {
             );
         }
 
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.gpu
+        self.shared.gpu
             .queue
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
@@ -4525,12 +4576,12 @@ impl State {
         // foreground text toward the bg color near each edge; the blur sits
         // on top to soften whatever's still visible in the gradient region.
         if !strip_indices.is_empty() {
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
                 0,
                 bytemuck::cast_slice(&strip_vertices),
             );
-            self.gpu.queue.write_buffer(
+            self.shared.gpu.queue.write_buffer(
                 &self.strip_index_buffer,
                 0,
                 bytemuck::cast_slice(&strip_indices),
@@ -4547,7 +4598,7 @@ impl State {
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
         ];
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.fade_buffer,
             0,
             bytemuck::cast_slice(&fade_data),
@@ -4721,10 +4772,10 @@ impl State {
             return;
         }
         let case_sensitive = search::smart_case(&query);
-        let total = self.terminal.scrollback_len() + self.terminal.rows;
+        let total = self.active_tab().terminal.scrollback_len() + self.active_tab().terminal.rows;
         let mut matches = Vec::new();
         for abs in 0..total as isize {
-            let Some(cells) = self.terminal.line_at(abs) else {
+            let Some(cells) = self.active_tab().terminal.line_at(abs) else {
                 continue;
             };
             // One char per column. Drop trailing blanks so padding spaces don't
@@ -4753,15 +4804,15 @@ impl State {
     /// Scroll the viewport so the current match is visible, then redraw.
     fn focus_current_match(&mut self) {
         if let Some(m) = self.search.current_match() {
-            self.terminal.scroll_line_into_view(m.line);
-            self.scroll_y = 0.0;
+            self.active_tab_mut().terminal.scroll_line_into_view(m.line);
+            self.active_tab_mut().scroll_y = 0.0;
         }
         self.invalidate();
     }
 
-    /// This window's top-left in logical points, for handing to a child window
-    /// to cascade off (see [`spawn_new_window`]). `None` if the platform can't
-    /// report the position — the child then keeps the OS default spot.
+    /// This window's top-left in logical points, for a Cmd-N window to cascade
+    /// off (see [`spawn_window_in_process`]). `None` if the platform can't
+    /// report the position — the new window then keeps the OS default spot.
     fn window_origin(&self) -> Option<(f64, f64)> {
         let phys = self.window.outer_position().ok()?;
         let logical: winit::dpi::LogicalPosition<f64> =
@@ -4782,10 +4833,10 @@ impl State {
             // Route through the OSC-0/2 path so the existing title plumbing
             // (take_title_update -> effective_title) applies uniformly; the
             // event loop picks the change up after this returns.
-            A::SetTitle => self
+            A::SetTitle => self.active_tab_mut()
                 .terminal
                 .set_window_title(arg.as_deref().unwrap_or("")),
-            A::ClearTitle => self.terminal.set_window_title(""),
+            A::ClearTitle => self.active_tab_mut().terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
             // The picker hands back a label; map it to a scheme slot value
             // ("Default (built-in)" / empty -> None, revert to built-in).
@@ -4820,14 +4871,14 @@ impl State {
             A::ZoomIn => self.change_font_size(1.0),
             A::ZoomOut => self.change_font_size(-1.0),
             A::ToggleWireframe => {
-                if self.wireframe_pipeline.is_some() {
+                if self.shared.wireframe_pipeline.is_some() {
                     self.wireframe = !self.wireframe;
                 }
             }
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
-            A::NewWindow => spawn_new_window(self.terminal.cwd(), self.window_origin()),
+            A::NewWindow => self.pending_new_window = true,
             // Re-arm first-run and relaunch into it. Each window owns a single
             // PTY (forked at startup, already attached to a shell), so there's
             // no in-place way to swap the running shell for onboarding —
@@ -4872,19 +4923,19 @@ impl State {
         }
         self.pt_size = new_pt;
         self.config.font_size = self.pt_size;
-        self.font.set_char_size(self.pt_size, self.dpi);
-        self.atlas = self.font.build_atlas();
+        self.shared.font.borrow_mut().set_char_size(self.pt_size, self.dpi);
+        self.atlas = self.shared.font.borrow_mut().build_atlas();
         self.font_texture = renderer::texture::Texture::from_memory(
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             &self.atlas.buffer,
             self.atlas.width as u32,
             self.atlas.height as u32,
             wgpu::TextureFormat::R8Unorm,
             Some("font texture"),
         );
-        self.font_bind_group = self.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &self.font_bind_group_layout,
+        self.font_bind_group = self.shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.shared.font_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -4899,18 +4950,18 @@ impl State {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let viewport = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
-        self.terminal.resize(viewport.char_width, viewport.char_height);
+        self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.sync_terminal_cell_size();
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
         true
     }
@@ -4919,21 +4970,26 @@ impl State {
         // A move to a display with a different scale factor changes the native
         // title bar's physical height; keep the chrome band in step.
         self.refresh_chrome_band();
-        self.gpu.resize(size);
+        self.surface.resize(&self.shared.gpu.device, size);
         if size.width > 0 && size.height > 0 {
-            self.blur
-                .resize(&self.gpu.device, &self.gpu.queue, size.width, size.height);
+            self.blur.resize(
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.blur_pipelines,
+                size.width,
+                size.height,
+            );
             // FG scene mirrors the BG scene's size/format. Recreate the
             // texture and rebuild every bind group that samples it.
             self.scene_fg = SceneTarget::new(
-                &self.gpu.device,
-                self.gpu.config.format,
+                &self.shared.gpu.device,
+                self.surface.config.format,
                 size.width,
                 size.height,
                 "scene fg",
             );
-            self.scene_fg_blit_bg = self.blur.make_blit_bind_group(
-                &self.gpu.device,
+            self.scene_fg_blit_bg = self.shared.blur_pipelines.make_blit_bind_group(
+                &self.shared.gpu.device,
                 &self.scene_fg.view,
                 "scene fg blit bg",
             );
@@ -4941,33 +4997,35 @@ impl State {
             // scene view — resize rebuilds it against the (potentially
             // recreated) texture handle.
             self.glow.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.blur.scene.view,
             );
             self.glow_fg.resize(
-                &self.gpu.device,
-                &self.gpu.queue,
+                &self.shared.gpu.device,
+                &self.shared.gpu.queue,
+                &self.shared.glow_pipelines,
                 size.width,
                 size.height,
                 &self.scene_fg.view,
             );
             // Mask bind groups sample the (just-recreated) bg scene
             // texture, so they have to be rebuilt against the new view.
-            self.glow_bg_mask = self.glow.make_mask_bind_group(
-                &self.gpu.device,
+            self.glow_bg_mask = self.shared.glow_pipelines.make_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow bg mask (bg scene)",
             );
-            self.glow_fg_mask = self.glow_fg.make_mask_bind_group(
-                &self.gpu.device,
+            self.glow_fg_mask = self.shared.glow_pipelines.make_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 "glow fg mask (bg scene)",
             );
-            self.scanline_overlay_mask = self.glow.make_overlay_mask_bind_group(
-                &self.gpu.device,
+            self.scanline_overlay_mask = self.shared.glow_pipelines.make_overlay_mask_bind_group(
+                &self.shared.gpu.device,
                 &self.blur.scene.view,
                 &self.scene_fg.view,
                 "scanline overlay mask (bg + fg)",
@@ -4975,16 +5033,16 @@ impl State {
         }
         self.camera_uniform
             .update_view_proj(&self.camera, size.width as f32, size.height as f32);
-        self.gpu.queue.write_buffer(
+        self.shared.gpu.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.font.face().size_metrics().unwrap();
-        let size = State::get_viewport_size(
-            self.gpu.config.width as f32,
-            self.gpu.config.height as f32,
-            self.font.cell_width(),
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let size = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
         // Only touch the PTY winsize when the character grid actually
@@ -4996,14 +5054,14 @@ impl State {
         // fresh prompt per frame, so growing the window appears to push the
         // prompt downward. Gating on rows/cols collapses a drag back to one
         // signal per row boundary crossed.
-        let grid_changed = size.char_width != self.terminal.cols
-            || size.char_height != self.terminal.rows;
-        self.terminal.resize(size.char_width, size.char_height);
+        let grid_changed = size.char_width != self.active_tab().terminal.cols
+            || size.char_height != self.active_tab().terminal.rows;
+        self.active_tab_mut().terminal.resize(size.char_width, size.char_height);
         if grid_changed {
             self.notify_pty_size(size.char_width, size.char_height);
         }
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
     }
 
@@ -5013,8 +5071,8 @@ impl State {
         // discover the cell-pixel size. Zero here would make those
         // tools refuse to send images with "Terminal does not support
         // reporting screen sizes in pixels."
-        let metrics = self.font.face().size_metrics().unwrap();
-        let cell_w = self.font.cell_width() as u32;
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
         let ypixel = (rows as u32).saturating_mul(line_h).min(u16::MAX as u32) as u16;
@@ -5025,12 +5083,12 @@ impl State {
             ws_ypixel: ypixel,
         };
         unsafe {
-            libc::ioctl(self.master, libc::TIOCSWINSZ, &ws);
+            libc::ioctl(self.active_tab().master, libc::TIOCSWINSZ, &ws);
         }
     }
 
     fn write_pty(&self, bytes: &[u8]) {
-        if let Err(e) = nix::unistd::write(self.master, bytes) {
+        if let Err(e) = nix::unistd::write(self.active_tab().master, bytes) {
             eprintln!("pty write failed: {e}");
         }
     }
@@ -5038,20 +5096,20 @@ impl State {
     /// Effective blink state: DECSCUSR's request is gated by the user's
     /// `cursor_blink` config so opting out disables blinking globally.
     fn cursor_blink_enabled(&self) -> bool {
-        self.config.cursor_blink && self.terminal.cursor_blink()
+        self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
     }
 
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the
     /// cursor exists at all; blink only suppresses it on the "off" half-phase
     /// of the cycle when DECSCUSR has selected a blinking variant.
     fn cursor_currently_visible(&self) -> bool {
-        self.terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
+        self.active_tab().terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
     }
 
     /// If a blink half-cycle has elapsed, flip the phase and request a redraw.
     /// Returns true when the cursor visibility actually changed.
     fn maybe_blink_tick(&mut self) -> bool {
-        if !self.cursor_blink_enabled() || !self.terminal.cursor_visible() {
+        if !self.cursor_blink_enabled() || !self.active_tab().terminal.cursor_visible() {
             return false;
         }
         if self.last_blink.elapsed() < BLINK_INTERVAL {
@@ -5065,7 +5123,7 @@ impl State {
     /// Next instant the event loop should wake to flip the blink phase, or
     /// `None` if the cursor isn't blinking right now.
     fn next_blink_wake(&self) -> Option<std::time::Instant> {
-        if self.cursor_blink_enabled() && self.terminal.cursor_visible() {
+        if self.cursor_blink_enabled() && self.active_tab().terminal.cursor_visible() {
             Some(self.last_blink + BLINK_INTERVAL)
         } else {
             None
@@ -5083,11 +5141,11 @@ impl State {
     /// still fading. Keeps the event loop ticking until both finish so
     /// the redraw isn't held up waiting for the next PTY/blink event.
     fn is_cursor_animating(&self) -> bool {
-        let anim_active = match &self.cursor_anim {
+        let anim_active = match &self.active_tab().cursor_anim {
             Some(a) => a.animating(self.config.cursor_anim_secs),
             None => false,
         };
-        anim_active || !self.cursor_ghosts.is_empty()
+        anim_active || !self.active_tab().cursor_ghosts.is_empty()
     }
 
     /// Edge-fade distances `(bottom, top)` that drive the fade phases and the
@@ -5103,7 +5161,7 @@ impl State {
         scrollback_len: f32,
         line_height: f32,
     ) -> (f32, f32) {
-        if self.terminal.on_alt_screen() {
+        if self.active_tab().terminal.on_alt_screen() {
             (0.0, 0.0)
         } else {
             (
@@ -5116,15 +5174,15 @@ impl State {
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     fn is_top_fade_animating(&self) -> bool {
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let view_offset = self.terminal.view_offset() as f32;
-        let metrics = self.font.face().size_metrics().unwrap();
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
         let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
@@ -5194,10 +5252,10 @@ impl State {
         ];
         for g in [&mut self.glow, &mut self.glow_fg] {
             apply_glow_config(g, &self.config, &p.glow);
-            g.set_bright_palette(&self.gpu.queue, &bright);
+            g.set_bright_palette(&self.shared.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
-            g.write_glow_params(&self.gpu.queue);
+            g.write_glow_params(&self.shared.gpu.queue);
         }
 
         // Already-painted cells carry pre-resolved RGBA from when their
@@ -5205,7 +5263,7 @@ impl State {
         // up the new scheme so the visible viewport actually changes
         // color, not just any new output printed after this point.
         // Truecolor cells (absolute RGB from the app) are left alone.
-        self.terminal.reresolve_palette();
+        self.active_tab_mut().terminal.reresolve_palette();
         // Cell vertex buffer caches bg colors and glyph fg colors per
         // cell; the sweep above just changed those values, so the
         // cached vertices are stale.
@@ -5268,7 +5326,7 @@ impl State {
             palette::linear_to_srgb_u8(c[1]),
             palette::linear_to_srgb_u8(c[2]),
         ];
-        self.terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
+        self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
     }
 
     /// 1-based (col, row) form of `pixel_to_visual_cell` for mouse reporting.
@@ -5313,7 +5371,7 @@ impl State {
     /// Forward a mouse event to the PTY in the host's preferred encoding,
     /// if any tracking mode is enabled. `motion` is set for drag/move events.
     fn report_mouse(&mut self, button: input::MouseButton, press: bool, motion: bool) {
-        let mp = self.terminal.mouse_protocol();
+        let mp = self.active_tab().terminal.mouse_protocol();
         if !mp.enabled() {
             return;
         }
@@ -5326,10 +5384,10 @@ impl State {
         let (col, row) = self.pixel_to_cell(self.mouse_x, self.mouse_y);
         if motion {
             // Coalesce: only report when the cell changes.
-            if self.last_reported_cell == Some((col, row)) {
+            if self.active_tab().last_reported_cell == Some((col, row)) {
                 return;
             }
-            self.last_reported_cell = Some((col, row));
+            self.active_tab_mut().last_reported_cell = Some((col, row));
         }
         let bytes = input::encode_mouse(button, col, row, press, motion, mp.sgr, self.modifiers);
         self.write_pty(&bytes);
@@ -5344,24 +5402,24 @@ impl State {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;
         let bg_h = ascender - descender;
-        let cell_w = self.font.cell_width() as f64;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f64;
         // Mirror the renderer's dynamic decorator offset: full DECORATOR_HEIGHT
         // at both scroll-range boundaries (live grid and top of scrollback),
         // easing to 0 over one line in either direction. Out-of-sync formulas
         // here would drift the hit-test by a row vs. what's actually drawn.
-        let view_offset = self.terminal.view_offset() as f64;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let view_offset = self.active_tab().terminal.view_offset() as f64;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f64
+            self.active_tab().terminal.scrollback_len() as f64
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
@@ -5372,16 +5430,16 @@ impl State {
         let row_strip_top =
             WINDOW_PADDING as f64 + chrome_offset + line_height - ascender - strip_pad;
         let col = ((px - WINDOW_PADDING as f64) / cell_w).floor() as i64;
-        let row = ((py - row_strip_top - self.scroll_y) / line_height).floor() as i64;
-        let col = col.clamp(0, self.terminal.cols as i64 - 1) as usize;
-        let row = row.clamp(0, self.terminal.rows as i64 - 1) as isize;
+        let row = ((py - row_strip_top - self.active_tab().scroll_y) / line_height).floor() as i64;
+        let col = col.clamp(0, self.active_tab().terminal.cols as i64 - 1) as usize;
+        let row = row.clamp(0, self.active_tab().terminal.rows as i64 - 1) as isize;
         (col, row)
     }
 
     /// Pixel coord → absolute (line, col) selection point.
     fn pixel_to_selection_point(&self, px: f64, py: f64) -> (isize, usize) {
         let (col, vrow) = self.pixel_to_visual_cell(px, py);
-        (self.terminal.visual_to_abs_line(vrow), col)
+        (self.active_tab().terminal.visual_to_abs_line(vrow), col)
     }
 
     /// Recompute the URL under the mouse pointer. Tracks Cmd state so the
@@ -5401,12 +5459,12 @@ impl State {
         }
         let new = if self.modifiers.super_key() {
             let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
-            let abs_line = self.terminal.visual_to_abs_line(vrow);
-            find_url_at(&self.terminal, abs_line, col)
+            let abs_line = self.active_tab().terminal.visual_to_abs_line(vrow);
+            find_url_at(&self.active_tab().terminal, abs_line, col)
         } else {
             None
         };
-        if new == self.hover_url {
+        if new == self.active_tab().hover_url {
             return;
         }
         let icon = if new.is_some() {
@@ -5415,7 +5473,7 @@ impl State {
             winit::window::CursorIcon::Text
         };
         self.window.set_cursor_icon(icon);
-        self.hover_url = new;
+        self.active_tab_mut().hover_url = new;
         self.invalidate();
     }
 
@@ -5425,23 +5483,23 @@ impl State {
     fn handle_mouse_press(&mut self) {
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
         let now = std::time::Instant::now();
-        let continued = self
+        let continued = self.active_tab()
             .last_click
             .map(|(t, c)| c == p && now.duration_since(t) < DOUBLE_CLICK_THRESHOLD)
             .unwrap_or(false);
-        self.click_count = if continued { (self.click_count % 3) + 1 } else { 1 };
-        self.last_click = Some((now, p));
-        self.selection_mode = match self.click_count {
+        self.active_tab_mut().click_count = if continued { (self.active_tab().click_count % 3) + 1 } else { 1 };
+        self.active_tab_mut().last_click = Some((now, p));
+        self.active_tab_mut().selection_mode = match self.active_tab().click_count {
             1 => SelectionMode::Cell,
             2 => SelectionMode::Word,
             _ => SelectionMode::Line,
         };
-        self.press_cell = Some(p);
-        self.press_pixel = Some((self.mouse_x, self.mouse_y));
+        self.active_tab_mut().press_cell = Some(p);
+        self.active_tab_mut().press_pixel = Some((self.mouse_x, self.mouse_y));
         // Word and Line modes show their selection on click. Cell mode waits
         // until the drag exceeds DRAG_THRESHOLD_PX so a plain click doesn't
         // briefly highlight a single character.
-        self.selection = match self.selection_mode {
+        self.active_tab_mut().selection = match self.active_tab().selection_mode {
             SelectionMode::Cell => None,
             _ => self.compute_selection(p, p),
         };
@@ -5449,9 +5507,9 @@ impl State {
 
     /// Update the head of the active selection from the current mouse pos.
     fn handle_mouse_drag(&mut self) {
-        let Some(p0) = self.press_cell else { return };
-        if self.selection_mode == SelectionMode::Cell && self.selection.is_none() {
-            let Some((px, py)) = self.press_pixel else { return };
+        let Some(p0) = self.active_tab().press_cell else { return };
+        if self.active_tab().selection_mode == SelectionMode::Cell && self.active_tab().selection.is_none() {
+            let Some((px, py)) = self.active_tab().press_pixel else { return };
             let dx = self.mouse_x - px;
             let dy = self.mouse_y - py;
             if dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
@@ -5459,23 +5517,23 @@ impl State {
             }
         }
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
-        self.selection = self.compute_selection(p0, p);
+        self.active_tab_mut().selection = self.compute_selection(p0, p);
     }
 
     fn handle_mouse_release(&mut self) {
-        self.press_cell = None;
-        self.press_pixel = None;
+        self.active_tab_mut().press_cell = None;
+        self.active_tab_mut().press_pixel = None;
     }
 
     /// Build a selection from two cells under the current `selection_mode`.
     /// In Word / Line mode, each end snaps outward to the word or line edge.
     fn compute_selection(&self, a: (isize, usize), b: (isize, usize)) -> Option<Selection> {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let (start, end) = match self.selection_mode {
+        let (start, end) = match self.active_tab().selection_mode {
             SelectionMode::Cell => (start, end),
             SelectionMode::Word => (self.word_start(start), self.word_end(end)),
             SelectionMode::Line => {
-                let last = self.terminal.cols.saturating_sub(1);
+                let last = self.active_tab().terminal.cols.saturating_sub(1);
                 ((start.0, 0), (end.0, last))
             }
         };
@@ -5484,7 +5542,7 @@ impl State {
 
     /// Walk left from `p` while the previous cell is a word char.
     fn word_start(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -5497,7 +5555,7 @@ impl State {
 
     /// Walk right from `p` while the next cell is a word char.
     fn word_end(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -5511,10 +5569,10 @@ impl State {
     fn clear_selection(&mut self) -> bool {
         // Reset multi-click bookkeeping too — typing should make the next
         // click count as a fresh single-click.
-        self.last_click = None;
-        self.click_count = 0;
-        if self.selection.is_some() {
-            self.selection = None;
+        self.active_tab_mut().last_click = None;
+        self.active_tab_mut().click_count = 0;
+        if self.active_tab().selection.is_some() {
+            self.active_tab_mut().selection = None;
             true
         } else {
             false
@@ -5524,11 +5582,11 @@ impl State {
     /// Materialize the current selection as plain text, trimming trailing
     /// whitespace per line and joining with '\n'.
     fn selection_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
+        let sel = self.active_tab().selection.as_ref()?;
         let (start, end) = sel.range();
         let mut out = String::new();
         for line in start.0..=end.0 {
-            let Some(cells) = self.terminal.line_at(line) else { continue };
+            let Some(cells) = self.active_tab().terminal.line_at(line) else { continue };
             let from = if line == start.0 { start.1 } else { 0 };
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
@@ -5560,15 +5618,15 @@ impl State {
     /// `OutputStart`..`CommandEnd`). Returns false (no-op) when no completed
     /// command has any output. Drives the Cmd-Shift-O keybinding.
     fn select_last_command_output(&mut self) -> bool {
-        let Some((start_line, end_line)) = self.terminal.last_command_output_span() else {
+        let Some((start_line, end_line)) = self.active_tab().terminal.last_command_output_span() else {
             return false;
         };
-        let last_col = self.terminal.cols.saturating_sub(1);
-        self.selection = Some(Selection {
+        let last_col = self.active_tab().terminal.cols.saturating_sub(1);
+        self.active_tab_mut().selection = Some(Selection {
             anchor: (start_line, 0),
             head: (end_line, last_col),
         });
-        self.selection_mode = SelectionMode::Cell;
+        self.active_tab_mut().selection_mode = SelectionMode::Cell;
         self.copy_selection();
         self.invalidate();
         true
@@ -5595,13 +5653,13 @@ impl State {
         // extent was specified — `poll_pending_images` computes it from
         // the decoded image's pixel dimensions. The pre-allocated
         // ImageId is therefore discarded here; the OSC 1337 path uses it.
-        let (pending, _image_id) = self.image_store.request_insert(
+        let (pending, _image_id) = self.tabs[self.active].image_store.request_insert(
             bytes,
             self.config.images_max_pixels,
             std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
             Some(label.to_string()),
         );
-        self.pending_placements.push(PendingImagePlacement {
+        self.active_tab_mut().pending_placements.push(PendingImagePlacement {
             request: pending,
             row,
             col,
@@ -5628,14 +5686,14 @@ impl State {
         // base image's PendingImagePlacement finalizes and
         // `pending_placements` empties — and the animation stays
         // pinned on its first frame forever.
-        if self.pending_placements.is_empty() && self.image_store.pending_count() == 0 {
+        if self.tabs[self.active].pending_placements.is_empty() && self.tabs[self.active].image_store.pending_count() == 0 {
             return;
         }
         let nearest = self.config.images_filter == "nearest";
-        let results = self.image_store.poll(
+        let results = self.tabs[self.active].image_store.poll(
             &self.image_pipeline,
-            &self.gpu.device,
-            &self.gpu.queue,
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
             nearest,
         );
         // CRITICAL: must request_redraw if there are still pending decodes,
@@ -5656,21 +5714,21 @@ impl State {
         // whole `cat`/`icat` in one burst and reliably lose this race;
         // slower debug builds spread ingest across events and win it.)
         if should_rearm_image_poll(
-            self.pending_placements.is_empty(),
+            self.active_tab().pending_placements.is_empty(),
             results.is_empty(),
-            self.image_store.pending_count(),
+            self.active_tab().image_store.pending_count(),
         ) {
             self.window.request_redraw();
         }
         if results.is_empty() {
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let mut any_placed = false;
         for (pending_id, outcome) in results {
-            let Some(i) = self
+            let Some(i) = self.active_tab()
                 .pending_placements
                 .iter()
                 .position(|p| p.request == pending_id)
@@ -5680,12 +5738,12 @@ impl State {
                 // current code paths). Drop the GPU upload on the floor.
                 continue;
             };
-            let pp = self.pending_placements.remove(i);
+            let pp = self.active_tab_mut().pending_placements.remove(i);
             match (outcome, pp.preplaced_image_id) {
                 // Deferred path success: compute extent from pixel dims
                 // and create the placement now.
                 (Ok(image_id), None) => {
-                    let img = self
+                    let img = self.active_tab()
                         .image_store
                         .peek(image_id)
                         .expect("just-inserted image");
@@ -5693,7 +5751,7 @@ impl State {
                     let cols = (img.width_px + cell_w - 1) / cell_w;
                     let rows = rows.clamp(1, u16::MAX as u32) as u16;
                     let cols = cols.clamp(1, u16::MAX as u32) as u16;
-                    self.terminal
+                    self.active_tab_mut().terminal
                         .insert_placement(image_id, pp.row, pp.col, rows, cols, 0);
                     any_placed = true;
                 }
@@ -5710,7 +5768,7 @@ impl State {
                 // the user doesn't stare at a blank space forever.
                 (Err(e), Some(image_id)) => {
                     eprintln!("image decode failed: {e}");
-                    let removed = self.terminal.remove_placements_with_image(image_id);
+                    let removed = self.active_tab_mut().terminal.remove_placements_with_image(image_id);
                     if removed > 0 {
                         any_placed = true; // grid changed; redraw
                     }
@@ -5910,16 +5968,16 @@ impl State {
         if images_enabled && !opted_in {
             return out;
         }
-        let cols = self.terminal.cols;
-        let view_offset = self.terminal.view_offset();
-        let rows = self.terminal.rows;
-        for p in self.terminal.live_placements() {
-            let is_pending = self.image_store.is_pending(p.image);
-            let gpu_ok = self.image_store.peek(p.image).is_some();
+        let cols = self.active_tab().terminal.cols;
+        let view_offset = self.active_tab().terminal.view_offset();
+        let rows = self.active_tab().terminal.rows;
+        for p in self.active_tab().terminal.live_placements() {
+            let is_pending = self.active_tab().image_store.is_pending(p.image);
+            let gpu_ok = self.active_tab().image_store.peek(p.image).is_some();
             if !Self::should_halfblock(images_enabled, opted_in, is_pending, gpu_ok) {
                 continue;
             }
-            let Some(preview) = self.image_store.preview(p.image) else {
+            let Some(preview) = self.active_tab().image_store.preview(p.image) else {
                 // Disabled-but-no-preview: nothing to draw with. The
                 // empty space is the right behaviour here; users who
                 // want a placeholder would have to wait for a future
@@ -5959,7 +6017,7 @@ impl State {
     /// advance and placement insertion — leaving the placement at a
     /// stale anchor. See sub-slice P2.4 design notes.
     fn feed_terminal(&mut self, bytes: &str) {
-        self.terminal.feed(bytes);
+        self.active_tab_mut().terminal.feed(bytes);
         self.maybe_start_alt_scroll();
         self.drain_pending_image_uploads();
     }
@@ -5972,7 +6030,7 @@ impl State {
         if ALT_SCROLL_ANIM_SECS <= 0.0 {
             return;
         }
-        let Some(scroll) = self.terminal.take_alt_scroll() else {
+        let Some(scroll) = self.active_tab_mut().terminal.take_alt_scroll() else {
             return;
         };
         // The renderer slides the region and clips its bottom edge, so the
@@ -5982,13 +6040,13 @@ impl State {
         // bleed past its top edge, so skip the slide there; the scroll has
         // already been applied to the grid, it just snaps instead of animating.
         if scroll.region_top != 0 {
-            self.terminal.clear_alt_anim();
+            self.active_tab_mut().terminal.clear_alt_anim();
             return;
         }
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let total_px = scroll.rows as f32 * line_height;
-        self.alt_scroll_anim = Some(AltScrollAnim {
+        self.active_tab_mut().alt_scroll_anim = Some(AltScrollAnim {
             up: scroll.up,
             rows: scroll.rows,
             region_top: scroll.region_top,
@@ -5998,7 +6056,7 @@ impl State {
         });
         // Start displaying the pre-scroll frame: shift the (already-scrolled)
         // grid back by the full distance so the departing rows fill the gap.
-        self.scroll_y = if scroll.up { total_px } else { -total_px } as f64;
+        self.active_tab_mut().scroll_y = if scroll.up { total_px } else { -total_px } as f64;
         self.invalidate();
     }
 
@@ -6006,12 +6064,12 @@ impl State {
     /// toward zero. Finishes (and releases the frozen rows) when the slide
     /// completes or the alt screen is no longer active. No-op when idle.
     fn update_alt_scroll(&mut self) {
-        let Some(anim) = self.alt_scroll_anim else {
+        let Some(anim) = self.active_tab().alt_scroll_anim else {
             return;
         };
-        if !self.terminal.on_alt_screen() {
+        if !self.active_tab().terminal.on_alt_screen() {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
         let t = (anim.started.elapsed().as_secs_f32() / ALT_SCROLL_ANIM_SECS).clamp(0.0, 1.0);
@@ -6020,25 +6078,25 @@ impl State {
         let remaining = anim.total_px * (1.0 - eased);
         if t >= 1.0 || remaining <= 0.5 {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
-        self.scroll_y = if anim.up { remaining } else { -remaining } as f64;
+        self.active_tab_mut().scroll_y = if anim.up { remaining } else { -remaining } as f64;
     }
 
     /// End any alt-screen scroll slide and drop the terminal's frozen rows.
     /// Leaves `scroll_y` untouched — callers that cancel mid-slide (a keystroke
     /// snapping the view) zero it themselves.
     fn finish_alt_scroll(&mut self) {
-        if self.alt_scroll_anim.take().is_some() {
-            self.terminal.clear_alt_anim();
+        if self.active_tab_mut().alt_scroll_anim.take().is_some() {
+            self.active_tab_mut().terminal.clear_alt_anim();
         }
     }
 
     /// True while an alt-screen scroll slide is mid-flight — keeps the event
     /// loop ticking frames until it settles.
     fn is_alt_scroll_animating(&self) -> bool {
-        self.alt_scroll_anim.is_some()
+        self.active_tab().alt_scroll_anim.is_some()
     }
 
     /// Refresh the cached completion-popup suggestions, but only when the
@@ -6048,25 +6106,25 @@ impl State {
     /// doesn't dump the whole cwd. Returns true if the cache changed (so the
     /// caller can request a redraw).
     fn recompute_completions(&mut self) -> bool {
-        let cur = self.terminal.current_input().cloned();
+        let cur = self.active_tab().terminal.current_input().cloned();
         let key = cur.as_ref().map(|c| (c.buffer.clone(), c.cursor));
-        if key == self.completions_input {
+        if key == self.active_tab().completions_input {
             return false;
         }
-        self.completions_input = key;
+        self.active_tab_mut().completions_input = key;
         // A dismissed popup (Enter/Esc) must not reopen when the shell re-emits
         // OSC 2122 after an accepted suffix — keep it empty until a real
         // keystroke clears the flag. The `autocomplete` config gate works the
         // same way: when the feature is off, never run `completion::complete`,
         // just keep the cache empty (read live so config reload toggles it).
-        self.completions = if self.completion_dismissed || !self.config.autocomplete {
+        self.active_tab_mut().completions = if self.active_tab().completion_dismissed || !self.config.autocomplete {
             Vec::new()
         } else {
             match &cur {
                 // `complete` returns empty for empty/whitespace input on its own
                 // (no history match, empty token skipped), so no separate gate.
                 Some(c) => {
-                    let cwd = self.terminal.cwd().map(std::path::Path::new);
+                    let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
                     let path = std::env::var_os("PATH");
                     let home = std::env::var_os("HOME");
                     completion::complete(
@@ -6075,7 +6133,7 @@ impl State {
                         cwd,
                         path.as_deref(),
                         home.as_deref().map(std::path::Path::new),
-                        &self.command_history,
+                        &self.active_tab().command_history,
                         false,
                     )
                 }
@@ -6084,8 +6142,8 @@ impl State {
         };
         // The cache was replaced: restart selection at the top and reset the
         // scroll window so navigation state never points past a shorter list.
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         true
     }
 
@@ -6102,29 +6160,29 @@ impl State {
         if !self.config.autocomplete {
             return;
         }
-        self.completion_dismissed = false;
+        self.active_tab_mut().completion_dismissed = false;
         // Clone the buffer/cursor out of the immutable `current_input()` borrow so
         // it ends before we take `cwd()` and then mutably write `self.*` fields.
-        if let Some((buffer, cursor)) = self
+        if let Some((buffer, cursor)) = self.active_tab()
             .terminal
             .current_input()
             .map(|c| (c.buffer.clone(), c.cursor))
         {
-            let cwd = self.terminal.cwd().map(std::path::Path::new);
+            let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
             let path = std::env::var_os("PATH");
             let home = std::env::var_os("HOME");
-            self.completions = completion::complete(
+            self.active_tab_mut().completions = completion::complete(
                 &buffer,
                 cursor,
                 cwd,
                 path.as_deref(),
                 home.as_deref().map(std::path::Path::new),
-                &self.command_history,
+                &self.active_tab().command_history,
                 true,
             );
-            self.completions_input = Some((buffer, cursor));
-            self.selected_completion = 0;
-            self.completion_scroll = 0;
+            self.active_tab_mut().completions_input = Some((buffer, cursor));
+            self.active_tab_mut().selected_completion = 0;
+            self.active_tab_mut().completion_scroll = 0;
         }
         self.invalidate();
     }
@@ -6147,16 +6205,16 @@ impl State {
     /// submits as-typed). `submit` implies not-keep-open and always closes the
     /// popup (the command is running, so the popup must go).
     fn accept_selected_completion(&mut self, keep_open: bool, submit: bool) {
-        let Some(sug) = self.completions.get(self.selected_completion) else {
+        let Some(sug) = self.active_tab().completions.get(self.active_tab().selected_completion) else {
             return;
         };
         // Clone the suggestion so the byte payload below can hold the immutable
-        // `self.terminal` borrow without also borrowing `self.completions`.
+        // `self.active_tab().terminal` borrow without also borrowing `self.active_tab().completions`.
         let sug = sug.clone();
         // Build the byte payload (cloning the suffix) while holding the
-        // immutable `self.terminal` borrow, then drop it before the &self
+        // immutable `self.active_tab().terminal` borrow, then drop it before the &self
         // `write_pty` call below.
-        let bytes: Option<Vec<u8>> = self.terminal.current_input().map(|c| {
+        let bytes: Option<Vec<u8>> = self.active_tab().terminal.current_input().map(|c| {
             let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &sug) {
                 Some(suffix) => suffix.as_bytes().to_vec(),
                 // A stale / non-extending suggestion: no suffix to insert, but
@@ -6176,22 +6234,22 @@ impl State {
         if submit {
             // Submitting: the command is running, so the popup must close and
             // stay closed until the user types again.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         } else if keep_open {
             // Drilling into a directory: force a fresh recompute on the next
             // OSC 2122 report, but leave the popup open and undismissed so the
             // round-trip refilters to the subdirectory's contents.
-            self.completions_input = None;
+            self.active_tab_mut().completions_input = None;
         } else {
             // Finishing: close and keep closed until the user types.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         }
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         self.invalidate();
     }
 
@@ -6205,10 +6263,10 @@ impl State {
         if !self.config.images_enabled {
             // Drain anyway so the queue doesn't grow unboundedly if the
             // config is toggled at runtime.
-            let _ = self.terminal.take_pending_image_uploads();
+            let _ = self.active_tab_mut().terminal.take_pending_image_uploads();
             return;
         }
-        let uploads = self.terminal.take_pending_image_uploads();
+        let uploads = self.active_tab_mut().terminal.take_pending_image_uploads();
         if uploads.is_empty() {
             return;
         }
@@ -6217,10 +6275,10 @@ impl State {
             // straight into the store's playback-state mutation.
             if let Some(ctrl) = up.animation_control.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(image_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(image_id) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
-                self.image_store.apply_animation_control(
+                self.active_tab_mut().image_store.apply_animation_control(
                     image_id,
                     ctrl.control,
                     ctrl.loop_count,
@@ -6241,11 +6299,11 @@ impl State {
             // payloads go through the worker.
             if let Some(frame_spec) = up.animation_frame.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(parent) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(parent) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
                 if let Some((w, h)) = up.raw_rgba_dims {
-                    let _ = self.image_store.request_insert_frame_rgba(
+                    let _ = self.active_tab_mut().image_store.request_insert_frame_rgba(
                         parent,
                         up.bytes,
                         w,
@@ -6258,7 +6316,7 @@ impl State {
                         frame_spec.dst_y,
                     );
                 } else {
-                    let _ = self.image_store.request_insert_frame(
+                    let _ = self.tabs[self.active].image_store.request_insert_frame(
                         parent,
                         up.bytes,
                         self.config.images_max_pixels,
@@ -6284,21 +6342,21 @@ impl State {
             // payloads (signaled by `raw_rgba_dims`) skip the decode
             // worker entirely; PNG-style payloads go through it.
             let (pending, image_id) = if let Some((w, h)) = up.raw_rgba_dims {
-                self.image_store.request_insert_animatable_rgba(
+                self.active_tab_mut().image_store.request_insert_animatable_rgba(
                     up.bytes,
                     w,
                     h,
                     up.label,
                 )
             } else if up.kitty_image_id.is_some() {
-                self.image_store.request_insert_animatable(
+                self.tabs[self.active].image_store.request_insert_animatable(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
                     up.label,
                 )
             } else {
-                self.image_store.request_insert(
+                self.tabs[self.active].image_store.request_insert(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
@@ -6310,7 +6368,7 @@ impl State {
             // (delete). Register the mapping immediately so those ops
             // resolve even before the decode completes.
             if let Some(client_id) = up.kitty_image_id {
-                self.terminal.register_kitty_image_id(client_id, image_id);
+                self.active_tab_mut().terminal.register_kitty_image_id(client_id, image_id);
             }
             let (rows, cols) = up.cell_extent;
             let (row, col) = up.cell_anchor;
@@ -6323,7 +6381,7 @@ impl State {
                 // ids all thread onto the Placement. For iTerm OSCs all
                 // the Kitty-only fields are at their defaults so this
                 // produces the same result as `insert_placement`.
-                self.terminal.insert_placement_kitty(
+                self.active_tab_mut().terminal.insert_placement_kitty(
                     image_id,
                     row,
                     col,
@@ -6336,7 +6394,7 @@ impl State {
                     up.kitty_placement_id,
                 );
             }
-            self.pending_placements.push(PendingImagePlacement {
+            self.active_tab_mut().pending_placements.push(PendingImagePlacement {
                 request: pending,
                 row,
                 col,
@@ -6359,10 +6417,10 @@ impl State {
     /// sizing math can resolve `Npx` / `N%` / `Auto` specs. Called on
     /// init and on every font-size change.
     fn sync_terminal_cell_size(&mut self) {
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
-        let cell_w = self.font.cell_width() as u32;
-        self.terminal.set_cell_size_px(cell_w, line_h);
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
+        self.active_tab_mut().terminal.set_cell_size_px(cell_w, line_h);
     }
 
     /// Path used by the Cmd-Shift-I keybind. Env var override beats the
@@ -6385,7 +6443,7 @@ impl State {
                 return;
             }
         };
-        if self.terminal.bracketed_paste() {
+        if self.active_tab().terminal.bracketed_paste() {
             self.write_pty(b"\x1b[200~");
             self.write_pty(text.as_bytes());
             self.write_pty(b"\x1b[201~");
@@ -6419,7 +6477,7 @@ impl State {
                     self.window
                         .set_cursor_icon(winit::window::CursorIcon::Default);
                     force_native_arrow_cursor(&self.window);
-                    if self.hover_url.take().is_some() {
+                    if self.active_tab_mut().hover_url.take().is_some() {
                         self.invalidate();
                     }
                     return true;
@@ -6435,11 +6493,11 @@ impl State {
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.
                 let mouse_mode_active =
-                    self.terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
+                    self.active_tab().terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
                 if mouse_mode_active {
                     if let Some(b) = self.held_button {
                         self.report_mouse(b, true, true);
-                    } else if self.terminal.mouse_protocol().any_motion {
+                    } else if self.active_tab().terminal.mouse_protocol().any_motion {
                         // Per xterm, "no button" motion uses code 3 (release-ish).
                         self.report_mouse(3, true, true);
                     }
@@ -6508,7 +6566,7 @@ impl State {
                         && code == input::MOUSE_LEFT
                         && self.modifiers.super_key()
                     {
-                        if let Some(hu) = self.hover_url.clone() {
+                        if let Some(hu) = self.active_tab().hover_url.clone() {
                             if is_safe_url(&hu.url) {
                                 open_url(&hu.url);
                             }
@@ -6517,7 +6575,7 @@ impl State {
                             return true;
                         }
                     }
-                    let mouse_mode_active = self.terminal.mouse_protocol().enabled()
+                    let mouse_mode_active = self.active_tab().terminal.mouse_protocol().enabled()
                         && !self.modifiers.shift_key();
                     if mouse_mode_active {
                         self.report_mouse(code, press, false);
@@ -6544,7 +6602,7 @@ impl State {
                 if self.in_top_toolbar(self.mouse_y) {
                     return true;
                 }
-                let m = self.font.face().size_metrics().unwrap();
+                let m = self.shared.with_font(|f| f.face().size_metrics().unwrap());
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // A `Started` after a real idle gap is the user putting fingers
                 // back on the trackpad — that supersedes any prior suppression.
@@ -6555,24 +6613,24 @@ impl State {
                 const FRESH_GESTURE_GAP: std::time::Duration =
                     std::time::Duration::from_millis(100);
                 let now = std::time::Instant::now();
-                let gap = self.last_wheel_at.map(|t| now.duration_since(t));
+                let gap = self.active_tab().last_wheel_at.map(|t| now.duration_since(t));
                 if matches!(phase, TouchPhase::Started)
                     && gap.map_or(true, |g| g >= FRESH_GESTURE_GAP)
                 {
-                    self.scroll_suppressed = false;
+                    self.active_tab_mut().scroll_suppressed = false;
                 }
-                if self.scroll_suppressed {
+                if self.active_tab().scroll_suppressed {
                     // Don't advance `last_wheel_at` on suppressed events —
                     // otherwise the steady stream of momentum ticks keeps
                     // resetting the idle gap, and a real fresh gesture that
                     // arrives mid-momentum still looks like a 16ms follow-up.
                     return true;
                 }
-                self.last_wheel_at = Some(now);
+                self.active_tab_mut().last_wheel_at = Some(now);
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
-                if self.terminal.mouse_protocol().enabled() {
+                if self.active_tab().terminal.mouse_protocol().enabled() {
                     // Accumulate pixels so a slow trackpad gesture (many
                     // sub-line events) still produces wheel reports instead
                     // of truncating every event to 0. LineDelta synthesizes
@@ -6582,7 +6640,7 @@ impl State {
                         MouseScrollDelta::PixelDelta(p) => p.y,
                     };
                     let notches = input::drain_wheel_accum(
-                        &mut self.wheel_pty_accum,
+                        &mut self.active_tab_mut().wheel_pty_accum,
                         pixels,
                         line_height,
                     );
@@ -6602,18 +6660,18 @@ impl State {
                 // disabled, swallow the wheel: full-screen apps provide their
                 // own keyboard motion, and without this guard trackpad pixels
                 // would accumulate in scroll_y and drift the grid past bounds.
-                if self.terminal.on_alt_screen() {
-                    if self.terminal.alternate_scroll() {
+                if self.active_tab().terminal.on_alt_screen() {
+                    if self.active_tab().terminal.alternate_scroll() {
                         let pixels = match delta {
                             MouseScrollDelta::LineDelta(_, d) => *d as f64 * line_height,
                             MouseScrollDelta::PixelDelta(p) => p.y,
                         };
                         let notches = input::drain_wheel_accum(
-                            &mut self.wheel_pty_accum,
+                            &mut self.active_tab_mut().wheel_pty_accum,
                             pixels,
                             line_height,
                         );
-                        let app_cursor = self.terminal.app_cursor_keys();
+                        let app_cursor = self.active_tab().terminal.app_cursor_keys();
                         for _ in 0..notches.up {
                             self.write_pty(&input::alt_scroll_key(true, app_cursor));
                         }
@@ -6628,7 +6686,7 @@ impl State {
                         // No alternate scroll and no scrollback to navigate —
                         // swallow the wheel so trackpad pixels can't drift the
                         // grid via an accumulated offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     return true;
                 }
@@ -6636,39 +6694,39 @@ impl State {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
                         if *d > 0.0 {
-                            self.terminal.scroll_up(n);
+                            self.active_tab_mut().terminal.scroll_up(n);
                         } else if *d < 0.0 {
-                            self.terminal.scroll_down(n);
+                            self.active_tab_mut().terminal.scroll_down(n);
                         }
                         // Discrete scrolls snap — don't leave a sub-line offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     MouseScrollDelta::PixelDelta(p) => {
-                        self.scroll_y += p.y;
+                        self.active_tab_mut().scroll_y += p.y;
                         // Drain accumulated pixels into discrete line scrolls.
                         // Zero the residue if scroll_up/down refused so scroll_y
                         // can't accumulate past a viewport boundary regardless
                         // of what at_top/at_bottom report.
-                        while self.scroll_y >= line_height {
-                            if !self.terminal.scroll_up(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y >= line_height {
+                            if !self.active_tab_mut().terminal.scroll_up(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y -= line_height;
+                            self.active_tab_mut().scroll_y -= line_height;
                         }
-                        while self.scroll_y <= -line_height {
-                            if !self.terminal.scroll_down(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y <= -line_height {
+                            if !self.active_tab_mut().terminal.scroll_down(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y += line_height;
+                            self.active_tab_mut().scroll_y += line_height;
                         }
                         // Hard-stop at viewport boundaries: no elastic overscroll.
-                        if self.scroll_y > 0.0 && self.terminal.at_top() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y > 0.0 && self.active_tab().terminal.at_top() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
-                        if self.scroll_y < 0.0 && self.terminal.at_bottom() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y < 0.0 && self.active_tab().terminal.at_bottom() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
                     }
                 }
@@ -6738,16 +6796,16 @@ impl State {
                         if self.modifiers.shift_key() {
                             use winit::keyboard::{Key, NamedKey};
                             if event.logical_key == Key::Named(NamedKey::ArrowUp) {
-                                if self.terminal.scroll_to_prev_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_prev_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
                                 return true;
                             }
                             if event.logical_key == Key::Named(NamedKey::ArrowDown) {
-                                if self.terminal.scroll_to_next_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_next_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
@@ -6769,7 +6827,10 @@ impl State {
                             // !shift so Cmd-Shift-N stays free for a future
                             // binding.
                             if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
-                                spawn_new_window(self.terminal.cwd(), self.window_origin());
+                                // Request an in-process window; the event loop
+                                // (which owns AppShared + the window map) does
+                                // the actual spawn after `input` returns.
+                                self.pending_new_window = true;
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -6789,7 +6850,7 @@ impl State {
                             if self.modifiers.shift_key()
                                 && (s.eq_ignore_ascii_case("w"))
                             {
-                                if self.wireframe_pipeline.is_some() {
+                                if self.shared.wireframe_pipeline.is_some() {
                                     self.wireframe = !self.wireframe;
                                     self.window.request_redraw();
                                 }
@@ -6813,7 +6874,7 @@ impl State {
                                 && (s.eq_ignore_ascii_case("i"))
                             {
                                 if let Some(path) = Self::debug_image_path() {
-                                    let cur = self.terminal.cursor();
+                                    let cur = self.active_tab().terminal.cursor();
                                     let row = cur.row as isize;
                                     let col = cur.col as isize;
                                     let path_str = path.to_string_lossy().to_string();
@@ -6884,20 +6945,20 @@ impl State {
                     // means these keys reach the shell normally when no popup is
                     // open, and only steer the popup while it is.
                     let popup_active =
-                        !self.completions.is_empty() && self.terminal.view_offset() == 0;
+                        !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
                     let plain = !self.modifiers.control_key()
                         && !self.modifiers.alt_key()
                         && !self.modifiers.super_key();
                     if popup_active && plain {
                         use winit::keyboard::{Key, NamedKey};
-                        let len = self.completions.len();
+                        let len = self.active_tab().completions.len();
                         match &event.logical_key {
                             Key::Named(NamedKey::ArrowDown) => {
-                                self.selected_completion =
-                                    (self.selected_completion + 1).min(len - 1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    (self.active_tab().selected_completion + 1).min(len - 1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -6905,22 +6966,22 @@ impl State {
                             }
                             // ArrowUp, and Shift-Tab, move the selection up.
                             Key::Named(NamedKey::ArrowUp) => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
                                 return true;
                             }
                             Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -6930,9 +6991,9 @@ impl State {
                             // in (popup stays open and refilters to the dir's
                             // contents); on a file it accepts and closes.
                             Key::Named(NamedKey::Tab) => {
-                                let keep = self
+                                let keep = self.active_tab()
                                     .completions
-                                    .get(self.selected_completion)
+                                    .get(self.active_tab().selected_completion)
                                     .map(|s| s.is_dir)
                                     .unwrap_or(false);
                                 self.accept_selected_completion(keep, false);
@@ -6959,9 +7020,9 @@ impl State {
                                 // set the dismissed flag so the popup stays
                                 // closed even when the shell re-reports input,
                                 // until the user types more.
-                                self.completions.clear();
-                                self.completions_input = None;
-                                self.completion_dismissed = true;
+                                self.active_tab_mut().completions.clear();
+                                self.active_tab_mut().completions_input = None;
+                                self.active_tab_mut().completion_dismissed = true;
                                 self.invalidate();
                                 return true;
                             }
@@ -6987,28 +7048,28 @@ impl State {
                         logical_key,
                         text,
                         self.modifiers,
-                        self.terminal.app_cursor_keys(),
+                        self.active_tab().terminal.app_cursor_keys(),
                     );
                     if let Some(bytes) = bytes {
                         // A keystroke we're sending to the PTY snaps the view
                         // back to the live grid; passive modifiers (Cmd+C etc.)
                         // returned None and don't touch the scroll state.
-                        self.terminal.scroll_to_bottom();
+                        self.active_tab_mut().terminal.scroll_to_bottom();
                         // A keystroke cancels any alt-screen scroll slide —
                         // snap straight to the settled frame.
                         self.finish_alt_scroll();
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                         // Drop any in-flight trackpad momentum so the snap
                         // sticks — otherwise the tail of the flick keeps
                         // scrolling the view away from the bottom.
-                        self.scroll_suppressed = true;
+                        self.active_tab_mut().scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
                         // A genuine keystroke re-enables the popup after a
                         // finish/dismiss. The auto-inserted accept suffix goes
                         // through `write_pty` directly (not this path), so
                         // accepting never clears the flag — only real input does.
-                        self.completion_dismissed = false;
+                        self.active_tab_mut().completion_dismissed = false;
                         self.write_pty(&bytes);
                         self.invalidate();
                         return true;
@@ -7027,13 +7088,27 @@ impl State {
         clear: wgpu::Color,
     ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
         let surface_t0 = std::time::Instant::now();
-        let output = self.gpu.surface.get_current_texture().unwrap();
+        let output = match self.surface.surface.get_current_texture() {
+            Ok(o) => o,
+            // A backgrounded / occluded / just-resized surface returns
+            // `Outdated` (and `Lost`) routinely once there's more than one
+            // window — reconfigure and skip this frame rather than panicking;
+            // the next redraw re-acquires. (With one window this only tripped
+            // on resize, which is why the old `unwrap` survived.)
+            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                self.surface
+                    .surface
+                    .configure(&self.shared.gpu.device, &self.surface.config);
+                return Ok((surface_t0.elapsed(), true));
+            }
+            Err(e) => return Err(e),
+        };
         let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder =
-            self.gpu
+            self.shared.gpu
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("terminal"),
@@ -7073,22 +7148,22 @@ impl State {
         // anchor → pixel rect uses the same font metrics + decorator_offset
         // + scroll_y that `update_vertices` applies to cell quads, so
         // images scroll smoothly alongside text.
-        let metrics = self.font.face().size_metrics().unwrap();
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.font.cell_width() as f32;
-        let view_offset = self.terminal.view_offset() as f32;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y as f32;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y as f32;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y as f32;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y as f32;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         // Resolve store entries up front so the borrow can live alongside
         // the upcoming `&mut encoder` calls. Placements whose image was
@@ -7111,20 +7186,20 @@ impl State {
         // in.
         let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
         if self.config.images_enabled {
-            let view_offset = self.terminal.view_offset();
-            let rows = self.terminal.rows;
-            let scrollback_draws = self
+            let view_offset = self.active_tab().terminal.view_offset();
+            let rows = self.active_tab().terminal.rows;
+            let scrollback_draws = self.active_tab()
                 .terminal
-                .scrollback_placements_in_view(self.terminal.rows);
+                .scrollback_placements_in_view(self.active_tab().terminal.rows);
             image_draws.reserve(
-                self.terminal.live_placements().len() + scrollback_draws.len(),
+                self.active_tab().terminal.live_placements().len() + scrollback_draws.len(),
             );
             // `(viewport_row, placement)` tuples — by the time the pixel
             // math runs, the row index is in viewport coords. Live
             // placements get the same shift `extended_cell` applies to
             // cells (history rows push live content down); scrollback
             // placements arrive pre-shifted from `scrollback_placements_in_view`.
-            let live_iter = self.terminal.live_placements().iter().map(|p| {
+            let live_iter = self.active_tab().terminal.live_placements().iter().map(|p| {
                 (
                     Self::live_placement_viewport_row(p.top_row, view_offset, rows),
                     p,
@@ -7136,7 +7211,7 @@ impl State {
                 // peek_at picks the current animation frame for animated
                 // images; for static images it returns the same texture
                 // as peek().
-                let Some(gpu_img) = self.image_store.peek_at(p.image, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(p.image, now) else { continue };
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
@@ -7184,19 +7259,19 @@ impl State {
             // halfway through the image — visibly clips at the
             // surviving cells instead of distorting the image into
             // whatever shrinking rect remained.
-            for run in self.terminal.kitty_placeholder_runs() {
-                let Some(store_id) = self.terminal.kitty_image_id_lookup(run.client_id)
+            for run in self.active_tab().terminal.kitty_placeholder_runs() {
+                let Some(store_id) = self.active_tab().terminal.kitty_image_id_lookup(run.client_id)
                 else {
                     continue;
                 };
                 let Some((total_cols, total_rows)) =
-                    self.terminal.kitty_image_cell_extent(run.client_id)
+                    self.active_tab().terminal.kitty_image_cell_extent(run.client_id)
                 else {
                     // No `c=`/`r=` on the transmission — no honest
                     // UV denominator. Skip rather than guess.
                     continue;
                 };
-                let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(store_id, now) else { continue };
                 // `run.screen_row` is already in the same visual-row
                 // frame `update_vertices` uses (the scanner walks
                 // `extended_cell(-2..rows+2, ..)`), so plug it
@@ -7230,9 +7305,9 @@ impl State {
         let has_images = !image_draws.is_empty();
 
         let grid_pipeline = if self.wireframe {
-            self.wireframe_pipeline.as_ref().unwrap_or(&self.render_pipeline)
+            self.shared.wireframe_pipeline.as_ref().unwrap_or(&self.shared.render_pipeline)
         } else {
-            &self.render_pipeline
+            &self.shared.render_pipeline
         };
 
         // Helper to issue a draw of part of the cell vertex buffer into
@@ -7281,7 +7356,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &view,
                     wgpu::LoadOp::Load,
@@ -7322,7 +7397,7 @@ impl State {
                     occlusion_query_set: None,
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -7342,7 +7417,7 @@ impl State {
             if has_images {
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -7360,13 +7435,13 @@ impl State {
             );
             // Pass 3: glow each layer against its own un-blurred scene
             // so the bright pass extracts crisp colour, not post-blur smear.
-            self.glow.run(&mut encoder);
-            self.glow_fg.run(&mut encoder);
+            self.glow.run(&mut encoder, &self.shared.glow_pipelines);
+            self.glow_fg.run(&mut encoder, &self.shared.glow_pipelines);
             // Strip blur still samples the bg scene — strips live near
             // the window edges where there's rarely text, so a bg-only
             // blur source reads close to the legacy combined-scene blur.
             if needs_strips {
-                self.blur.run(&mut encoder);
+                self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
             // Pass 4: composite to swapchain. Order is bg → bg glow →
@@ -7388,7 +7463,7 @@ impl State {
             });
 
             // bg scene (opaque blit).
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -7396,13 +7471,13 @@ impl State {
             // halo over colored cells so the bg's own pixels aren't
             // re-tinted by their bloom; the halo still appears in
             // transparent areas adjacent to colored cells.
-            pass.set_pipeline(&self.glow.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_bg_mask, &[]);
             pass.draw(0..3, 0..1);
 
             // fg scene (alpha-blended on top of bg + bg glow).
-            pass.set_pipeline(&self.blur.blit_alpha_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_alpha_pipeline);
             pass.set_bind_group(0, &self.scene_fg_blit_bg, &[]);
             pass.draw(0..3, 0..1);
 
@@ -7410,7 +7485,7 @@ impl State {
             // the bloom paints over adjacent cells' colored backgrounds
             // and visually shifts them; this keeps the halo only in
             // areas where bg is transparent.
-            pass.set_pipeline(&self.glow_fg.composite_masked_pipeline);
+            pass.set_pipeline(&self.shared.glow_pipelines.composite_masked_pipeline);
             pass.set_bind_group(0, &self.glow_fg.composite_bg, &[]);
             pass.set_bind_group(1, &self.glow_fg_mask, &[]);
             pass.draw(0..3, 0..1);
@@ -7426,18 +7501,18 @@ impl State {
                     // Layered path has both scene textures — mask
                     // samples bg + fg so glyphs on default-bg cells
                     // still get scanlines.
-                    pass.set_pipeline(&self.glow.scanline_overlay_masked_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_masked_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                     pass.set_bind_group(1, &self.scanline_overlay_mask, &[]);
                 } else {
-                    pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                    pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                     pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 }
                 pass.draw(0..3, 0..1);
             }
 
             if needs_strips {
-                pass.set_pipeline(&self.blur.strip_pipeline);
+                pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
                 pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
                 pass.set_bind_group(1, &self.camera_bind_group, &[]);
                 pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -7463,7 +7538,7 @@ impl State {
                 );
                 self.image_pipeline.render(
                     &mut encoder,
-                    &self.gpu.queue,
+                    &self.shared.gpu.queue,
                     &self.camera_bind_group,
                     &self.blur.scene.view,
                     wgpu::LoadOp::Load,
@@ -7485,7 +7560,7 @@ impl State {
                     "scene pass",
                 );
             }
-            self.blur.run(&mut encoder);
+            self.blur.run(&mut encoder, &self.shared.blur_pipelines);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
@@ -7502,7 +7577,7 @@ impl State {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(&self.blur.blit_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.blit_pipeline);
             pass.set_bind_group(0, self.blur.blit_bind_group(), &[]);
             pass.draw(0..3, 0..1);
 
@@ -7513,12 +7588,12 @@ impl State {
             // content, producing artifacts. `skip_primary_bg` therefore
             // only takes effect in the layered (glow-on) path.
             if content_overlay_on {
-                pass.set_pipeline(&self.glow.scanline_overlay_pipeline);
+                pass.set_pipeline(&self.shared.glow_pipelines.scanline_overlay_pipeline);
                 pass.set_bind_group(0, &self.glow.composite_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
 
-            pass.set_pipeline(&self.blur.strip_pipeline);
+            pass.set_pipeline(&self.shared.blur_pipelines.strip_pipeline);
             pass.set_bind_group(0, &self.blur.strip_blur_bg, &[]);
             pass.set_bind_group(1, &self.camera_bind_group, &[]);
             pass.set_bind_group(2, &self.blur.strip_uniform_bg, &[]);
@@ -7530,7 +7605,7 @@ impl State {
             pass.draw_indexed(0..self.num_strip_indices, 0, 0..1);
         }
 
-        self.gpu.queue.submit(std::iter::once(encoder.finish()));
+        self.shared.gpu.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
         Ok((surface_wait, !needs_offscreen))
@@ -7682,6 +7757,183 @@ fn load_font_data(config: &Config) -> FontData {
     FontData { primary_data, styled, fallbacks }
 }
 
+/// Mint the next process-unique `TabId`. Monotonic; never reused, so a freed
+/// tab's id can't collide with a later one (a just-closed tab's reader thread
+/// may still deliver one final event — the resolver treats unknown ids as a
+/// no-op).
+fn next_tab_id() -> app_window::TabId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    app_window::TabId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Create a new tab: open a PTY, fork `program` onto it, spawn the reader
+/// thread (tagging every event with the new `TabId`), and build the
+/// `TabState`. The grid is sized to `cols`×`rows` — the caller passes the
+/// owning window's viewport so the window's vertex buffers match. The reader
+/// thread takes the `Pty` by value (it reads + reaps the child); `TabState`
+/// keeps copies of `master`+`child` so the tab can be closed cleanly later
+/// (`close(master)` + `kill(child, SIGHUP)`).
+fn create_tab(
+    proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+    program: pty::ChildProgram,
+    zdotdir: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+    cols: usize,
+    rows: usize,
+    image_mem_cap_bytes: usize,
+) -> (app_window::TabId, TabState) {
+    let fdm = unsafe { posix_openpt(O_RDWR) };
+    if fdm < 0 {
+        panic!("Error on posix_openpt()");
+    }
+    let pty = pty::fork_pty(fdm, program, zdotdir, cwd).expect("failed to fork pty");
+    let tab_id = next_tab_id();
+    let master = pty.master;
+    let child = pty.child;
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        let code = pty.run(|data| {
+            let _ = proxy
+                .send_event(app_window::CustomEvent::PtyInput(tab_id, data.to_owned()));
+        });
+        // `run` returns once the shell has exited and been reaped; tell the
+        // loop so it reacts instead of leaving a frozen tab.
+        let _ = proxy.send_event(app_window::CustomEvent::PtyExit(tab_id, code));
+    });
+    let tab = TabState {
+        tab_id,
+        master,
+        child,
+        terminal: terminal::Terminal::new(cols, rows, 10000),
+        image_store: images::Store::new(image_mem_cap_bytes),
+        pending_placements: Vec::new(),
+        scroll_y: 0.0,
+        alt_scroll_anim: None,
+        wheel_pty_accum: 0.0,
+        scroll_suppressed: false,
+        last_wheel_at: None,
+        last_reported_cell: None,
+        cursor_anim: None,
+        prev_visible: None,
+        cursor_ghosts: Vec::new(),
+        completions: Vec::new(),
+        completions_input: None,
+        selected_completion: 0,
+        completion_scroll: 0,
+        completion_dismissed: false,
+        command_history: Vec::new(),
+        selection: None,
+        selection_mode: SelectionMode::Cell,
+        press_cell: None,
+        press_pixel: None,
+        last_click: None,
+        click_count: 0,
+        hover_url: None,
+    };
+    (tab_id, tab)
+}
+
+/// Tear down a tab's PTY. The reader thread's `read(master)` only returns once
+/// the child exits, so we `kill(child, SIGHUP)` to end the shell *and*
+/// `close(master)` to unblock the read — the thread then reaps the child and
+/// exits, firing a final `PtyExit` for this (now-unmapped) tab that the
+/// resolver drops. Safe on an already-exited child (the `kill` just returns
+/// `ESRCH`).
+fn close_tab_pty(tab: &TabState) {
+    unsafe {
+        libc::kill(tab.child, libc::SIGHUP);
+        libc::close(tab.master);
+    }
+}
+
+/// Open a new window in this process (Cmd-N / palette "New window"). Builds the
+/// `NSWindow` from the live event loop, a sibling surface from the shared
+/// instance, and a fresh tab, then registers both in the window/tab maps. The
+/// new window cascades down-and-right off `origin` (the spawner's top-left, in
+/// logical points) and its shell opens in `cwd` (the spawner's shell cwd).
+#[allow(clippy::too_many_arguments)]
+fn spawn_window_in_process(
+    elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    shared: &Rc<AppShared>,
+    proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+    windows: &mut std::collections::HashMap<winit::window::WindowId, WindowState>,
+    tab_to_window: &mut std::collections::HashMap<app_window::TabId, winit::window::WindowId>,
+    config: &Config,
+    zdotdir: &Option<std::path::PathBuf>,
+    cwd: Option<String>,
+    origin: Option<(f64, f64)>,
+) {
+    let title = effective_title(None, cwd.as_deref());
+    let transparent = false; // matches the first window (shadow bug)
+    let mut builder = WindowBuilder::new()
+        .with_title(&title)
+        .with_titlebar_transparent(true)
+        .with_transparent(transparent)
+        .with_has_shadow(!transparent)
+        .with_fullsize_content_view(true)
+        .with_decorations(true)
+        .with_blur(transparent);
+    if let Some((x, y)) = origin {
+        builder = builder.with_position(winit::dpi::LogicalPosition::new(
+            x + WINDOW_CASCADE_STEP,
+            y + WINDOW_CASCADE_STEP,
+        ));
+    }
+    let window = match builder.build(elwt) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("new window: build failed: {e}");
+            return;
+        }
+    };
+    // Match the OS title-bar appearance + native bg to the active palette,
+    // exactly as the first window does, so it doesn't flash a wrong fill.
+    window.set_theme(Some(theme_for_bg(palette::get().background)));
+    set_native_window_bg(&window, palette::get().background);
+    window.set_cursor_icon(winit::window::CursorIcon::Text);
+
+    let surface = shared.gpu.create_surface(&window);
+    let dpi = (window.scale_factor() * 96.0) as u32;
+    let (cols, rows) = {
+        let (cell_w, line_h) = shared.with_font(|f| {
+            let m = f.face().size_metrics().unwrap();
+            (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
+        });
+        let vp = WindowState::get_viewport_size(
+            surface.config.width as f32,
+            surface.config.height as f32,
+            cell_w,
+            line_h,
+        );
+        (vp.char_width, vp.char_height)
+    };
+    // New windows always get a normal shell — onboarding is first-run only.
+    let (tab_id, tab) = create_tab(
+        proxy,
+        pty::ChildProgram::Shell,
+        zdotdir.clone(),
+        cwd.map(std::path::PathBuf::from),
+        cols,
+        rows,
+        config.images_memory_cap_mb * 1024 * 1024,
+    );
+    let mut state =
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, tab);
+    // Mirror the post-construction setup `run()` does for the first window.
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
+    state.refresh_chrome_band();
+    state.sync_theme_colors();
+    let keep = state.config.images_in_scrollback;
+    state.active_tab_mut().terminal.set_keep_placements_in_scrollback(keep);
+    state.sync_terminal_cell_size();
+    state.invalidate();
+
+    let wid = state.window.id();
+    windows.insert(wid, state);
+    tab_to_window.insert(tab_id, wid);
+}
+
 async fn run() {
     env_logger::init();
     // Startup phase timing, printed only when YUTANI_STARTUP_TIMING is set so
@@ -7697,16 +7949,6 @@ async fn run() {
         .build()
         .unwrap();
     let event_loop_proxy = event_loop.create_proxy();
-
-    // create the pty before forking so we have the handle available
-    let fdm: i32;
-    unsafe {
-        fdm = posix_openpt(O_RDWR);
-        println!("fdm: {fdm}");
-        if fdm < 0 {
-            panic!("Error on posix_openpt()");
-        }
-    }
 
     // On first run (or after a "Run first-time setup…" re-arm), the PTY child
     // becomes the onboarding console program instead of the shell; it execs the
@@ -7725,21 +7967,9 @@ async fn run() {
 
     // Materialize the zsh shell-integration ZDOTDIR (no-op when opted out or
     // $SHELL isn't zsh) so the forked shell auto-loads it — no manual
-    // `source …` in the user's rc required.
+    // `source …` in the user's rc required. The PTY itself is forked by
+    // `create_tab` once the window/font exist and the grid size is known.
     let zdotdir = shell_integration::prepare_zdotdir();
-
-    // Fork before the window is created so we hold the master fd across setup.
-    let pty = pty::fork_pty(fdm, child_program, zdotdir).expect("failed to fork pty");
-    lap("after fork_pty");
-    std::thread::spawn(move || {
-        let code = pty.run(|data| {
-            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
-        });
-        // `run` returns once the shell has exited and been reaped. Wake the
-        // event loop so it can react instead of leaving a frozen window —
-        // queued after every PtyInput, so any final shell output lands first.
-        let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
-    });
 
     // Seed the window title from our own working directory — the shell the
     // PTY just forked inherits it (no chdir in the child), so this matches
@@ -7751,20 +7981,18 @@ async fn run() {
     let initial_title = effective_title(None, initial_cwd.as_deref());
 
     let transparent = false; // needed because of a shadow bug
-    let mut window_builder = WindowBuilder::new()
+    // The first window takes the OS default position; subsequent (Cmd-N)
+    // windows cascade off their spawner in `spawn_window_in_process`.
+    let window = WindowBuilder::new()
         .with_title(&initial_title)
         .with_titlebar_transparent(true)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
         .with_decorations(true)
-        .with_blur(transparent);
-    // When spawned via Cmd-N the parent forwards its position; cascade off it
-    // so the new window steps down-and-right instead of stacking exactly atop.
-    if let Some(pos) = cascade_position() {
-        window_builder = window_builder.with_position(pos);
-    }
-    let window = window_builder.build(&event_loop).unwrap();
+        .with_blur(transparent)
+        .build(&event_loop)
+        .unwrap();
     lap("after window build");
 
     // event_loop.set_control_flow(ControlFlow::Poll);
@@ -7773,20 +8001,20 @@ async fn run() {
     lap("after config load");
 
     // Load all font data on a worker thread while the GPU is brought up on
-    // this (main) thread. The two are independent until State::new needs both,
+    // this (main) thread. The two are independent until WindowState::new needs both,
     // so overlapping them hides whichever finishes first. Font work must hand
     // back owned bytes (FreeType faces aren't Send); GPU/surface creation must
     // stay on the main thread (Cocoa isn't thread-safe), hence this split.
     let config_for_fonts = config.clone();
     let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    let gpu = gpu::GpuContext::new(&window).await;
-    lap("after GpuContext::new (concurrent with font load)");
+    let (gpu, surface) = gpu::Gpu::new(&window).await;
+    lap("after Gpu::new (concurrent with font load)");
 
     let fd = font_handle.join().expect("font loader thread panicked");
     lap("after font data loaded (joined)");
 
-    // Install the color scheme before constructing State so style.rs and the
+    // Install the color scheme before constructing WindowState so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
     // doesn't take the terminal down. With `auto_theme` on, pick the slot for
@@ -7834,15 +8062,48 @@ async fn run() {
     }
 
     lap("after font faces + shaper built");
-    let mut state = State::new(fdm, window, gpu, font, shaper, config, dpi).await;
-    lap("after State::new (GPU/atlas/pipelines)");
-    state.notify_pty_size(state.terminal.cols, state.terminal.rows);
+
+    // Build the once-per-process shared resources (device/queue/font/shaper +
+    // pipelines), then the initial tab + window against them. `shared` is kept
+    // (cloned per window) so Cmd-N can spawn further windows in-process.
+    let shared = Rc::new(AppShared::new(gpu, surface.config.format, font, shaper));
+    lap("after AppShared::new");
+
+    // Size the initial tab's grid to this window's viewport so the vertex
+    // buffers create_window allocates match the terminal dimensions.
+    let (cols, rows) = {
+        let (cell_w, line_h) = shared.with_font(|f| {
+            let m = f.face().size_metrics().unwrap();
+            (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
+        });
+        let vp = WindowState::get_viewport_size(
+            surface.config.width as f32,
+            surface.config.height as f32,
+            cell_w,
+            line_h,
+        );
+        (vp.char_width, vp.char_height)
+    };
+    let (tab_id, initial_tab) = create_tab(
+        &event_loop_proxy,
+        child_program,
+        zdotdir.clone(),
+        None, // first window inherits our process cwd, as before
+        cols,
+        rows,
+        config.images_memory_cap_mb * 1024 * 1024,
+    );
+    lap("after create_tab (fork)");
+    let mut state =
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, initial_tab);
+    lap("after create_window (GPU/atlas/pipelines)");
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window
-    // exists; the field was seeded with the renderer's reserve in State::new.
+    // exists; the field was seeded with the renderer's reserve in WindowState::new.
     state.refresh_chrome_band();
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
-    state
+    state.tabs[state.active]
         .terminal
         .set_keep_placements_in_scrollback(state.config.images_in_scrollback);
     state.sync_terminal_cell_size();
@@ -7854,22 +8115,38 @@ async fn run() {
     }
     state.invalidate();
 
-    let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
-
-    // Program-set window title (OSC 0/2). When `Some`, it wins over the
-    // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
-    // at which point we fall back to the cwd.
-    let mut manual_title: Option<String> = None;
+    // `manual_title` and `theme` are now per-window (`WindowState` fields), so
+    // each window tracks its own OSC-0 title and appearance.
     let mut first_frame_done = false;
+
+    // The window registry. One process owns every window; events are routed
+    // here rather than against a single `state` binding. `tab_to_window`
+    // resolves a `TabId` (carried on every PtyInput/PtyExit) to its window.
+    // First cut: exactly one window with one tab.
+    let initial_window_id = state.window.id();
+    let mut windows: std::collections::HashMap<winit::window::WindowId, WindowState> =
+        std::collections::HashMap::new();
+    windows.insert(initial_window_id, state);
+    let mut tab_to_window: std::collections::HashMap<app_window::TabId, winit::window::WindowId> =
+        std::collections::HashMap::new();
+    tab_to_window.insert(tab_id, initial_window_id);
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::UserEvent(n) => match n {
-                app_window::CustomEvent::PtyInput(z) => {
+                app_window::CustomEvent::PtyInput(ev_tab, z) => {
+                    // Resolve the tab's window. A just-closed tab can still
+                    // deliver one last event — treat an unknown id as a no-op.
+                    let Some(state) = tab_to_window
+                        .get(&ev_tab)
+                        .and_then(|wid| windows.get_mut(wid))
+                    else {
+                        return;
+                    };
                     let bytes = z.len();
                     let t0 = std::time::Instant::now();
                     state.feed_terminal(&z);
-                    let reply = state.terminal.take_response();
+                    let reply = state.active_tab_mut().terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
@@ -7878,40 +8155,40 @@ async fn run() {
                     // manual title wins; otherwise we show the cwd ($HOME
                     // collapsed to `~`). Both `take_*` calls must run to clear
                     // their dirty flags even when the title doesn't change.
-                    let title_changed = state.terminal.take_title_update().map(|t| {
-                        manual_title = t;
+                    let title_changed = state.active_tab_mut().terminal.take_title_update().map(|t| {
+                        state.manual_title = t;
                     });
-                    let cwd_changed = state.terminal.take_cwd_update();
+                    let cwd_changed = state.active_tab_mut().terminal.take_cwd_update();
                     if title_changed.is_some() || cwd_changed.is_some() {
                         state.window.set_title(&effective_title(
-                            manual_title.as_deref(),
-                            state.terminal.cwd(),
+                            state.manual_title.as_deref(),
+                            state.active_tab().terminal.cwd(),
                         ));
                     }
                     // The shell may have reported its history file (OSC 2124):
                     // read + parse it and merge past commands into the in-memory
                     // history (most-recent-first), behind any already-captured
                     // session commands so those stay at the front.
-                    if let Some(path) = state.terminal.take_histfile_update() {
+                    if let Some(path) = state.active_tab_mut().terminal.take_histfile_update() {
                         if let Ok(contents) = std::fs::read_to_string(&path) {
                             let parsed = completion::parse_zsh_history(&contents);
                             for cmd in parsed.iter().rev() {
-                                if !state.command_history.iter().any(|c| c == cmd) {
-                                    state.command_history.push(cmd.clone());
+                                if !state.active_tab().command_history.iter().any(|c| c == cmd) {
+                                    state.active_tab_mut().command_history.push(cmd.clone());
                                 }
                             }
-                            state.command_history.truncate(COMMAND_HISTORY_CAP);
+                            state.active_tab_mut().command_history.truncate(COMMAND_HISTORY_CAP);
                         }
                     }
                     // A command just submitted at the prompt (OSC 133 C): fold
                     // it into the front of the history (deduped).
-                    if let Some(cmd) = state.terminal.take_submitted_command() {
-                        dedup_prepend(&mut state.command_history, cmd);
+                    if let Some(cmd) = state.active_tab_mut().terminal.take_submitted_command() {
+                        dedup_prepend(&mut state.active_tab_mut().command_history, cmd);
                     }
                     // First-run onboarding (running as the PTY child) may have
                     // emitted OSC 2125 live-preview requests in this chunk —
                     // apply each to the running renderer.
-                    for req in state.terminal.take_preview_requests() {
+                    for req in state.active_tab_mut().terminal.take_preview_requests() {
                         state.apply_preview(req);
                     }
                     // The chunk may have carried an OSC 2122 input report;
@@ -7925,15 +8202,29 @@ async fn run() {
                     // sits under the pointer.
                     state.update_hover_url();
                 }
-                app_window::CustomEvent::PtyExit(code) => {
-                    let close = match state.config.shell_exit_mode {
-                        ShellExitMode::Always => true,
-                        ShellExitMode::Never => false,
-                        ShellExitMode::OnSuccess => code == 0,
+                app_window::CustomEvent::PtyExit(ev_tab, code) => {
+                    let Some(&wid) = tab_to_window.get(&ev_tab) else { return };
+                    let close = match windows.get(&wid).map(|s| s.config.shell_exit_mode) {
+                        Some(ShellExitMode::Always) => true,
+                        Some(ShellExitMode::Never) => false,
+                        Some(ShellExitMode::OnSuccess) => code == 0,
+                        None => return,
                     };
                     if close {
-                        elwt.exit();
-                    } else {
+                        // Drop this window and free every tab it owned from the
+                        // resolver. Quit once the last window is gone. (With one
+                        // window this is the old `exit()`; the registry
+                        // generalizes it.)
+                        if let Some(state) = windows.remove(&wid) {
+                            for t in &state.tabs {
+                                close_tab_pty(t);
+                                tab_to_window.remove(&t.tab_id);
+                            }
+                        }
+                        if windows.is_empty() {
+                            elwt.exit();
+                        }
+                    } else if let Some(state) = windows.get_mut(&wid) {
                         // Keep the window so the user can read the final
                         // output / a crash's exit code, then dismiss it
                         // themselves. The PTY master is closed, so typed
@@ -7948,110 +8239,162 @@ async fn run() {
                     }
                 }
             },
-            Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
-                let consumed = state.input(&event, elwt);
-                // The palette's Set/Clear title actions set the title through
-                // the same terminal path OSC 0/2 uses, but a keystroke isn't
-                // followed by PtyInput, so poll the title update here too.
-                // Mirrors the OSC-driven poll in the PtyInput arm above.
-                if let Some(t) = state.terminal.take_title_update() {
-                    manual_title = t;
-                    state.window.set_title(&effective_title(
-                        manual_title.as_deref(),
-                        state.terminal.cwd(),
-                    ));
+            Event::WindowEvent { window_id, event } => {
+                // A new-window request (cwd, origin) raised by Cmd-N / palette
+                // during `input()`, and whether this window asked to close —
+                // both acted on after the `state` borrow is released, since
+                // they mutate the window registry.
+                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>)> = None;
+                let mut close_this = false;
+                if let Some(state) = windows.get_mut(&window_id) {
+                    let consumed = state.input(&event, elwt);
+                    // The palette's Set/Clear title actions set the title
+                    // through the same terminal path OSC 0/2 uses, but a
+                    // keystroke isn't followed by PtyInput, so poll the title
+                    // update here too. Mirrors the PtyInput arm above.
+                    if let Some(t) = state.active_tab_mut().terminal.take_title_update() {
+                        state.manual_title = t;
+                        state.window.set_title(&effective_title(
+                            state.manual_title.as_deref(),
+                            state.active_tab().terminal.cwd(),
+                        ));
+                    }
+                    if !consumed {
+                        match event {
+                            WindowEvent::ThemeChanged(new_theme) => {
+                                state.theme = new_theme;
+                                // Following the system appearance? Swap to the
+                                // scheme slot for the new mode. Otherwise just
+                                // keep the OSC color reports in sync as before —
+                                // the active scheme doesn't track the OS.
+                                if state.config.auto_theme {
+                                    state.apply_active_scheme();
+                                } else {
+                                    state.sync_theme_colors();
+                                    state.invalidate();
+                                }
+                            }
+                            WindowEvent::CloseRequested => {
+                                close_this = true;
+                            }
+                            WindowEvent::Resized(size) => {
+                                state.resize(size);
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::ScaleFactorChanged {
+                                scale_factor: _scale_factor,
+                                ..
+                            } => {
+                                state.refresh_chrome_band();
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::RedrawRequested => {
+                                state.update();
+                                state.prepare_frame();
+                                let t0 = std::time::Instant::now();
+                                let result = state.render(clear_color(state.theme));
+                                let render_dur = t0.elapsed();
+                                if !first_frame_done {
+                                    first_frame_done = true;
+                                    if timing {
+                                        eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                                    }
+                                }
+                                match result {
+                                    Ok((surface_wait, fast)) => {
+                                        state.perf.note_render(render_dur, surface_wait, fast);
+                                    }
+                                    Err(wgpu::SurfaceError::Lost) => state.resize(state.surface.size),
+                                    Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                                    Err(e) => eprintln!("{:?}", e),
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    // Drain a new-window request raised during `input()`.
+                    if std::mem::take(&mut state.pending_new_window) {
+                        spawn_req = Some((
+                            state.active_tab().terminal.cwd().map(str::to_owned),
+                            state.window_origin(),
+                        ));
+                    }
                 }
-                if !consumed {
-                    match event {
-                        WindowEvent::ThemeChanged(new_theme) => {
-                            theme = new_theme;
-                            // Following the system appearance? Swap to the
-                            // scheme slot for the new mode. Otherwise just keep
-                            // the OSC color reports in sync as before — the
-                            // active scheme doesn't track the OS.
-                            if state.config.auto_theme {
-                                state.apply_active_scheme();
-                            } else {
-                                state.sync_theme_colors();
-                                state.invalidate();
-                            }
+                if let Some((cwd, origin)) = spawn_req {
+                    spawn_window_in_process(
+                        elwt,
+                        &shared,
+                        &event_loop_proxy,
+                        &mut windows,
+                        &mut tab_to_window,
+                        &config,
+                        &zdotdir,
+                        cwd,
+                        origin,
+                    );
+                }
+                if close_this {
+                    // Tear down this window: kill + reap each tab's shell and
+                    // free its TabId, then drop the window. Quit when the last
+                    // window is gone.
+                    if let Some(state) = windows.remove(&window_id) {
+                        for t in &state.tabs {
+                            close_tab_pty(t);
+                            tab_to_window.remove(&t.tab_id);
                         }
-                        WindowEvent::CloseRequested => {
-                            elwt.exit();
-                        }
-                        WindowEvent::Resized(size) => {
-                            state.resize(size);
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            scale_factor: _scale_factor,
-                            ..
-                        } => {
-                            state.refresh_chrome_band();
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::RedrawRequested => {
-                            state.update();
-                            state.prepare_frame();
-                            let t0 = std::time::Instant::now();
-                            let result = state.render(clear_color(theme));
-                            let render_dur = t0.elapsed();
-                            if !first_frame_done {
-                                first_frame_done = true;
-                                if timing {
-                                    eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
-                                }
-                            }
-                            match result {
-                                Ok((surface_wait, fast)) => {
-                                    state.perf.note_render(render_dur, surface_wait, fast);
-                                }
-                                Err(wgpu::SurfaceError::Lost) => state.resize(state.gpu.size),
-                                Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                                Err(e) => eprintln!("{:?}", e),
-                            }
-                        }
-                        _ => (),
+                    }
+                    if windows.is_empty() {
+                        elwt.exit();
                     }
                 }
             }
             Event::AboutToWait => {
-                if state.maybe_blink_tick() {
-                    state.invalidate();
+                // Each window animates independently; collect the earliest
+                // wake-up across all of them and arm the loop for that.
+                let mut next_wake: Option<std::time::Instant> = None;
+                for state in windows.values_mut() {
+                    if state.maybe_blink_tick() {
+                        state.invalidate();
+                    }
+                    // Edge-fade and cursor-position eases: keep ticking frames
+                    // as long as either is still chasing its target.
+                    let animating = state.is_top_fade_animating()
+                        || state.is_cursor_animating()
+                        || state.is_alt_scroll_animating();
+                    if animating {
+                        state.invalidate();
+                    }
+                    state.perf.maybe_flush();
+                    let next_anim = if animating {
+                        Some(std::time::Instant::now() + ANIM_FRAME)
+                    } else {
+                        None
+                    };
+                    // Image-animation deadline (Kitty `a=a` playback). The
+                    // store returns `None` if no animated image is
+                    // currently advancing; otherwise it returns the
+                    // earliest moment a frame swap is due.
+                    let next_image_anim = state
+                        .active_tab()
+                        .image_store
+                        .next_frame_deadline(std::time::Instant::now());
+                    if next_image_anim.is_some() {
+                        state.invalidate();
+                    }
+                    let this = [
+                        state.next_blink_wake(),
+                        next_anim,
+                        next_image_anim,
+                        state.perf.next_wake(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    next_wake = match (next_wake, this) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
-                // Edge-fade and cursor-position eases: keep ticking frames
-                // as long as either is still chasing its target.
-                let animating = state.is_top_fade_animating()
-                    || state.is_cursor_animating()
-                    || state.is_alt_scroll_animating();
-                if animating {
-                    state.invalidate();
-                }
-                state.perf.maybe_flush();
-                let next_anim = if animating {
-                    Some(std::time::Instant::now() + ANIM_FRAME)
-                } else {
-                    None
-                };
-                // Image-animation deadline (Kitty `a=a` playback). The
-                // store returns `None` if no animated image is
-                // currently advancing; otherwise it returns the
-                // earliest moment a frame swap is due.
-                let next_image_anim = state
-                    .image_store
-                    .next_frame_deadline(std::time::Instant::now());
-                if next_image_anim.is_some() {
-                    state.invalidate();
-                }
-                let next_wake = [
-                    state.next_blink_wake(),
-                    next_anim,
-                    next_image_anim,
-                    state.perf.next_wake(),
-                ]
-                .into_iter()
-                .flatten()
-                .min();
                 match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),
@@ -8323,7 +8666,7 @@ fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
 
 /// Window-relative `py` (physical pixels) falls inside the title bar / toolbar
 /// chrome band of height `band_px`. Free function so the boundary is
-/// unit-testable without standing up a full `State`; `State::in_top_toolbar`
+/// unit-testable without standing up a full `WindowState`; `WindowState::in_top_toolbar`
 /// delegates here, passing the live `chrome_band_px`. See `in_top_toolbar` for
 /// why the band tracks the native title-bar height rather than the
 /// scroll-animated decorator offset.
@@ -8333,7 +8676,7 @@ fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
 
 /// Choose the chrome band height from the live native title-bar height (if
 /// queryable) and the renderer's fixed `reserve`. Extracted from
-/// `State::refresh_chrome_band` so the selection arithmetic is unit-testable
+/// `WindowState::refresh_chrome_band` so the selection arithmetic is unit-testable
 /// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
 /// but never go below the reserve (and fall back to the reserve when the query
 /// failed). See `refresh_chrome_band` for the rationale.
@@ -8380,6 +8723,28 @@ mod tests {
 
     fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
         approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    #[test]
+    fn next_tab_id_is_strictly_increasing_and_distinct() {
+        use std::collections::HashSet;
+        // The minter must hand out unique ids; tabs are routed by TabId, so a
+        // repeat would misroute a PTY's events to the wrong tab.
+        let ids: Vec<_> = (0..8).map(|_| next_tab_id()).collect();
+
+        // All distinct.
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "next_tab_id() returned a duplicate");
+
+        // Strictly increasing across successive calls.
+        for pair in ids.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0,
+                "next_tab_id() not strictly increasing: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
@@ -8508,12 +8873,12 @@ mod tests {
         // 1–2 row grid, which spills the prompt into scrollback on resize.
         // The row count must never drop below MIN_GRID_ROWS no matter how
         // short the window. cell 8px wide, 18px line height.
-        let tiny = State::get_viewport_size(800.0, 0.0, 8, 18);
+        let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18);
         assert_eq!(tiny.char_height, MIN_GRID_ROWS);
-        let short = State::get_viewport_size(800.0, 60.0, 8, 18);
+        let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18);
         assert_eq!(short.char_height, MIN_GRID_ROWS);
         // A normally-sized window is unaffected — the floor doesn't clamp it.
-        let normal = State::get_viewport_size(800.0, 600.0, 8, 18);
+        let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18);
         assert!(normal.char_height > MIN_GRID_ROWS);
     }
 
@@ -9168,7 +9533,7 @@ mod tests {
             for &oi in &[true, false] {
                 for &gpu in &[true, false] {
                     assert!(
-                        !State::should_halfblock(en, oi, /*pending*/ true, gpu),
+                        !WindowState::should_halfblock(en, oi, /*pending*/ true, gpu),
                         "pending should suppress halfblock (en={en} oi={oi} gpu={gpu})"
                     );
                 }
@@ -9184,7 +9549,7 @@ mod tests {
         for &oi in &[true, false] {
             for &gpu in &[true, false] {
                 assert!(
-                    State::should_halfblock(/*en*/ false, oi, false, gpu),
+                    WindowState::should_halfblock(/*en*/ false, oi, false, gpu),
                     "disabled should always halfblock (oi={oi} gpu={gpu})"
                 );
             }
@@ -9195,16 +9560,16 @@ mod tests {
     fn halfblock_decision_enabled_with_gpu_image_never_renders() {
         // GPU has the texture, GPU path draws → don't double-emit a
         // half-block on top.
-        assert!(!State::should_halfblock(true, false, false, true));
-        assert!(!State::should_halfblock(true, true, false, true));
+        assert!(!WindowState::should_halfblock(true, false, false, true));
+        assert!(!WindowState::should_halfblock(true, true, false, true));
     }
 
     #[test]
     fn halfblock_decision_enabled_missing_image_needs_opt_in() {
         // images_enabled=true, peek=None, !pending → decode failed and
         // cleanup hasn't fired. Only honored when the user opts in.
-        assert!(!State::should_halfblock(true, false, false, false));
-        assert!(State::should_halfblock(true, true, false, false));
+        assert!(!WindowState::should_halfblock(true, false, false, false));
+        assert!(WindowState::should_halfblock(true, true, false, false));
     }
 
     //
@@ -9220,21 +9585,21 @@ mod tests {
         // Cmd-Shift-I debug-paste: no Kitty id, no up-front display.
         // Caller stores `None` so the on-decode-success branch creates
         // the Placement at the cursor.
-        assert!(!State::suppress_deferred_placement(false, None));
+        assert!(!WindowState::suppress_deferred_placement(false, None));
     }
 
     #[test]
     fn suppress_deferred_placement_a_t_capital_already_placed_skips_deferred_place() {
         // `a=T` without `U=1`: `insert_placement_kitty` already ran.
         // No second Placement should be auto-created.
-        assert!(State::suppress_deferred_placement(true, Some(42)));
+        assert!(WindowState::suppress_deferred_placement(true, Some(42)));
     }
 
     #[test]
     fn suppress_deferred_placement_a_t_capital_with_virtual_placement_skips_deferred_place() {
         // `a=T,U=1`: placeholder cells own the placement. A deferred
         // auto-place would produce the "ghost image" regression.
-        assert!(State::suppress_deferred_placement(false, Some(42)));
+        assert!(WindowState::suppress_deferred_placement(false, Some(42)));
     }
 
     #[test]
@@ -9242,7 +9607,7 @@ mod tests {
         // `a=t`: client will issue `a=p` later. Auto-placing at
         // cursor would beat the client's explicit placement to the
         // screen and end up double-drawn after `a=p` arrives.
-        assert!(State::suppress_deferred_placement(false, Some(7)));
+        assert!(WindowState::suppress_deferred_placement(false, Some(7)));
     }
 
     //
@@ -9258,16 +9623,16 @@ mod tests {
     fn live_placement_viewport_row_passes_through_with_no_offset() {
         // The no-scrollback-in-view common case — image at grid row 5 in
         // a 24-row viewport renders at viewport row 5.
-        assert_eq!(State::live_placement_viewport_row(5, 0, 24), 5);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 0, 24), 5);
     }
 
     #[test]
     fn live_placement_viewport_row_shifts_down_by_view_offset() {
         // 3 scrollback rows pulled into view → live content shifts down 3.
-        assert_eq!(State::live_placement_viewport_row(5, 3, 24), 8);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 3, 24), 8);
         // Negative grid rows (placement straddling above the viewport)
         // shift the same way — clipping happens downstream.
-        assert_eq!(State::live_placement_viewport_row(-2, 3, 24), 1);
+        assert_eq!(WindowState::live_placement_viewport_row(-2, 3, 24), 1);
     }
 
     #[test]
@@ -9280,11 +9645,11 @@ mod tests {
         // (viewport_row hadn't moved). Without the clamp, viewport_row
         // moves in lockstep with view_offset and scroll_y, giving a
         // continuous slide as the image enters from below.
-        assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 100);
-        assert_eq!(State::live_placement_viewport_row(0, 50, 24), 50);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 100, 24), 5 + 100);
+        assert_eq!(WindowState::live_placement_viewport_row(0, 50, 24), 50);
         // Sanity: at view_offset <= rows, behavior is unchanged from
         // the pre-clamp version.
-        assert_eq!(State::live_placement_viewport_row(5, 20, 24), 25);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 20, 24), 25);
     }
 
     //
@@ -9296,7 +9661,7 @@ mod tests {
         // 3 cells wide, image_row 0, total (3, 2) →
         //   u: 0..3/3 = 0..1
         //   v: 0..1/2 = 0..0.5
-        let uv = State::placeholder_run_uv(0, 3, 0, 3, 2);
+        let uv = WindowState::placeholder_run_uv(0, 3, 0, 3, 2);
         assert_eq!(uv, (0.0, 0.0, 1.0, 0.5));
     }
 
@@ -9304,7 +9669,7 @@ mod tests {
     fn placeholder_run_uv_partial_row_samples_proper_strip() {
         // Cells image_col 1..3 of a 4-col tile, image_row 1 of 2
         // rows → upper-left at (0.25, 0.5), lower-right at (0.75, 1.0).
-        let uv = State::placeholder_run_uv(1, 3, 1, 4, 2);
+        let uv = WindowState::placeholder_run_uv(1, 3, 1, 4, 2);
         assert_eq!(uv, (0.25, 0.5, 0.75, 1.0));
     }
 
@@ -9312,7 +9677,7 @@ mod tests {
     fn placeholder_run_uv_clamps_out_of_range_to_unit_square() {
         // image_col_end past the right edge, image_row past the
         // bottom — both clamp to 1.0 rather than wrap or NaN.
-        let uv = State::placeholder_run_uv(5, 10, 7, 4, 2);
+        let uv = WindowState::placeholder_run_uv(5, 10, 7, 4, 2);
         assert_eq!(uv, (1.0, 1.0, 1.0, 1.0));
     }
 
@@ -9322,7 +9687,7 @@ mod tests {
         // (the renderer skips runs without a recorded extent), but
         // guard the denominator so we never NaN. With cols=0 →
         // denom 1, image_col_end=0 → u1=0.0 clamped from 0 itself.
-        let uv = State::placeholder_run_uv(0, 0, 0, 0, 0);
+        let uv = WindowState::placeholder_run_uv(0, 0, 0, 0, 0);
         assert_eq!(uv, (0.0, 0.0, 0.0, 1.0));
     }
 
@@ -9337,7 +9702,7 @@ mod tests {
         // atlas origin (0, 0), sampling cols 0..8 / rows 0..16 of a
         // 128x128 atlas.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
         assert!(approx_pair((u0, u1), (0.5 / 128.0, 7.5 / 128.0)));
         assert!(approx_pair((v0, v1), (0.5 / 128.0, 15.5 / 128.0)));
     }
@@ -9352,7 +9717,7 @@ mod tests {
         // cell_filling, so the horizontal extent IS pulled in here. Glyph
         // at (10, 20), sampling cols 0..8 / rows 0..16 of a 256x256 atlas.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
+            WindowState::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
         assert!(approx_pair((u0, u1), (10.5 / 256.0, 17.5 / 256.0)));
         assert!(approx_pair((v0, v1), (20.5 / 256.0, 35.5 / 256.0)));
     }
@@ -9363,7 +9728,7 @@ mod tests {
         // the UV is the raw sample rect, so ordinary antialiased glyphs
         // aren't thinned or shifted.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
+            WindowState::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
         assert!(approx_pair((u0, u1), (5.0 / 64.0, 11.0 / 64.0)));
         assert!(approx_pair((v0, v1), (6.0 / 64.0, 18.0 / 64.0)));
     }
@@ -9376,9 +9741,9 @@ mod tests {
         // that in atlas-texel units so a regression to a different inset is
         // caught.
         let raw =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
         let inset =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
         assert!(approx_eq((raw.2 - raw.0) * 100.0 - (inset.2 - inset.0) * 100.0, 1.0));
         assert!(approx_eq((raw.3 - raw.1) * 100.0 - (inset.3 - inset.1) * 100.0, 1.0));
     }
@@ -10509,7 +10874,8 @@ mod tests {
             view_formats: &[],
         });
         let scene_view = scene_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let glow = renderer::glow::Glow::new(&device, format, 16, 16, &scene_view);
+        let pipelines = renderer::glow::GlowPipelines::new(&device, format);
+        let glow = renderer::glow::Glow::new(&device, &pipelines, 16, 16, &scene_view);
         Some((device, queue, glow))
     }
 

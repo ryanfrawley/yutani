@@ -1,8 +1,11 @@
 //! Dual-Kawase blur for the edge-fade strips.
 //!
-//! Owns the offscreen scene target, a chain of half-resolution mips,
-//! pipelines, and per-level uniforms. The down/up chain uses 3 levels
-//! (1/2 → 1/4 → 1/8) which gives a generous "fat" glass blur.
+//! Split into [`BlurPipelines`] — the shader, layouts, samplers, and render
+//! pipelines, which depend only on the device + surface format and are shared
+//! by every window via `AppShared` — and [`BlurChain`], the per-window
+//! offscreen scene target, half-resolution mip chain, bind groups, and
+//! per-level uniforms. The down/up chain uses 3 levels (1/2 → 1/4 → 1/8)
+//! which gives a generous "fat" glass blur.
 
 use wgpu::util::DeviceExt;
 
@@ -26,21 +29,16 @@ pub struct Target {
     pub height: u32,
 }
 
-pub struct BlurChain {
+/// Shader, layouts, sampler, and render pipelines for the dual-Kawase blur.
+/// Depend only on the device and the (process-uniform) surface format, so one
+/// instance is shared by every window through `AppShared` — the blur shader is
+/// compiled once per process, not once per window. The size-dependent
+/// textures, bind groups, and uniforms live in [`BlurChain`] (one per window).
+pub struct BlurPipelines {
     pub format: wgpu::TextureFormat,
-    pub scene: Target,
-
-    chain: Vec<Target>,
     sampler: wgpu::Sampler,
-
-    // One bind group per source texture per pass — built once per resize.
-    blit_scene_bg: wgpu::BindGroup,             // sample scene → swap
-    down_bgs: Vec<wgpu::BindGroup>,             // src for each down pass
-    up_bgs: Vec<wgpu::BindGroup>,               // src for each up pass
-    pub strip_blur_bg: wgpu::BindGroup,         // sample final blur in strip pass
-    pub strip_uniform_bg: wgpu::BindGroup,      // strip-pass uniform (1/viewport)
-
-    blur_bgl: wgpu::BindGroupLayout,            // group(0) for fullscreen passes
+    blur_bgl: wgpu::BindGroupLayout, // group(0) for fullscreen passes
+    strip_uniform_bgl: wgpu::BindGroupLayout, // group(2) for the strip pass
 
     pub blit_pipeline: wgpu::RenderPipeline,
     /// Same shader as `blit_pipeline`, but with premultiplied-alpha
@@ -52,21 +50,16 @@ pub struct BlurChain {
     pub up_pipeline: wgpu::RenderPipeline,
     pub strip_pipeline: wgpu::RenderPipeline,
 
-    // Per-level uniforms holding the source's 1/texel_size.
-    down_uniforms: Vec<wgpu::Buffer>,
-    up_uniforms: Vec<wgpu::Buffer>,
-    blit_uniform: wgpu::Buffer,                 // unused fields, kept for layout
-    strip_uniform: wgpu::Buffer,                // 1/viewport for strip pass
-
-    pub iterations: usize,
+    /// Dummy uniform bound at group(0) binding 2 of the blit / strip-source
+    /// bind groups. Its contents are unused by those shaders, but the layout
+    /// requires a buffer; shared because it never holds per-window state.
+    blit_uniform: wgpu::Buffer,
 }
 
-impl BlurChain {
+impl BlurPipelines {
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
-        width: u32,
-        height: u32,
         camera_bgl: &wgpu::BindGroupLayout,
         vertex_layout: wgpu::VertexBufferLayout<'static>,
     ) -> Self {
@@ -209,12 +202,90 @@ impl BlurChain {
             multiview: None,
         });
 
-        // Static uniform buffers — sizes filled in by build_resources below.
+        // Static dummy uniform — its texel_size field is unused by the blit /
+        // strip-source shaders, but the bind-group layout requires a buffer.
         let blit_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur blit uniform"),
             contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        Self {
+            format,
+            sampler,
+            blur_bgl,
+            strip_uniform_bgl,
+            blit_pipeline,
+            blit_alpha_pipeline,
+            down_pipeline,
+            up_pipeline,
+            strip_pipeline,
+            blit_uniform,
+        }
+    }
+
+    /// Bind group compatible with `blit_pipeline` / `blit_alpha_pipeline`
+    /// for an arbitrary same-format texture view. Used by the layered
+    /// render path to blit a second offscreen scene (the fg layer) to
+    /// the swapchain with alpha blending. The shared `blit_uniform` is
+    /// unused by the blit shader but the bind-group layout requires it.
+    pub fn make_blit_bind_group(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.blit_uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
+}
+
+/// Per-window blur resources: the offscreen scene target, the half-resolution
+/// mip chain, the bind groups that feed each pass, and the per-level uniforms.
+/// Rebuilt on resize. Renders against the shared [`BlurPipelines`].
+pub struct BlurChain {
+    pub scene: Target,
+
+    chain: Vec<Target>,
+
+    // One bind group per source texture per pass — built once per resize.
+    blit_scene_bg: wgpu::BindGroup,        // sample scene → swap
+    down_bgs: Vec<wgpu::BindGroup>,        // src for each down pass
+    up_bgs: Vec<wgpu::BindGroup>,          // src for each up pass
+    pub strip_blur_bg: wgpu::BindGroup,    // sample final blur in strip pass
+    pub strip_uniform_bg: wgpu::BindGroup, // strip-pass uniform (1/viewport)
+
+    // Per-level uniforms holding the source's 1/texel_size.
+    down_uniforms: Vec<wgpu::Buffer>,
+    up_uniforms: Vec<wgpu::Buffer>,
+    strip_uniform: wgpu::Buffer, // 1/viewport for strip pass
+
+    pub iterations: usize,
+}
+
+impl BlurChain {
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &BlurPipelines,
+        width: u32,
+        height: u32,
+    ) -> Self {
         let strip_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("blur strip uniform"),
             contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
@@ -237,67 +308,57 @@ impl BlurChain {
 
         let strip_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("blur strip uniform bg"),
-            layout: &strip_uniform_bgl,
+            layout: &pipelines.strip_uniform_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: strip_uniform.as_entire_binding(),
             }],
         });
 
-        // Build textures + per-level bind groups and upload uniforms.
+        // Build textures + per-level bind groups.
         let (scene, chain, blit_scene_bg, down_bgs, up_bgs, strip_blur_bg) = build_resources(
             device,
-            format,
+            pipelines.format,
             width,
             height,
-            &sampler,
-            &blur_bgl,
-            &blit_uniform,
+            &pipelines.sampler,
+            &pipelines.blur_bgl,
+            &pipelines.blit_uniform,
             &down_uniforms,
             &up_uniforms,
         );
 
-        let me = Self {
-            format,
+        Self {
             scene,
             chain,
-            sampler,
             blit_scene_bg,
             down_bgs,
             up_bgs,
             strip_blur_bg,
             strip_uniform_bg,
-            blur_bgl,
-            blit_pipeline,
-            blit_alpha_pipeline,
-            down_pipeline,
-            up_pipeline,
-            strip_pipeline,
             down_uniforms,
             up_uniforms,
-            blit_uniform,
             strip_uniform,
             iterations: DEFAULT_BLUR_ITERATIONS,
-        };
-        let _ = device;
-        me
+        }
     }
 
     pub fn resize(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pipelines: &BlurPipelines,
         width: u32,
         height: u32,
     ) {
         let (scene, chain, blit_scene_bg, down_bgs, up_bgs, strip_blur_bg) = build_resources(
             device,
-            self.format,
+            pipelines.format,
             width,
             height,
-            &self.sampler,
-            &self.blur_bgl,
-            &self.blit_uniform,
+            &pipelines.sampler,
+            &pipelines.blur_bgl,
+            &pipelines.blit_uniform,
             &self.down_uniforms,
             &self.up_uniforms,
         );
@@ -362,11 +423,11 @@ impl BlurChain {
     /// use the last "up" target as the final, which by our walk lands in
     /// chain[0] (matches the source resolution / 2). The strip pass treats
     /// chain[0] as the blur sampler.
-    pub fn run(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn run(&self, encoder: &mut wgpu::CommandEncoder, pipelines: &BlurPipelines) {
         // Down chain: scene → chain[0] → chain[1] → chain[2].
         self.fullscreen_pass(
             encoder,
-            &self.down_pipeline,
+            &pipelines.down_pipeline,
             &self.down_bgs[0],
             &self.chain[0].view,
             "blur down 0",
@@ -374,7 +435,7 @@ impl BlurChain {
         for i in 1..CHAIN_LEVELS {
             self.fullscreen_pass(
                 encoder,
-                &self.down_pipeline,
+                &pipelines.down_pipeline,
                 &self.down_bgs[i],
                 &self.chain[i].view,
                 "blur down i",
@@ -385,7 +446,7 @@ impl BlurChain {
             let dst_idx = CHAIN_LEVELS - 2 - i;
             self.fullscreen_pass(
                 encoder,
-                &self.up_pipeline,
+                &pipelines.up_pipeline,
                 &self.up_bgs[i],
                 &self.chain[dst_idx].view,
                 "blur up i",
@@ -397,14 +458,14 @@ impl BlurChain {
         for _ in 1..self.iterations.max(1) {
             self.fullscreen_pass(
                 encoder,
-                &self.down_pipeline,
+                &pipelines.down_pipeline,
                 &self.down_bgs[CHAIN_LEVELS - 1],
                 &self.chain[CHAIN_LEVELS - 1].view,
                 "blur down iter",
             );
             self.fullscreen_pass(
                 encoder,
-                &self.up_pipeline,
+                &pipelines.up_pipeline,
                 &self.up_bgs[CHAIN_LEVELS - 2],
                 &self.chain[0].view,
                 "blur up iter",
@@ -442,37 +503,6 @@ impl BlurChain {
     /// Bind group that samples `self.scene` (used to blit scene → swap).
     pub fn blit_bind_group(&self) -> &wgpu::BindGroup {
         &self.blit_scene_bg
-    }
-
-    /// Bind group compatible with `blit_pipeline` / `blit_alpha_pipeline`
-    /// for an arbitrary same-format texture view. Used by the layered
-    /// render path to blit a second offscreen scene (the fg layer) to
-    /// the swapchain with alpha blending. The shared `blit_uniform` is
-    /// unused by the blit shader but the bind-group layout requires it.
-    pub fn make_blit_bind_group(
-        &self,
-        device: &wgpu::Device,
-        view: &wgpu::TextureView,
-        label: &str,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(label),
-            layout: &self.blur_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.blit_uniform.as_entire_binding(),
-                },
-            ],
-        })
     }
 }
 
