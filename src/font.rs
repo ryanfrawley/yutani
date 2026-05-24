@@ -258,19 +258,6 @@ impl Atlas {
         if !self.tried_chars[vi].insert(ch) {
             return;
         }
-        // Box-drawing (U+2500..U+257F) and block-element (U+2580..U+259F)
-        // codepoints are synthesized into the atlas at build time so they
-        // tile edge-to-edge with no half-alpha hairlines (see `build_atlas`
-        // and `box_drawing::synth`). The installed font usually ALSO provides
-        // these glyphs, but its versions are trimmed to their ink bbox and
-        // bear into the cell — packing one here would overwrite the
-        // synthesized entry and bring the seams back (e.g. ▐ rendered as a
-        // font glyph is a half-width bitmap that leaves a gap against ▛).
-        // Leave the synthesized entry in place for every variant; bold/italic
-        // lookups fall back to the Regular synth via `Atlas::lookup`.
-        if (0x2500..=0x259F).contains(&(ch as u32)) {
-            return;
-        }
         // Styled variant with no primary face: any rendering for this
         // char will fall through to Regular via Atlas::lookup, so make
         // sure Regular is the one that gets ensured.
@@ -1246,34 +1233,33 @@ mod tests {
         }
     }
 
-    // Regression: block-element / box-drawing codepoints are synthesized
-    // into the atlas (full-cell, edge-to-edge tiling). The lazy font loader
-    // must not overwrite a synthesized entry with the font's trimmed glyph —
-    // doing so brought back the hairline seam between e.g. ▐ and ▛, because
-    // the font packs ▐ as a half-width bitmap bearing into the cell.
+    // Regression: box-drawing / block-element codepoints are synthesized on
+    // demand by `ensure_char` (full-cell, edge-to-edge tiling), NOT rasterized
+    // from the font. The synth branch must run before the FreeType path so the
+    // entry is the pixel-aligned synth glyph — the font packs ▐ as a trimmed
+    // half-width bitmap bearing into the cell, which leaves a hairline seam
+    // against ▛. ensure_char must (a) actually create the glyph — a too-broad
+    // early-return once left these as notdef — and (b) make it the synth glyph.
     #[test]
-    fn ensure_char_keeps_synthesized_block_glyph() {
+    fn ensure_char_synthesizes_block_glyph_full_width() {
         let Some(mut font) = load_test_font() else {
             eprintln!("skipping: no test font installed");
             return;
         };
         let cell_w = font.cell_width();
         let mut atlas = font.build_atlas();
-        // After build, ▐ is the synthesized entry: zero bearing, fills the
-        // cell width (not the font's trimmed right-half bbox).
-        let (x0, w0, bx0) = {
-            let e = atlas.lookup('\u{2590}', FaceVariant::Regular);
-            (e.x, e.width, e.bearing_x)
-        };
-        assert_eq!(bx0, 0, "synth ▐ should have zero bearing_x");
-        assert_eq!(w0, cell_w, "synth ▐ should fill the cell width");
-        // The lazy loader must leave it untouched.
+        // Lazily realized: ▐ is not pre-packed, so it starts as notdef.
+        let notdef_x = atlas.notdef.x;
+        assert_eq!(
+            atlas.lookup('\u{2590}', FaceVariant::Regular).x,
+            notdef_x,
+            "▐ should be unrealized (notdef) before ensure_char"
+        );
         atlas.ensure_char(&mut font, FaceVariant::Regular, '\u{2590}');
-        let (x1, w1, bx1) = {
-            let e = atlas.lookup('\u{2590}', FaceVariant::Regular);
-            (e.x, e.width, e.bearing_x)
-        };
-        assert_eq!((x1, w1, bx1), (x0, w0, bx0), "ensure_char must not repack ▐");
+        let e = atlas.lookup('\u{2590}', FaceVariant::Regular);
+        assert_ne!(e.x, notdef_x, "ensure_char must realize ▐, not leave it notdef");
+        assert_eq!(e.bearing_x, 0, "synth ▐ has zero bearing_x");
+        assert_eq!(e.width, cell_w, "synth ▐ fills the cell width (not the font bbox)");
     }
 
     // Second call for the same (variant, char) is a no-op — the
