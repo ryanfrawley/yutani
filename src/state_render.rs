@@ -1766,14 +1766,17 @@ impl WindowState {
             push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
         }
 
+        // Computed unconditionally — like the top, these also feed the
+        // per-fragment glyph-fade uniform below. The strip quad itself is
+        // skipped at phase=0 (see the top-fade note).
+        let bottom_alpha = self.bottom_fade_phase;
+        let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
-            let bottom_alpha = self.bottom_fade_phase;
             let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
-            let bottom_fade_height = bottom_fade_height_max * self.bottom_fade_phase;
             push_strip(
                 &mut strip_vertices,
                 &mut strip_indices,
-                win_h - bottom_fade_height,
+                win_h - bottom_band_height,
                 win_h,
                 clear,
                 bottom_blur,
@@ -1806,12 +1809,14 @@ impl WindowState {
         }
         self.num_strip_indices = strip_indices.len() as u32;
 
-        // Bottom edge keeps just the blur strip — zero band_height here
-        // disables the per-fragment glyph/bg fade so cells stay solid right
-        // up to the window's bottom edge.
+        // Both edges run the per-fragment glyph fade so scrollback text
+        // dissolves into the blur strip instead of reaching the edge sharp.
+        // band_height is 0 at phase=0 (the live prompt at rest), which the
+        // shader treats as "no fade" — so cells stay solid up to the bottom
+        // edge whenever the bottom strip isn't engaged.
         let fade_data: [f32; 16] = [
             top_band_height, top_alpha, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
+            bottom_band_height, bottom_alpha, 0.0, 0.0,
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
         ];
