@@ -32,6 +32,23 @@ pub struct Suggestion {
 /// Maximum candidates returned, to bound directory-scan cost and popup size.
 pub const MAX_SUGGESTIONS: usize = 50;
 
+/// Common shell builtins that are not executables on `$PATH` and so would never
+/// be found by scanning directories (e.g. `exit`, `cd`). We seed command
+/// completion with these so the commands users actually type — but that live
+/// inside the shell — still appear. Sourced from the zsh builtin set (the shell
+/// our integration targets), trimmed to the ones worth suggesting. A builtin
+/// shadows a same-named PATH executable in `complete_command`, matching how the
+/// shell resolves a bare command word.
+const SHELL_BUILTINS: &[&str] = &[
+    "alias", "bg", "bindkey", "builtin", "cd", "command", "declare", "dirs",
+    "disown", "echo", "eval", "exec", "exit", "export", "false", "fc", "fg",
+    "getopts", "hash", "history", "jobs", "kill", "let", "local", "logout",
+    "popd", "printf", "pushd", "pwd", "read", "readonly", "return", "set",
+    "setopt", "shift", "source", "test", "times", "trap", "true", "type",
+    "typeset", "ulimit", "umask", "unalias", "unset", "unsetopt", "wait",
+    "where", "which", "whence",
+];
+
 /// Compute filesystem path completions for the token under the cursor.
 ///
 /// `buffer` is the full edit line; `cursor` is a *character* (code-point)
@@ -134,18 +151,34 @@ fn is_command_position(buffer: &str, token_start: usize) -> bool {
 //
 // `path` here is the *terminal process's* `$PATH`, not the shell's live PATH
 // (a known limitation: the shell's PATH after `export PATH=...` would need an
-// OSC report to observe). Likewise this only sees executables on disk — no
-// shell builtins, functions, or aliases.
+// OSC report to observe). Beyond executables on disk it also seeds a fixed set
+// of common [`SHELL_BUILTINS`] (e.g. `exit`, `cd`) so the in-shell commands
+// users type still complete; it does not see functions or aliases. A `None`
+// `path` still yields matching builtins (they don't depend on `$PATH`).
 pub fn complete_command(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<Suggestion> {
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
 
-    let Some(path) = path else {
-        return Vec::new();
-    };
-
     let mut seen: HashSet<String> = HashSet::new();
     let mut suggestions: Vec<Suggestion> = Vec::new();
+
+    // Seed builtins first so a builtin shadows a same-named PATH executable
+    // (the shell resolves a bare command word to the builtin).
+    for &name in SHELL_BUILTINS {
+        if name.starts_with(prefix) && seen.insert(name.to_string()) {
+            suggestions.push(Suggestion {
+                text: format!("{name} "),
+                is_dir: false,
+                whole_line: false,
+            });
+        }
+    }
+
+    let Some(path) = path else {
+        suggestions.sort_by(|a, b| a.text.cmp(&b.text));
+        suggestions.truncate(MAX_SUGGESTIONS);
+        return suggestions;
+    };
 
     // `split_paths` handles `:` separation (and empty entries) correctly.
     for dir in std::env::split_paths(path) {
@@ -957,9 +990,33 @@ mod tests {
         tmp.touch_mode("alps", 0o755);
         tmp.touch_mode("beta", 0o755);
 
+        // Prefix "alp" avoids the `alias` builtin so this exercises only the
+        // PATH-scan prefix filtering.
         let p = path_of(&[tmp.path.as_path()]);
-        let s = complete_command("al", Some(p.as_os_str()));
+        let s = complete_command("alp", Some(p.as_os_str()));
         assert_eq!(texts(&s), vec!["alpha ", "alps "]);
+    }
+
+    #[test]
+    fn complete_command_includes_shell_builtins() {
+        // `exit` is a shell builtin, not a file on PATH, yet should complete.
+        let empty = path_of(&[]);
+        let s = complete_command("exi", Some(empty.as_os_str()));
+        assert_eq!(texts(&s), vec!["exit "]);
+
+        // Builtins surface even with no PATH at all.
+        let s = complete_command("exi", None);
+        assert_eq!(texts(&s), vec!["exit "]);
+    }
+
+    #[test]
+    fn complete_command_builtin_shadows_path_executable() {
+        // A PATH executable named like a builtin yields a single, deduped entry.
+        let tmp = TempDir::new();
+        tmp.touch_mode("exit", 0o755);
+        let p = path_of(&[tmp.path.as_path()]);
+        let s = complete_command("exi", Some(p.as_os_str()));
+        assert_eq!(texts(&s), vec!["exit "]);
     }
 
     #[test]
