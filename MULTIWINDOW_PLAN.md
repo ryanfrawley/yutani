@@ -131,6 +131,44 @@ exactly one tab per window. The **tab-bar chrome, tab keybindings (new/close/
 next/prev tab), and tab drag/reorder are deferred** to a follow-up — but the
 data model above lands now so that follow-up is additive, not another rewrite.
 
+### Tab tear-off / move between windows (planned follow-up; no architecture change)
+
+Dragging a tab out of window A and dropping it on window B (or on empty space to
+spawn a new window) is, in this model, a **`TabState` move**:
+
+```
+let tab = window_a.tabs.remove(i);
+// during drag: app.dragging = Some((tab_id, tab));   // owned, not in any window
+window_b.tabs.push(tab);  tab_to_window.insert(tab_id, window_b.id());
+window_b.reflow_active();  // notify_pty_size + grid reflow to B's cols/rows/dpi
+```
+
+This works **only because of choices already in the plan** — so tear-off is a
+validation of the architecture, not a change to it. Three invariants make it
+hold; treat them as hard constraints during Stages 1–3:
+
+1. **`TabState` holds zero window- or GPU-context-coupled state.** No atlas, no
+   surface, no per-window buffers, no `pt_size`/`dpi`. (`Terminal` stores
+   codepoints + style — resolution-independent.) A moved tab adopts the
+   destination window's size/DPI/zoom on reflow, which is the correct,
+   expected behavior. If per-tab zoom is ever wanted it would couple a tab to
+   atlas metrics and break this — explicitly out of scope.
+2. **The GPU device lives in `AppShared`, not per-window.** A tab's GPU-resident
+   images (`image_store` textures) were created on the process device, so they
+   stay valid across the move. A per-window device would corrupt them — another
+   reason device sharing is non-negotiable.
+3. **Routing is by `TabId`.** The move is one `tab_to_window` map update; the PTY
+   reader thread keeps tagging `TabId` and never learns it changed windows.
+
+Two things to provide for so the follow-up stays additive:
+- **`create_window` takes an initial `TabState`** (move-in), with `create_tab`
+  as the fresh-tab producer. Tear-off-to-new-window is then
+  `create_window(shared, elwt, dragged_tab)` — no special path. Factor this in
+  Stage 3.
+- **A tab can be transiently window-less mid-drag.** The `TabId` resolver must
+  also look in `app.dragging` (and a backgrounded/detached tab still drains its
+  PTY), so events for an in-flight tab aren't dropped or panicked on.
+
 ## Known constraints / non-goals (first cut)
 - **Palette is process-global** (`palette::install`). All windows *and tabs*
   share one color scheme initially. Per-window/per-tab themes would require
@@ -254,9 +292,12 @@ changes shape — find out in an hour, not at Stage 4. Revert the prototype afte
 ### Stage 3 — Window + tab factories
 - `fn create_tab(shared, ...) -> (TabId, TabState)` — fork the PTY, spawn its
   reader thread tagging events with the new `TabId`, build the `Terminal`.
-- `fn create_window(shared, elwt, cwd) -> WindowState` — build the `NSWindow`,
-  surface, per-window buffers + atlas, and an initial tab via `create_tab`,
-  reusing `AppShared`. `run()` calls it once for the initial window.
+- `fn create_window(shared, elwt, initial_tab: TabState) -> WindowState` — build
+  the `NSWindow`, surface, per-window buffers + atlas, and adopt `initial_tab`,
+  reusing `AppShared`. `run()` calls `create_window(shared, elwt,
+  create_tab(shared, cwd))` for the initial window. Taking an existing
+  `TabState` (rather than always forging a fresh one) is what lets a future
+  tear-off-to-new-window reuse this path verbatim — see "Tab tear-off".
 
 ### Stage 4 — Wire Cmd-N to in-process spawn (the feature)
 - Cmd-N handler and palette `NewWindow` call `create_window` via the
@@ -282,8 +323,10 @@ changes shape — find out in an hour, not at Stage 4. Revert the prototype afte
 
 ### Follow-up (separate effort, not this scope) — tab UX
 With the model in place: tab-bar chrome + hit-testing, keybindings (new/close/
-next/prev tab), `create_tab` wired to "new tab in this window", tab reorder.
-Each is additive against the Stage 1 data model.
+next/prev tab), `create_tab` wired to "new tab in this window", tab reorder, and
+**tab tear-off / drag between windows** (a `TabState` move + `tab_to_window`
+update + reflow — see the "Tab tear-off" section; no architecture change). Each
+is additive against the Stage 1 data model.
 
 ## Principal risks
 *(Ordered by how badly a late discovery hurts. 1–3 are the ones that could force
