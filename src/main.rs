@@ -163,7 +163,7 @@ fn rearm_onboarding() {
 /// Coarse CRT-glow presets the onboarding offers, mapped to the underlying
 /// `glow_*` config knobs by [`Config::apply_glow_level`]. Shared by the
 /// onboarding writer (which persists the choice) and the live-preview path in
-/// `State::apply_preview` (which mirrors it onto the running renderer), so the
+/// `WindowState::apply_preview` (which mirrors it onto the running renderer), so the
 /// preview can never drift from what actually gets saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlowLevel {
@@ -272,7 +272,7 @@ fn scheme_value_from_pick(arg: Option<String>) -> Option<String> {
 
 /// Byte size of the grid's vertex and index buffers for a viewport of
 /// `cols × rows`. `(vertex_bytes, index_bytes)`. Single source of
-/// truth so the `State::new` and `resize_buffers` paths can't drift.
+/// truth so the `WindowState::new` and `resize_buffers` paths can't drift.
 ///
 /// Capacity model: each cell emits two quads (background + glyph), so
 /// `area = cols * rows` cells contribute `2 * area` quads. The slack
@@ -1253,11 +1253,11 @@ struct AppShared {
     /// after a font-size change rebuilds its atlas texture.
     font_bind_group_layout: wgpu::BindGroupLayout,
     /// Dual-Kawase blur pipelines (shader compiled once per process). The
-    /// per-window textures/bind-groups live in `State::blur`.
+    /// per-window textures/bind-groups live in `WindowState::blur`.
     blur_pipelines: renderer::blur::BlurPipelines,
     /// Glow/bloom pipelines (shared by both the bg and fg `Glow` instances of
-    /// every window). The per-window/per-layer resources live in `State::glow`
-    /// / `State::glow_fg`.
+    /// every window). The per-window/per-layer resources live in `WindowState::glow`
+    /// / `WindowState::glow_fg`.
     glow_pipelines: renderer::glow::GlowPipelines,
 }
 
@@ -1278,6 +1278,9 @@ impl AppShared {
 /// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
 /// per window; the tab UI is a later follow-up.
 struct TabState {
+    /// Process-unique id this tab's PTY reader thread tags its events with.
+    /// The event loop resolves it to the owning window via `tab_to_window`.
+    tab_id: app_window::TabId,
     master: i32,
     terminal: terminal::Terminal,
     /// Decode + GPU residency cache for this tab's images. Per-tab: each shell
@@ -1343,7 +1346,7 @@ struct TabState {
     hover_url: Option<HoverUrl>,
 }
 
-struct State {
+struct WindowState {
     /// Per-window GPU surface. Declared first so it drops before `window` —
     /// the surface holds unsafe references to the window's resources.
     surface: gpu::WindowSurface,
@@ -2202,9 +2205,10 @@ impl Selection {
 
 }
 
-impl State {
+impl WindowState {
     async fn new(
         master: i32,
+        tab_id: app_window::TabId,
         window: Window,
         gpu: gpu::Gpu,
         surface: gpu::WindowSurface,
@@ -2215,7 +2219,7 @@ impl State {
     ) -> Self {
         let _sw = std::time::Instant::now();
         let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
-        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... State::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
+        macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... WindowState::new {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         // Share the device/queue/instance behind an `Rc` so future windows
         // reuse them. `gpu.device` / `gpu.queue` below deref through the `Rc`.
         let gpu = Rc::new(gpu);
@@ -2435,7 +2439,7 @@ impl State {
 
         // Calculate console viewport & buffer sizes
         let metrics = font.face().size_metrics().unwrap();
-        let viewport = State::get_viewport_size(
+        let viewport = WindowState::get_viewport_size(
             surface.config.width as f32,
             surface.config.height as f32,
             font.cell_width(),
@@ -2538,7 +2542,7 @@ impl State {
         }
         // Bright-ANSI matching needs the palette's hue table; foreground
         // matching needs the foreground RGB. Palette is installed before
-        // State::new (see `run()`), so this reads the active scheme — or
+        // WindowState::new (see `run()`), so this reads the active scheme — or
         // the defaults if no scheme was configured.
         {
             let p = palette::get();
@@ -2604,6 +2608,7 @@ impl State {
         };
 
         let tab = TabState {
+            tab_id,
             master,
             terminal: terminal::Terminal::new(
                 viewport.char_width,
@@ -2797,7 +2802,7 @@ impl State {
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
-        let viewport = State::get_viewport_size(
+        let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
@@ -4995,7 +5000,7 @@ impl State {
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
-        let viewport = State::get_viewport_size(
+        let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
@@ -5083,7 +5088,7 @@ impl State {
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
-        let size = State::get_viewport_size(
+        let size = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
@@ -7784,6 +7789,16 @@ fn load_font_data(config: &Config) -> FontData {
     FontData { primary_data, styled, fallbacks }
 }
 
+/// Mint the next process-unique `TabId`. Monotonic; never reused, so a freed
+/// tab's id can't collide with a later one (a just-closed tab's reader thread
+/// may still deliver one final event — the resolver treats unknown ids as a
+/// no-op).
+fn next_tab_id() -> app_window::TabId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    app_window::TabId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 async fn run() {
     env_logger::init();
     // Startup phase timing, printed only when YUTANI_STARTUP_TIMING is set so
@@ -7833,14 +7848,18 @@ async fn run() {
     // Fork before the window is created so we hold the master fd across setup.
     let pty = pty::fork_pty(fdm, child_program, zdotdir).expect("failed to fork pty");
     lap("after fork_pty");
+    // Mint this tab's id and tag every event the reader thread sends with it,
+    // so the event loop can route to the right tab/window via `tab_to_window`.
+    let tab_id = next_tab_id();
     std::thread::spawn(move || {
         let code = pty.run(|data| {
-            let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyInput(data.to_owned()));
+            let _ = event_loop_proxy
+                .send_event(app_window::CustomEvent::PtyInput(tab_id, data.to_owned()));
         });
         // `run` returns once the shell has exited and been reaped. Wake the
         // event loop so it can react instead of leaving a frozen window —
         // queued after every PtyInput, so any final shell output lands first.
-        let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(code));
+        let _ = event_loop_proxy.send_event(app_window::CustomEvent::PtyExit(tab_id, code));
     });
 
     // Seed the window title from our own working directory — the shell the
@@ -7875,7 +7894,7 @@ async fn run() {
     lap("after config load");
 
     // Load all font data on a worker thread while the GPU is brought up on
-    // this (main) thread. The two are independent until State::new needs both,
+    // this (main) thread. The two are independent until WindowState::new needs both,
     // so overlapping them hides whichever finishes first. Font work must hand
     // back owned bytes (FreeType faces aren't Send); GPU/surface creation must
     // stay on the main thread (Cocoa isn't thread-safe), hence this split.
@@ -7888,7 +7907,7 @@ async fn run() {
     let fd = font_handle.join().expect("font loader thread panicked");
     lap("after font data loaded (joined)");
 
-    // Install the color scheme before constructing State so style.rs and the
+    // Install the color scheme before constructing WindowState so style.rs and the
     // renderer see the right palette on their first read. Missing file is a
     // soft failure: warn and keep defaults so a typo in the config name
     // doesn't take the terminal down. With `auto_theme` on, pick the slot for
@@ -7936,11 +7955,11 @@ async fn run() {
     }
 
     lap("after font faces + shaper built");
-    let mut state = State::new(fdm, window, gpu, surface, font, shaper, config, dpi).await;
-    lap("after State::new (GPU/atlas/pipelines)");
+    let mut state = WindowState::new(fdm, tab_id, window, gpu, surface, font, shaper, config, dpi).await;
+    lap("after WindowState::new (GPU/atlas/pipelines)");
     state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window
-    // exists; the field was seeded with the renderer's reserve in State::new.
+    // exists; the field was seeded with the renderer's reserve in WindowState::new.
     state.refresh_chrome_band();
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
@@ -7964,10 +7983,30 @@ async fn run() {
     let mut manual_title: Option<String> = None;
     let mut first_frame_done = false;
 
+    // The window registry. One process owns every window; events are routed
+    // here rather than against a single `state` binding. `tab_to_window`
+    // resolves a `TabId` (carried on every PtyInput/PtyExit) to its window.
+    // First cut: exactly one window with one tab.
+    let initial_window_id = state.window.id();
+    let mut windows: std::collections::HashMap<winit::window::WindowId, WindowState> =
+        std::collections::HashMap::new();
+    windows.insert(initial_window_id, state);
+    let mut tab_to_window: std::collections::HashMap<app_window::TabId, winit::window::WindowId> =
+        std::collections::HashMap::new();
+    tab_to_window.insert(tab_id, initial_window_id);
+
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::UserEvent(n) => match n {
-                app_window::CustomEvent::PtyInput(z) => {
+                app_window::CustomEvent::PtyInput(ev_tab, z) => {
+                    // Resolve the tab's window. A just-closed tab can still
+                    // deliver one last event — treat an unknown id as a no-op.
+                    let Some(state) = tab_to_window
+                        .get(&ev_tab)
+                        .and_then(|wid| windows.get_mut(wid))
+                    else {
+                        return;
+                    };
                     let bytes = z.len();
                     let t0 = std::time::Instant::now();
                     state.feed_terminal(&z);
@@ -8027,15 +8066,28 @@ async fn run() {
                     // sits under the pointer.
                     state.update_hover_url();
                 }
-                app_window::CustomEvent::PtyExit(code) => {
-                    let close = match state.config.shell_exit_mode {
-                        ShellExitMode::Always => true,
-                        ShellExitMode::Never => false,
-                        ShellExitMode::OnSuccess => code == 0,
+                app_window::CustomEvent::PtyExit(ev_tab, code) => {
+                    let Some(&wid) = tab_to_window.get(&ev_tab) else { return };
+                    let close = match windows.get(&wid).map(|s| s.config.shell_exit_mode) {
+                        Some(ShellExitMode::Always) => true,
+                        Some(ShellExitMode::Never) => false,
+                        Some(ShellExitMode::OnSuccess) => code == 0,
+                        None => return,
                     };
                     if close {
-                        elwt.exit();
-                    } else {
+                        // Drop this window and free every tab it owned from the
+                        // resolver. Quit once the last window is gone. (With one
+                        // window this is the old `exit()`; the registry
+                        // generalizes it.)
+                        if let Some(state) = windows.remove(&wid) {
+                            for t in &state.tabs {
+                                tab_to_window.remove(&t.tab_id);
+                            }
+                        }
+                        if windows.is_empty() {
+                            elwt.exit();
+                        }
+                    } else if let Some(state) = windows.get_mut(&wid) {
                         // Keep the window so the user can read the final
                         // output / a crash's exit code, then dismiss it
                         // themselves. The PTY master is closed, so typed
@@ -8050,7 +8102,8 @@ async fn run() {
                     }
                 }
             },
-            Event::WindowEvent { window_id, event } if window_id == state.window.id() => {
+            Event::WindowEvent { window_id, event } => {
+                let Some(state) = windows.get_mut(&window_id) else { return };
                 let consumed = state.input(&event, elwt);
                 // The palette's Set/Clear title actions set the title through
                 // the same terminal path OSC 0/2 uses, but a keystroke isn't
@@ -8118,42 +8171,52 @@ async fn run() {
                 }
             }
             Event::AboutToWait => {
-                if state.maybe_blink_tick() {
-                    state.invalidate();
+                // Each window animates independently; collect the earliest
+                // wake-up across all of them and arm the loop for that.
+                let mut next_wake: Option<std::time::Instant> = None;
+                for state in windows.values_mut() {
+                    if state.maybe_blink_tick() {
+                        state.invalidate();
+                    }
+                    // Edge-fade and cursor-position eases: keep ticking frames
+                    // as long as either is still chasing its target.
+                    let animating = state.is_top_fade_animating()
+                        || state.is_cursor_animating()
+                        || state.is_alt_scroll_animating();
+                    if animating {
+                        state.invalidate();
+                    }
+                    state.perf.maybe_flush();
+                    let next_anim = if animating {
+                        Some(std::time::Instant::now() + ANIM_FRAME)
+                    } else {
+                        None
+                    };
+                    // Image-animation deadline (Kitty `a=a` playback). The
+                    // store returns `None` if no animated image is
+                    // currently advancing; otherwise it returns the
+                    // earliest moment a frame swap is due.
+                    let next_image_anim = state
+                        .active_tab()
+                        .image_store
+                        .next_frame_deadline(std::time::Instant::now());
+                    if next_image_anim.is_some() {
+                        state.invalidate();
+                    }
+                    let this = [
+                        state.next_blink_wake(),
+                        next_anim,
+                        next_image_anim,
+                        state.perf.next_wake(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                    next_wake = match (next_wake, this) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
-                // Edge-fade and cursor-position eases: keep ticking frames
-                // as long as either is still chasing its target.
-                let animating = state.is_top_fade_animating()
-                    || state.is_cursor_animating()
-                    || state.is_alt_scroll_animating();
-                if animating {
-                    state.invalidate();
-                }
-                state.perf.maybe_flush();
-                let next_anim = if animating {
-                    Some(std::time::Instant::now() + ANIM_FRAME)
-                } else {
-                    None
-                };
-                // Image-animation deadline (Kitty `a=a` playback). The
-                // store returns `None` if no animated image is
-                // currently advancing; otherwise it returns the
-                // earliest moment a frame swap is due.
-                let next_image_anim = state.active_tab()
-                    .image_store
-                    .next_frame_deadline(std::time::Instant::now());
-                if next_image_anim.is_some() {
-                    state.invalidate();
-                }
-                let next_wake = [
-                    state.next_blink_wake(),
-                    next_anim,
-                    next_image_anim,
-                    state.perf.next_wake(),
-                ]
-                .into_iter()
-                .flatten()
-                .min();
                 match next_wake {
                     Some(t) => elwt.set_control_flow(
                         winit::event_loop::ControlFlow::WaitUntil(t),
@@ -8425,7 +8488,7 @@ fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
 
 /// Window-relative `py` (physical pixels) falls inside the title bar / toolbar
 /// chrome band of height `band_px`. Free function so the boundary is
-/// unit-testable without standing up a full `State`; `State::in_top_toolbar`
+/// unit-testable without standing up a full `WindowState`; `WindowState::in_top_toolbar`
 /// delegates here, passing the live `chrome_band_px`. See `in_top_toolbar` for
 /// why the band tracks the native title-bar height rather than the
 /// scroll-animated decorator offset.
@@ -8435,7 +8498,7 @@ fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
 
 /// Choose the chrome band height from the live native title-bar height (if
 /// queryable) and the renderer's fixed `reserve`. Extracted from
-/// `State::refresh_chrome_band` so the selection arithmetic is unit-testable
+/// `WindowState::refresh_chrome_band` so the selection arithmetic is unit-testable
 /// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
 /// but never go below the reserve (and fall back to the reserve when the query
 /// failed). See `refresh_chrome_band` for the rationale.
@@ -8482,6 +8545,28 @@ mod tests {
 
     fn approx_pair(a: (f32, f32), b: (f32, f32)) -> bool {
         approx_eq(a.0, b.0) && approx_eq(a.1, b.1)
+    }
+
+    #[test]
+    fn next_tab_id_is_strictly_increasing_and_distinct() {
+        use std::collections::HashSet;
+        // The minter must hand out unique ids; tabs are routed by TabId, so a
+        // repeat would misroute a PTY's events to the wrong tab.
+        let ids: Vec<_> = (0..8).map(|_| next_tab_id()).collect();
+
+        // All distinct.
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "next_tab_id() returned a duplicate");
+
+        // Strictly increasing across successive calls.
+        for pair in ids.windows(2) {
+            assert!(
+                pair[1].0 > pair[0].0,
+                "next_tab_id() not strictly increasing: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]
@@ -8610,12 +8695,12 @@ mod tests {
         // 1–2 row grid, which spills the prompt into scrollback on resize.
         // The row count must never drop below MIN_GRID_ROWS no matter how
         // short the window. cell 8px wide, 18px line height.
-        let tiny = State::get_viewport_size(800.0, 0.0, 8, 18);
+        let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18);
         assert_eq!(tiny.char_height, MIN_GRID_ROWS);
-        let short = State::get_viewport_size(800.0, 60.0, 8, 18);
+        let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18);
         assert_eq!(short.char_height, MIN_GRID_ROWS);
         // A normally-sized window is unaffected — the floor doesn't clamp it.
-        let normal = State::get_viewport_size(800.0, 600.0, 8, 18);
+        let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18);
         assert!(normal.char_height > MIN_GRID_ROWS);
     }
 
@@ -9270,7 +9355,7 @@ mod tests {
             for &oi in &[true, false] {
                 for &gpu in &[true, false] {
                     assert!(
-                        !State::should_halfblock(en, oi, /*pending*/ true, gpu),
+                        !WindowState::should_halfblock(en, oi, /*pending*/ true, gpu),
                         "pending should suppress halfblock (en={en} oi={oi} gpu={gpu})"
                     );
                 }
@@ -9286,7 +9371,7 @@ mod tests {
         for &oi in &[true, false] {
             for &gpu in &[true, false] {
                 assert!(
-                    State::should_halfblock(/*en*/ false, oi, false, gpu),
+                    WindowState::should_halfblock(/*en*/ false, oi, false, gpu),
                     "disabled should always halfblock (oi={oi} gpu={gpu})"
                 );
             }
@@ -9297,16 +9382,16 @@ mod tests {
     fn halfblock_decision_enabled_with_gpu_image_never_renders() {
         // GPU has the texture, GPU path draws → don't double-emit a
         // half-block on top.
-        assert!(!State::should_halfblock(true, false, false, true));
-        assert!(!State::should_halfblock(true, true, false, true));
+        assert!(!WindowState::should_halfblock(true, false, false, true));
+        assert!(!WindowState::should_halfblock(true, true, false, true));
     }
 
     #[test]
     fn halfblock_decision_enabled_missing_image_needs_opt_in() {
         // images_enabled=true, peek=None, !pending → decode failed and
         // cleanup hasn't fired. Only honored when the user opts in.
-        assert!(!State::should_halfblock(true, false, false, false));
-        assert!(State::should_halfblock(true, true, false, false));
+        assert!(!WindowState::should_halfblock(true, false, false, false));
+        assert!(WindowState::should_halfblock(true, true, false, false));
     }
 
     //
@@ -9322,21 +9407,21 @@ mod tests {
         // Cmd-Shift-I debug-paste: no Kitty id, no up-front display.
         // Caller stores `None` so the on-decode-success branch creates
         // the Placement at the cursor.
-        assert!(!State::suppress_deferred_placement(false, None));
+        assert!(!WindowState::suppress_deferred_placement(false, None));
     }
 
     #[test]
     fn suppress_deferred_placement_a_t_capital_already_placed_skips_deferred_place() {
         // `a=T` without `U=1`: `insert_placement_kitty` already ran.
         // No second Placement should be auto-created.
-        assert!(State::suppress_deferred_placement(true, Some(42)));
+        assert!(WindowState::suppress_deferred_placement(true, Some(42)));
     }
 
     #[test]
     fn suppress_deferred_placement_a_t_capital_with_virtual_placement_skips_deferred_place() {
         // `a=T,U=1`: placeholder cells own the placement. A deferred
         // auto-place would produce the "ghost image" regression.
-        assert!(State::suppress_deferred_placement(false, Some(42)));
+        assert!(WindowState::suppress_deferred_placement(false, Some(42)));
     }
 
     #[test]
@@ -9344,7 +9429,7 @@ mod tests {
         // `a=t`: client will issue `a=p` later. Auto-placing at
         // cursor would beat the client's explicit placement to the
         // screen and end up double-drawn after `a=p` arrives.
-        assert!(State::suppress_deferred_placement(false, Some(7)));
+        assert!(WindowState::suppress_deferred_placement(false, Some(7)));
     }
 
     //
@@ -9360,16 +9445,16 @@ mod tests {
     fn live_placement_viewport_row_passes_through_with_no_offset() {
         // The no-scrollback-in-view common case — image at grid row 5 in
         // a 24-row viewport renders at viewport row 5.
-        assert_eq!(State::live_placement_viewport_row(5, 0, 24), 5);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 0, 24), 5);
     }
 
     #[test]
     fn live_placement_viewport_row_shifts_down_by_view_offset() {
         // 3 scrollback rows pulled into view → live content shifts down 3.
-        assert_eq!(State::live_placement_viewport_row(5, 3, 24), 8);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 3, 24), 8);
         // Negative grid rows (placement straddling above the viewport)
         // shift the same way — clipping happens downstream.
-        assert_eq!(State::live_placement_viewport_row(-2, 3, 24), 1);
+        assert_eq!(WindowState::live_placement_viewport_row(-2, 3, 24), 1);
     }
 
     #[test]
@@ -9382,11 +9467,11 @@ mod tests {
         // (viewport_row hadn't moved). Without the clamp, viewport_row
         // moves in lockstep with view_offset and scroll_y, giving a
         // continuous slide as the image enters from below.
-        assert_eq!(State::live_placement_viewport_row(5, 100, 24), 5 + 100);
-        assert_eq!(State::live_placement_viewport_row(0, 50, 24), 50);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 100, 24), 5 + 100);
+        assert_eq!(WindowState::live_placement_viewport_row(0, 50, 24), 50);
         // Sanity: at view_offset <= rows, behavior is unchanged from
         // the pre-clamp version.
-        assert_eq!(State::live_placement_viewport_row(5, 20, 24), 25);
+        assert_eq!(WindowState::live_placement_viewport_row(5, 20, 24), 25);
     }
 
     //
@@ -9398,7 +9483,7 @@ mod tests {
         // 3 cells wide, image_row 0, total (3, 2) →
         //   u: 0..3/3 = 0..1
         //   v: 0..1/2 = 0..0.5
-        let uv = State::placeholder_run_uv(0, 3, 0, 3, 2);
+        let uv = WindowState::placeholder_run_uv(0, 3, 0, 3, 2);
         assert_eq!(uv, (0.0, 0.0, 1.0, 0.5));
     }
 
@@ -9406,7 +9491,7 @@ mod tests {
     fn placeholder_run_uv_partial_row_samples_proper_strip() {
         // Cells image_col 1..3 of a 4-col tile, image_row 1 of 2
         // rows → upper-left at (0.25, 0.5), lower-right at (0.75, 1.0).
-        let uv = State::placeholder_run_uv(1, 3, 1, 4, 2);
+        let uv = WindowState::placeholder_run_uv(1, 3, 1, 4, 2);
         assert_eq!(uv, (0.25, 0.5, 0.75, 1.0));
     }
 
@@ -9414,7 +9499,7 @@ mod tests {
     fn placeholder_run_uv_clamps_out_of_range_to_unit_square() {
         // image_col_end past the right edge, image_row past the
         // bottom — both clamp to 1.0 rather than wrap or NaN.
-        let uv = State::placeholder_run_uv(5, 10, 7, 4, 2);
+        let uv = WindowState::placeholder_run_uv(5, 10, 7, 4, 2);
         assert_eq!(uv, (1.0, 1.0, 1.0, 1.0));
     }
 
@@ -9424,7 +9509,7 @@ mod tests {
         // (the renderer skips runs without a recorded extent), but
         // guard the denominator so we never NaN. With cols=0 →
         // denom 1, image_col_end=0 → u1=0.0 clamped from 0 itself.
-        let uv = State::placeholder_run_uv(0, 0, 0, 0, 0);
+        let uv = WindowState::placeholder_run_uv(0, 0, 0, 0, 0);
         assert_eq!(uv, (0.0, 0.0, 0.0, 1.0));
     }
 
@@ -9439,7 +9524,7 @@ mod tests {
         // atlas origin (0, 0), sampling cols 0..8 / rows 0..16 of a
         // 128x128 atlas.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
         assert!(approx_pair((u0, u1), (0.5 / 128.0, 7.5 / 128.0)));
         assert!(approx_pair((v0, v1), (0.5 / 128.0, 15.5 / 128.0)));
     }
@@ -9454,7 +9539,7 @@ mod tests {
         // cell_filling, so the horizontal extent IS pulled in here. Glyph
         // at (10, 20), sampling cols 0..8 / rows 0..16 of a 256x256 atlas.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
+            WindowState::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
         assert!(approx_pair((u0, u1), (10.5 / 256.0, 17.5 / 256.0)));
         assert!(approx_pair((v0, v1), (20.5 / 256.0, 35.5 / 256.0)));
     }
@@ -9465,7 +9550,7 @@ mod tests {
         // the UV is the raw sample rect, so ordinary antialiased glyphs
         // aren't thinned or shifted.
         let (u0, v0, u1, v1) =
-            State::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
+            WindowState::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
         assert!(approx_pair((u0, u1), (5.0 / 64.0, 11.0 / 64.0)));
         assert!(approx_pair((v0, v1), (6.0 / 64.0, 18.0 / 64.0)));
     }
@@ -9478,9 +9563,9 @@ mod tests {
         // that in atlas-texel units so a regression to a different inset is
         // caught.
         let raw =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
         let inset =
-            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
+            WindowState::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
         assert!(approx_eq((raw.2 - raw.0) * 100.0 - (inset.2 - inset.0) * 100.0, 1.0));
         assert!(approx_eq((raw.3 - raw.1) * 100.0 - (inset.3 - inset.1) * 100.0, 1.0));
     }
