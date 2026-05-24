@@ -53,6 +53,9 @@ pub enum PaletteAction {
     /// Re-run the first-time setup: re-arm the onboarding marker and relaunch
     /// Yutani so it boots into onboarding-in-PTY exactly like a real first run.
     RunOnboarding,
+    /// Toggle the filesystem/history autocomplete popup (`autocomplete`) on or
+    /// off, persisting the new value so it sticks across restarts.
+    ToggleAutocomplete,
 }
 
 /// One entry in the palette's command list.
@@ -155,6 +158,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         title: "Run first-time setup…",
         action: PaletteAction::RunOnboarding,
+        arg_prompt: None,
+        choose: false,
+    },
+    Command {
+        title: "Toggle autocomplete",
+        action: PaletteAction::ToggleAutocomplete,
         arg_prompt: None,
         choose: false,
     },
@@ -1418,6 +1427,27 @@ mod tests {
         assert_eq!(
             p.row_label(p.selected),
             Some(format!("theme{}", p.filtered[p.selected]).as_str())
+        );
+    }
+
+    #[test]
+    fn toggle_autocomplete_is_discoverable_and_runs_immediately() {
+        // The command is registered and reachable through the fuzzy filter.
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "autocomplete".into();
+        p.refilter();
+        let titles: Vec<&str> = p.filtered.iter().map(|&i| COMMANDS[i].title).collect();
+        assert!(titles.contains(&"Toggle autocomplete"));
+
+        // It takes no argument, so accepting runs it straight away.
+        let out = p.accept();
+        assert_eq!(
+            out,
+            Outcome::Run {
+                action: PaletteAction::ToggleAutocomplete,
+                arg: None
+            }
         );
     }
 }
