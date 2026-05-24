@@ -1271,6 +1271,78 @@ impl AppShared {
     }
 }
 
+/// One shell session and the interaction state bound to it. Everything here
+/// scrolls, selects, or completes against a single PTY + `Terminal`; none of
+/// it is coupled to the window's GPU surface, atlas, or buffers (so a tab can
+/// later move between windows — see MULTIWINDOW_PLAN.md). A window owns a
+/// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
+/// per window; the tab UI is a later follow-up.
+struct TabState {
+    master: i32,
+    terminal: terminal::Terminal,
+    /// Decode + GPU residency cache for this tab's images. Per-tab: each shell
+    /// has its own placements + scrollback. Mark-and-sweep eviction keyed on
+    /// the live + scrollback placement set runs at the start of each `render`.
+    image_store: images::Store,
+    /// Cell anchors waiting on async decode, matched back to the tab's
+    /// `Terminal` by `PendingId` when `Store::poll` yields the result.
+    pending_placements: Vec<PendingImagePlacement>,
+    scroll_y: f64,
+    /// In-flight smooth slide for an explicit alt-screen scroll captured from
+    /// the running app (`Terminal::take_alt_scroll`).
+    alt_scroll_anim: Option<AltScrollAnim>,
+    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
+    /// less, htop). Drained per `line_height` like `scroll_y`.
+    wheel_pty_accum: f64,
+    /// Drop in-flight trackpad momentum once a newer command has overridden
+    /// the user's scroll intent. See `last_wheel_at`.
+    scroll_suppressed: bool,
+    last_wheel_at: Option<std::time::Instant>,
+    /// Last cell a motion event was reported for — coalesces per-pixel motion
+    /// down to per-cell transitions for the host.
+    last_reported_cell: Option<(u16, u16)>,
+    /// Smooth cursor motion: eases the rendered cursor quad toward the logical
+    /// cursor over `config.cursor_anim_secs`. `None` off-screen / pre-first-frame.
+    cursor_anim: Option<CursorAnim>,
+    /// Snapshot of the previous frame's visible cells (+ a viewport key) used
+    /// to spawn fade-out ghosts when the cursor retargets across deleted glyphs.
+    prev_visible: Option<GridSnapshot>,
+    /// Glyphs fading out at their old cell position after the cursor moved off.
+    cursor_ghosts: Vec<CursorGhost>,
+    /// Completion popup suggestions, recomputed only when the shell's reported
+    /// input changes (path completion does disk I/O).
+    completions: Vec<completion::Suggestion>,
+    /// The (buffer, cursor) the cached `completions` were computed from.
+    completions_input: Option<(String, usize)>,
+    /// Highlighted row in the completion popup (index into `completions`).
+    selected_completion: usize,
+    /// First visible popup row when `completions` exceeds MAX_VISIBLE.
+    completion_scroll: usize,
+    /// When true the popup stays closed as the shell re-reports input — set by
+    /// Enter/Esc, cleared by the next real keystroke.
+    completion_dismissed: bool,
+    /// Past command lines for history-based completion, most-recent-first and
+    /// deduped. Seeded from $HISTFILE (OSC 2124), grown at OSC 133 `C`.
+    command_history: Vec<String>,
+    /// Active local text selection in (absolute_line, col) coordinates so it
+    /// stays anchored to content as the grid scrolls.
+    selection: Option<Selection>,
+    /// Granularity for the active drag (set on press from click_count).
+    selection_mode: SelectionMode,
+    /// Cell where the current drag started; recomputes word/line selections as
+    /// the head moves. `None` when no button is being dragged.
+    press_cell: Option<(isize, usize)>,
+    /// Pixel position of the mouse-down — suppresses a Cell-mode selection
+    /// until the cursor moves at least DRAG_THRESHOLD_PX.
+    press_pixel: Option<(f64, f64)>,
+    /// Last left-button press, for multi-click detection (cell + time window).
+    last_click: Option<(std::time::Instant, (isize, usize))>,
+    click_count: u32,
+    /// URL under the mouse while Cmd is held. Drives the underline overlay and
+    /// the Cmd-click open behavior.
+    hover_url: Option<HoverUrl>,
+}
+
 struct State {
     /// Per-window GPU surface. Declared first so it drops before `window` —
     /// the surface holds unsafe references to the window's resources.
@@ -1305,16 +1377,6 @@ struct State {
     /// vertex/index buffers and is invoked once per frame between the bg
     /// and fg cell passes (when there are placements to draw).
     image_pipeline: renderer::images::ImagePipeline,
-    /// Decode + GPU residency cache for images. Populated by parsers and
-    /// the debug-keybind path; queried by the renderer via `Store::peek`.
-    /// Mark-and-sweep eviction keyed on the live + scrollback placement
-    /// set runs at the start of each `render()`.
-    image_store: images::Store,
-    /// Cell anchors waiting on async decode. When the worker finishes a
-    /// decode and `Store::poll` yields the result, we match it back by
-    /// `PendingId` and call `Terminal::insert_placement` at the stored row
-    /// / col. Survives the in-flight decode interval — typically <100ms.
-    pending_placements: Vec<PendingImagePlacement>,
     blur: renderer::blur::BlurChain,
     /// Saturation-threshold bloom. When `glow.enabled` is true, the scene is
     /// always rendered to the offscreen `blur.scene` texture so the glow
@@ -1364,33 +1426,14 @@ struct State {
     fade_buffer: wgpu::Buffer,
     fade_bind_group: wgpu::BindGroup,
     atlas: font::Atlas,
-    terminal: terminal::Terminal,
+    /// The window's tabs and which one is active. Per-tab state (shell,
+    /// scroll, selection, completions, images) lives in `TabState`; the
+    /// window renders only `tabs[active]`. First cut: always exactly one tab.
+    tabs: Vec<TabState>,
+    active: usize,
     modifiers: winit::keyboard::ModifiersState,
-    scroll_y: f64,
-    /// In-flight smooth slide for an explicit alt-screen scroll captured from
-    /// the running app (`Terminal::take_alt_scroll`). Drives `scroll_y` on the
-    /// alt screen while active; the departing rows it slides over live on the
-    /// terminal until `finish_alt_scroll` clears them.
-    alt_scroll_anim: Option<AltScrollAnim>,
-    /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
-    /// less, htop). Trackpads stream small PixelDelta events — without
-    /// accumulation, every event truncates to 0 lines and slow scrolls
-    /// produce no wheel reports at all until one event finally crosses the
-    /// line-height threshold and emits a burst. Drained per `line_height`
-    /// just like `scroll_y` so the rate matches the local-scrollback path.
-    wheel_pty_accum: f64,
-    /// Drop in-flight trackpad momentum once a newer command (a keystroke
-    /// that snaps to the bottom) has overridden the user's scroll intent.
-    /// Cleared when momentum runs out OR a fresh gesture begins after a
-    /// real idle gap — see `last_wheel_at` for how we tell the two apart
-    /// (momentum's Started arrives ~one frame after the prior Ended).
-    scroll_suppressed: bool,
-    last_wheel_at: Option<std::time::Instant>,
     mouse_x: f64,
     mouse_y: f64,
-    // Last cell we reported a motion event for. Mouse motion fires per pixel,
-    // but the host only cares about per-cell transitions — coalesce.
-    last_reported_cell: Option<(u16, u16)>,
     // Currently-held mouse button (in xterm code). `None` when no button down.
     held_button: Option<input::MouseButton>,
     // Cursor blink. `blink_on` is the visible phase; `last_blink` anchors the
@@ -1404,44 +1447,6 @@ struct State {
     top_fade_phase: f32,
     bottom_fade_phase: f32,
     last_anim_tick: std::time::Instant,
-    /// Smooth cursor motion: when the logical cursor moves, the rendered
-    /// quad eases from the previous displayed position toward the new
-    /// target over `config.cursor_anim_secs`. `None` while the cursor is
-    /// off-screen (scrollback) or before the first frame; the next visible
-    /// frame snaps to the target without animating.
-    cursor_anim: Option<CursorAnim>,
-    /// Snapshot of the previous frame's visible cells, plus a viewport key
-    /// (rows / cols / view_offset / alt-screen). Compared on retarget to
-    /// spot cells that just went non-blank → blank so the deleted glyph can
-    /// fade out as a ghost while the cursor slides over it. A key mismatch
-    /// (resize, scrollback, alt-screen toggle) skips ghost detection that
-    /// frame so a wholesale grid shift doesn't spawn ghosts everywhere.
-    prev_visible: Option<GridSnapshot>,
-    /// Glyphs being faded out at their old cell position, captured from
-    /// `prev_visible` when the cursor retargets across them. Each fades to
-    /// alpha 0 over `cursor_anim_secs`; the entry is dropped early if the
-    /// underlying cell becomes non-blank again (a follow-up keystroke).
-    cursor_ghosts: Vec<CursorGhost>,
-    /// Suggestions for the completion popup, recomputed only when the shell's
-    /// reported input changes (path completion does disk I/O — never recompute
-    /// per frame). Drawn by `update_vertices`; display-only in K10 (K11 adds
-    /// keyboard nav + accept).
-    completions: Vec<completion::Suggestion>,
-    /// The (buffer, cursor) the cached `completions` were computed from, so we
-    /// can skip the recompute (and the `read_dir`) when nothing changed.
-    completions_input: Option<(String, usize)>,
-    /// Highlighted row in the completion popup (index into `completions`). Reset
-    /// to 0 whenever the list is recomputed. Only meaningful while `completions`
-    /// is non-empty.
-    selected_completion: usize,
-    /// First visible row when `completions` exceeds the popup's MAX_VISIBLE
-    /// rows; scrolls to keep `selected_completion` on screen.
-    completion_scroll: usize,
-    /// When true, the popup stays closed even as the shell re-reports input —
-    /// set by Enter (finish) and Esc (dismiss), cleared by the next real
-    /// keystroke. Lets Tab drill into subdirectories while Enter/Esc actually
-    /// close the menu.
-    completion_dismissed: bool,
     /// The command palette overlay (Cmd-Shift-P). While `open`, it owns the
     /// keyboard: keystrokes filter/drive it instead of reaching the PTY. Holds
     /// its own search/argument text field and selection state; see
@@ -1451,29 +1456,6 @@ struct State {
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
     search: search::Search,
-    /// Past command lines for history-based completion suggestions, most-recent-
-    /// first and deduped. Seeded from the shell's $HISTFILE (reported via OSC
-    /// 2124) and grown with this session's submitted commands (captured at OSC
-    /// 133 `C`). Capped to bound memory.
-    command_history: Vec<String>,
-    // Active local text selection, in (absolute_line, col) coordinates so it
-    // stays anchored to content as the grid scrolls. `None` when nothing is
-    // selected. The two endpoints are anchor (mouse-down cell) and head
-    // (latest cell under the cursor); they may be in either order.
-    selection: Option<Selection>,
-    // Granularity for the active drag (set on press from click_count).
-    selection_mode: SelectionMode,
-    // Cell where the current drag started; used to recompute word/line
-    // selections as the head moves. `None` when no button is being dragged.
-    press_cell: Option<(isize, usize)>,
-    // Pixel position of the mouse-down. In Cell mode we suppress the
-    // selection until the cursor has moved at least DRAG_THRESHOLD_PX from
-    // here, so a plain click doesn't briefly highlight a single character.
-    press_pixel: Option<(f64, f64)>,
-    // Last left-button press, for multi-click detection (must match cell and
-    // be within the threshold window).
-    last_click: Option<(std::time::Instant, (isize, usize))>,
-    click_count: u32,
     // Time of the last left-press in the title-bar band, for double-click
     // detection there. Separate from `last_click` (which keys on a grid cell)
     // since toolbar clicks have no cell. A double-click toggles window zoom.
@@ -1488,11 +1470,6 @@ struct State {
     /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
     /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
     chrome_band_px: f64,
-    /// URL under the mouse while Cmd is held. `None` whenever Cmd is up or
-    /// the pointer isn't over a URL. Drives the underline overlay and the
-    /// Cmd-click open behavior.
-    hover_url: Option<HoverUrl>,
-    master: i32,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -2626,6 +2603,39 @@ impl State {
             glow_pipelines,
         };
 
+        let tab = TabState {
+            master,
+            terminal: terminal::Terminal::new(
+                viewport.char_width,
+                viewport.char_height,
+                10000,
+            ),
+            image_store,
+            pending_placements: Vec::new(),
+            scroll_y: 0.0,
+            alt_scroll_anim: None,
+            wheel_pty_accum: 0.0,
+            scroll_suppressed: false,
+            last_wheel_at: None,
+            last_reported_cell: None,
+            cursor_anim: None,
+            prev_visible: None,
+            cursor_ghosts: Vec::new(),
+            completions: Vec::new(),
+            completions_input: None,
+            selected_completion: 0,
+            completion_scroll: 0,
+            completion_dismissed: false,
+            command_history: Vec::new(),
+            selection: None,
+            selection_mode: SelectionMode::Cell,
+            press_cell: None,
+            press_pixel: None,
+            last_click: None,
+            click_count: 0,
+            hover_url: None,
+        };
+
         Self {
             surface,
             window,
@@ -2640,8 +2650,6 @@ impl State {
             strip_index_buffer,
             num_strip_indices: 0,
             image_pipeline,
-            image_store,
-            pending_placements: Vec::new(),
             blur,
             glow,
             glow_fg,
@@ -2661,54 +2669,40 @@ impl State {
             camera_bind_group,
             fade_buffer,
             fade_bind_group,
-            terminal: terminal::Terminal::new(
-                viewport.char_width,
-                viewport.char_height,
-                10000,
-            ),
+            tabs: vec![tab],
+            active: 0,
             modifiers: winit::keyboard::ModifiersState::empty(),
-            scroll_y: 0.0,
-            alt_scroll_anim: None,
-            wheel_pty_accum: 0.0,
-            scroll_suppressed: false,
-            last_wheel_at: None,
             mouse_x: 0.0,
             mouse_y: 0.0,
-            last_reported_cell: None,
             held_button: None,
             blink_on: true,
             last_blink: std::time::Instant::now(),
             top_fade_phase: 0.0,
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
-            cursor_anim: None,
-            prev_visible: None,
-            cursor_ghosts: Vec::new(),
-            completions: Vec::new(),
-            completions_input: None,
-            selected_completion: 0,
-            completion_scroll: 0,
-            completion_dismissed: false,
             command_palette: command_palette::CommandPalette::default(),
             search: search::Search::default(),
-            command_history: Vec::new(),
-            selection: None,
-            selection_mode: SelectionMode::Cell,
-            press_cell: None,
-            press_pixel: None,
-            last_click: None,
-            click_count: 0,
             last_toolbar_click: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
             // DPI-scaled native title-bar height.
             chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
-            hover_url: None,
-            master,
             perf: PerfLog::new(),
             vertices_dirty: true,
         }
+    }
+
+    /// The active tab (read-only). First cut: always `tabs[0]`.
+    #[inline]
+    fn active_tab(&self) -> &TabState {
+        &self.tabs[self.active]
+    }
+
+    /// The active tab (mutable).
+    #[inline]
+    fn active_tab_mut(&mut self) -> &mut TabState {
+        &mut self.tabs[self.active]
     }
 
     /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls
@@ -2747,8 +2741,8 @@ impl State {
         // Mark-and-sweep AFTER poll so a freshly-landed image referenced
         // by a placement created in this same `poll_pending_images` call
         // is kept alive.
-        let referenced = self.terminal.referenced_image_ids();
-        self.image_store.retain(&referenced);
+        let referenced = self.active_tab().terminal.referenced_image_ids();
+        self.active_tab_mut().image_store.retain(&referenced);
         self.flush_vertices();
     }
 
@@ -2838,8 +2832,8 @@ impl State {
         // Advance any alt-screen scroll slide first so this frame reads the
         // freshly-eased `scroll_y`.
         self.update_alt_scroll();
-        let cols = self.terminal.cols;
-        let rows = self.terminal.rows;
+        let cols = self.active_tab().terminal.cols;
+        let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
@@ -2905,7 +2899,7 @@ impl State {
         let atlas_h = self.atlas.height as f32;
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
@@ -2965,13 +2959,13 @@ impl State {
         // toolbar. Mid-scroll the offset is 0 so older content can flow
         // behind the title bar smoothly. Eases linearly over one line at
         // each boundary. Hit-test in pixel_to_visual_cell mirrors this.
-        let view_offset = self.terminal.view_offset() as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
         // Alt screen has no scrollback to fade toward — pin both distances
         // to zero so the top/bottom edge fades stay invisible.
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
@@ -2987,7 +2981,7 @@ impl State {
         // both for shaping (below) and the main emit loop further down. During
         // an alt-screen scroll slide `scroll_y` can exceed a line, so widen the
         // band to cover the departing rows being slid in from the edge.
-        let anim_extra = if self.terminal.on_alt_screen() {
+        let anim_extra = if self.active_tab().terminal.on_alt_screen() {
             (scroll_y.abs() / line_height).ceil() as isize
         } else {
             0
@@ -3019,7 +3013,7 @@ impl State {
         for r in r_lo..r_hi {
             row_chars.clear();
             for c in 0..cols {
-                let cell = self.terminal.extended_cell(r, c);
+                let cell = self.active_tab().terminal.extended_cell(r, c);
                 let ch = cell.map(|cell| cell.ch).unwrap_or(' ');
                 // Pre-pack any char outside build_atlas's fixed ranges
                 // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
@@ -3037,7 +3031,7 @@ impl State {
             let mut row_override: Option<Vec<Option<(u32, font::FaceVariant)>>> = None;
             let mut c = 0;
             while c < cols {
-                let Some(start_cell) = self.terminal.extended_cell(r, c) else {
+                let Some(start_cell) = self.active_tab().terminal.extended_cell(r, c) else {
                     c += 1;
                     continue;
                 };
@@ -3055,7 +3049,7 @@ impl State {
                 // style — a colored or weight-changing split breaks the
                 // visual cohesion that contextual-alternate halves rely on.
                 let style_uniform = (1..span).all(|i| {
-                    self.terminal
+                    self.active_tab().terminal
                         .extended_cell(r, c + i)
                         .map(|cell| cell.style == start_cell.style)
                         .unwrap_or(false)
@@ -3095,8 +3089,8 @@ impl State {
         // re-upload right after). Done here, before the `&self.atlas` borrow,
         // because `ensure_char` needs `&mut self.atlas` and a `&mut Font`
         // (taken as a single-statement `borrow_mut` per the AppShared rule).
-        if !self.completions.is_empty() {
-            let chars: Vec<char> = self
+        if !self.active_tab().completions.is_empty() {
+            let chars: Vec<char> = self.active_tab()
                 .completions
                 .iter()
                 .flat_map(|s| s.text.chars())
@@ -3162,7 +3156,7 @@ impl State {
         // departing content slides *under* the static status line instead of
         // bleeding glyphs over it; for a full-height region it sits below the
         // window and clips nothing.
-        let (anim_lo, anim_hi, clip_bottom_px) = match &self.alt_scroll_anim {
+        let (anim_lo, anim_hi, clip_bottom_px) = match &self.active_tab().alt_scroll_anim {
             Some(a) => {
                 let d = a.rows as isize;
                 // Up-scroll departing rows sit above the region top (off-grid
@@ -3179,7 +3173,7 @@ impl State {
             }
             None => (0, 0, f32::INFINITY),
         };
-        let anim_active = self.alt_scroll_anim.is_some();
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
         let row_moving = move |r: isize| anim_active && r >= anim_lo && r <= anim_hi;
         // Per-row vertical offset. When no slide is active this is the global
         // `scroll_y` for every row (unchanged scrollback behavior).
@@ -3371,7 +3365,7 @@ impl State {
             sel[2] * selection_alpha,
             selection_alpha,
         ];
-        let selection = self.selection;
+        let selection = self.active_tab().selection;
 
         // 0b. Half-block fallback overrides for image placements that
         // the GPU image pipeline can't draw this frame (config-disabled
@@ -3409,7 +3403,7 @@ impl State {
             // row falls outside the selection. Mirrors `strip_at` further
             // down where the overlay quads are emitted.
             let sel_strip = selection_range.and_then(|(start, end)| {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 if abs_line < start.0 || abs_line > end.0 {
                     return None;
                 }
@@ -3442,7 +3436,7 @@ impl State {
                     });
                     continue;
                 }
-                let Some(cell) = self.terminal.extended_cell(r, c) else { continue };
+                let Some(cell) = self.active_tab().terminal.extended_cell(r, c) else { continue };
                 // Kitty unicode-placeholder cells (`U+10EEEE` + image-id
                 // encoded in fg). The image quad draws over this cell on
                 // its own pipeline pass — emitting the U+10EEEE glyph
@@ -3514,9 +3508,9 @@ impl State {
         // overlay (1b) so a selected URL still reads as selected. Walks the
         // phantom-row range like the cell loop so the underline follows the
         // text through smooth scroll.
-        if let Some(hu) = &self.hover_url {
+        if let Some(hu) = &self.active_tab().hover_url {
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 // Underline every segment that lands on this line. Most links
                 // have one per line; an OSC 8 link with an `id=` shared across
                 // non-contiguous spans can have several, so don't stop early.
@@ -3546,7 +3540,7 @@ impl State {
                     }
                     // Match the cell's foreground color so the underline tracks
                     // theme overrides; fall back to the default fg.
-                    let fg = self
+                    let fg = self.active_tab()
                         .terminal
                         .extended_cell(r, from)
                         .map(|cell| {
@@ -3605,7 +3599,7 @@ impl State {
             // Match the cell loop's phantom range so a partially-scrolled
             // row keeps its selection strip drawn through the slide.
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((from, to)) = strip_at(abs_line) else { continue };
                 let prev = strip_at(abs_line - 1);
                 let next = strip_at(abs_line + 1);
@@ -3734,7 +3728,7 @@ impl State {
                 yellow[2] * cur_a,
                 cur_a,
             ];
-            let top_abs = self.terminal.visual_to_abs_line(0);
+            let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
             let emit_match = |vertices: &mut Vec<renderer::vertex::Vertex>,
                               indices: &mut Vec<u32>,
                               m: &search::Match,
@@ -3784,7 +3778,7 @@ impl State {
         let status_markers = if self.config.prompt_gutter == PromptGutter::None {
             Vec::new()
         } else {
-            self.terminal.prompt_status_markers()
+            self.active_tab().terminal.prompt_status_markers()
         };
         if !status_markers.is_empty() {
             let pal = palette::get();
@@ -3793,7 +3787,7 @@ impl State {
             let strip_pad = (line_height - bg_h) * 0.5;
             let bar_radius = bar_w * 0.5;
             for r in r_lo..r_hi {
-                let abs_line = self.terminal.visual_to_abs_line(r);
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
                 let Some((_, status)) = status_markers.iter().find(|(l, _)| *l == abs_line)
                 else {
                     continue;
@@ -3838,20 +3832,20 @@ impl State {
         let viewport_key = ViewportKey {
             rows,
             cols,
-            view_offset: self.terminal.view_offset(),
-            on_alt_screen: self.terminal.on_alt_screen(),
+            view_offset: self.active_tab().terminal.view_offset(),
+            on_alt_screen: self.active_tab().terminal.on_alt_screen(),
         };
         // A viewport change (resize, scrollback, alt-screen toggle) makes
         // last frame's snapshot non-comparable cell-for-cell, so we drop
         // any in-flight ghosts and skip detection until we have a fresh
         // matching snapshot to compare against.
-        let key_matches = self
+        let key_matches = self.active_tab()
             .prev_visible
             .as_ref()
             .map(|s| s.key == viewport_key)
             .unwrap_or(false);
         if !key_matches {
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // The cursor and its ghosts animate in BUFFER coordinates so changes
@@ -3860,18 +3854,18 @@ impl State {
         // grid. `live_grid_offset` is the integer visual-row delta to apply
         // when converting buffer rows back to viewport pixel space; equal
         // to `scrollback_visible` on the primary screen, 0 on alt screen.
-        let live_grid_offset_i = if self.terminal.on_alt_screen() {
+        let live_grid_offset_i = if self.active_tab().terminal.on_alt_screen() {
             0usize
         } else {
-            self.terminal.view_offset().min(rows)
+            self.active_tab().terminal.view_offset().min(rows)
         };
         let live_grid_offset = live_grid_offset_i as f32;
 
         // Cursor anchor for the completion popup, captured while the cursor is
         // drawn (same row/col→pixel mapping). `(anchor_x, cursor_row_top)`.
         let mut popup_anchor: Option<(f32, f32)> = None;
-        if let Some(_cur_visual_row) = self.terminal.cursor_visual_row() {
-            let cur = self.terminal.cursor();
+        if let Some(_cur_visual_row) = self.active_tab().terminal.cursor_visual_row() {
+            let cur = self.active_tab().terminal.cursor();
             let cur_col = cur.col.min(cols.saturating_sub(1));
             let target = (cur_col as f32, cur.row as f32);
             let anim_secs = self.config.cursor_anim_secs;
@@ -3882,10 +3876,14 @@ impl State {
             // buffer coords; prev_visible uses visual rows, so translate via
             // `live_grid_offset` (consistent because key_matches implies
             // view_offset hasn't changed since the snapshot).
+            // Collected into a local Vec, then appended after the `snap`
+            // borrow below is dropped — pushing straight into the tab would
+            // borrow it mutably while `snap` holds the same tab immutably.
+            let mut new_ghosts: Vec<CursorGhost> = Vec::new();
             if anim_secs > 0.0 && key_matches {
                 if let (Some(prev_anim), Some(snap)) = (
-                    self.cursor_anim.as_ref(),
-                    self.prev_visible.as_ref(),
+                    self.active_tab().cursor_anim.as_ref(),
+                    self.active_tab().prev_visible.as_ref(),
                 ) {
                     let (pcol, prow) = prev_anim.to;
                     let moved = (pcol - target.0).abs() > f32::EPSILON
@@ -3914,11 +3912,11 @@ impl State {
                                 if is_blank_cell(&prev) {
                                     continue;
                                 }
-                                let now_cell = self.terminal.visible_cell(vis_r, c);
+                                let now_cell = self.active_tab().terminal.visible_cell(vis_r, c);
                                 if !is_blank_cell(&now_cell) {
                                     continue;
                                 }
-                                self.cursor_ghosts.push(CursorGhost {
+                                new_ghosts.push(CursorGhost {
                                     ch: prev.ch,
                                     style: prev.style,
                                     buffer_row: buf_r,
@@ -3931,24 +3929,35 @@ impl State {
                 }
             }
 
+            // Now that `snap`'s immutable borrow has ended, fold in the ghosts
+            // captured above.
+            self.tabs[self.active].cursor_ghosts.append(&mut new_ghosts);
+
             // Drop ghosts whose underlying cell got rewritten with new
             // content (e.g. user typed a replacement after the backspace),
             // or whose fade has run out.
             let now = std::time::Instant::now();
-            let terminal = &self.terminal;
-            self.cursor_ghosts.retain(|g| {
-                let elapsed = now.duration_since(g.started_at).as_secs_f32();
-                if anim_secs <= 0.0 || elapsed >= anim_secs {
-                    return false;
-                }
-                let vis_r = g.buffer_row + live_grid_offset_i;
-                is_blank_cell(&terminal.visible_cell(vis_r, g.col))
-            });
+            {
+                // Scoped so the `&mut tab` (which borrows `self.tabs`) is
+                // released before the ghost-emit loop reads the active tab.
+                // `cursor_ghosts` (mut) and `terminal` (read) split-borrow the
+                // one tab.
+                let tab = &mut self.tabs[self.active];
+                let terminal = &tab.terminal;
+                tab.cursor_ghosts.retain(|g| {
+                    let elapsed = now.duration_since(g.started_at).as_secs_f32();
+                    if anim_secs <= 0.0 || elapsed >= anim_secs {
+                        return false;
+                    }
+                    let vis_r = g.buffer_row + live_grid_offset_i;
+                    is_blank_cell(&terminal.visible_cell(vis_r, g.col))
+                });
+            }
 
             // Emit ghost glyphs as foreground-only quads with linearly
             // decaying alpha. Drawn before the cursor box so the cursor
             // visually consumes the ghost as it slides over.
-            for ghost in &self.cursor_ghosts {
+            for ghost in &self.active_tab().cursor_ghosts {
                 let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
                 let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
                 let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
@@ -3971,7 +3980,7 @@ impl State {
                 );
             }
 
-            let anim = self.cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
+            let anim = self.tabs[self.active].cursor_anim.get_or_insert_with(|| CursorAnim::snapped(target));
             anim.retarget(target, anim_secs);
 
             if visible {
@@ -3990,7 +3999,7 @@ impl State {
                 let cursor_color = palette::get().cursor;
                 // Underline / bar use a 2-px stripe; block fills the full cell.
                 let stripe = 2.0_f32;
-                let (cx, cy, cw, ch) = match self.terminal.cursor_shape() {
+                let (cx, cy, cw, ch) = match self.active_tab().terminal.cursor_shape() {
                     terminal::CursorShape::Block => (block_x, block_y, cell_w, line_height),
                     terminal::CursorShape::Underline => {
                         (block_x, block_y + line_height - stripe, cell_w, stripe)
@@ -4014,8 +4023,8 @@ impl State {
             // Cursor scrolled out of view. Drop the ease so the next time it
             // returns we snap to the new position instead of sliding in from
             // a stale one. Ghosts are tied to the cursor's motion so go with it.
-            self.cursor_anim = None;
-            self.cursor_ghosts.clear();
+            self.tabs[self.active].cursor_anim = None;
+            self.tabs[self.active].cursor_ghosts.clear();
         }
 
         // Completion popup overlay (autocomplete slice K10). Drawn AFTER the
@@ -4027,14 +4036,14 @@ impl State {
         // TODO(K11+): consider excluding the popup from bloom. Appending into
         // the FG index range means it participates in the glow/bloom pass when
         // glow is on; acceptable for K10.
-        let popup_visible = !self.completions.is_empty() && self.terminal.view_offset() == 0;
+        let popup_visible = !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
         if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
-            let len = self.completions.len();
+            let len = self.active_tab().completions.len();
             // The visible window: `COMPLETION_MAX_VISIBLE` rows starting at the
             // scroll offset, clamped to the list. `n` is how many rows render.
-            let start = self.completion_scroll.min(len);
+            let start = self.active_tab().completion_scroll.min(len);
             let end = (start + COMPLETION_MAX_VISIBLE).min(len);
-            let visible = &self.completions[start..end];
+            let visible = &self.active_tab().completions[start..end];
             let n = visible.len();
             let item_h = line_height;
             // Box width: longest visible suggestion (chars) plus a little
@@ -4100,7 +4109,7 @@ impl State {
             // visible window. Round the highlight's top corners only when it's
             // the box's first visible row, and its bottom corners only when it's
             // the last — so the highlight's rounding tracks the box's edges.
-            let hl_row = self.selected_completion.saturating_sub(start);
+            let hl_row = self.active_tab().selected_completion.saturating_sub(start);
             if hl_row < n {
                 let hl_y = layout.y + hl_row as f32 * item_h;
                 let round_top = if hl_row == 0 { radius } else { 0.0 };
@@ -4470,11 +4479,11 @@ impl State {
         for r in 0..rows {
             let mut row_cells: Vec<style::Cell> = Vec::with_capacity(cols);
             for c in 0..cols {
-                row_cells.push(self.terminal.visible_cell(r, c));
+                row_cells.push(self.active_tab().terminal.visible_cell(r, c));
             }
             snap_cells.push(row_cells);
         }
-        self.prev_visible = Some(GridSnapshot {
+        self.tabs[self.active].prev_visible = Some(GridSnapshot {
             cells: snap_cells,
             key: viewport_key,
         });
@@ -4807,10 +4816,10 @@ impl State {
             return;
         }
         let case_sensitive = search::smart_case(&query);
-        let total = self.terminal.scrollback_len() + self.terminal.rows;
+        let total = self.active_tab().terminal.scrollback_len() + self.active_tab().terminal.rows;
         let mut matches = Vec::new();
         for abs in 0..total as isize {
-            let Some(cells) = self.terminal.line_at(abs) else {
+            let Some(cells) = self.active_tab().terminal.line_at(abs) else {
                 continue;
             };
             // One char per column. Drop trailing blanks so padding spaces don't
@@ -4839,8 +4848,8 @@ impl State {
     /// Scroll the viewport so the current match is visible, then redraw.
     fn focus_current_match(&mut self) {
         if let Some(m) = self.search.current_match() {
-            self.terminal.scroll_line_into_view(m.line);
-            self.scroll_y = 0.0;
+            self.active_tab_mut().terminal.scroll_line_into_view(m.line);
+            self.active_tab_mut().scroll_y = 0.0;
         }
         self.invalidate();
     }
@@ -4868,10 +4877,10 @@ impl State {
             // Route through the OSC-0/2 path so the existing title plumbing
             // (take_title_update -> effective_title) applies uniformly; the
             // event loop picks the change up after this returns.
-            A::SetTitle => self
+            A::SetTitle => self.active_tab_mut()
                 .terminal
                 .set_window_title(arg.as_deref().unwrap_or("")),
-            A::ClearTitle => self.terminal.set_window_title(""),
+            A::ClearTitle => self.active_tab_mut().terminal.set_window_title(""),
             A::ReloadConfig => self.reload_config(),
             // The picker hands back a label; map it to a scheme slot value
             // ("Default (built-in)" / empty -> None, revert to built-in).
@@ -4913,7 +4922,7 @@ impl State {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
-            A::NewWindow => spawn_new_window(self.terminal.cwd(), self.window_origin()),
+            A::NewWindow => spawn_new_window(self.active_tab().terminal.cwd(), self.window_origin()),
             // Re-arm first-run and relaunch into it. Each window owns a single
             // PTY (forked at startup, already attached to a shell), so there's
             // no in-place way to swap the running shell for onboarding —
@@ -4992,11 +5001,11 @@ impl State {
             self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
         );
-        self.terminal.resize(viewport.char_width, viewport.char_height);
+        self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
         self.sync_terminal_cell_size();
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
         true
     }
@@ -5089,14 +5098,14 @@ impl State {
         // fresh prompt per frame, so growing the window appears to push the
         // prompt downward. Gating on rows/cols collapses a drag back to one
         // signal per row boundary crossed.
-        let grid_changed = size.char_width != self.terminal.cols
-            || size.char_height != self.terminal.rows;
-        self.terminal.resize(size.char_width, size.char_height);
+        let grid_changed = size.char_width != self.active_tab().terminal.cols
+            || size.char_height != self.active_tab().terminal.rows;
+        self.active_tab_mut().terminal.resize(size.char_width, size.char_height);
         if grid_changed {
             self.notify_pty_size(size.char_width, size.char_height);
         }
         self.resize_buffers();
-        self.cursor_anim = None;
+        self.active_tab_mut().cursor_anim = None;
         self.invalidate();
     }
 
@@ -5118,12 +5127,12 @@ impl State {
             ws_ypixel: ypixel,
         };
         unsafe {
-            libc::ioctl(self.master, libc::TIOCSWINSZ, &ws);
+            libc::ioctl(self.active_tab().master, libc::TIOCSWINSZ, &ws);
         }
     }
 
     fn write_pty(&self, bytes: &[u8]) {
-        if let Err(e) = nix::unistd::write(self.master, bytes) {
+        if let Err(e) = nix::unistd::write(self.active_tab().master, bytes) {
             eprintln!("pty write failed: {e}");
         }
     }
@@ -5131,20 +5140,20 @@ impl State {
     /// Effective blink state: DECSCUSR's request is gated by the user's
     /// `cursor_blink` config so opting out disables blinking globally.
     fn cursor_blink_enabled(&self) -> bool {
-        self.config.cursor_blink && self.terminal.cursor_blink()
+        self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
     }
 
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the
     /// cursor exists at all; blink only suppresses it on the "off" half-phase
     /// of the cycle when DECSCUSR has selected a blinking variant.
     fn cursor_currently_visible(&self) -> bool {
-        self.terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
+        self.active_tab().terminal.cursor_visible() && (!self.cursor_blink_enabled() || self.blink_on)
     }
 
     /// If a blink half-cycle has elapsed, flip the phase and request a redraw.
     /// Returns true when the cursor visibility actually changed.
     fn maybe_blink_tick(&mut self) -> bool {
-        if !self.cursor_blink_enabled() || !self.terminal.cursor_visible() {
+        if !self.cursor_blink_enabled() || !self.active_tab().terminal.cursor_visible() {
             return false;
         }
         if self.last_blink.elapsed() < BLINK_INTERVAL {
@@ -5158,7 +5167,7 @@ impl State {
     /// Next instant the event loop should wake to flip the blink phase, or
     /// `None` if the cursor isn't blinking right now.
     fn next_blink_wake(&self) -> Option<std::time::Instant> {
-        if self.cursor_blink_enabled() && self.terminal.cursor_visible() {
+        if self.cursor_blink_enabled() && self.active_tab().terminal.cursor_visible() {
             Some(self.last_blink + BLINK_INTERVAL)
         } else {
             None
@@ -5176,11 +5185,11 @@ impl State {
     /// still fading. Keeps the event loop ticking until both finish so
     /// the redraw isn't held up waiting for the next PTY/blink event.
     fn is_cursor_animating(&self) -> bool {
-        let anim_active = match &self.cursor_anim {
+        let anim_active = match &self.active_tab().cursor_anim {
             Some(a) => a.animating(self.config.cursor_anim_secs),
             None => false,
         };
-        anim_active || !self.cursor_ghosts.is_empty()
+        anim_active || !self.active_tab().cursor_ghosts.is_empty()
     }
 
     /// Edge-fade distances `(bottom, top)` that drive the fade phases and the
@@ -5196,7 +5205,7 @@ impl State {
         scrollback_len: f32,
         line_height: f32,
     ) -> (f32, f32) {
-        if self.terminal.on_alt_screen() {
+        if self.active_tab().terminal.on_alt_screen() {
             (0.0, 0.0)
         } else {
             (
@@ -5209,15 +5218,15 @@ impl State {
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     fn is_top_fade_animating(&self) -> bool {
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let view_offset = self.terminal.view_offset() as f32;
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
         let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
@@ -5298,7 +5307,7 @@ impl State {
         // up the new scheme so the visible viewport actually changes
         // color, not just any new output printed after this point.
         // Truecolor cells (absolute RGB from the app) are left alone.
-        self.terminal.reresolve_palette();
+        self.active_tab_mut().terminal.reresolve_palette();
         // Cell vertex buffer caches bg colors and glyph fg colors per
         // cell; the sweep above just changed those values, so the
         // cached vertices are stale.
@@ -5361,7 +5370,7 @@ impl State {
             palette::linear_to_srgb_u8(c[1]),
             palette::linear_to_srgb_u8(c[2]),
         ];
-        self.terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
+        self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
     }
 
     /// 1-based (col, row) form of `pixel_to_visual_cell` for mouse reporting.
@@ -5406,7 +5415,7 @@ impl State {
     /// Forward a mouse event to the PTY in the host's preferred encoding,
     /// if any tracking mode is enabled. `motion` is set for drag/move events.
     fn report_mouse(&mut self, button: input::MouseButton, press: bool, motion: bool) {
-        let mp = self.terminal.mouse_protocol();
+        let mp = self.active_tab().terminal.mouse_protocol();
         if !mp.enabled() {
             return;
         }
@@ -5419,10 +5428,10 @@ impl State {
         let (col, row) = self.pixel_to_cell(self.mouse_x, self.mouse_y);
         if motion {
             // Coalesce: only report when the cell changes.
-            if self.last_reported_cell == Some((col, row)) {
+            if self.active_tab().last_reported_cell == Some((col, row)) {
                 return;
             }
-            self.last_reported_cell = Some((col, row));
+            self.active_tab_mut().last_reported_cell = Some((col, row));
         }
         let bytes = input::encode_mouse(button, col, row, press, motion, mp.sgr, self.modifiers);
         self.write_pty(&bytes);
@@ -5447,14 +5456,14 @@ impl State {
         // at both scroll-range boundaries (live grid and top of scrollback),
         // easing to 0 over one line in either direction. Out-of-sync formulas
         // here would drift the hit-test by a row vs. what's actually drawn.
-        let view_offset = self.terminal.view_offset() as f64;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let view_offset = self.active_tab().terminal.view_offset() as f64;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f64
+            self.active_tab().terminal.scrollback_len() as f64
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
@@ -5465,16 +5474,16 @@ impl State {
         let row_strip_top =
             WINDOW_PADDING as f64 + chrome_offset + line_height - ascender - strip_pad;
         let col = ((px - WINDOW_PADDING as f64) / cell_w).floor() as i64;
-        let row = ((py - row_strip_top - self.scroll_y) / line_height).floor() as i64;
-        let col = col.clamp(0, self.terminal.cols as i64 - 1) as usize;
-        let row = row.clamp(0, self.terminal.rows as i64 - 1) as isize;
+        let row = ((py - row_strip_top - self.active_tab().scroll_y) / line_height).floor() as i64;
+        let col = col.clamp(0, self.active_tab().terminal.cols as i64 - 1) as usize;
+        let row = row.clamp(0, self.active_tab().terminal.rows as i64 - 1) as isize;
         (col, row)
     }
 
     /// Pixel coord → absolute (line, col) selection point.
     fn pixel_to_selection_point(&self, px: f64, py: f64) -> (isize, usize) {
         let (col, vrow) = self.pixel_to_visual_cell(px, py);
-        (self.terminal.visual_to_abs_line(vrow), col)
+        (self.active_tab().terminal.visual_to_abs_line(vrow), col)
     }
 
     /// Recompute the URL under the mouse pointer. Tracks Cmd state so the
@@ -5494,12 +5503,12 @@ impl State {
         }
         let new = if self.modifiers.super_key() {
             let (col, vrow) = self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
-            let abs_line = self.terminal.visual_to_abs_line(vrow);
-            find_url_at(&self.terminal, abs_line, col)
+            let abs_line = self.active_tab().terminal.visual_to_abs_line(vrow);
+            find_url_at(&self.active_tab().terminal, abs_line, col)
         } else {
             None
         };
-        if new == self.hover_url {
+        if new == self.active_tab().hover_url {
             return;
         }
         let icon = if new.is_some() {
@@ -5508,7 +5517,7 @@ impl State {
             winit::window::CursorIcon::Text
         };
         self.window.set_cursor_icon(icon);
-        self.hover_url = new;
+        self.active_tab_mut().hover_url = new;
         self.invalidate();
     }
 
@@ -5518,23 +5527,23 @@ impl State {
     fn handle_mouse_press(&mut self) {
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
         let now = std::time::Instant::now();
-        let continued = self
+        let continued = self.active_tab()
             .last_click
             .map(|(t, c)| c == p && now.duration_since(t) < DOUBLE_CLICK_THRESHOLD)
             .unwrap_or(false);
-        self.click_count = if continued { (self.click_count % 3) + 1 } else { 1 };
-        self.last_click = Some((now, p));
-        self.selection_mode = match self.click_count {
+        self.active_tab_mut().click_count = if continued { (self.active_tab().click_count % 3) + 1 } else { 1 };
+        self.active_tab_mut().last_click = Some((now, p));
+        self.active_tab_mut().selection_mode = match self.active_tab().click_count {
             1 => SelectionMode::Cell,
             2 => SelectionMode::Word,
             _ => SelectionMode::Line,
         };
-        self.press_cell = Some(p);
-        self.press_pixel = Some((self.mouse_x, self.mouse_y));
+        self.active_tab_mut().press_cell = Some(p);
+        self.active_tab_mut().press_pixel = Some((self.mouse_x, self.mouse_y));
         // Word and Line modes show their selection on click. Cell mode waits
         // until the drag exceeds DRAG_THRESHOLD_PX so a plain click doesn't
         // briefly highlight a single character.
-        self.selection = match self.selection_mode {
+        self.active_tab_mut().selection = match self.active_tab().selection_mode {
             SelectionMode::Cell => None,
             _ => self.compute_selection(p, p),
         };
@@ -5542,9 +5551,9 @@ impl State {
 
     /// Update the head of the active selection from the current mouse pos.
     fn handle_mouse_drag(&mut self) {
-        let Some(p0) = self.press_cell else { return };
-        if self.selection_mode == SelectionMode::Cell && self.selection.is_none() {
-            let Some((px, py)) = self.press_pixel else { return };
+        let Some(p0) = self.active_tab().press_cell else { return };
+        if self.active_tab().selection_mode == SelectionMode::Cell && self.active_tab().selection.is_none() {
+            let Some((px, py)) = self.active_tab().press_pixel else { return };
             let dx = self.mouse_x - px;
             let dy = self.mouse_y - py;
             if dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
@@ -5552,23 +5561,23 @@ impl State {
             }
         }
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
-        self.selection = self.compute_selection(p0, p);
+        self.active_tab_mut().selection = self.compute_selection(p0, p);
     }
 
     fn handle_mouse_release(&mut self) {
-        self.press_cell = None;
-        self.press_pixel = None;
+        self.active_tab_mut().press_cell = None;
+        self.active_tab_mut().press_pixel = None;
     }
 
     /// Build a selection from two cells under the current `selection_mode`.
     /// In Word / Line mode, each end snaps outward to the word or line edge.
     fn compute_selection(&self, a: (isize, usize), b: (isize, usize)) -> Option<Selection> {
         let (start, end) = if a <= b { (a, b) } else { (b, a) };
-        let (start, end) = match self.selection_mode {
+        let (start, end) = match self.active_tab().selection_mode {
             SelectionMode::Cell => (start, end),
             SelectionMode::Word => (self.word_start(start), self.word_end(end)),
             SelectionMode::Line => {
-                let last = self.terminal.cols.saturating_sub(1);
+                let last = self.active_tab().terminal.cols.saturating_sub(1);
                 ((start.0, 0), (end.0, last))
             }
         };
@@ -5577,7 +5586,7 @@ impl State {
 
     /// Walk left from `p` while the previous cell is a word char.
     fn word_start(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -5590,7 +5599,7 @@ impl State {
 
     /// Walk right from `p` while the next cell is a word char.
     fn word_end(&self, p: (isize, usize)) -> (isize, usize) {
-        let Some(line) = self.terminal.line_at(p.0) else { return p };
+        let Some(line) = self.active_tab().terminal.line_at(p.0) else { return p };
         if p.1 >= line.len() || !is_word_char(line[p.1].ch) {
             return p;
         }
@@ -5604,10 +5613,10 @@ impl State {
     fn clear_selection(&mut self) -> bool {
         // Reset multi-click bookkeeping too — typing should make the next
         // click count as a fresh single-click.
-        self.last_click = None;
-        self.click_count = 0;
-        if self.selection.is_some() {
-            self.selection = None;
+        self.active_tab_mut().last_click = None;
+        self.active_tab_mut().click_count = 0;
+        if self.active_tab().selection.is_some() {
+            self.active_tab_mut().selection = None;
             true
         } else {
             false
@@ -5617,11 +5626,11 @@ impl State {
     /// Materialize the current selection as plain text, trimming trailing
     /// whitespace per line and joining with '\n'.
     fn selection_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
+        let sel = self.active_tab().selection.as_ref()?;
         let (start, end) = sel.range();
         let mut out = String::new();
         for line in start.0..=end.0 {
-            let Some(cells) = self.terminal.line_at(line) else { continue };
+            let Some(cells) = self.active_tab().terminal.line_at(line) else { continue };
             let from = if line == start.0 { start.1 } else { 0 };
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
@@ -5653,15 +5662,15 @@ impl State {
     /// `OutputStart`..`CommandEnd`). Returns false (no-op) when no completed
     /// command has any output. Drives the Cmd-Shift-O keybinding.
     fn select_last_command_output(&mut self) -> bool {
-        let Some((start_line, end_line)) = self.terminal.last_command_output_span() else {
+        let Some((start_line, end_line)) = self.active_tab().terminal.last_command_output_span() else {
             return false;
         };
-        let last_col = self.terminal.cols.saturating_sub(1);
-        self.selection = Some(Selection {
+        let last_col = self.active_tab().terminal.cols.saturating_sub(1);
+        self.active_tab_mut().selection = Some(Selection {
             anchor: (start_line, 0),
             head: (end_line, last_col),
         });
-        self.selection_mode = SelectionMode::Cell;
+        self.active_tab_mut().selection_mode = SelectionMode::Cell;
         self.copy_selection();
         self.invalidate();
         true
@@ -5688,13 +5697,13 @@ impl State {
         // extent was specified — `poll_pending_images` computes it from
         // the decoded image's pixel dimensions. The pre-allocated
         // ImageId is therefore discarded here; the OSC 1337 path uses it.
-        let (pending, _image_id) = self.image_store.request_insert(
+        let (pending, _image_id) = self.tabs[self.active].image_store.request_insert(
             bytes,
             self.config.images_max_pixels,
             std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
             Some(label.to_string()),
         );
-        self.pending_placements.push(PendingImagePlacement {
+        self.active_tab_mut().pending_placements.push(PendingImagePlacement {
             request: pending,
             row,
             col,
@@ -5721,11 +5730,11 @@ impl State {
         // base image's PendingImagePlacement finalizes and
         // `pending_placements` empties — and the animation stays
         // pinned on its first frame forever.
-        if self.pending_placements.is_empty() && self.image_store.pending_count() == 0 {
+        if self.tabs[self.active].pending_placements.is_empty() && self.tabs[self.active].image_store.pending_count() == 0 {
             return;
         }
         let nearest = self.config.images_filter == "nearest";
-        let results = self.image_store.poll(
+        let results = self.tabs[self.active].image_store.poll(
             &self.image_pipeline,
             &self.shared.gpu.device,
             &self.shared.gpu.queue,
@@ -5749,9 +5758,9 @@ impl State {
         // whole `cat`/`icat` in one burst and reliably lose this race;
         // slower debug builds spread ingest across events and win it.)
         if should_rearm_image_poll(
-            self.pending_placements.is_empty(),
+            self.active_tab().pending_placements.is_empty(),
             results.is_empty(),
-            self.image_store.pending_count(),
+            self.active_tab().image_store.pending_count(),
         ) {
             self.window.request_redraw();
         }
@@ -5763,7 +5772,7 @@ impl State {
         let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let mut any_placed = false;
         for (pending_id, outcome) in results {
-            let Some(i) = self
+            let Some(i) = self.active_tab()
                 .pending_placements
                 .iter()
                 .position(|p| p.request == pending_id)
@@ -5773,12 +5782,12 @@ impl State {
                 // current code paths). Drop the GPU upload on the floor.
                 continue;
             };
-            let pp = self.pending_placements.remove(i);
+            let pp = self.active_tab_mut().pending_placements.remove(i);
             match (outcome, pp.preplaced_image_id) {
                 // Deferred path success: compute extent from pixel dims
                 // and create the placement now.
                 (Ok(image_id), None) => {
-                    let img = self
+                    let img = self.active_tab()
                         .image_store
                         .peek(image_id)
                         .expect("just-inserted image");
@@ -5786,7 +5795,7 @@ impl State {
                     let cols = (img.width_px + cell_w - 1) / cell_w;
                     let rows = rows.clamp(1, u16::MAX as u32) as u16;
                     let cols = cols.clamp(1, u16::MAX as u32) as u16;
-                    self.terminal
+                    self.active_tab_mut().terminal
                         .insert_placement(image_id, pp.row, pp.col, rows, cols, 0);
                     any_placed = true;
                 }
@@ -5803,7 +5812,7 @@ impl State {
                 // the user doesn't stare at a blank space forever.
                 (Err(e), Some(image_id)) => {
                     eprintln!("image decode failed: {e}");
-                    let removed = self.terminal.remove_placements_with_image(image_id);
+                    let removed = self.active_tab_mut().terminal.remove_placements_with_image(image_id);
                     if removed > 0 {
                         any_placed = true; // grid changed; redraw
                     }
@@ -6003,16 +6012,16 @@ impl State {
         if images_enabled && !opted_in {
             return out;
         }
-        let cols = self.terminal.cols;
-        let view_offset = self.terminal.view_offset();
-        let rows = self.terminal.rows;
-        for p in self.terminal.live_placements() {
-            let is_pending = self.image_store.is_pending(p.image);
-            let gpu_ok = self.image_store.peek(p.image).is_some();
+        let cols = self.active_tab().terminal.cols;
+        let view_offset = self.active_tab().terminal.view_offset();
+        let rows = self.active_tab().terminal.rows;
+        for p in self.active_tab().terminal.live_placements() {
+            let is_pending = self.active_tab().image_store.is_pending(p.image);
+            let gpu_ok = self.active_tab().image_store.peek(p.image).is_some();
             if !Self::should_halfblock(images_enabled, opted_in, is_pending, gpu_ok) {
                 continue;
             }
-            let Some(preview) = self.image_store.preview(p.image) else {
+            let Some(preview) = self.active_tab().image_store.preview(p.image) else {
                 // Disabled-but-no-preview: nothing to draw with. The
                 // empty space is the right behaviour here; users who
                 // want a placeholder would have to wait for a future
@@ -6052,7 +6061,7 @@ impl State {
     /// advance and placement insertion — leaving the placement at a
     /// stale anchor. See sub-slice P2.4 design notes.
     fn feed_terminal(&mut self, bytes: &str) {
-        self.terminal.feed(bytes);
+        self.active_tab_mut().terminal.feed(bytes);
         self.maybe_start_alt_scroll();
         self.drain_pending_image_uploads();
     }
@@ -6065,7 +6074,7 @@ impl State {
         if ALT_SCROLL_ANIM_SECS <= 0.0 {
             return;
         }
-        let Some(scroll) = self.terminal.take_alt_scroll() else {
+        let Some(scroll) = self.active_tab_mut().terminal.take_alt_scroll() else {
             return;
         };
         // The renderer slides the region and clips its bottom edge, so the
@@ -6075,13 +6084,13 @@ impl State {
         // bleed past its top edge, so skip the slide there; the scroll has
         // already been applied to the grid, it just snaps instead of animating.
         if scroll.region_top != 0 {
-            self.terminal.clear_alt_anim();
+            self.active_tab_mut().terminal.clear_alt_anim();
             return;
         }
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let total_px = scroll.rows as f32 * line_height;
-        self.alt_scroll_anim = Some(AltScrollAnim {
+        self.active_tab_mut().alt_scroll_anim = Some(AltScrollAnim {
             up: scroll.up,
             rows: scroll.rows,
             region_top: scroll.region_top,
@@ -6091,7 +6100,7 @@ impl State {
         });
         // Start displaying the pre-scroll frame: shift the (already-scrolled)
         // grid back by the full distance so the departing rows fill the gap.
-        self.scroll_y = if scroll.up { total_px } else { -total_px } as f64;
+        self.active_tab_mut().scroll_y = if scroll.up { total_px } else { -total_px } as f64;
         self.invalidate();
     }
 
@@ -6099,12 +6108,12 @@ impl State {
     /// toward zero. Finishes (and releases the frozen rows) when the slide
     /// completes or the alt screen is no longer active. No-op when idle.
     fn update_alt_scroll(&mut self) {
-        let Some(anim) = self.alt_scroll_anim else {
+        let Some(anim) = self.active_tab().alt_scroll_anim else {
             return;
         };
-        if !self.terminal.on_alt_screen() {
+        if !self.active_tab().terminal.on_alt_screen() {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
         let t = (anim.started.elapsed().as_secs_f32() / ALT_SCROLL_ANIM_SECS).clamp(0.0, 1.0);
@@ -6113,25 +6122,25 @@ impl State {
         let remaining = anim.total_px * (1.0 - eased);
         if t >= 1.0 || remaining <= 0.5 {
             self.finish_alt_scroll();
-            self.scroll_y = 0.0;
+            self.active_tab_mut().scroll_y = 0.0;
             return;
         }
-        self.scroll_y = if anim.up { remaining } else { -remaining } as f64;
+        self.active_tab_mut().scroll_y = if anim.up { remaining } else { -remaining } as f64;
     }
 
     /// End any alt-screen scroll slide and drop the terminal's frozen rows.
     /// Leaves `scroll_y` untouched — callers that cancel mid-slide (a keystroke
     /// snapping the view) zero it themselves.
     fn finish_alt_scroll(&mut self) {
-        if self.alt_scroll_anim.take().is_some() {
-            self.terminal.clear_alt_anim();
+        if self.active_tab_mut().alt_scroll_anim.take().is_some() {
+            self.active_tab_mut().terminal.clear_alt_anim();
         }
     }
 
     /// True while an alt-screen scroll slide is mid-flight — keeps the event
     /// loop ticking frames until it settles.
     fn is_alt_scroll_animating(&self) -> bool {
-        self.alt_scroll_anim.is_some()
+        self.active_tab().alt_scroll_anim.is_some()
     }
 
     /// Refresh the cached completion-popup suggestions, but only when the
@@ -6141,25 +6150,25 @@ impl State {
     /// doesn't dump the whole cwd. Returns true if the cache changed (so the
     /// caller can request a redraw).
     fn recompute_completions(&mut self) -> bool {
-        let cur = self.terminal.current_input().cloned();
+        let cur = self.active_tab().terminal.current_input().cloned();
         let key = cur.as_ref().map(|c| (c.buffer.clone(), c.cursor));
-        if key == self.completions_input {
+        if key == self.active_tab().completions_input {
             return false;
         }
-        self.completions_input = key;
+        self.active_tab_mut().completions_input = key;
         // A dismissed popup (Enter/Esc) must not reopen when the shell re-emits
         // OSC 2122 after an accepted suffix — keep it empty until a real
         // keystroke clears the flag. The `autocomplete` config gate works the
         // same way: when the feature is off, never run `completion::complete`,
         // just keep the cache empty (read live so config reload toggles it).
-        self.completions = if self.completion_dismissed || !self.config.autocomplete {
+        self.active_tab_mut().completions = if self.active_tab().completion_dismissed || !self.config.autocomplete {
             Vec::new()
         } else {
             match &cur {
                 // `complete` returns empty for empty/whitespace input on its own
                 // (no history match, empty token skipped), so no separate gate.
                 Some(c) => {
-                    let cwd = self.terminal.cwd().map(std::path::Path::new);
+                    let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
                     let path = std::env::var_os("PATH");
                     let home = std::env::var_os("HOME");
                     completion::complete(
@@ -6168,7 +6177,7 @@ impl State {
                         cwd,
                         path.as_deref(),
                         home.as_deref().map(std::path::Path::new),
-                        &self.command_history,
+                        &self.active_tab().command_history,
                         false,
                     )
                 }
@@ -6177,8 +6186,8 @@ impl State {
         };
         // The cache was replaced: restart selection at the top and reset the
         // scroll window so navigation state never points past a shorter list.
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         true
     }
 
@@ -6195,29 +6204,29 @@ impl State {
         if !self.config.autocomplete {
             return;
         }
-        self.completion_dismissed = false;
+        self.active_tab_mut().completion_dismissed = false;
         // Clone the buffer/cursor out of the immutable `current_input()` borrow so
         // it ends before we take `cwd()` and then mutably write `self.*` fields.
-        if let Some((buffer, cursor)) = self
+        if let Some((buffer, cursor)) = self.active_tab()
             .terminal
             .current_input()
             .map(|c| (c.buffer.clone(), c.cursor))
         {
-            let cwd = self.terminal.cwd().map(std::path::Path::new);
+            let cwd = self.active_tab().terminal.cwd().map(std::path::Path::new);
             let path = std::env::var_os("PATH");
             let home = std::env::var_os("HOME");
-            self.completions = completion::complete(
+            self.active_tab_mut().completions = completion::complete(
                 &buffer,
                 cursor,
                 cwd,
                 path.as_deref(),
                 home.as_deref().map(std::path::Path::new),
-                &self.command_history,
+                &self.active_tab().command_history,
                 true,
             );
-            self.completions_input = Some((buffer, cursor));
-            self.selected_completion = 0;
-            self.completion_scroll = 0;
+            self.active_tab_mut().completions_input = Some((buffer, cursor));
+            self.active_tab_mut().selected_completion = 0;
+            self.active_tab_mut().completion_scroll = 0;
         }
         self.invalidate();
     }
@@ -6240,16 +6249,16 @@ impl State {
     /// submits as-typed). `submit` implies not-keep-open and always closes the
     /// popup (the command is running, so the popup must go).
     fn accept_selected_completion(&mut self, keep_open: bool, submit: bool) {
-        let Some(sug) = self.completions.get(self.selected_completion) else {
+        let Some(sug) = self.active_tab().completions.get(self.active_tab().selected_completion) else {
             return;
         };
         // Clone the suggestion so the byte payload below can hold the immutable
-        // `self.terminal` borrow without also borrowing `self.completions`.
+        // `self.active_tab().terminal` borrow without also borrowing `self.active_tab().completions`.
         let sug = sug.clone();
         // Build the byte payload (cloning the suffix) while holding the
-        // immutable `self.terminal` borrow, then drop it before the &self
+        // immutable `self.active_tab().terminal` borrow, then drop it before the &self
         // `write_pty` call below.
-        let bytes: Option<Vec<u8>> = self.terminal.current_input().map(|c| {
+        let bytes: Option<Vec<u8>> = self.active_tab().terminal.current_input().map(|c| {
             let mut bytes = match completion::accept_suffix(&c.buffer, c.cursor, &sug) {
                 Some(suffix) => suffix.as_bytes().to_vec(),
                 // A stale / non-extending suggestion: no suffix to insert, but
@@ -6269,22 +6278,22 @@ impl State {
         if submit {
             // Submitting: the command is running, so the popup must close and
             // stay closed until the user types again.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         } else if keep_open {
             // Drilling into a directory: force a fresh recompute on the next
             // OSC 2122 report, but leave the popup open and undismissed so the
             // round-trip refilters to the subdirectory's contents.
-            self.completions_input = None;
+            self.active_tab_mut().completions_input = None;
         } else {
             // Finishing: close and keep closed until the user types.
-            self.completions.clear();
-            self.completions_input = None;
-            self.completion_dismissed = true;
+            self.active_tab_mut().completions.clear();
+            self.active_tab_mut().completions_input = None;
+            self.active_tab_mut().completion_dismissed = true;
         }
-        self.selected_completion = 0;
-        self.completion_scroll = 0;
+        self.active_tab_mut().selected_completion = 0;
+        self.active_tab_mut().completion_scroll = 0;
         self.invalidate();
     }
 
@@ -6298,10 +6307,10 @@ impl State {
         if !self.config.images_enabled {
             // Drain anyway so the queue doesn't grow unboundedly if the
             // config is toggled at runtime.
-            let _ = self.terminal.take_pending_image_uploads();
+            let _ = self.active_tab_mut().terminal.take_pending_image_uploads();
             return;
         }
-        let uploads = self.terminal.take_pending_image_uploads();
+        let uploads = self.active_tab_mut().terminal.take_pending_image_uploads();
         if uploads.is_empty() {
             return;
         }
@@ -6310,10 +6319,10 @@ impl State {
             // straight into the store's playback-state mutation.
             if let Some(ctrl) = up.animation_control.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(image_id) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(image_id) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
-                self.image_store.apply_animation_control(
+                self.active_tab_mut().image_store.apply_animation_control(
                     image_id,
                     ctrl.control,
                     ctrl.loop_count,
@@ -6334,11 +6343,11 @@ impl State {
             // payloads go through the worker.
             if let Some(frame_spec) = up.animation_frame.clone() {
                 let Some(client_id) = up.kitty_image_id else { continue };
-                let Some(parent) = self.terminal.kitty_image_id_lookup(client_id) else {
+                let Some(parent) = self.active_tab().terminal.kitty_image_id_lookup(client_id) else {
                     continue;
                 };
                 if let Some((w, h)) = up.raw_rgba_dims {
-                    let _ = self.image_store.request_insert_frame_rgba(
+                    let _ = self.active_tab_mut().image_store.request_insert_frame_rgba(
                         parent,
                         up.bytes,
                         w,
@@ -6351,7 +6360,7 @@ impl State {
                         frame_spec.dst_y,
                     );
                 } else {
-                    let _ = self.image_store.request_insert_frame(
+                    let _ = self.tabs[self.active].image_store.request_insert_frame(
                         parent,
                         up.bytes,
                         self.config.images_max_pixels,
@@ -6377,21 +6386,21 @@ impl State {
             // payloads (signaled by `raw_rgba_dims`) skip the decode
             // worker entirely; PNG-style payloads go through it.
             let (pending, image_id) = if let Some((w, h)) = up.raw_rgba_dims {
-                self.image_store.request_insert_animatable_rgba(
+                self.active_tab_mut().image_store.request_insert_animatable_rgba(
                     up.bytes,
                     w,
                     h,
                     up.label,
                 )
             } else if up.kitty_image_id.is_some() {
-                self.image_store.request_insert_animatable(
+                self.tabs[self.active].image_store.request_insert_animatable(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
                     up.label,
                 )
             } else {
-                self.image_store.request_insert(
+                self.tabs[self.active].image_store.request_insert(
                     up.bytes,
                     self.config.images_max_pixels,
                     std::time::Duration::from_millis(self.config.images_decode_timeout_ms),
@@ -6403,7 +6412,7 @@ impl State {
             // (delete). Register the mapping immediately so those ops
             // resolve even before the decode completes.
             if let Some(client_id) = up.kitty_image_id {
-                self.terminal.register_kitty_image_id(client_id, image_id);
+                self.active_tab_mut().terminal.register_kitty_image_id(client_id, image_id);
             }
             let (rows, cols) = up.cell_extent;
             let (row, col) = up.cell_anchor;
@@ -6416,7 +6425,7 @@ impl State {
                 // ids all thread onto the Placement. For iTerm OSCs all
                 // the Kitty-only fields are at their defaults so this
                 // produces the same result as `insert_placement`.
-                self.terminal.insert_placement_kitty(
+                self.active_tab_mut().terminal.insert_placement_kitty(
                     image_id,
                     row,
                     col,
@@ -6429,7 +6438,7 @@ impl State {
                     up.kitty_placement_id,
                 );
             }
-            self.pending_placements.push(PendingImagePlacement {
+            self.active_tab_mut().pending_placements.push(PendingImagePlacement {
                 request: pending,
                 row,
                 col,
@@ -6455,7 +6464,7 @@ impl State {
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
-        self.terminal.set_cell_size_px(cell_w, line_h);
+        self.active_tab_mut().terminal.set_cell_size_px(cell_w, line_h);
     }
 
     /// Path used by the Cmd-Shift-I keybind. Env var override beats the
@@ -6478,7 +6487,7 @@ impl State {
                 return;
             }
         };
-        if self.terminal.bracketed_paste() {
+        if self.active_tab().terminal.bracketed_paste() {
             self.write_pty(b"\x1b[200~");
             self.write_pty(text.as_bytes());
             self.write_pty(b"\x1b[201~");
@@ -6512,7 +6521,7 @@ impl State {
                     self.window
                         .set_cursor_icon(winit::window::CursorIcon::Default);
                     force_native_arrow_cursor(&self.window);
-                    if self.hover_url.take().is_some() {
+                    if self.active_tab_mut().hover_url.take().is_some() {
                         self.invalidate();
                     }
                     return true;
@@ -6528,11 +6537,11 @@ impl State {
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.
                 let mouse_mode_active =
-                    self.terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
+                    self.active_tab().terminal.mouse_protocol().enabled() && !self.modifiers.shift_key();
                 if mouse_mode_active {
                     if let Some(b) = self.held_button {
                         self.report_mouse(b, true, true);
-                    } else if self.terminal.mouse_protocol().any_motion {
+                    } else if self.active_tab().terminal.mouse_protocol().any_motion {
                         // Per xterm, "no button" motion uses code 3 (release-ish).
                         self.report_mouse(3, true, true);
                     }
@@ -6601,7 +6610,7 @@ impl State {
                         && code == input::MOUSE_LEFT
                         && self.modifiers.super_key()
                     {
-                        if let Some(hu) = self.hover_url.clone() {
+                        if let Some(hu) = self.active_tab().hover_url.clone() {
                             if is_safe_url(&hu.url) {
                                 open_url(&hu.url);
                             }
@@ -6610,7 +6619,7 @@ impl State {
                             return true;
                         }
                     }
-                    let mouse_mode_active = self.terminal.mouse_protocol().enabled()
+                    let mouse_mode_active = self.active_tab().terminal.mouse_protocol().enabled()
                         && !self.modifiers.shift_key();
                     if mouse_mode_active {
                         self.report_mouse(code, press, false);
@@ -6648,24 +6657,24 @@ impl State {
                 const FRESH_GESTURE_GAP: std::time::Duration =
                     std::time::Duration::from_millis(100);
                 let now = std::time::Instant::now();
-                let gap = self.last_wheel_at.map(|t| now.duration_since(t));
+                let gap = self.active_tab().last_wheel_at.map(|t| now.duration_since(t));
                 if matches!(phase, TouchPhase::Started)
                     && gap.map_or(true, |g| g >= FRESH_GESTURE_GAP)
                 {
-                    self.scroll_suppressed = false;
+                    self.active_tab_mut().scroll_suppressed = false;
                 }
-                if self.scroll_suppressed {
+                if self.active_tab().scroll_suppressed {
                     // Don't advance `last_wheel_at` on suppressed events —
                     // otherwise the steady stream of momentum ticks keeps
                     // resetting the idle gap, and a real fresh gesture that
                     // arrives mid-momentum still looks like a 16ms follow-up.
                     return true;
                 }
-                self.last_wheel_at = Some(now);
+                self.active_tab_mut().last_wheel_at = Some(now);
                 // Scroll-wheel forwarding to the PTY when an app has asked
                 // for mouse tracking (vim, less, htop). Otherwise the wheel
                 // drives our own scrollback viewport.
-                if self.terminal.mouse_protocol().enabled() {
+                if self.active_tab().terminal.mouse_protocol().enabled() {
                     // Accumulate pixels so a slow trackpad gesture (many
                     // sub-line events) still produces wheel reports instead
                     // of truncating every event to 0. LineDelta synthesizes
@@ -6675,7 +6684,7 @@ impl State {
                         MouseScrollDelta::PixelDelta(p) => p.y,
                     };
                     let notches = input::drain_wheel_accum(
-                        &mut self.wheel_pty_accum,
+                        &mut self.active_tab_mut().wheel_pty_accum,
                         pixels,
                         line_height,
                     );
@@ -6695,18 +6704,18 @@ impl State {
                 // disabled, swallow the wheel: full-screen apps provide their
                 // own keyboard motion, and without this guard trackpad pixels
                 // would accumulate in scroll_y and drift the grid past bounds.
-                if self.terminal.on_alt_screen() {
-                    if self.terminal.alternate_scroll() {
+                if self.active_tab().terminal.on_alt_screen() {
+                    if self.active_tab().terminal.alternate_scroll() {
                         let pixels = match delta {
                             MouseScrollDelta::LineDelta(_, d) => *d as f64 * line_height,
                             MouseScrollDelta::PixelDelta(p) => p.y,
                         };
                         let notches = input::drain_wheel_accum(
-                            &mut self.wheel_pty_accum,
+                            &mut self.active_tab_mut().wheel_pty_accum,
                             pixels,
                             line_height,
                         );
-                        let app_cursor = self.terminal.app_cursor_keys();
+                        let app_cursor = self.active_tab().terminal.app_cursor_keys();
                         for _ in 0..notches.up {
                             self.write_pty(&input::alt_scroll_key(true, app_cursor));
                         }
@@ -6721,7 +6730,7 @@ impl State {
                         // No alternate scroll and no scrollback to navigate —
                         // swallow the wheel so trackpad pixels can't drift the
                         // grid via an accumulated offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     return true;
                 }
@@ -6729,39 +6738,39 @@ impl State {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
                         if *d > 0.0 {
-                            self.terminal.scroll_up(n);
+                            self.active_tab_mut().terminal.scroll_up(n);
                         } else if *d < 0.0 {
-                            self.terminal.scroll_down(n);
+                            self.active_tab_mut().terminal.scroll_down(n);
                         }
                         // Discrete scrolls snap — don't leave a sub-line offset.
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                     }
                     MouseScrollDelta::PixelDelta(p) => {
-                        self.scroll_y += p.y;
+                        self.active_tab_mut().scroll_y += p.y;
                         // Drain accumulated pixels into discrete line scrolls.
                         // Zero the residue if scroll_up/down refused so scroll_y
                         // can't accumulate past a viewport boundary regardless
                         // of what at_top/at_bottom report.
-                        while self.scroll_y >= line_height {
-                            if !self.terminal.scroll_up(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y >= line_height {
+                            if !self.active_tab_mut().terminal.scroll_up(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y -= line_height;
+                            self.active_tab_mut().scroll_y -= line_height;
                         }
-                        while self.scroll_y <= -line_height {
-                            if !self.terminal.scroll_down(1) {
-                                self.scroll_y = 0.0;
+                        while self.active_tab().scroll_y <= -line_height {
+                            if !self.active_tab_mut().terminal.scroll_down(1) {
+                                self.active_tab_mut().scroll_y = 0.0;
                                 break;
                             }
-                            self.scroll_y += line_height;
+                            self.active_tab_mut().scroll_y += line_height;
                         }
                         // Hard-stop at viewport boundaries: no elastic overscroll.
-                        if self.scroll_y > 0.0 && self.terminal.at_top() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y > 0.0 && self.active_tab().terminal.at_top() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
-                        if self.scroll_y < 0.0 && self.terminal.at_bottom() {
-                            self.scroll_y = 0.0;
+                        if self.active_tab().scroll_y < 0.0 && self.active_tab().terminal.at_bottom() {
+                            self.active_tab_mut().scroll_y = 0.0;
                         }
                     }
                 }
@@ -6831,16 +6840,16 @@ impl State {
                         if self.modifiers.shift_key() {
                             use winit::keyboard::{Key, NamedKey};
                             if event.logical_key == Key::Named(NamedKey::ArrowUp) {
-                                if self.terminal.scroll_to_prev_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_prev_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
                                 return true;
                             }
                             if event.logical_key == Key::Named(NamedKey::ArrowDown) {
-                                if self.terminal.scroll_to_next_prompt() {
-                                    self.scroll_y = 0.0;
+                                if self.active_tab_mut().terminal.scroll_to_next_prompt() {
+                                    self.active_tab_mut().scroll_y = 0.0;
                                     self.invalidate();
                                     self.update_hover_url();
                                 }
@@ -6862,7 +6871,7 @@ impl State {
                             // !shift so Cmd-Shift-N stays free for a future
                             // binding.
                             if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
-                                spawn_new_window(self.terminal.cwd(), self.window_origin());
+                                spawn_new_window(self.active_tab().terminal.cwd(), self.window_origin());
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -6906,7 +6915,7 @@ impl State {
                                 && (s.eq_ignore_ascii_case("i"))
                             {
                                 if let Some(path) = Self::debug_image_path() {
-                                    let cur = self.terminal.cursor();
+                                    let cur = self.active_tab().terminal.cursor();
                                     let row = cur.row as isize;
                                     let col = cur.col as isize;
                                     let path_str = path.to_string_lossy().to_string();
@@ -6977,20 +6986,20 @@ impl State {
                     // means these keys reach the shell normally when no popup is
                     // open, and only steer the popup while it is.
                     let popup_active =
-                        !self.completions.is_empty() && self.terminal.view_offset() == 0;
+                        !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
                     let plain = !self.modifiers.control_key()
                         && !self.modifiers.alt_key()
                         && !self.modifiers.super_key();
                     if popup_active && plain {
                         use winit::keyboard::{Key, NamedKey};
-                        let len = self.completions.len();
+                        let len = self.active_tab().completions.len();
                         match &event.logical_key {
                             Key::Named(NamedKey::ArrowDown) => {
-                                self.selected_completion =
-                                    (self.selected_completion + 1).min(len - 1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    (self.active_tab().selected_completion + 1).min(len - 1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -6998,22 +7007,22 @@ impl State {
                             }
                             // ArrowUp, and Shift-Tab, move the selection up.
                             Key::Named(NamedKey::ArrowUp) => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
                                 return true;
                             }
                             Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
-                                self.selected_completion =
-                                    self.selected_completion.saturating_sub(1);
-                                self.completion_scroll = completion::visible_window_start(
-                                    self.selected_completion,
-                                    self.completion_scroll,
+                                self.active_tab_mut().selected_completion =
+                                    self.active_tab().selected_completion.saturating_sub(1);
+                                self.active_tab_mut().completion_scroll = completion::visible_window_start(
+                                    self.active_tab().selected_completion,
+                                    self.active_tab().completion_scroll,
                                     COMPLETION_MAX_VISIBLE,
                                 );
                                 self.invalidate();
@@ -7023,9 +7032,9 @@ impl State {
                             // in (popup stays open and refilters to the dir's
                             // contents); on a file it accepts and closes.
                             Key::Named(NamedKey::Tab) => {
-                                let keep = self
+                                let keep = self.active_tab()
                                     .completions
-                                    .get(self.selected_completion)
+                                    .get(self.active_tab().selected_completion)
                                     .map(|s| s.is_dir)
                                     .unwrap_or(false);
                                 self.accept_selected_completion(keep, false);
@@ -7052,9 +7061,9 @@ impl State {
                                 // set the dismissed flag so the popup stays
                                 // closed even when the shell re-reports input,
                                 // until the user types more.
-                                self.completions.clear();
-                                self.completions_input = None;
-                                self.completion_dismissed = true;
+                                self.active_tab_mut().completions.clear();
+                                self.active_tab_mut().completions_input = None;
+                                self.active_tab_mut().completion_dismissed = true;
                                 self.invalidate();
                                 return true;
                             }
@@ -7080,28 +7089,28 @@ impl State {
                         logical_key,
                         text,
                         self.modifiers,
-                        self.terminal.app_cursor_keys(),
+                        self.active_tab().terminal.app_cursor_keys(),
                     );
                     if let Some(bytes) = bytes {
                         // A keystroke we're sending to the PTY snaps the view
                         // back to the live grid; passive modifiers (Cmd+C etc.)
                         // returned None and don't touch the scroll state.
-                        self.terminal.scroll_to_bottom();
+                        self.active_tab_mut().terminal.scroll_to_bottom();
                         // A keystroke cancels any alt-screen scroll slide —
                         // snap straight to the settled frame.
                         self.finish_alt_scroll();
-                        self.scroll_y = 0.0;
+                        self.active_tab_mut().scroll_y = 0.0;
                         // Drop any in-flight trackpad momentum so the snap
                         // sticks — otherwise the tail of the flick keeps
                         // scrolling the view away from the bottom.
-                        self.scroll_suppressed = true;
+                        self.active_tab_mut().scroll_suppressed = true;
                         self.reset_blink();
                         self.clear_selection();
                         // A genuine keystroke re-enables the popup after a
                         // finish/dismiss. The auto-inserted accept suffix goes
                         // through `write_pty` directly (not this path), so
                         // accepting never clears the flag — only real input does.
-                        self.completion_dismissed = false;
+                        self.active_tab_mut().completion_dismissed = false;
                         self.write_pty(&bytes);
                         self.invalidate();
                         return true;
@@ -7169,19 +7178,19 @@ impl State {
         let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
-        let view_offset = self.terminal.view_offset() as f32;
-        let scrollback_len = if self.terminal.on_alt_screen() {
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0
         } else {
-            self.terminal.scrollback_len() as f32
+            self.active_tab().terminal.scrollback_len() as f32
         };
-        let dist_from_bottom = view_offset * line_height + self.scroll_y as f32;
-        let dist_from_top = (scrollback_len - view_offset) * line_height - self.scroll_y as f32;
+        let dist_from_bottom = view_offset * line_height + self.active_tab().scroll_y as f32;
+        let dist_from_top = (scrollback_len - view_offset) * line_height - self.active_tab().scroll_y as f32;
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
-        let scroll_y = self.scroll_y as f32;
+        let scroll_y = self.active_tab().scroll_y as f32;
 
         // Resolve store entries up front so the borrow can live alongside
         // the upcoming `&mut encoder` calls. Placements whose image was
@@ -7204,20 +7213,20 @@ impl State {
         // in.
         let mut image_draws: Vec<renderer::images::ImageDraw<'_>> = Vec::new();
         if self.config.images_enabled {
-            let view_offset = self.terminal.view_offset();
-            let rows = self.terminal.rows;
-            let scrollback_draws = self
+            let view_offset = self.active_tab().terminal.view_offset();
+            let rows = self.active_tab().terminal.rows;
+            let scrollback_draws = self.active_tab()
                 .terminal
-                .scrollback_placements_in_view(self.terminal.rows);
+                .scrollback_placements_in_view(self.active_tab().terminal.rows);
             image_draws.reserve(
-                self.terminal.live_placements().len() + scrollback_draws.len(),
+                self.active_tab().terminal.live_placements().len() + scrollback_draws.len(),
             );
             // `(viewport_row, placement)` tuples — by the time the pixel
             // math runs, the row index is in viewport coords. Live
             // placements get the same shift `extended_cell` applies to
             // cells (history rows push live content down); scrollback
             // placements arrive pre-shifted from `scrollback_placements_in_view`.
-            let live_iter = self.terminal.live_placements().iter().map(|p| {
+            let live_iter = self.active_tab().terminal.live_placements().iter().map(|p| {
                 (
                     Self::live_placement_viewport_row(p.top_row, view_offset, rows),
                     p,
@@ -7229,7 +7238,7 @@ impl State {
                 // peek_at picks the current animation frame for animated
                 // images; for static images it returns the same texture
                 // as peek().
-                let Some(gpu_img) = self.image_store.peek_at(p.image, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(p.image, now) else { continue };
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
@@ -7277,19 +7286,19 @@ impl State {
             // halfway through the image — visibly clips at the
             // surviving cells instead of distorting the image into
             // whatever shrinking rect remained.
-            for run in self.terminal.kitty_placeholder_runs() {
-                let Some(store_id) = self.terminal.kitty_image_id_lookup(run.client_id)
+            for run in self.active_tab().terminal.kitty_placeholder_runs() {
+                let Some(store_id) = self.active_tab().terminal.kitty_image_id_lookup(run.client_id)
                 else {
                     continue;
                 };
                 let Some((total_cols, total_rows)) =
-                    self.terminal.kitty_image_cell_extent(run.client_id)
+                    self.active_tab().terminal.kitty_image_cell_extent(run.client_id)
                 else {
                     // No `c=`/`r=` on the transmission — no honest
                     // UV denominator. Skip rather than guess.
                     continue;
                 };
-                let Some(gpu_img) = self.image_store.peek_at(store_id, now) else { continue };
+                let Some(gpu_img) = self.active_tab().image_store.peek_at(store_id, now) else { continue };
                 // `run.screen_row` is already in the same visual-row
                 // frame `update_vertices` uses (the scanner walks
                 // `extended_cell(-2..rows+2, ..)`), so plug it
@@ -7929,13 +7938,13 @@ async fn run() {
     lap("after font faces + shaper built");
     let mut state = State::new(fdm, window, gpu, surface, font, shaper, config, dpi).await;
     lap("after State::new (GPU/atlas/pipelines)");
-    state.notify_pty_size(state.terminal.cols, state.terminal.rows);
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window
     // exists; the field was seeded with the renderer's reserve in State::new.
     state.refresh_chrome_band();
     state.window.set_cursor_icon(winit::window::CursorIcon::Text);
     state.sync_theme_colors();
-    state
+    state.tabs[state.active]
         .terminal
         .set_keep_placements_in_scrollback(state.config.images_in_scrollback);
     state.sync_terminal_cell_size();
@@ -7962,7 +7971,7 @@ async fn run() {
                     let bytes = z.len();
                     let t0 = std::time::Instant::now();
                     state.feed_terminal(&z);
-                    let reply = state.terminal.take_response();
+                    let reply = state.active_tab_mut().terminal.take_response();
                     if !reply.is_empty() {
                         state.write_pty(&reply);
                     }
@@ -7971,40 +7980,40 @@ async fn run() {
                     // manual title wins; otherwise we show the cwd ($HOME
                     // collapsed to `~`). Both `take_*` calls must run to clear
                     // their dirty flags even when the title doesn't change.
-                    let title_changed = state.terminal.take_title_update().map(|t| {
+                    let title_changed = state.active_tab_mut().terminal.take_title_update().map(|t| {
                         manual_title = t;
                     });
-                    let cwd_changed = state.terminal.take_cwd_update();
+                    let cwd_changed = state.active_tab_mut().terminal.take_cwd_update();
                     if title_changed.is_some() || cwd_changed.is_some() {
                         state.window.set_title(&effective_title(
                             manual_title.as_deref(),
-                            state.terminal.cwd(),
+                            state.active_tab().terminal.cwd(),
                         ));
                     }
                     // The shell may have reported its history file (OSC 2124):
                     // read + parse it and merge past commands into the in-memory
                     // history (most-recent-first), behind any already-captured
                     // session commands so those stay at the front.
-                    if let Some(path) = state.terminal.take_histfile_update() {
+                    if let Some(path) = state.active_tab_mut().terminal.take_histfile_update() {
                         if let Ok(contents) = std::fs::read_to_string(&path) {
                             let parsed = completion::parse_zsh_history(&contents);
                             for cmd in parsed.iter().rev() {
-                                if !state.command_history.iter().any(|c| c == cmd) {
-                                    state.command_history.push(cmd.clone());
+                                if !state.active_tab().command_history.iter().any(|c| c == cmd) {
+                                    state.active_tab_mut().command_history.push(cmd.clone());
                                 }
                             }
-                            state.command_history.truncate(COMMAND_HISTORY_CAP);
+                            state.active_tab_mut().command_history.truncate(COMMAND_HISTORY_CAP);
                         }
                     }
                     // A command just submitted at the prompt (OSC 133 C): fold
                     // it into the front of the history (deduped).
-                    if let Some(cmd) = state.terminal.take_submitted_command() {
-                        dedup_prepend(&mut state.command_history, cmd);
+                    if let Some(cmd) = state.active_tab_mut().terminal.take_submitted_command() {
+                        dedup_prepend(&mut state.active_tab_mut().command_history, cmd);
                     }
                     // First-run onboarding (running as the PTY child) may have
                     // emitted OSC 2125 live-preview requests in this chunk —
                     // apply each to the running renderer.
-                    for req in state.terminal.take_preview_requests() {
+                    for req in state.active_tab_mut().terminal.take_preview_requests() {
                         state.apply_preview(req);
                     }
                     // The chunk may have carried an OSC 2122 input report;
@@ -8047,11 +8056,11 @@ async fn run() {
                 // the same terminal path OSC 0/2 uses, but a keystroke isn't
                 // followed by PtyInput, so poll the title update here too.
                 // Mirrors the OSC-driven poll in the PtyInput arm above.
-                if let Some(t) = state.terminal.take_title_update() {
+                if let Some(t) = state.active_tab_mut().terminal.take_title_update() {
                     manual_title = t;
                     state.window.set_title(&effective_title(
                         manual_title.as_deref(),
-                        state.terminal.cwd(),
+                        state.active_tab().terminal.cwd(),
                     ));
                 }
                 if !consumed {
@@ -8130,7 +8139,7 @@ async fn run() {
                 // store returns `None` if no animated image is
                 // currently advancing; otherwise it returns the
                 // earliest moment a frame swap is due.
-                let next_image_anim = state
+                let next_image_anim = state.active_tab()
                     .image_store
                     .next_frame_deadline(std::time::Instant::now());
                 if next_image_anim.is_some() {
