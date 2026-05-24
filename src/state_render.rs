@@ -156,18 +156,11 @@ impl WindowState {
         let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
-        // Two extra rows above and below the visible grid are rendered so
-        // smooth sub-line scrolling stays populated through the snap. Used
-        // both for shaping (below) and the main emit loop further down. During
-        // an alt-screen scroll slide `scroll_y` can exceed a line, so widen the
-        // band to cover the departing rows being slid in from the edge.
-        let anim_extra = if self.active_tab().terminal.on_alt_screen() {
-            (scroll_y.abs() / line_height).ceil() as isize
-        } else {
-            0
-        };
-        let r_lo: isize = -2 - anim_extra;
-        let r_hi: isize = rows as isize + 2 + anim_extra;
+        // Half-open band `[r_lo, r_hi)` of grid rows to render — the visible
+        // grid plus phantom rows above and below so smooth sub-line scrolling
+        // stays populated through the snap. Used both for shaping (below) and
+        // the main emit loop further down. See `phantom_row_band` for the math.
+        let (r_lo, r_hi) = Self::phantom_row_band(scroll_y, rows, line_height);
 
         // Programming-ligature pass. Walks each visible row, prefix-matches
         // each cell against the per-variant ligature table the Shaper
@@ -1852,6 +1845,34 @@ impl WindowState {
         }
     }
 
+    /// Half-open band `[r_lo, r_hi)` of grid rows to render: the visible grid
+    /// (`0..rows`) plus phantom rows above and below so smooth sub-line
+    /// scrolling stays populated through the snap.
+    ///
+    /// The fixed ±2 covers the rows that peek past the nominal grid because
+    /// content flows behind the translucent title bar: `get_viewport_size`
+    /// reserves DECORATOR_HEIGHT when sizing the grid, and mid-scroll
+    /// `decorator_offset` is 0, so the visible region extends ~2 rows below the
+    /// last grid row. A non-zero `scroll_y` then slides one further row in from
+    /// the moving edge — without widening the band that row stays blank until
+    /// the scroll crosses a line boundary, popping (snapping) into place
+    /// instead of sliding in from off screen.
+    ///
+    /// On an alt-screen slide `scroll_y` spans the whole scrolled distance and
+    /// can exceed a line; on the primary it's the sub-line scrollback offset.
+    /// `ceil` of the offset (in rows) covers both — so the band widens on the
+    /// primary screen too, fixing the bottom row snapping instead of sliding in.
+    pub(crate) fn phantom_row_band(
+        scroll_y: f32,
+        rows: usize,
+        line_height: f32,
+    ) -> (isize, isize) {
+        let anim_extra = (scroll_y.abs() / line_height).ceil() as isize;
+        let r_lo = -2 - anim_extra;
+        let r_hi = rows as isize + 2 + anim_extra;
+        (r_lo, r_hi)
+    }
+
     /// True while either edge-fade phase is still chasing its target —
     /// used to keep the event loop ticking until the slide completes.
     pub(crate) fn is_top_fade_animating(&self) -> bool {
@@ -2620,5 +2641,54 @@ impl WindowState {
         output.present();
 
         Ok((surface_wait, !needs_offscreen))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A representative line height; the band is invariant in its absolute
+    // value as long as `scroll_y` is expressed in the same pixel units.
+    const LH: f32 = 20.0;
+    const ROWS: usize = 24;
+
+    #[test]
+    fn zero_offset_is_exactly_visible_grid_plus_two() {
+        // No sub-line scroll → no phantom rows beyond the fixed ±2.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH);
+        assert_eq!(r_lo, -2);
+        assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn sub_line_scroll_down_extends_band_at_bottom() {
+        // Scrolling down (negative scroll_y) slides a row in from the bottom
+        // edge. The band widens by `ceil(|offset|)` == 1 row; the bottom
+        // gaining that row (r_hi == rows+3) is what fixes the snap. The band is
+        // sign-agnostic (driven by |scroll_y|), so the top widens to -3 too.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(-0.5 * LH, ROWS, LH);
+        assert_eq!(r_hi, ROWS as isize + 3);
+        assert_eq!(r_lo, -3);
+    }
+
+    #[test]
+    fn sub_line_scroll_up_extends_band_at_top() {
+        // Scrolling up (positive scroll_y) slides a row in from the top edge.
+        // Same one-row widening, top edge in focus (r_lo == -3); symmetric at
+        // the bottom (rows+3).
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.5 * LH, ROWS, LH);
+        assert_eq!(r_lo, -3);
+        assert_eq!(r_hi, ROWS as isize + 3);
+    }
+
+    #[test]
+    fn multi_line_alt_screen_slide_ceils_offset_in_rows() {
+        // An alt-screen slide where scroll_y spans 2.5 lines → ceil(2.5) == 3
+        // extra rows on each side. The band is symmetric because the offset
+        // magnitude, not its sign, sets the width.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(2.5 * LH, ROWS, LH);
+        assert_eq!(r_lo, -2 - 3);
+        assert_eq!(r_hi, ROWS as isize + 2 + 3);
     }
 }
