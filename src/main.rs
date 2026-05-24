@@ -3229,10 +3229,27 @@ impl State {
                         g.height as f32,
                     )
                 };
-                let u0 = (g.x as f32 + q_start) / atlas_w;
-                let u1 = (g.x as f32 + q_end) / atlas_w;
-                let v0 = (g.y as f32 + p_start) / atlas_h;
-                let v1 = (g.y as f32 + p_end) / atlas_h;
+                // Half-texel inset on a stretched (cell-filling) axis. The
+                // glyph is packed with one transparent column/row of padding
+                // (`stride = w + 1` in font.rs), so sampling right up to the
+                // texel boundary `g.x + g.width` makes the Linear filter
+                // average the opaque edge with that transparent neighbor —
+                // ~50% alpha along the seam, which reads as a hairline gap
+                // between abutting blocks (and varies with the bitmap→cell
+                // stretch ratio, hence "only at certain font sizes"). Pulling
+                // the UV in by half a texel keeps every edge fragment on a
+                // fully-opaque texel center. Only the filling axis is inset:
+                // the non-filling axis is placed 1:1 and must keep its true
+                // extent so normal glyphs aren't thinned.
+                let (u0, v0, u1, v1) = Self::glyph_quad_uv(
+                    g.x as f32,
+                    g.y as f32,
+                    (q_start, q_end),
+                    (p_start, p_end),
+                    cell_filling,
+                    atlas_w,
+                    atlas_h,
+                );
                 // Clip a moving glyph at the region's bottom edge so it slides
                 // under the static status line rather than over it.
                 let Some((gh, v1)) = clip_row_quad(r, gy, gh, v0, v1) else {
@@ -5818,6 +5835,48 @@ impl State {
         let u1 = (image_col_end as f32 / denom_cols).clamp(0.0, 1.0);
         let v0 = (image_row as f32 / denom_rows).clamp(0.0, 1.0);
         let v1 = ((image_row as f32 + 1.0) / denom_rows).clamp(0.0, 1.0);
+        (u0, v0, u1, v1)
+    }
+
+    /// UV sub-rect for one cell-filling glyph quad, including the
+    /// half-texel inset that closes hairline seams between abutting
+    /// block / box-drawing glyphs. `(gx, gy)` is the glyph's atlas
+    /// origin in texels; `(q_start, q_end)` / `(p_start, p_end)` are the
+    /// in-glyph sample extents (horizontal / vertical) already clamped to
+    /// the glyph bitmap; `atlas_w` / `atlas_h` are the atlas dimensions in
+    /// texels.
+    ///
+    /// Synthesized cell-filling glyphs have *hard* opaque edges, and the
+    /// atlas packs every glyph with one transparent column/row of padding
+    /// (`stride = w + 1` in font.rs). Sampling right up to the texel
+    /// boundary therefore makes the Linear filter average the opaque edge
+    /// with that transparent neighbour (~50% alpha — a visible seam
+    /// between abutting cells). So for a cell-filling glyph we pull the UV
+    /// in by half a texel on *both* axes, landing every edge fragment on a
+    /// fully-opaque texel center.
+    ///
+    /// The inset is gated on `cell_filling`, not on whether the axis is
+    /// stretched: a glyph trimmed to its opaque bounding box (e.g. ▐,
+    /// packed as a half-width bitmap bearing into the cell) is placed 1:1
+    /// on its narrow axis yet its filled side still reaches the bitmap
+    /// edge and would bleed into the padding there — that was the residual
+    /// seam a fills_h/fills_v-only inset left behind. Normal glyphs
+    /// (`cell_filling == false`) keep their true extent so they aren't
+    /// thinned or shifted. Returns `(u0, v0, u1, v1)`.
+    fn glyph_quad_uv(
+        gx: f32,
+        gy: f32,
+        (q_start, q_end): (f32, f32),
+        (p_start, p_end): (f32, f32),
+        cell_filling: bool,
+        atlas_w: f32,
+        atlas_h: f32,
+    ) -> (f32, f32, f32, f32) {
+        let inset = if cell_filling { 0.5 } else { 0.0 };
+        let u0 = (gx + q_start + inset) / atlas_w;
+        let u1 = (gx + q_end - inset) / atlas_w;
+        let v0 = (gy + p_start + inset) / atlas_h;
+        let v1 = (gy + p_end - inset) / atlas_h;
         (u0, v0, u1, v1)
     }
 
@@ -9268,6 +9327,63 @@ mod tests {
         // denom 1, image_col_end=0 → u1=0.0 clamped from 0 itself.
         let uv = State::placeholder_run_uv(0, 0, 0, 0, 0);
         assert_eq!(uv, (0.0, 0.0, 0.0, 1.0));
+    }
+
+    //
+    // Cell-filling glyph quad UV math (half-texel seam inset).
+    //
+
+    #[test]
+    fn glyph_quad_uv_insets_both_axes_for_a_cell_filling_glyph() {
+        // Any cell-filling glyph is inset half a texel on BOTH axes so no
+        // hard opaque edge samples the transparent atlas padding. Glyph at
+        // atlas origin (0, 0), sampling cols 0..8 / rows 0..16 of a
+        // 128x128 atlas.
+        let (u0, v0, u1, v1) =
+            State::glyph_quad_uv(0.0, 0.0, (0.0, 8.0), (0.0, 16.0), true, 128.0, 128.0);
+        assert!(approx_pair((u0, u1), (0.5 / 128.0, 7.5 / 128.0)));
+        assert!(approx_pair((v0, v1), (0.5 / 128.0, 15.5 / 128.0)));
+    }
+
+    #[test]
+    fn glyph_quad_uv_insets_a_trimmed_half_block_on_its_narrow_axis() {
+        // Regression: ▐ is packed trimmed to its opaque right half
+        // (a half-width bitmap that bears into the cell), so its narrow
+        // axis is placed 1:1 — yet its filled side reaches the bitmap edge
+        // and must still be inset, or it bleeds into the padding and
+        // leaves a hairline at the cell boundary. The inset is keyed on
+        // cell_filling, so the horizontal extent IS pulled in here. Glyph
+        // at (10, 20), sampling cols 0..8 / rows 0..16 of a 256x256 atlas.
+        let (u0, v0, u1, v1) =
+            State::glyph_quad_uv(10.0, 20.0, (0.0, 8.0), (0.0, 16.0), true, 256.0, 256.0);
+        assert!(approx_pair((u0, u1), (10.5 / 256.0, 17.5 / 256.0)));
+        assert!(approx_pair((v0, v1), (20.5 / 256.0, 35.5 / 256.0)));
+    }
+
+    #[test]
+    fn glyph_quad_uv_no_inset_for_a_non_filling_glyph() {
+        // A normal (non-cell-filling) glyph gets no inset on either axis:
+        // the UV is the raw sample rect, so ordinary antialiased glyphs
+        // aren't thinned or shifted.
+        let (u0, v0, u1, v1) =
+            State::glyph_quad_uv(4.0, 4.0, (1.0, 7.0), (2.0, 14.0), false, 64.0, 64.0);
+        assert!(approx_pair((u0, u1), (5.0 / 64.0, 11.0 / 64.0)));
+        assert!(approx_pair((v0, v1), (6.0 / 64.0, 18.0 / 64.0)));
+    }
+
+    #[test]
+    fn glyph_quad_uv_inset_shrinks_each_sampled_span_by_one_texel() {
+        // The seam fix narrows the sampled span by exactly one texel total
+        // (half a texel off each edge) on both axes for a cell-filling
+        // glyph, and leaves both spans untouched for a normal glyph. Pin
+        // that in atlas-texel units so a regression to a different inset is
+        // caught.
+        let raw =
+            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), false, 100.0, 100.0);
+        let inset =
+            State::glyph_quad_uv(0.0, 0.0, (0.0, 10.0), (0.0, 10.0), true, 100.0, 100.0);
+        assert!(approx_eq((raw.2 - raw.0) * 100.0 - (inset.2 - inset.0) * 100.0, 1.0));
+        assert!(approx_eq((raw.3 - raw.1) * 100.0 - (inset.3 - inset.1) * 100.0, 1.0));
     }
 
     #[test]
