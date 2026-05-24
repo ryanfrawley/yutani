@@ -80,6 +80,7 @@ pub fn fork_pty(
     fdm: i32,
     program: ChildProgram,
     zdotdir: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
 ) -> Result<Pty, String> {
     let fds: i32;
 
@@ -112,6 +113,16 @@ pub fn fork_pty(
 
                 setsid();
                 ioctl(0, TIOCSCTTY.into(), 1);
+
+                // Open in the requested directory (a new window inherits the
+                // spawning shell's cwd). Best-effort: a failed chdir just
+                // leaves the child in the parent's cwd. Done here, in the
+                // child, so the parent process's cwd is untouched.
+                if let Some(dir) = &cwd {
+                    if let Ok(c) = CString::new(dir.as_os_str().as_encoded_bytes()) {
+                        chdir(c.as_ptr());
+                    }
+                }
 
                 // Advertise our termcap so apps (and zle) pick the right key
                 // sequences. When the app is launched from Finder, $TERM is

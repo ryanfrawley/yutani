@@ -11,10 +11,11 @@
 /// resize.
 pub struct Gpu {
     /// Kept so additional windows can create their surfaces from the same
-    /// instance/adapter the device was built against. Unused until the
-    /// multi-window factory (Stage 3) creates per-window surfaces from it.
-    #[allow(dead_code)]
+    /// instance the device was built against (see [`Gpu::create_surface`]).
     pub instance: wgpu::Instance,
+    /// Kept alongside the instance so a new window's surface config can be
+    /// derived from the same adapter's capabilities as the first window's.
+    pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
 }
@@ -73,6 +74,7 @@ impl Gpu {
 
         let gpu = Self {
             instance,
+            adapter,
             device,
             queue,
         };
@@ -82,6 +84,23 @@ impl Gpu {
             size,
         };
         (gpu, window_surface)
+    }
+
+    /// Build a surface for an additional window from the shared instance,
+    /// configured against the same device/adapter as the first window. The
+    /// returned surface holds an unsafe reference to `window`, so the caller
+    /// must keep `window` alive at least as long as the surface (and drop the
+    /// surface first) — `WindowState`'s field order enforces this.
+    pub fn create_surface(&self, window: &winit::window::Window) -> WindowSurface {
+        let size = window.inner_size();
+        let surface = unsafe { self.instance.create_surface(window) }.unwrap();
+        let config = surface_config(&surface, &self.adapter, size);
+        surface.configure(&self.device, &config);
+        WindowSurface {
+            surface,
+            config,
+            size,
+        }
     }
 }
 

@@ -1472,10 +1472,8 @@ struct TabState {
     master: i32,
     /// Forked child pid. Kept so tab close can `kill(child, SIGHUP)` — the
     /// blocking `read(master)` only returns once the child exits, so closing a
-    /// tab running e.g. `vim` needs both `close(master)` and the signal. Wired
-    /// to the close path in Stage 4; stored here (per the plan) when the tab is
-    /// minted.
-    #[allow(dead_code)]
+    /// tab running e.g. `vim` needs both `close(master)` and the signal. See
+    /// [`close_tab_pty`].
     child: i32,
     terminal: terminal::Terminal,
     /// Decode + GPU residency cache for this tab's images. Per-tab: each shell
@@ -1668,6 +1666,19 @@ struct WindowState {
     /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
     /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
     chrome_band_px: f64,
+    /// Program-set window title (OSC 0/2). When `Some` it wins over the
+    /// cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload.
+    /// Per-window so each window tracks its own shell's title.
+    manual_title: Option<String>,
+    /// This window's current appearance, from `WindowEvent::ThemeChanged`.
+    /// Per-window so windows on differently-themed monitors (or after an
+    /// independent override) clear/redraw to their own background.
+    theme: winit::window::Theme,
+    /// Set by Cmd-N / the palette's "New window" action; drained by the event
+    /// loop, which owns the registry + `AppShared` and actually spawns the
+    /// window in-process. (A window can't build its sibling itself — it has no
+    /// handle to the shared resources or the window map.)
+    pending_new_window: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -2224,6 +2235,10 @@ const CASCADE_ENV: &str = "YUTANI_CASCADE_FROM";
 /// `origin` is the spawning window's top-left in logical points; when present
 /// it's forwarded so the child can cascade off it. Failures are logged rather
 /// than fatal: a missing exe path shouldn't kill the window the user is in.
+///
+/// Superseded by [`spawn_window_in_process`] in Stage 4 — kept until the
+/// Stage 5 cleanup removes the whole subprocess path.
+#[allow(dead_code)]
 fn spawn_new_window(cwd: Option<&str>, origin: Option<(f64, f64)>) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -2418,6 +2433,7 @@ impl WindowState {
         let _timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
         macro_rules! sub { ($l:expr) => { if _timing { eprintln!("[startup]   ... create_window {:>7.1}ms  {}", _sw.elapsed().as_secs_f64()*1000.0, $l); } } }
         let pt_size = config.font_size;
+        let window_theme = window.theme().unwrap_or(winit::window::Theme::Light);
 
         // Per-window glyph atlas, rasterized on demand from the shared faces.
         let atlas = shared.font.borrow_mut().build_atlas();
@@ -2680,6 +2696,9 @@ impl WindowState {
             // (and on every resize / scale change) replaces it with the real
             // DPI-scaled native title-bar height.
             chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
+            manual_title: None,
+            theme: window_theme,
+            pending_new_window: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
         }
@@ -4914,7 +4933,7 @@ impl WindowState {
             A::CopyLastOutput => {
                 self.select_last_command_output();
             }
-            A::NewWindow => spawn_new_window(self.active_tab().terminal.cwd(), self.window_origin()),
+            A::NewWindow => self.pending_new_window = true,
             // Re-arm first-run and relaunch into it. Each window owns a single
             // PTY (forked at startup, already attached to a shell), so there's
             // no in-place way to swap the running shell for onboarding —
@@ -6863,7 +6882,10 @@ impl WindowState {
                             // !shift so Cmd-Shift-N stays free for a future
                             // binding.
                             if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("n") {
-                                spawn_new_window(self.active_tab().terminal.cwd(), self.window_origin());
+                                // Request an in-process window; the event loop
+                                // (which owns AppShared + the window map) does
+                                // the actual spawn after `input` returns.
+                                self.pending_new_window = true;
                                 return true;
                             }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
@@ -7121,7 +7143,21 @@ impl WindowState {
         clear: wgpu::Color,
     ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
         let surface_t0 = std::time::Instant::now();
-        let output = self.surface.surface.get_current_texture().unwrap();
+        let output = match self.surface.surface.get_current_texture() {
+            Ok(o) => o,
+            // A backgrounded / occluded / just-resized surface returns
+            // `Outdated` (and `Lost`) routinely once there's more than one
+            // window — reconfigure and skip this frame rather than panicking;
+            // the next redraw re-acquires. (With one window this only tripped
+            // on resize, which is why the old `unwrap` survived.)
+            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                self.surface
+                    .surface
+                    .configure(&self.shared.gpu.device, &self.surface.config);
+                return Ok((surface_t0.elapsed(), true));
+            }
+            Err(e) => return Err(e),
+        };
         let surface_wait = surface_t0.elapsed();
         let view = output
             .texture
@@ -7797,6 +7833,7 @@ fn create_tab(
     proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
     program: pty::ChildProgram,
     zdotdir: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
     cols: usize,
     rows: usize,
     image_mem_cap_bytes: usize,
@@ -7805,7 +7842,7 @@ fn create_tab(
     if fdm < 0 {
         panic!("Error on posix_openpt()");
     }
-    let pty = pty::fork_pty(fdm, program, zdotdir).expect("failed to fork pty");
+    let pty = pty::fork_pty(fdm, program, zdotdir, cwd).expect("failed to fork pty");
     let tab_id = next_tab_id();
     let master = pty.master;
     let child = pty.child;
@@ -7850,6 +7887,106 @@ fn create_tab(
         hover_url: None,
     };
     (tab_id, tab)
+}
+
+/// Tear down a tab's PTY. The reader thread's `read(master)` only returns once
+/// the child exits, so we `kill(child, SIGHUP)` to end the shell *and*
+/// `close(master)` to unblock the read — the thread then reaps the child and
+/// exits, firing a final `PtyExit` for this (now-unmapped) tab that the
+/// resolver drops. Safe on an already-exited child (the `kill` just returns
+/// `ESRCH`).
+fn close_tab_pty(tab: &TabState) {
+    unsafe {
+        libc::kill(tab.child, libc::SIGHUP);
+        libc::close(tab.master);
+    }
+}
+
+/// Open a new window in this process (Cmd-N / palette "New window"). Builds the
+/// `NSWindow` from the live event loop, a sibling surface from the shared
+/// instance, and a fresh tab, then registers both in the window/tab maps. The
+/// new window cascades down-and-right off `origin` (the spawner's top-left, in
+/// logical points) and its shell opens in `cwd` (the spawner's shell cwd).
+#[allow(clippy::too_many_arguments)]
+fn spawn_window_in_process(
+    elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    shared: &Rc<AppShared>,
+    proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+    windows: &mut std::collections::HashMap<winit::window::WindowId, WindowState>,
+    tab_to_window: &mut std::collections::HashMap<app_window::TabId, winit::window::WindowId>,
+    config: &Config,
+    zdotdir: &Option<std::path::PathBuf>,
+    cwd: Option<String>,
+    origin: Option<(f64, f64)>,
+) {
+    let title = effective_title(None, cwd.as_deref());
+    let transparent = false; // matches the first window (shadow bug)
+    let mut builder = WindowBuilder::new()
+        .with_title(&title)
+        .with_titlebar_transparent(true)
+        .with_transparent(transparent)
+        .with_has_shadow(!transparent)
+        .with_fullsize_content_view(true)
+        .with_decorations(true)
+        .with_blur(transparent);
+    if let Some((x, y)) = origin {
+        builder = builder.with_position(winit::dpi::LogicalPosition::new(
+            x + WINDOW_CASCADE_STEP,
+            y + WINDOW_CASCADE_STEP,
+        ));
+    }
+    let window = match builder.build(elwt) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("new window: build failed: {e}");
+            return;
+        }
+    };
+    // Match the OS title-bar appearance + native bg to the active palette,
+    // exactly as the first window does, so it doesn't flash a wrong fill.
+    window.set_theme(Some(theme_for_bg(palette::get().background)));
+    set_native_window_bg(&window, palette::get().background);
+    window.set_cursor_icon(winit::window::CursorIcon::Text);
+
+    let surface = shared.gpu.create_surface(&window);
+    let dpi = (window.scale_factor() * 96.0) as u32;
+    let (cols, rows) = {
+        let (cell_w, line_h) = shared.with_font(|f| {
+            let m = f.face().size_metrics().unwrap();
+            (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
+        });
+        let vp = WindowState::get_viewport_size(
+            surface.config.width as f32,
+            surface.config.height as f32,
+            cell_w,
+            line_h,
+        );
+        (vp.char_width, vp.char_height)
+    };
+    // New windows always get a normal shell — onboarding is first-run only.
+    let (tab_id, tab) = create_tab(
+        proxy,
+        pty::ChildProgram::Shell,
+        zdotdir.clone(),
+        cwd.map(std::path::PathBuf::from),
+        cols,
+        rows,
+        config.images_memory_cap_mb * 1024 * 1024,
+    );
+    let mut state =
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, tab);
+    // Mirror the post-construction setup `run()` does for the first window.
+    state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
+    state.refresh_chrome_band();
+    state.sync_theme_colors();
+    let keep = state.config.images_in_scrollback;
+    state.active_tab_mut().terminal.set_keep_placements_in_scrollback(keep);
+    state.sync_terminal_cell_size();
+    state.invalidate();
+
+    let wid = state.window.id();
+    windows.insert(wid, state);
+    tab_to_window.insert(tab_id, wid);
 }
 
 async fn run() {
@@ -8007,14 +8144,15 @@ async fn run() {
     let (tab_id, initial_tab) = create_tab(
         &event_loop_proxy,
         child_program,
-        zdotdir,
+        zdotdir.clone(),
+        None, // first window inherits our process cwd, as before
         cols,
         rows,
         config.images_memory_cap_mb * 1024 * 1024,
     );
     lap("after create_tab (fork)");
     let mut state =
-        WindowState::create_window(shared.clone(), window, surface, config, dpi, initial_tab);
+        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, initial_tab);
     lap("after create_window (GPU/atlas/pipelines)");
     state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window
@@ -8034,12 +8172,8 @@ async fn run() {
     }
     state.invalidate();
 
-    let mut theme = state.window.theme().unwrap_or(winit::window::Theme::Light);
-
-    // Program-set window title (OSC 0/2). When `Some`, it wins over the
-    // cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload,
-    // at which point we fall back to the cwd.
-    let mut manual_title: Option<String> = None;
+    // `manual_title` and `theme` are now per-window (`WindowState` fields), so
+    // each window tracks its own OSC-0 title and appearance.
     let mut first_frame_done = false;
 
     // The window registry. One process owns every window; events are routed
@@ -8079,12 +8213,12 @@ async fn run() {
                     // collapsed to `~`). Both `take_*` calls must run to clear
                     // their dirty flags even when the title doesn't change.
                     let title_changed = state.active_tab_mut().terminal.take_title_update().map(|t| {
-                        manual_title = t;
+                        state.manual_title = t;
                     });
                     let cwd_changed = state.active_tab_mut().terminal.take_cwd_update();
                     if title_changed.is_some() || cwd_changed.is_some() {
                         state.window.set_title(&effective_title(
-                            manual_title.as_deref(),
+                            state.manual_title.as_deref(),
                             state.active_tab().terminal.cwd(),
                         ));
                     }
@@ -8140,6 +8274,7 @@ async fn run() {
                         // generalizes it.)
                         if let Some(state) = windows.remove(&wid) {
                             for t in &state.tabs {
+                                close_tab_pty(t);
                                 tab_to_window.remove(&t.tab_id);
                             }
                         }
@@ -8162,70 +8297,111 @@ async fn run() {
                 }
             },
             Event::WindowEvent { window_id, event } => {
-                let Some(state) = windows.get_mut(&window_id) else { return };
-                let consumed = state.input(&event, elwt);
-                // The palette's Set/Clear title actions set the title through
-                // the same terminal path OSC 0/2 uses, but a keystroke isn't
-                // followed by PtyInput, so poll the title update here too.
-                // Mirrors the OSC-driven poll in the PtyInput arm above.
-                if let Some(t) = state.active_tab_mut().terminal.take_title_update() {
-                    manual_title = t;
-                    state.window.set_title(&effective_title(
-                        manual_title.as_deref(),
-                        state.active_tab().terminal.cwd(),
-                    ));
+                // A new-window request (cwd, origin) raised by Cmd-N / palette
+                // during `input()`, and whether this window asked to close —
+                // both acted on after the `state` borrow is released, since
+                // they mutate the window registry.
+                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>)> = None;
+                let mut close_this = false;
+                if let Some(state) = windows.get_mut(&window_id) {
+                    let consumed = state.input(&event, elwt);
+                    // The palette's Set/Clear title actions set the title
+                    // through the same terminal path OSC 0/2 uses, but a
+                    // keystroke isn't followed by PtyInput, so poll the title
+                    // update here too. Mirrors the PtyInput arm above.
+                    if let Some(t) = state.active_tab_mut().terminal.take_title_update() {
+                        state.manual_title = t;
+                        state.window.set_title(&effective_title(
+                            state.manual_title.as_deref(),
+                            state.active_tab().terminal.cwd(),
+                        ));
+                    }
+                    if !consumed {
+                        match event {
+                            WindowEvent::ThemeChanged(new_theme) => {
+                                state.theme = new_theme;
+                                // Following the system appearance? Swap to the
+                                // scheme slot for the new mode. Otherwise just
+                                // keep the OSC color reports in sync as before —
+                                // the active scheme doesn't track the OS.
+                                if state.config.auto_theme {
+                                    state.apply_active_scheme();
+                                } else {
+                                    state.sync_theme_colors();
+                                    state.invalidate();
+                                }
+                            }
+                            WindowEvent::CloseRequested => {
+                                close_this = true;
+                            }
+                            WindowEvent::Resized(size) => {
+                                state.resize(size);
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::ScaleFactorChanged {
+                                scale_factor: _scale_factor,
+                                ..
+                            } => {
+                                state.refresh_chrome_band();
+                                state.window.request_redraw();
+                            }
+                            WindowEvent::RedrawRequested => {
+                                state.update();
+                                state.prepare_frame();
+                                let t0 = std::time::Instant::now();
+                                let result = state.render(clear_color(state.theme));
+                                let render_dur = t0.elapsed();
+                                if !first_frame_done {
+                                    first_frame_done = true;
+                                    if timing {
+                                        eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
+                                    }
+                                }
+                                match result {
+                                    Ok((surface_wait, fast)) => {
+                                        state.perf.note_render(render_dur, surface_wait, fast);
+                                    }
+                                    Err(wgpu::SurfaceError::Lost) => state.resize(state.surface.size),
+                                    Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                                    Err(e) => eprintln!("{:?}", e),
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    // Drain a new-window request raised during `input()`.
+                    if std::mem::take(&mut state.pending_new_window) {
+                        spawn_req = Some((
+                            state.active_tab().terminal.cwd().map(str::to_owned),
+                            state.window_origin(),
+                        ));
+                    }
                 }
-                if !consumed {
-                    match event {
-                        WindowEvent::ThemeChanged(new_theme) => {
-                            theme = new_theme;
-                            // Following the system appearance? Swap to the
-                            // scheme slot for the new mode. Otherwise just keep
-                            // the OSC color reports in sync as before — the
-                            // active scheme doesn't track the OS.
-                            if state.config.auto_theme {
-                                state.apply_active_scheme();
-                            } else {
-                                state.sync_theme_colors();
-                                state.invalidate();
-                            }
+                if let Some((cwd, origin)) = spawn_req {
+                    spawn_window_in_process(
+                        elwt,
+                        &shared,
+                        &event_loop_proxy,
+                        &mut windows,
+                        &mut tab_to_window,
+                        &config,
+                        &zdotdir,
+                        cwd,
+                        origin,
+                    );
+                }
+                if close_this {
+                    // Tear down this window: kill + reap each tab's shell and
+                    // free its TabId, then drop the window. Quit when the last
+                    // window is gone.
+                    if let Some(state) = windows.remove(&window_id) {
+                        for t in &state.tabs {
+                            close_tab_pty(t);
+                            tab_to_window.remove(&t.tab_id);
                         }
-                        WindowEvent::CloseRequested => {
-                            elwt.exit();
-                        }
-                        WindowEvent::Resized(size) => {
-                            state.resize(size);
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::ScaleFactorChanged {
-                            scale_factor: _scale_factor,
-                            ..
-                        } => {
-                            state.refresh_chrome_band();
-                            state.window.request_redraw();
-                        }
-                        WindowEvent::RedrawRequested => {
-                            state.update();
-                            state.prepare_frame();
-                            let t0 = std::time::Instant::now();
-                            let result = state.render(clear_color(theme));
-                            let render_dur = t0.elapsed();
-                            if !first_frame_done {
-                                first_frame_done = true;
-                                if timing {
-                                    eprintln!("[startup] {:>7.1}ms  FIRST FRAME presented", t_start.elapsed().as_secs_f64() * 1000.0);
-                                }
-                            }
-                            match result {
-                                Ok((surface_wait, fast)) => {
-                                    state.perf.note_render(render_dur, surface_wait, fast);
-                                }
-                                Err(wgpu::SurfaceError::Lost) => state.resize(state.surface.size),
-                                Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                                Err(e) => eprintln!("{:?}", e),
-                            }
-                        }
-                        _ => (),
+                    }
+                    if windows.is_empty() {
+                        elwt.exit();
                     }
                 }
             }
