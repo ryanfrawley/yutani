@@ -17,7 +17,20 @@ terminal — these features just stay dark.
 
 ## Install
 
-Source the script from your `~/.zshrc`:
+**Nothing to do — it's automatic (zsh).** Yutani forks your shell itself, so on
+zsh it auto-loads this integration by pointing the shell's `$ZDOTDIR` at a
+Yutani-managed directory that sources your real startup files first, then this
+script. The script is embedded in the binary, so there's no path to keep in
+sync. Just open a new Yutani window.
+
+To turn auto-loading off (e.g. you'd rather wire it up yourself), export
+`YUTANI_SHELL_INTEGRATION=0` before Yutani launches.
+
+### Manual install (other shells, or opting out of auto-load)
+
+Auto-loading currently covers **zsh only** (bash/fish are a planned follow-up —
+see `FEATURES.md`). For those, or if you set `YUTANI_SHELL_INTEGRATION=0`, source
+the script yourself from your `~/.zshrc`:
 
 ```zsh
 source /path/to/shell-integration/yutani.zsh

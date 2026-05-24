@@ -92,8 +92,21 @@ this is low priority — listed for completeness.
 
 ## Known limitations / follow-ups
 
-*(none outstanding for the shipped hyperlink support — the OSC 8 `id=`
-co-highlighting follow-up has landed.)*
+- **Shell-integration auto-loading is zsh-only.** Yutani auto-loads
+  `shell-integration/yutani.zsh` by redirecting the forked shell's `$ZDOTDIR`
+  (see `src/shell_integration.rs`), so zsh users get the autocomplete popup /
+  prompt marks / cwd reporting with zero setup. **bash and fish are not yet
+  covered** — those users must still source the script manually. Follow-up:
+  - **bash** — inject via `--rcfile` (login/interactive bash reads it), or set
+    `BASH_ENV`/`PROMPT_COMMAND`, sourcing the user's `~/.bashrc` first; needs a
+    `yutani.bash` integration script (doesn't exist yet).
+  - **fish** — set `XDG_DATA_DIRS` / drop a conf.d snippet, or point at a
+    Yutani-managed `$__fish_config_dir`; needs a `yutani.fish` script.
+  - Opt-out (`YUTANI_SHELL_INTEGRATION=0`) and manual sourcing already work for
+    every shell today.
+
+*(Hyperlink support is complete — the OSC 8 `id=` co-highlighting follow-up has
+landed.)*
 
 ---
 
