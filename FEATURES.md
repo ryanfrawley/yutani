@@ -30,6 +30,14 @@ started.
 - Shell semantics: OSC 133 prompt marks (navigation, exit-status gutter,
   select-last-output), OSC 7 cwd -> window title, OSC 2122/2124 input + history
   reporting feeding multi-source autocomplete (filesystem / $PATH / $HISTFILE).
+- **Find / search in scrollback** (Cmd-F) — `Search` state model (`search.rs`),
+  smart-case matching, per-line match highlighting, and wrap-around next/prev
+  navigation. Cmd-F opens the search bar and owns the keyboard while active.
+- **Multi-window** (Cmd-N) — launches a fresh Yutani window, cascading
+  down-and-right from its spawner. (This is separate windows, not in-window
+  tabs/splits — see below.)
+- First-run onboarding wizard rendered in the PTY (color / theme / font /
+  autocomplete setup).
 - Rendering: wgpu pipeline, glyph atlas, programming ligatures, procedural
   box-drawing, glow/bloom, CRT scanlines, blur.
 - Config: TOML config + color schemes, hot-reload (Cmd-Shift-R) of palette/glow.
@@ -42,15 +50,11 @@ started.
 ### Tier 1 — defining gaps vs. mainstream terminals
 
 #### Tabs, splits, and panes
-Single-window, single-pane today. No multiplexing model behind the macOS
-"new tab" toolbar button. This is the largest gap vs. iTerm2 / kitty /
-WezTerm / Ghostty. Touches window management, input routing, renderer
-viewport handling, and config. Largest effort item on this list.
-
-#### Find / search in scrollback
-No way to search the visible buffer or history (Cmd-F). High-frequency feature,
-relatively contained: needs a search-state model, match highlighting in the
-renderer, and next/prev navigation keybindings.
+Single-window, single-pane today. Cmd-N opens separate top-level windows, but
+there's no in-window multiplexing model behind the macOS "new tab" toolbar
+button. This is the largest gap vs. iTerm2 / kitty / WezTerm / Ghostty. Touches
+window management, input routing, renderer viewport handling, and config.
+Largest effort item on this list.
 
 ### Tier 2 — polish users notice quickly
 
@@ -100,5 +104,5 @@ co-highlighting follow-up has landed.)*
 ## Suggested priority order
 
 1. **Tabs / splits** — the defining missing capability.
-2. **Find in scrollback** — high frequency, contained scope.
-3. **Scrollbar + configurable keybindings** — visible polish.
+2. **Scrollbar + configurable keybindings** — visible polish.
+3. **Bell / notifications** — small scope, frequently noticed.
