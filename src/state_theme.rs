@@ -54,7 +54,7 @@ impl WindowState {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,

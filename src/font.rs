@@ -125,7 +125,35 @@ impl Variant {
 
 pub struct Font {
     pub variants: [Variant; 4],
+    // Grid metrics cached from the Regular face, refreshed only when the face
+    // is (re)sized via `set_char_size`. Reading these from the face directly
+    // would call `load_char('M')` / touch `FT_Size`, which mutates the shared
+    // glyph slot and is unsound to do from a render thread — and it happened
+    // on every frame. Cache once per size change so the per-frame layout path
+    // never touches the face. Both are zeroed until the first `set_char_size`
+    // (which bring-up always calls before any glyph work).
+    cached_cell_width: usize,
+    cached_metrics: ft::ffi::FT_Size_Metrics,
+    // Underline geometry from the Regular face's `post` table, in font design
+    // units (size-independent; the renderer scales them by `y_scale`). Cached
+    // alongside the metrics so the per-frame underline path reads no face.
+    cached_underline_position: ft::ffi::FT_Short,
+    cached_underline_thickness: ft::ffi::FT_Short,
 }
+
+// A zeroed `FT_Size_Metrics` for the pre-sizing window. `FT_Size_Metrics` is a
+// plain `#[repr(C)]` integer struct (Copy) but derives no `Default`, so spell
+// the zero value out.
+const ZERO_METRICS: ft::ffi::FT_Size_Metrics = ft::ffi::FT_Size_Metrics {
+    x_ppem: 0,
+    y_ppem: 0,
+    x_scale: 0,
+    y_scale: 0,
+    ascender: 0,
+    descender: 0,
+    height: 0,
+    max_advance: 0,
+};
 
 pub struct Atlas {
     pub width: usize,
@@ -196,17 +224,11 @@ impl Atlas {
         if self.ligatures[vi].contains_key(&glyph_id) {
             return true;
         }
-        // Compute cell metrics BEFORE loading the glyph. `cell_width`
-        // calls `load_char('M', DEFAULT)` on the Regular face, and the
-        // Regular variant's face shares its single glyph slot with us
-        // when vi == 0 — doing this after `load_glyph(RENDER)` would
-        // overwrite the just-rendered bitmap with an unrendered 'M' and
-        // leave the FT_Bitmap pointer in an indeterminate state.
+        // Cached metrics — no face access, so (unlike the old `cell_width()`
+        // that called `load_char('M')`) this can't clobber the shared glyph
+        // slot we're about to render into.
         let cell_w = font.cell_width();
-        let metrics = font
-            .face()
-            .size_metrics()
-            .expect("primary face has no size metrics");
+        let metrics = font.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
         let face = match font.variants[vi].face.as_ref() {
             Some(f) => f,
@@ -265,15 +287,10 @@ impl Atlas {
             self.ensure_char(font, FaceVariant::Regular, ch);
             return;
         }
-        // Compute cell metrics BEFORE loading the glyph — `cell_width`
-        // calls `load_char('M', DEFAULT)` on the Regular face and the
-        // shared FT_GlyphSlot would otherwise overwrite the bitmap we
-        // just rendered. Same dance as `ensure_glyph_id`.
+        // Cached metrics (no face access) — same as `ensure_glyph_id`, this
+        // can't disturb the glyph slot we're about to rasterize into.
         let cell_w = font.cell_width();
-        let metrics = font
-            .face()
-            .size_metrics()
-            .expect("primary face has no size metrics");
+        let metrics = font.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
 
         // Box-drawing & block-element glyphs are synthesized (pixel-aligned
@@ -370,7 +387,13 @@ impl Font {
             Variant::empty(),
         ];
         variants[FaceVariant::Regular as usize].face = Some(face);
-        Font { variants }
+        Font {
+            variants,
+            cached_cell_width: 0,
+            cached_metrics: ZERO_METRICS,
+            cached_underline_position: 0,
+            cached_underline_thickness: 0,
+        }
     }
 
     // Install the primary face for a styled variant (Bold/Italic/BoldItalic).
@@ -450,16 +473,55 @@ impl Font {
             .expect("regular face missing")
     }
 
-    // Width of a representative ASCII cell. For monospace fonts that ship
-    // both half-width Latin and full-width CJK/symbol glyphs (e.g. Iosevka),
-    // `size_metrics().max_advance` returns the *wide* cell, leaving Latin
-    // text with a column of empty space after every glyph. Sampling 'M'
-    // gives us the half-width advance the user actually expects.
+    // Cached cell width (see `cached_cell_width`). Cheap, touches no face —
+    // safe to call every frame and from a render thread.
     pub fn cell_width(&self) -> usize {
+        self.cached_cell_width
+    }
+
+    // Cached Regular-face size metrics (see `cached_metrics`). Like
+    // `cell_width`, reads only the cache — the per-frame layout path uses this
+    // instead of `face().size_metrics()`.
+    pub fn metrics(&self) -> ft::ffi::FT_Size_Metrics {
+        self.cached_metrics
+    }
+
+    // Cached `post`-table underline geometry (design units). See the renderer
+    // for how `y_scale` turns these into pixels.
+    pub fn underline_position(&self) -> ft::ffi::FT_Short {
+        self.cached_underline_position
+    }
+
+    pub fn underline_thickness(&self) -> ft::ffi::FT_Short {
+        self.cached_underline_thickness
+    }
+
+    // Measure a representative ASCII cell's width by loading 'M'. For monospace
+    // fonts that ship both half-width Latin and full-width CJK/symbol glyphs
+    // (e.g. Iosevka), `size_metrics().max_advance` returns the *wide* cell,
+    // leaving Latin text with a column of empty space after every glyph.
+    // Sampling 'M' gives us the half-width advance the user actually expects.
+    // This mutates the Regular face's glyph slot, so it runs only at sizing
+    // time (via `refresh_grid_metrics`), never per frame.
+    fn measure_cell_width(&self) -> usize {
         let face = self.face();
         face.load_char('M' as usize, ft::face::LoadFlag::DEFAULT)
             .unwrap();
         (face.glyph().metrics().horiAdvance >> 6) as usize
+    }
+
+    // Recompute the cached cell width + size metrics from the freshly-sized
+    // Regular face. Called after every `set_char_size`; nothing else changes
+    // the grid geometry (styled variants and fallbacks are sized to match).
+    fn refresh_grid_metrics(&mut self) {
+        self.cached_cell_width = self.measure_cell_width();
+        let face = self.face();
+        let metrics = face.size_metrics().unwrap_or(ZERO_METRICS);
+        let underline_position = face.underline_position();
+        let underline_thickness = face.underline_thickness();
+        self.cached_metrics = metrics;
+        self.cached_underline_position = underline_position;
+        self.cached_underline_thickness = underline_thickness;
     }
 
     pub fn set_char_size(&mut self, height_points: f32, dpi: u32) {
@@ -472,14 +534,12 @@ impl Font {
                 let _ = face.set_char_size(size, 0, dpi, dpi);
             }
         }
+        self.refresh_grid_metrics();
     }
 
     pub fn build_atlas(&mut self) -> Atlas {
         let cell_w = self.cell_width();
-        let metrics = self
-            .face()
-            .size_metrics()
-            .expect("primary face has no size metrics");
+        let metrics = self.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
 
         // Ranges we care about rendering. Control chars are excluded — the

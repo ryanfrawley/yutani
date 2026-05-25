@@ -152,7 +152,7 @@ pub(crate) async fn run() {
     // buffers create_window allocates match the terminal dimensions.
     let (cols, rows) = {
         let (cell_w, line_h) = shared.with_font(|f| {
-            let m = f.face().size_metrics().unwrap();
+            let m = f.metrics();
             (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
         });
         let vp = WindowState::get_viewport_size(
@@ -368,6 +368,39 @@ pub(crate) async fn run() {
                             WindowEvent::CloseRequested => {
                                 close_this = true;
                             }
+                            WindowEvent::Focused(focused) => {
+                                state.focused = focused;
+                                // Snap the cursor to its solid phase on either
+                                // transition: gaining focus shouldn't catch the
+                                // cursor mid-blink-off, and losing focus parks it
+                                // steady (blinking is now disabled). Repaint so
+                                // the cursor style change shows immediately.
+                                state.reset_blink();
+                                if focused {
+                                    // Track the key window so the native tab
+                                    // bar's `+` button (no window context) opens
+                                    // a tab in the right group. Refresh the chrome
+                                    // band since the tab bar's presence (and thus
+                                    // the title bar height) changes as tabs come
+                                    // and go.
+                                    focused_window = Some(window_id);
+                                    state.refresh_chrome_band();
+                                }
+                                state.invalidate();
+                            }
+                            WindowEvent::Occluded(occluded) => {
+                                // A fully hidden window neither animates nor
+                                // redraws (see the AboutToWait tick). When it
+                                // comes back into view, repaint once to catch up
+                                // on anything that changed while it was dark —
+                                // refreshing the chrome band too, since a tab
+                                // selection can change the bar's height.
+                                state.occluded = occluded;
+                                if !occluded {
+                                    state.refresh_chrome_band();
+                                    state.invalidate();
+                                }
+                            }
                             WindowEvent::Resized(size) => {
                                 state.resize(size);
                                 state.window.request_redraw();
@@ -379,30 +412,9 @@ pub(crate) async fn run() {
                                 state.refresh_chrome_band();
                                 state.window.request_redraw();
                             }
-                            // Selecting a native tab makes its window key. The
-                            // app renders on demand, so a tab that produced no
-                            // output while hidden would show stale/blank until
-                            // the next event — force a redraw. The chrome band is
-                            // refreshed too since the tab bar's appearance (and
-                            // thus the title bar height) changes as tabs come and
-                            // go.
-                            WindowEvent::Focused(true) => {
-                                focused_window = Some(window_id);
-                                state.refresh_chrome_band();
-                                state.invalidate();
-                                state.window.request_redraw();
-                            }
-                            // Track occlusion so background tabs skip rendering
-                            // (their shells keep parsing). Reveal forces a fresh
-                            // frame since none were drawn while hidden.
-                            WindowEvent::Occluded(occ) => {
-                                state.occluded = occ;
-                                if !occ {
-                                    state.refresh_chrome_band();
-                                    state.invalidate();
-                                    state.window.request_redraw();
-                                }
-                            }
+                            // A background native tab still receives PTY output,
+                            // which invalidates it — but nothing is on screen, so
+                            // skip the GPU work. Reveal (Occluded false) repaints.
                             WindowEvent::RedrawRequested if state.occluded => {
                                 // Background native tab — nothing is on screen,
                                 // so skip the GPU work. The reveal (Occluded
@@ -521,17 +533,37 @@ pub(crate) async fn run() {
                 // wake-up across all of them and arm the loop for that.
                 let mut next_wake: Option<std::time::Instant> = None;
                 for state in windows.values_mut() {
+                    // A fully occluded window can't be seen, so don't spend the
+                    // shared thread animating or redrawing it — and don't let it
+                    // pull the loop's wake-up earlier. PTY output still feeds its
+                    // terminal (it just defers the repaint until Occluded(false)
+                    // invalidates it). perf still flushes so its burst closes.
+                    if state.occluded {
+                        state.perf.maybe_flush();
+                        continue;
+                    }
                     if state.maybe_blink_tick() {
                         state.invalidate();
                     }
                     // Edge-fade and cursor-position eases: keep ticking frames
-                    // as long as either is still chasing its target.
+                    // as long as anything is still chasing its target.
                     let animating = state.is_top_fade_animating()
                         || state.is_cursor_animating()
                         || state.is_alt_scroll_animating()
                         || state.is_primary_scroll_animating();
                     if animating {
-                        state.invalidate();
+                        // The cursor quad and the alt-screen slide's per-row
+                        // offsets live in the cell geometry, so they need a full
+                        // rebuild. The global scroll slide (primary) and the
+                        // edge fades only move the camera / fade uniforms, which
+                        // `refresh_scroll_uniforms` handles on the cheap
+                        // scroll-only path — so prefer that when no
+                        // geometry-bound animation is in flight.
+                        if state.is_cursor_animating() || state.is_alt_scroll_animating() {
+                            state.invalidate();
+                        } else {
+                            state.invalidate_scroll();
+                        }
                     }
                     state.perf.maybe_flush();
                     let next_anim = if animating {
