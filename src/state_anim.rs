@@ -5,9 +5,13 @@ use crate::*;
 
 impl WindowState {
     /// Effective blink state: DECSCUSR's request is gated by the user's
-    /// `cursor_blink` config so opting out disables blinking globally.
+    /// `cursor_blink` config so opting out disables blinking globally. An
+    /// unfocused window never blinks — it shows a steady cursor (the usual
+    /// terminal convention) and, more importantly, stops driving redraws that
+    /// would block the shared event loop's single thread on this window's vsync
+    /// while the user is typing in another window.
     pub(crate) fn cursor_blink_enabled(&self) -> bool {
-        self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
+        self.focused && self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
     }
 
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the

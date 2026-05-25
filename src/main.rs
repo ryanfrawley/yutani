@@ -703,6 +703,16 @@ struct WindowState {
     // timer so user input can reset it (cursor stays solid while typing).
     blink_on: bool,
     last_blink: std::time::Instant,
+    /// Window focus + occlusion, tracked from winit's `Focused`/`Occluded`
+    /// events. The event loop is single-threaded and shared across every
+    /// window, so a backgrounded window that kept blinking its cursor or
+    /// running animations would drive `request_redraw`s whose vsync-blocking
+    /// renders serialize on the one thread — adding latency to whatever window
+    /// the user is actually typing in. We gate blink on `focused` (an
+    /// unfocused terminal shows a steady cursor, the usual convention) and
+    /// skip animation/redraw entirely while `occluded`.
+    focused: bool,
+    occluded: bool,
     /// Edge fade animations: phase ramps 0→1 in TOP_FADE_ANIM duration as
     /// soon as the view scrolls away from the corresponding boundary, and
     /// 1→0 when it returns. Decoupled from scroll distance so the fade
@@ -1420,6 +1430,10 @@ impl WindowState {
             held_button: None,
             blink_on: true,
             last_blink: std::time::Instant::now(),
+            // A freshly-spawned window comes up key/visible; winit will correct
+            // either flag via Focused/Occluded if that's not so.
+            focused: true,
+            occluded: false,
             top_fade_phase: 0.0,
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
