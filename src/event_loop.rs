@@ -382,6 +382,15 @@ pub(crate) async fn run() {
                                     // bar's `+` button (no window context) opens
                                     // a tab in the right group.
                                     focused_window = Some(window_id);
+                                    // A focused window is on screen by
+                                    // definition. macOS coalesces/delays the
+                                    // matching `Occluded(false)`, so clear the
+                                    // flag now — otherwise the redraw requested
+                                    // below hits the `RedrawRequested if
+                                    // state.occluded` guard and gets dropped,
+                                    // leaving a just-selected tab blank until
+                                    // occlusion finally catches up (up to ~1s).
+                                    state.occluded = false;
                                 }
                                 // Reflow on *either* transition: the tab bar's
                                 // presence (and thus the usable height) changes
