@@ -83,12 +83,19 @@ const DEFAULT_FONT_SIZE: f32 = 10.0;
 /// cols` quads worth of vertices. The `+5` covers the cursor quad
 /// plus a handful of edge-fade and decorator overlays.
 ///
+/// The band also widens during a smooth scroll slide: by up to
+/// `SCROLL_ON_OUTPUT_MAX_ROWS` rows *per side* (the band is symmetric in
+/// `|scroll_y|`), on top of the fixed ±2. So the phantom budget is
+/// `2 + SCROLL_ON_OUTPUT_MAX_ROWS` rows per side.
+///
 /// Expressed as `2 * (area + extra_quads)` where
-/// `extra_quads = 4 * cols + 5` — i.e. one phantom-row strip per side
-/// plus the fixed extras, doubled to cover both top and bottom strips.
+/// `extra_quads = phantom_rows_per_side * 2 * cols + 5` — one phantom-row
+/// strip per side (its rows × `cols` cells × 2 quads) plus the fixed extras,
+/// doubled to cover both top and bottom strips.
 fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
     let area = cols * rows;
-    let extra_quads = 4 * cols + 5;
+    let phantom_rows_per_side = 2 + SCROLL_ON_OUTPUT_MAX_ROWS;
+    let extra_quads = phantom_rows_per_side * 2 * cols + 5;
     let quads = 2 * area + 2 * extra_quads;
     let vertex_bytes = quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
     let index_bytes = quads * std::mem::size_of::<u32>() * 6;
@@ -991,6 +998,15 @@ const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// stays responsive — the final frame is reached this many seconds after the
 /// scroll lands, regardless of distance.
 const ALT_SCROLL_ANIM_SECS: f32 = 0.07;
+
+/// Maximum displayed offset, in whole line-heights, for the primary
+/// scroll-on-output slide. The renderer widens its phantom row band by
+/// `ceil(|scroll_y| / line_height)` per side, and `grid_buffer_byte_sizes`
+/// reserves exactly enough GPU buffer for the fixed ±2 strips plus this much
+/// extra widening — so the cap and the buffer sizing must move together. A
+/// 1-line push (the common case) slides fully; larger bursts slide this far
+/// then snap the rest, which beats an unreadable full-distance blur.
+const SCROLL_ON_OUTPUT_MAX_ROWS: usize = 2;
 
 /// An in-flight alt-screen scroll animation. `total_px` is the full slide
 /// distance; the rendered offset eases from `total_px` down to 0 over

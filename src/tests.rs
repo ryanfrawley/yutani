@@ -96,7 +96,7 @@ fn grid_buffer_byte_sizes_uses_full_phantom_row_slack() {
     let cols = 98;
     let rows = 35;
     let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows);
-    let extra_quads = 4 * cols + 5;
+    let extra_quads = (2 + SCROLL_ON_OUTPUT_MAX_ROWS) * 2 * cols + 5;
     let area = cols * rows;
     let quads = 2 * area + 2 * extra_quads;
     let v = std::mem::size_of::<renderer::vertex::Vertex>();
@@ -127,21 +127,24 @@ fn grid_index_buffer_addresses_beyond_u16() {
 
     // The buffer sizing must reserve 4 bytes per index (u32), not 2.
     let (_, ibuf) = grid_buffer_byte_sizes(cols, rows);
-    let quads = 2 * (cols * rows) + 2 * (4 * cols + 5);
+    let quads = 2 * (cols * rows) + 2 * ((2 + SCROLL_ON_OUTPUT_MAX_ROWS) * 2 * cols + 5);
     assert_eq!(ibuf, quads * 4 * 6, "index buffer must be sized for u32 indices");
 }
 
 #[test]
 fn grid_buffer_byte_sizes_covers_full_update_vertices_walk() {
     // Symbolic upper bound on what `update_vertices` can push:
-    // the row loop covers `rows + 4` rows (two phantom strips on
-    // each side) × `cols` cells × 2 quads (bg + glyph) per cell,
-    // plus a cursor quad and two edge-fade quads. The vertex
-    // buffer must fit at least this many vertices, otherwise
-    // `queue.write_buffer` overruns at scroll time.
+    // the row loop covers the phantom band `r_lo..r_hi`, at its
+    // widest `rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS` rows — the
+    // fixed ±2 strips plus the smooth-scroll slide widening on each
+    // side — × `cols` cells × 2 quads (bg + glyph) per cell, plus a
+    // cursor quad and two edge-fade quads. The vertex buffer must
+    // fit at least this many vertices, otherwise `queue.write_buffer`
+    // overruns at scroll time (it did: a full-screen scroll-on-output
+    // slide pulled the whole band's worth of scrollback into view).
     for (cols, rows) in [(80, 24), (98, 35), (200, 60), (32, 8)] {
         let (vbuf, _) = grid_buffer_byte_sizes(cols, rows);
-        let worst_case_quads = (rows + 4) * cols * 2 + 3;
+        let worst_case_quads = (rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS) * cols * 2 + 3;
         let worst_case_bytes =
             worst_case_quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
         assert!(

@@ -162,10 +162,17 @@ impl WindowState {
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let new_px = rows as f32 * line_height;
         // Accumulate onto any in-flight slide so a fresh chunk mid-slide flows
-        // on continuously instead of snapping back. Cap at one screen — a
-        // larger offset would just show scrollback that's already gone by.
+        // on continuously instead of snapping back. The displayed offset is
+        // hard-capped at SCROLL_ON_OUTPUT_MAX_ROWS line-heights: the renderer
+        // widens the phantom row band by `ceil(|scroll_y| / line_height)` per
+        // side, and the GPU vertex buffer is sized for only ±2 phantom rows
+        // (see `grid_buffer_byte_sizes`). A larger offset pulls more populated
+        // scrollback rows into the band than the buffer holds and
+        // `queue.write_buffer` overruns. Bursts taller than the cap snap the
+        // remainder — they'd be an unreadable blur sliding the full distance
+        // anyway.
         let prior_remaining = self.active_tab().scroll_y.max(0.0) as f32;
-        let max_px = self.active_tab().terminal.rows as f32 * line_height;
+        let max_px = SCROLL_ON_OUTPUT_MAX_ROWS as f32 * line_height;
         let total_px = (prior_remaining + new_px).min(max_px);
         if total_px <= 0.5 {
             return;
