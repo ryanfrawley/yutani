@@ -58,6 +58,44 @@ impl WindowState {
         (self.chrome_band_px - self.titlebar_only_px).max(0.0) as f32
     }
 
+    /// Refresh the chrome band and, when the native tab bar's height actually
+    /// changed, reflow the grid + GPU buffers so cells land below the bar
+    /// rather than behind it.
+    ///
+    /// The tab bar shows or hides as tabs join or leave the group, which
+    /// shrinks/grows the usable height — but on macOS that doesn't raise a
+    /// `Resized` event: the full-size content view keeps its pixel size, only
+    /// `contentLayoutRect` moves. So when a second tab appears, the originating
+    /// window (which sees only a focus *loss*, never a resize) would otherwise
+    /// keep its bar-free grid geometry and render its prompt stranded behind
+    /// the freshly-shown bar. Driving this from the focus/occlusion handlers
+    /// catches both that window and the new tab. The change guard keeps an
+    /// ordinary app-switch (bar height unchanged) a no-op.
+    pub(crate) fn reflow_for_tab_bar(&mut self) {
+        let before = self.chrome_extra_top();
+        self.refresh_chrome_band();
+        if (self.chrome_extra_top() - before).abs() < 0.5 {
+            return;
+        }
+        let metrics = self.shared.with_font(|f| f.metrics());
+        let size = WindowState::get_viewport_size(
+            self.surface.config.width as f32,
+            self.surface.config.height as f32,
+            self.shared.with_font(|f| f.cell_width()),
+            ((metrics.ascender - metrics.descender) >> 6) as usize,
+            self.chrome_extra_top(),
+        );
+        let grid_changed = size.char_width != self.active_tab().terminal.cols
+            || size.char_height != self.active_tab().terminal.rows;
+        self.active_tab_mut().terminal.resize(size.char_width, size.char_height);
+        if grid_changed {
+            self.notify_pty_size(size.char_width, size.char_height);
+        }
+        self.resize_buffers();
+        self.active_tab_mut().cursor_anim = None;
+        self.invalidate();
+    }
+
     /// Forward a mouse event to the PTY in the host's preferred encoding,
     /// if any tracking mode is enabled. `motion` is set for drag/move events.
     pub(crate) fn report_mouse(&mut self, button: input::MouseButton, press: bool, motion: bool) {

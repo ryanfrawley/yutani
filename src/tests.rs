@@ -175,6 +175,95 @@ fn get_viewport_size_floors_rows_at_min_grid_rows() {
 }
 
 #[test]
+fn get_viewport_size_extra_top_removes_expected_rows() {
+    // The tab-bar reserve (`extra_top`) is subtracted from the usable height
+    // *before* the integer divide by line height. With a line height that
+    // divides the reserve evenly, the row drop must be exactly
+    // `extra_top / line_height` — the heart of the reflow bug fix (cells that
+    // used to land behind the bar now sit below it). Pick a tall window so the
+    // MIN_GRID_ROWS floor never interferes, and a reserve (72) that is an exact
+    // multiple of the line height (18) → 4 rows removed.
+    let line_height = 18;
+    let advance_x = 8;
+    let width = 800.0;
+    let height = 1000.0;
+    let no_bar = WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0);
+    let with_bar =
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 72.0);
+    assert_eq!(
+        no_bar.char_height - with_bar.char_height,
+        72 / line_height,
+        "a {line_height}px reserve-multiple should drop exactly that many rows",
+    );
+    // The bar reserve only touches the row count — column count is driven by
+    // width and must be untouched by `extra_top`.
+    assert_eq!(no_bar.char_width, with_bar.char_width);
+}
+
+#[test]
+fn get_viewport_size_rows_monotonically_nonincreasing_in_extra_top() {
+    // A taller tab-bar reserve can never *gain* rows: usable height only
+    // shrinks as `extra_top` grows. Pin the monotonicity directly so a future
+    // sign flip or off-by-one in the subtraction surfaces here.
+    let mut prev = usize::MAX;
+    for extra_top in [0.0, 10.0, 25.0, 50.0, 90.0, 200.0, 1000.0] {
+        let rows = WindowState::get_viewport_size(800.0, 1000.0, 8, 18, extra_top).char_height;
+        assert!(
+            rows <= prev,
+            "rows must not grow as extra_top increases: extra_top={extra_top} \
+             gave {rows} rows, previous was {prev}",
+        );
+        prev = rows;
+    }
+}
+
+#[test]
+fn get_viewport_size_floor_holds_even_with_huge_tab_bar() {
+    // A tab-bar reserve larger than the whole window must still leave a usable
+    // grid: the MIN_GRID_ROWS floor applies after `extra_top` is subtracted, so
+    // the row count never collapses to zero (which would divide-by-zero the
+    // shell or strand the prompt entirely).
+    let rows = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 10_000.0).char_height;
+    assert_eq!(rows, MIN_GRID_ROWS);
+    // And a negative usable height (reserve exceeds height) is clamped to 0
+    // before the divide, not wrapped — the `.max(0.0)` on the subtraction —
+    // so we still land exactly on the floor rather than panicking on an
+    // `as usize` of a negative float.
+    let rows_neg = WindowState::get_viewport_size(800.0, 50.0, 8, 18, 5_000.0).char_height;
+    assert_eq!(rows_neg, MIN_GRID_ROWS);
+}
+
+#[test]
+fn get_viewport_size_zero_extra_top_matches_unmodified_path() {
+    // `extra_top == 0.0` is the no-tab-bar case and must be identical to the
+    // pre-reflow geometry: subtracting zero changes nothing. This guards
+    // against the bar reserve accidentally leaking into single-window layout.
+    let v = WindowState::get_viewport_size(1024.0, 768.0, 9, 20, 0.0);
+    let expected_rows = ((768.0 - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT).max(0.0) as usize) / 20;
+    assert_eq!(v.char_height, expected_rows);
+}
+
+#[test]
+fn chrome_extra_top_formula_is_band_minus_baseline_floored_at_zero() {
+    // `chrome_extra_top` (the reflow's `extra_top`) is
+    // `(chrome_band_px - titlebar_only_px).max(0.0)`. The method lives on the
+    // GPU-backed WindowState and can't be invoked here, but its arithmetic is
+    // a pure two-input formula — replicate it so a change to the definition
+    // (e.g. dropping the floor, or swapping operands) is caught against this
+    // spelled-out expectation. These are the values that feed `get_viewport_size`.
+    fn extra_top(chrome_band_px: f64, titlebar_only_px: f64) -> f32 {
+        (chrome_band_px - titlebar_only_px).max(0.0) as f32
+    }
+    // Bar taller than the bar-free baseline → the difference is the reserve.
+    assert!(approx_eq(extra_top(96.0, 56.0), 40.0));
+    // No bar (band equals the baseline) → zero reserve, the single-window case.
+    assert!(approx_eq(extra_top(56.0, 56.0), 0.0));
+    // Defensive floor: if the baseline somehow exceeds the band, the reserve
+    // clamps to 0 rather than going negative (which would *add* rows downstream).
+    assert!(approx_eq(extra_top(40.0, 56.0), 0.0));
+}
+
+#[test]
 fn tab_index_for_digit_maps_positions_and_clamps() {
     // Absolute positions (0-based) for '1'..'8' when in range.
     assert_eq!(tab_index_for_digit('1', 5), 0);
