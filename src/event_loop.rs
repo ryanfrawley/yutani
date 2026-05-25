@@ -317,7 +317,7 @@ pub(crate) async fn run() {
                 // during `input()`, and whether this window asked to close —
                 // both acted on after the `state` borrow is released, since
                 // they mutate the window registry.
-                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>)> = None;
+                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>, Config)> = None;
                 let mut close_this = false;
                 if let Some(state) = windows.get_mut(&window_id) {
                     let consumed = state.input(&event, elwt);
@@ -385,22 +385,28 @@ pub(crate) async fn run() {
                             _ => (),
                         }
                     }
-                    // Drain a new-window request raised during `input()`.
+                    // Drain a new-window request raised during `input()`. Clone
+                    // the spawning window's *live* config so the new window
+                    // inherits whatever the user currently has — palette toggles
+                    // (autocomplete, theme, zoom) mutate the per-window config and
+                    // never the startup snapshot, so passing that snapshot here
+                    // would resurrect stale settings in every new window.
                     if std::mem::take(&mut state.pending_new_window) {
                         spawn_req = Some((
                             state.active_tab().terminal.cwd().map(str::to_owned),
                             state.window_origin(),
+                            state.config.clone(),
                         ));
                     }
                 }
-                if let Some((cwd, origin)) = spawn_req {
+                if let Some((cwd, origin, cfg)) = spawn_req {
                     spawn_window_in_process(
                         elwt,
                         &shared,
                         &event_loop_proxy,
                         &mut windows,
                         &mut tab_to_window,
-                        &config,
+                        &cfg,
                         &zdotdir,
                         cwd,
                         origin,
