@@ -88,15 +88,24 @@ const DEFAULT_FONT_SIZE: f32 = 10.0;
 /// `|scroll_y|`), on top of the fixed ±2. So the phantom budget is
 /// `2 + SCROLL_ON_OUTPUT_MAX_ROWS` rows per side.
 ///
+/// `top_inset_rows` is the *extra* widening `phantom_row_band` applies to the
+/// top edge alone when the native tab bar is shown (`ceil(chrome_extra_top /
+/// line_height)`, 0 with no bar). It stacks on the scroll slide there, so the
+/// worst-case top strip is `2 + SCROLL_ON_OUTPUT_MAX_ROWS + top_inset_rows`
+/// rows — the buffer must reserve those extra rows or a full-band scroll with
+/// the tab bar up overruns `queue.write_buffer`.
+///
 /// Expressed as `2 * (area + extra_quads)` where
 /// `extra_quads = phantom_rows_per_side * 2 * cols + 5` — one phantom-row
 /// strip per side (its rows × `cols` cells × 2 quads) plus the fixed extras,
-/// doubled to cover both top and bottom strips.
-fn grid_buffer_byte_sizes(cols: usize, rows: usize) -> (usize, usize) {
+/// doubled to cover both top and bottom strips — plus the asymmetric
+/// `top_inset_rows` strip (its rows × `cols` cells × 2 quads, top only).
+fn grid_buffer_byte_sizes(cols: usize, rows: usize, top_inset_rows: usize) -> (usize, usize) {
     let area = cols * rows;
     let phantom_rows_per_side = 2 + SCROLL_ON_OUTPUT_MAX_ROWS;
     let extra_quads = phantom_rows_per_side * 2 * cols + 5;
-    let quads = 2 * area + 2 * extra_quads;
+    let top_inset_quads = top_inset_rows * 2 * cols;
+    let quads = 2 * area + 2 * extra_quads + top_inset_quads;
     let vertex_bytes = quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
     let index_bytes = quads * std::mem::size_of::<u32>() * 6;
     (vertex_bytes, index_bytes)
@@ -1348,8 +1357,11 @@ impl WindowState {
         // `update_vertices` ran near a scroll edge, `queue.write_buffer`
         // panicked with a "Copy ... would end up overrunning" validation
         // error).
+        // No native tab bar exists yet at construction (the chrome band is
+        // seeded title-bar-only below), so the top inset is zero here; the
+        // bar's reflow drives `resize_buffers`, which re-sizes with the inset.
         let (vbuf_bytes, ibuf_bytes) =
-            grid_buffer_byte_sizes(cols, rows);
+            grid_buffer_byte_sizes(cols, rows, 0);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         let vertex_buffer = shared.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("vertex buffer"),
@@ -1690,15 +1702,19 @@ impl WindowState {
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
         let metrics = self.shared.with_font(|f| f.metrics());
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as usize;
         let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
-            ((metrics.ascender - metrics.descender) >> 6) as usize,
+            line_height,
             self.chrome_extra_top(),
         );
+        // Mirror `phantom_row_band`'s top widening so the buffer reserves the
+        // extra rows the tab bar's chrome inset pushes into the band.
+        let top_inset_rows = (self.chrome_extra_top() / line_height.max(1) as f32).ceil() as usize;
         let (vbuf_bytes, ibuf_bytes) =
-            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
+            grid_buffer_byte_sizes(viewport.char_width, viewport.char_height, top_inset_rows);
         let vertex_buf: Vec<u8> = vec![0; vbuf_bytes];
         self.vertex_buffer =
             self.shared.gpu

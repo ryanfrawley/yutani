@@ -205,7 +205,7 @@ impl WindowState {
         // grid plus phantom rows above and below so smooth sub-line scrolling
         // stays populated through the snap. Used both for shaping (below) and
         // the main emit loop further down. See `phantom_row_band` for the math.
-        let (r_lo, r_hi) = Self::phantom_row_band(scroll_y, rows, line_height);
+        let (r_lo, r_hi) = Self::phantom_row_band(scroll_y, rows, line_height, tab_top);
 
         // Programming-ligature pass. Walks each visible row, prefix-matches
         // each cell against the per-variant ligature table the Shaper
@@ -2148,13 +2148,24 @@ impl WindowState {
     /// can exceed a line; on the primary it's the sub-line scrollback offset.
     /// `ceil` of the offset (in rows) covers both — so the band widens on the
     /// primary screen too, fixing the bottom row snapping instead of sliding in.
+    ///
+    /// `top_inset_px` is the extra chrome height the native tab bar adds at the
+    /// top (`chrome_extra_top`, 0 when no tab bar). The fixed `-2` was sized for
+    /// the title-bar-only chrome (≈ DECORATOR_HEIGHT, ~1 row); the taller tab-bar
+    /// band hides more rows behind it, so the top of the band must grow by that
+    /// many rows. Without it, a row sliding out from behind the bar isn't emitted
+    /// yet and the soft edge-fade blurs the bare window background for a frame or
+    /// two before the row's geometry catches up — visible as the row's content
+    /// popping in late, only when tabs are shown.
     pub(crate) fn phantom_row_band(
         scroll_y: f32,
         rows: usize,
         line_height: f32,
+        top_inset_px: f32,
     ) -> (isize, isize) {
         let anim_extra = (scroll_y.abs() / line_height).ceil() as isize;
-        let r_lo = -2 - anim_extra;
+        let chrome_extra = (top_inset_px.max(0.0) / line_height).ceil() as isize;
+        let r_lo = -2 - anim_extra - chrome_extra;
         let r_hi = rows as isize + 2 + anim_extra;
         (r_lo, r_hi)
     }
@@ -2954,8 +2965,8 @@ mod tests {
 
     #[test]
     fn zero_offset_is_exactly_visible_grid_plus_two() {
-        // No sub-line scroll → no phantom rows beyond the fixed ±2.
-        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH);
+        // No sub-line scroll, no tab bar → no phantom rows beyond the fixed ±2.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, 0.0);
         assert_eq!(r_lo, -2);
         assert_eq!(r_hi, ROWS as isize + 2);
     }
@@ -2966,7 +2977,7 @@ mod tests {
         // edge. The band widens by `ceil(|offset|)` == 1 row; the bottom
         // gaining that row (r_hi == rows+3) is what fixes the snap. The band is
         // sign-agnostic (driven by |scroll_y|), so the top widens to -3 too.
-        let (r_lo, r_hi) = WindowState::phantom_row_band(-0.5 * LH, ROWS, LH);
+        let (r_lo, r_hi) = WindowState::phantom_row_band(-0.5 * LH, ROWS, LH, 0.0);
         assert_eq!(r_hi, ROWS as isize + 3);
         assert_eq!(r_lo, -3);
     }
@@ -2976,7 +2987,7 @@ mod tests {
         // Scrolling up (positive scroll_y) slides a row in from the top edge.
         // Same one-row widening, top edge in focus (r_lo == -3); symmetric at
         // the bottom (rows+3).
-        let (r_lo, r_hi) = WindowState::phantom_row_band(0.5 * LH, ROWS, LH);
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.5 * LH, ROWS, LH, 0.0);
         assert_eq!(r_lo, -3);
         assert_eq!(r_hi, ROWS as isize + 3);
     }
@@ -2986,8 +2997,74 @@ mod tests {
         // An alt-screen slide where scroll_y spans 2.5 lines → ceil(2.5) == 3
         // extra rows on each side. The band is symmetric because the offset
         // magnitude, not its sign, sets the width.
-        let (r_lo, r_hi) = WindowState::phantom_row_band(2.5 * LH, ROWS, LH);
+        let (r_lo, r_hi) = WindowState::phantom_row_band(2.5 * LH, ROWS, LH, 0.0);
         assert_eq!(r_lo, -2 - 3);
         assert_eq!(r_hi, ROWS as isize + 2 + 3);
+    }
+
+    #[test]
+    fn tab_bar_inset_widens_band_only_at_top() {
+        // A visible native tab bar adds chrome height at the top. The band's
+        // top must grow by `ceil(inset / line_height)` rows so a row sliding
+        // out from behind the taller bar is already emitted; the bottom is
+        // unaffected. Here the inset spans 1.5 lines → ceil == 2 extra rows.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, 1.5 * LH);
+        assert_eq!(r_lo, -2 - 2);
+        assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn tab_bar_inset_and_scroll_stack_at_top() {
+        // The scroll widening and the tab-bar widening are independent and
+        // both apply to the top: 0.5-line scroll (ceil == 1) plus a 1-line
+        // inset (ceil == 1) → top grows by 2 rows. The bottom only sees the
+        // scroll term.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.5 * LH, ROWS, LH, LH);
+        assert_eq!(r_lo, -2 - 1 - 1);
+        assert_eq!(r_hi, ROWS as isize + 2 + 1);
+    }
+
+    #[test]
+    fn negative_inset_is_clamped_to_zero_rows() {
+        // `top_inset_px` is clamped with `.max(0.0)` before the ceil, so a
+        // negative inset (which should never happen, but guards against a
+        // bogus chrome measurement going negative) contributes zero extra top
+        // rows rather than a negative `chrome_extra` that would *narrow* the
+        // band and re-introduce the pop-in. Both edges sit at the bare ±2.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, -5.0 * LH);
+        assert_eq!(r_lo, -2);
+        assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn fractional_inset_just_over_a_row_boundary_ceils_up() {
+        // ceil, not round/floor: an inset one pixel past a whole row must
+        // still reserve the *next* full row, because that row is already
+        // partially on-screen behind the chrome. 1.0 line + 1px → ceil == 2.
+        // (A floor here would leave a 1px-tall sliver row un-emitted — exactly
+        // the pop-in this fix targets.)
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, LH + 1.0);
+        assert_eq!(r_lo, -2 - 2);
+        assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn exact_multiple_inset_does_not_over_reserve() {
+        // An inset that lands exactly on a row boundary ceils to that whole
+        // number with no spurious extra row: 3.0 lines → ceil == 3, not 4.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, 3.0 * LH);
+        assert_eq!(r_lo, -2 - 3);
+        assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn very_large_inset_widens_top_without_touching_bottom() {
+        // A tab bar taller than the whole grid (pathological, but the formula
+        // must stay sane): the top grows by `ceil(inset / line_height)` rows
+        // and the bottom is still only the fixed +2. No saturation or sign
+        // flip in the `isize` arithmetic.
+        let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, 1000.0 * LH);
+        assert_eq!(r_lo, -2 - 1000);
+        assert_eq!(r_hi, ROWS as isize + 2);
     }
 }
