@@ -744,10 +744,6 @@ struct WindowState {
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
     search: search::Search,
-    // Time of the last left-press in the title-bar band, for double-click
-    // detection there. Separate from `last_click` (which keys on a grid cell)
-    // since toolbar clicks have no cell. A double-click toggles window zoom.
-    last_toolbar_click: Option<std::time::Instant>,
     // Whether the pointer is currently in the title-bar band. Tracked so a
     // crossing back into the grid can restore the I-beam exactly once.
     over_toolbar: bool,
@@ -1529,7 +1525,6 @@ impl WindowState {
             last_anim_tick: std::time::Instant::now(),
             command_palette: command_palette::CommandPalette::default(),
             search: search::Search::default(),
-            last_toolbar_click: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
