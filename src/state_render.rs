@@ -9,18 +9,21 @@ impl WindowState {
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
     // and the top/bottom edge fades.
     pub(crate) fn update_vertices(&mut self) {
-        // Advance any in-flight scroll slide first so this frame reads the
-        // freshly-eased `scroll_y` (alt-screen and primary are mutually
-        // exclusive — one screen is active at a time).
-        self.update_alt_scroll();
-        self.update_primary_scroll();
+        // Advance scroll animations and refresh the scroll-dependent uniforms
+        // (camera offset, edge fades). This also reads the freshly-eased
+        // `scroll_y` below. The scroll-only fast path calls this same method
+        // alone, skipping the per-cell geometry rebuild that follows.
+        self.refresh_scroll_uniforms();
         let cols = self.active_tab().terminal.cols;
         let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
-        let theme = self.window.theme().unwrap_or(winit::window::Theme::Light);
+        // Cached theme (synced from `WindowEvent::ThemeChanged`, the same
+        // source `clear_color` reads) — avoids an NSWindow OS roundtrip on the
+        // hot path.
+        let theme = self.theme;
         // All face-derived metrics are pulled in one borrow so the shared
         // font's `Ref` is dropped before the `ensure_*` fill calls below
         // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
@@ -82,6 +85,13 @@ impl WindowState {
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
         let scroll_y = self.active_tab().scroll_y as f32;
+        // True during an alt-screen scroll slide, where only the moving rows
+        // carry `scroll_y` (baked per-vertex). Off the slide — the global case
+        // (scrollback smooth-scroll, scroll-on-output) — the whole grid shares
+        // one vertical offset, which `refresh_scroll_uniforms` folds into the
+        // camera instead, so this geometry is built scroll-independent. See the
+        // `baked_vert` / `row_scroll` choices below.
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
 
         let push_quad =
             |verts: &mut Vec<renderer::vertex::Vertex>,
@@ -155,7 +165,22 @@ impl WindowState {
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
-        let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
+        // In the global case the decorator easing is a whole-grid translation,
+        // so (like `scroll_y`) it rides the camera and isn't baked into the
+        // geometry — that's what lets a scroll-only frame skip the rebuild.
+        // The alt-screen slide keeps it baked (the camera offset is zero
+        // there). Hit-testing is unaffected: it works in screen space and
+        // subtracts the same offsets regardless of where they're applied.
+        let baked_vert = if anim_active { decorator_offset } else { 0.0 };
+        let row_y = |r: isize| WINDOW_PADDING + baked_vert + (r as f32 + 1.0) * line_height;
+        // The vertical offset `refresh_scroll_uniforms` will fold into the
+        // camera (must stay in lockstep with it). Screen-fixed geometry in this
+        // same buffer — the command palette / find overlays — subtracts it so
+        // the camera shift cancels and they stay pinned to the window. (Cells,
+        // cursor, and the cursor-anchored completion popup intentionally ride
+        // the camera.) The skip fast path is disabled while either overlay is
+        // open, so this compensation is always rebuilt with the live offset.
+        let camera_vert = if anim_active { 0.0 } else { scroll_y + decorator_offset };
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
         // Half-open band `[r_lo, r_hi)` of grid rows to render — the visible
@@ -181,6 +206,7 @@ impl WindowState {
         > = std::collections::HashMap::new();
         // Reused across rows — refilled in place to avoid per-row allocation.
         let mut row_chars: Vec<char> = Vec::with_capacity(cols);
+        let _perf_t_shape0 = std::time::Instant::now();
         // Borrow the shared shaper once for the whole pass. `match_at` returns
         // a `&Ligature` into it, so the borrow must outlive each match's use;
         // it's disjoint from the `font`/`atlas` fills below (different fields).
@@ -302,6 +328,7 @@ impl WindowState {
             );
             self.atlas.dirty = false;
         }
+        let _perf_t_shape1 = std::time::Instant::now();
 
         let atlas = &self.atlas;
         // Foreground glyph source for a cell: a single char (existing
@@ -348,12 +375,12 @@ impl WindowState {
             }
             None => (0, 0, f32::INFINITY),
         };
-        let anim_active = self.active_tab().alt_scroll_anim.is_some();
         let row_moving = move |r: isize| anim_active && r >= anim_lo && r <= anim_hi;
-        // Per-row vertical offset. When no slide is active this is the global
-        // `scroll_y` for every row (unchanged scrollback behavior).
+        // Per-row vertical offset baked into geometry. Only the alt-screen
+        // slide's moving rows carry it; the global case bakes nothing because
+        // `refresh_scroll_uniforms` applies `scroll_y` via the camera.
         let row_scroll = move |r: isize| {
-            if !anim_active || row_moving(r) {
+            if anim_active && row_moving(r) {
                 scroll_y
             } else {
                 0.0
@@ -1339,12 +1366,13 @@ impl WindowState {
             let screen_w = self.surface.config.width as f32;
             let screen_h = self.surface.config.height as f32;
 
-            // Dim the terminal behind the palette to pull focus.
+            // Dim the terminal behind the palette to pull focus. `-camera_vert`
+            // keeps this screen-fixed under the scroll camera (see `camera_vert`).
             push_quad(
                 &mut vertices,
                 &mut indices,
                 0.0,
-                0.0,
+                -camera_vert,
                 screen_w,
                 screen_h,
                 [bg_u, bg_v],
@@ -1354,10 +1382,11 @@ impl WindowState {
             );
 
             // Box geometry: a fixed-ish width centered horizontally, parked near
-            // the top of the window.
+            // the top of the window. `-camera_vert` cancels the scroll camera so
+            // the box stays pinned (everything below derives from `box_y`).
             let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - WINDOW_PADDING * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
-            let box_y = (screen_h * 0.12).round();
+            let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
             let row_h = line_height;
             let sep_h = 1.0_f32;
@@ -1519,12 +1548,13 @@ impl WindowState {
             let screen_w = self.surface.config.width as f32;
             let screen_h = self.surface.config.height as f32;
 
-            // Dim the terminal behind the box.
+            // Dim the terminal behind the box. `-camera_vert` keeps it
+            // screen-fixed under the scroll camera (see `camera_vert`).
             push_quad(
                 &mut vertices,
                 &mut indices,
                 0.0,
-                0.0,
+                -camera_vert,
                 screen_w,
                 screen_h,
                 [bg_u, bg_v],
@@ -1537,7 +1567,7 @@ impl WindowState {
                 .clamp(cell_w * 24.0, cell_w * 72.0)
                 .min(screen_w - WINDOW_PADDING * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
-            let box_y = (screen_h * 0.12).round();
+            let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
             let row_h = line_height;
             let sep_h = 1.0_f32;
@@ -1663,24 +1693,91 @@ impl WindowState {
             key: viewport_key,
         });
 
-        // 3. Edge fades: vertical gradient quads pinned to the top and bottom
-        // of the window. The top one obscures content sliding up behind the
-        // macOS traffic-light strip; the bottom one mirrors the effect so the
-        // phantom row sliding into / out of the bottom edge dissolves rather
-        // than clipping abruptly. Drawn last so they overlay every cell. RGB
-        // is premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
+        // Cell/overlay geometry is complete — upload it. The edge fades,
+        // strips, and camera offset are refreshed every frame by
+        // `refresh_scroll_uniforms` (called at the top), so they're not
+        // rebuilt here; a scroll-only frame runs that method alone and reuses
+        // this buffer untouched.
+        self.shared.gpu
+            .queue
+            .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.shared.gpu
+            .queue
+            .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
+        self.num_indices = indices.len() as u32;
+        self.num_bg_indices = num_bg_indices;
+
+        self.perf.note_update_phases(
+            _perf_t_shape1.duration_since(_perf_t_shape0),
+            _perf_t_shape1.elapsed(),
+        );
+    }
+
+    /// Advance scroll animations and refresh only the uniforms that depend on
+    /// scroll position — the camera (which now carries the whole-grid vertical
+    /// offset for the global case) and the edge-fade strips + uniform. No
+    /// per-cell geometry. `update_vertices` runs this first; the scroll-only
+    /// fast path (`flush_vertices` when just `scroll_y` eased) runs it alone,
+    /// turning a slide frame from a ~13–29ms full rebuild into a few uniform
+    /// writes.
+    pub(crate) fn refresh_scroll_uniforms(&mut self) {
+        // Advance any in-flight scroll slide (alt-screen and primary are
+        // mutually exclusive — one screen is active at a time).
+        self.update_alt_scroll();
+        self.update_primary_scroll();
+
+        let line_height = self.shared.with_font(|font| {
+            let m = font.face().size_metrics().unwrap();
+            ((m.ascender - m.descender) >> 6) as f32
+        });
+        let scroll_y = self.active_tab().scroll_y as f32;
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
+        let view_offset = self.active_tab().terminal.view_offset() as f32;
+        let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
+            0.0
+        } else {
+            self.active_tab().terminal.scrollback_len() as f32
+        };
+        let (dist_from_bottom, dist_from_top) =
+            self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
+        let near = (dist_from_bottom / line_height)
+            .min(dist_from_top / line_height)
+            .clamp(0.0, 1.0);
+        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+
         let win_w = self.surface.config.width as f32;
         let win_h = self.surface.config.height as f32;
-        // Top fade is taller than the bottom: the title bar + toolbar takes
-        // about DECORATOR_HEIGHT to fully occlude, and a longer gradient
-        // below that gives content a soft runway as it scrolls into view
-        // rather than popping out from a hard edge.
+        let bg_u = 1.0 / self.atlas.width as f32;
+        let bg_v = 1.0 / self.atlas.height as f32;
+
+        // Camera carries the whole-grid vertical offset (scroll + decorator
+        // easing) for the global case, so the grid geometry is built once at
+        // rest and slid by this single uniform write. The alt-screen slide
+        // bakes its per-row offsets into geometry instead (camera offset 0).
+        let camera_vert = if anim_active {
+            0.0
+        } else {
+            scroll_y + decorator_offset
+        };
+        self.camera_uniform
+            .update_view_proj_scrolled(&self.camera, win_w, win_h, camera_vert);
+        self.shared.gpu.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[self.camera_uniform]),
+        );
+
+        // Edge fades: vertical gradient quads pinned to the top and bottom of
+        // the window. The top obscures content sliding up behind the macOS
+        // traffic-light strip; the bottom mirrors it so a phantom row sliding
+        // into / out of the bottom edge dissolves rather than clipping. RGB is
+        // premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
         let top_fade_height = self.config.top_fade_height;
         let bottom_fade_height_max = self.config.bottom_fade_height;
         let clear = [0.0, 0.0, 0.0, 0.0];
 
-        // Strip quads live in their own vertex/index buffer — they're drawn
-        // by the blur strip pipeline in the composite pass.
+        // Strip quads live in their own vertex/index buffer — drawn by the
+        // blur strip pipeline in the composite pass.
         let mut strip_vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(16);
         let mut strip_indices: Vec<u16> = Vec::with_capacity(32);
         let push_strip = |vertices: &mut Vec<renderer::vertex::Vertex>,
@@ -1689,6 +1786,10 @@ impl WindowState {
                           y1: f32,
                           c0: [f32; 4],
                           c1: [f32; 4]| {
+            // The strip pipeline draws through the same (scrolled) camera, but
+            // edge fades are pinned to the window — cancel the camera offset.
+            let y0 = y0 - camera_vert;
+            let y1 = y1 - camera_vert;
             let start = vertices.len() as u16;
             // radii = 0 so the shader skips the SDF mask; local_pos /
             // half_size go unused but we have to populate them.
@@ -1728,11 +1829,8 @@ impl WindowState {
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };
 
-        // Edge fade animations: each phase ramps 0→1 the moment its
-        // boundary distance leaves zero (and 1→0 when it returns) at a
-        // constant rate, so the fade slides in fully in TOP_FADE_ANIM_SECS
-        // regardless of scroll speed. The phase drives both the band height
-        // (0 → full) and the alpha (0 → 1) together.
+        // Edge fade animations: each phase ramps 0→1 the moment its boundary
+        // distance leaves zero (and 1→0 when it returns) at a constant rate.
         let now = std::time::Instant::now();
         let dt = now.duration_since(self.last_anim_tick).as_secs_f32();
         self.last_anim_tick = now;
@@ -1768,9 +1866,6 @@ impl WindowState {
             push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
         }
 
-        // Computed unconditionally — like the top, these also feed the
-        // per-fragment glyph-fade uniform below. The strip quad itself is
-        // skipped at phase=0 (see the top-fade note).
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
@@ -1785,18 +1880,9 @@ impl WindowState {
             );
         }
 
-        self.shared.gpu
-            .queue
-            .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-        self.shared.gpu
-            .queue
-            .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
-        self.num_indices = indices.len() as u32;
-        self.num_bg_indices = num_bg_indices;
-
         // Strip overlay: blur-only (tint = 0). The glyph fade already pulls
-        // foreground text toward the bg color near each edge; the blur sits
-        // on top to soften whatever's still visible in the gradient region.
+        // foreground text toward the bg color near each edge; the blur softens
+        // whatever's still visible in the gradient region.
         if !strip_indices.is_empty() {
             self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
@@ -1813,9 +1899,6 @@ impl WindowState {
 
         // Both edges run the per-fragment glyph fade so scrollback text
         // dissolves into the blur strip instead of reaching the edge sharp.
-        // band_height is 0 at phase=0 (the live prompt at rest), which the
-        // shader treats as "no fade" — so cells stay solid up to the bottom
-        // edge whenever the bottom strip isn't engaged.
         let fade_data: [f32; 16] = [
             top_band_height, top_alpha, 0.0, 0.0,
             bottom_band_height, bottom_alpha, 0.0, 0.0,
@@ -2203,6 +2286,16 @@ impl WindowState {
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
         let scroll_y = self.active_tab().scroll_y as f32;
+        // Match `update_vertices`: in the global case the camera carries the
+        // whole-grid vertical offset, so image quads are placed at rest and
+        // ride the same camera. Only the alt-screen slide bakes the offset into
+        // the quad positions (camera offset is zero there).
+        let anim_active = self.active_tab().alt_scroll_anim.is_some();
+        let img_vert = if anim_active {
+            decorator_offset + scroll_y
+        } else {
+            0.0
+        };
 
         // Resolve store entries up front so the borrow can live alongside
         // the upcoming `&mut encoder` calls. Placements whose image was
@@ -2258,9 +2351,8 @@ impl WindowState {
                     + (p.left_col as f32) * cell_w
                     + p.pixel_offset.0 as f32;
                 let y_px = WINDOW_PADDING
-                    + decorator_offset
+                    + img_vert
                     + (viewport_row as f32) * line_height
-                    + scroll_y
                     + p.pixel_offset.1 as f32;
                 let w_px = (p.cols as f32) * cell_w;
                 let h_px = (p.rows as f32) * line_height;
@@ -2319,9 +2411,8 @@ impl WindowState {
                 let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
                 let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
                 let y_px = WINDOW_PADDING
-                    + decorator_offset
-                    + (run.screen_row as f32) * line_height
-                    + scroll_y;
+                    + img_vert
+                    + (run.screen_row as f32) * line_height;
                 let w_px = cells_wide * cell_w;
                 let h_px = line_height;
                 let uv = Self::placeholder_run_uv(
