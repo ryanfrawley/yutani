@@ -395,6 +395,12 @@ impl Grid {
     /// side effect of the shift. The caller decides whether to route them
     /// into scrollback (only `Terminal::scroll_region_up_by` does, and only
     /// when the live grid is the full-screen primary).
+    /// `shift_damage` is set only by a scrollback-growing full-screen scroll
+    /// (see [`Terminal::scroll_region_up_by`]): there the shifted content keeps
+    /// its absolute-line identity, so each row's damage flag moves up with its
+    /// cells and the renderer reuses the unchanged rows by abs line. For every
+    /// other caller (partial region, DECSLRM, IL/DL) content changes per row
+    /// position, so the whole region is marked dirty.
     pub fn scroll_region_up(
         &mut self,
         top: usize,
@@ -403,20 +409,33 @@ impl Grid {
         right: usize,
         n: usize,
         blank: Cell,
+        shift_damage: bool,
     ) -> Vec<Placement> {
         let region = bottom - top + 1;
         let n = n.min(region);
         if n == 0 || left > right || right >= self.cols {
             return Vec::new();
         }
-        // Content shifts between rows across the whole region, so every row in
-        // it renders differently afterward. (`clear_row` gates the freed rows,
-        // but the copy_within'd rows above need marking too.)
-        for r in top..=bottom {
-            self.mark_dirty(r);
-        }
         let width = right - left + 1;
         let full_width = left == 0 && right == self.cols - 1;
+        if shift_damage && full_width {
+            // Move each row's damage up with its content; the freed rows at the
+            // bottom are re-marked by `clear_row` below. Read-ahead (r+n) is
+            // always above the write (r), so a forward sweep is safe. Guarded
+            // like the cell copy: when n == region nothing shifts (every row is
+            // cleared), and `bottom - n` would underflow.
+            if n < region {
+                for r in top..=bottom - n {
+                    self.dirty_rows[r] = self.dirty_rows[r + n];
+                }
+            }
+        } else {
+            // Content shifts between rows across the whole region, so every row
+            // in it renders differently afterward.
+            for r in top..=bottom {
+                self.mark_dirty(r);
+            }
+        }
         // Copy only if there's something to shift. When n == region, every
         // row of the region gets cleared and nothing moves.
         if n < region {
@@ -2364,9 +2383,15 @@ impl Terminal {
         let bottom = self.scroll_bottom;
         let left = self.scroll_left;
         let right = self.scroll_right;
+        // The damage flags may shift up with their content only when this is
+        // the scrollback-growing full-screen scroll — exactly the case where a
+        // line keeps its absolute-line identity (matches the push condition
+        // above). On the alt screen or a partial region, content changes per
+        // row position, so let `scroll_region_up` mark the region dirty.
+        let shift_damage = full_region && !self.use_alternate && self.scrollback_limit > 0;
         let dropped = self
             .active_grid_mut()
-            .scroll_region_up(top, bottom, left, right, n, blank);
+            .scroll_region_up(top, bottom, left, right, n, blank, shift_damage);
         // Promote scrolled-off placements into scrollback when the live grid
         // is the full-screen primary. Their anchor row in scrollback is
         // (current scrollback length - rows above the *original* viewport top),
@@ -2592,8 +2617,10 @@ impl Terminal {
         // counterpart to IL above.
         let full_width = left == 0 && right == self.cols - 1;
         self.note_alt_region_scroll(true, n, top, bottom, full_width);
+        // DL never grows scrollback, so content changes per row position —
+        // mark the region dirty rather than shifting damage flags.
         self.active_grid_mut()
-            .scroll_region_up(top, bottom, left, right, n, blank);
+            .scroll_region_up(top, bottom, left, right, n, blank, false);
         self.cursor.wrap_pending = false;
     }
 
@@ -13595,14 +13622,49 @@ mod tests {
     }
 
     #[test]
-    fn scroll_on_linefeed_dirties_the_region() {
-        // Streaming a line past the bottom scrolls the whole grid; every
-        // surviving row shows different content afterward.
+    fn full_region_scroll_shifts_damage_instead_of_marking_all() {
+        // A scrollback-growing full-screen scroll moves each row's damage flag
+        // up with its content rather than dirtying everything, so the renderer
+        // can reuse the unchanged lines (now on new visual rows) by absolute
+        // line. Only the freed+rewritten bottom row is damaged.
         let mut t = Terminal::new(10, 3, 100);
-        t.feed("a\r\nb\r\nc"); // fills 3 rows, cursor on last
+        t.feed("a\r\nb\r\nc"); // rows a,b,c; cursor at bottom
         t.clear_row_damage();
-        t.feed("\r\nd"); // newline at bottom → scroll up by 1
-        assert!(t.row_damage().iter().all(|&d| d), "scroll dirties all rows");
+        t.feed("\r\nd"); // scroll up 1, print d → b,c,d
+        assert!(!t.row_damage()[0], "shifted line stays clean");
+        assert!(!t.row_damage()[1], "shifted line stays clean");
+        assert!(t.row_damage()[2], "freed + rewritten bottom row is dirty");
+    }
+
+    #[test]
+    fn damage_follows_content_through_full_scroll() {
+        // A line dirtied in place keeps its damage when a later scroll moves it
+        // — the flag rides up with the content so the renderer re-emits it at
+        // its new visual row instead of reusing a stale cache entry.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc");
+        t.clear_row_damage();
+        t.feed("\x1b[2;1HX"); // overwrite row 1 'b' -> 'X' (dirties row 1)
+        t.feed("\x1b[3;1H\n"); // cursor to bottom, LF -> scroll up 1
+        // 'X…' moved from row 1 to row 0, carrying its damage; bottom row freed.
+        assert!(t.row_damage()[0], "modified line's damage follows it up");
+        assert!(!t.row_damage()[1], "unchanged shifted line stays clean");
+        assert!(t.row_damage()[2], "freed bottom row is dirty");
+    }
+
+    #[test]
+    fn partial_region_scroll_still_marks_all() {
+        // A scroll that does NOT grow scrollback (here a DECSTBM region) shifts
+        // content between fixed row positions, so abs-line identity isn't
+        // preserved — the whole region must be marked dirty.
+        let mut t = Terminal::new(10, 4, 100);
+        t.feed("a\r\nb\r\nc\r\nd");
+        t.feed("\x1b[1;3r"); // DECSTBM: scroll region rows 1..=3
+        t.clear_row_damage();
+        t.feed("\x1b[3;1H\n"); // LF at region bottom -> partial scroll up
+        assert!(t.row_damage()[0], "region row dirtied");
+        assert!(t.row_damage()[1], "region row dirtied");
+        assert!(t.row_damage()[2], "region row dirtied");
     }
 
     #[test]

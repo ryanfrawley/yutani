@@ -604,10 +604,12 @@ struct TabState {
     /// URL under the mouse while Cmd is held. Drives the underline overlay and
     /// the Cmd-click open behavior.
     hover_url: Option<HoverUrl>,
-    /// Per-visual-row cached cell geometry (`RowVerts`), keyed by visual row.
-    /// `update_vertices` reuses an entry whenever the row's terminal content
+    /// Cached cell geometry (`RowVerts`) keyed by **absolute line**.
+    /// `update_vertices` reuses an entry whenever that line's terminal content
     /// wasn't damaged and the cache key still matches, re-emitting only the
-    /// changed rows. Per-tab so tabs don't share geometry.
+    /// changed lines; a line that merely scrolled is shifted, not rebuilt.
+    /// Pruned to the visible abs-line range each frame. Per-tab so tabs don't
+    /// share geometry.
     row_cache: std::collections::HashMap<isize, RowVerts>,
     /// The `RowCacheKey` every current `row_cache` entry was built against. A
     /// mismatch on the next frame drops the whole cache.
@@ -1175,16 +1177,23 @@ struct GridSnapshot {
     key: ViewportKey,
 }
 
-/// Cached cell geometry for one visual row: the background quads and the
-/// foreground glyph quads, as raw vertices (indices are regenerated at
-/// assembly since they're position-dependent). Both `Vec`s are a multiple of
-/// 4 vertices — one quad each. Reused frame-to-frame for rows whose rendered
-/// content didn't change (see `Terminal::row_damage`), so a keystroke only
-/// re-emits the cursor's row instead of every visible cell.
+/// Cached cell geometry for one line: the background quads and the foreground
+/// glyph quads, as raw vertices (indices are regenerated at assembly since
+/// they're position-dependent). Both `Vec`s are a multiple of 4 vertices — one
+/// quad each. Reused frame-to-frame for lines whose rendered content didn't
+/// change (see `Terminal::row_damage`), so a keystroke only re-emits the
+/// cursor's line instead of every visible cell.
+///
+/// Keyed by **absolute line** (stable as content scrolls into scrollback), so
+/// a scroll reuses every unchanged line. `baked_row` records the visual row the
+/// vertices' `y` was last positioned for; when the line lands on a different
+/// visual row (it scrolled), the cached vertices are shifted by the row delta
+/// instead of re-emitted.
 #[derive(Clone)]
 struct RowVerts {
     bg: Vec<renderer::vertex::Vertex>,
     fg: Vec<renderer::vertex::Vertex>,
+    baked_row: isize,
 }
 
 /// Identifies the geometry assumptions a `RowVerts` was built under. Any change

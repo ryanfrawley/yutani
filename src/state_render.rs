@@ -638,16 +638,16 @@ impl WindowState {
             tab.row_cache_key = Some(rows_key);
         }
         // A `selection_fg` scheme recolors glyphs inside the selection, so a
-        // range change makes the cached rows it entered/left stale. (The
+        // range change makes the cached lines it entered/left stale. (The
         // translucent selection background is a separate dynamic overlay below
         // and needs no invalidation.) With no `selection_fg`, selection never
-        // touches cell colors — skip entirely.
+        // touches cell colors — skip entirely. The cache is keyed by absolute
+        // line, which is exactly the selection's coordinate space.
         if selection_fg.is_some() && self.active_tab().prev_selection_range != selection_range {
-            let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
             for rng in [self.active_tab().prev_selection_range, selection_range] {
                 if let Some((s, e)) = rng {
-                    for line in s.0..=e.0 {
-                        self.tabs[self.active].row_cache.remove(&(line - top_abs));
+                    for abs_line in s.0..=e.0 {
+                        self.tabs[self.active].row_cache.remove(&abs_line);
                     }
                 }
             }
@@ -676,22 +676,39 @@ impl WindowState {
         // (animation / late decode) with no cell write, so always re-emit them.
         let forced_rows: std::collections::HashSet<isize> =
             halfblock_overrides.keys().map(|(r, _c)| *r).collect();
+        // Visual row `r` shows absolute line `top_abs + r` (the mapping is
+        // linear). The cache is keyed by that abs line so a line scrolling into
+        // scrollback keeps its entry.
+        let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
 
         // Build per-layer cell geometry; indices are regenerated at assembly.
         let mut bg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
         let mut fg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
-        // Rows freshly emitted this frame, inserted into the cache after the
+        // Lines freshly emitted this frame, inserted into the cache after the
         // loop so the loop body never holds a `&mut self.tabs` borrow.
         let mut fresh_rows: Vec<(isize, RowVerts)> = Vec::new();
         let mut tmp_idx: Vec<u32> = Vec::new();
         for r in r_lo..r_hi {
+            let abs_line = top_abs + r;
             let forced = forced_rows.contains(&r);
             let reuse = caching
                 && !forced
                 && !is_damaged(r)
-                && self.active_tab().row_cache.contains_key(&r);
+                && self.active_tab().row_cache.contains_key(&abs_line);
             if reuse {
-                let rv = &self.tabs[self.active].row_cache[&r];
+                // Cache hit: the line's content is unchanged. If it moved to a
+                // different visual row (scrolled), shift the cached vertices'
+                // `y` by the row delta — far cheaper than re-emitting — and
+                // remember the new position so a steady row is a plain memcpy.
+                let rv = self.tabs[self.active].row_cache.get_mut(&abs_line).unwrap();
+                let delta = r - rv.baked_row;
+                if delta != 0 {
+                    let dy = delta as f32 * line_height;
+                    for v in rv.bg.iter_mut().chain(rv.fg.iter_mut()) {
+                        v.position[1] += dy;
+                    }
+                    rv.baked_row = r;
+                }
                 bg_verts.extend_from_slice(&rv.bg);
                 fg_verts.extend_from_slice(&rv.fg);
                 continue;
@@ -794,13 +811,22 @@ impl WindowState {
             bg_verts.extend_from_slice(&row_bg);
             fg_verts.extend_from_slice(&row_fg);
             if caching && !forced {
-                fresh_rows.push((r, RowVerts { bg: row_bg, fg: row_fg }));
+                fresh_rows.push((abs_line, RowVerts { bg: row_bg, fg: row_fg, baked_row: r }));
             }
         }
-        // Store freshly-emitted rows; consume the damage now that every row in
+        // Store freshly-emitted lines; consume the damage now that every row in
         // the band has been emitted or reused.
-        for (r, rv) in fresh_rows {
-            self.tabs[self.active].row_cache.insert(r, rv);
+        if caching {
+            for (abs_line, rv) in fresh_rows {
+                self.tabs[self.active].row_cache.insert(abs_line, rv);
+            }
+            // Drop cached lines no longer in the visible band so the map can't
+            // grow without bound as content streams into scrollback.
+            let lo_abs = top_abs + r_lo;
+            let hi_abs = top_abs + r_hi;
+            self.tabs[self.active]
+                .row_cache
+                .retain(|&abs, _| abs >= lo_abs && abs < hi_abs);
         }
         self.tabs[self.active].terminal.clear_row_damage();
 
