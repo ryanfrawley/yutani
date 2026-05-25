@@ -2004,6 +2004,15 @@ fn spawn_window_in_process(
     // window's id → AppKit adds this as a tab in that group; a fresh id → a
     // standalone window.
     tabbing_id: &str,
+    // The spawning window's measured bar-free title-bar height, in physical px,
+    // when this window joins an existing group as a native tab (`None` for a
+    // standalone window). A window born into a visible tab bar can't measure its
+    // own title-bar-only height — `contentLayoutRect` already excludes the bar —
+    // so without this baseline its `chrome_extra_top` is derived against the
+    // coarse `WINDOW_PADDING + DECORATOR_HEIGHT` seed and the grid sits at a
+    // different offset than its siblings. The title bar is the same height on
+    // every window of the group's display, so inherit the spawner's.
+    inherit_titlebar_px: Option<f64>,
 ) {
     let title = effective_title(None, cwd.as_deref());
     let transparent = false; // matches the first window (shadow bug)
@@ -2067,7 +2076,17 @@ fn spawn_window_in_process(
         WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, tab);
     // Mirror the post-construction setup `run()` does for the first window.
     state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
-    state.refresh_chrome_band();
+    // A tab born into an already-visible bar can't measure its own bar-free
+    // title-bar height; seed it from the spawner so `refresh_chrome_band`
+    // (which only re-records the baseline while the bar is hidden) derives the
+    // same `chrome_extra_top` as its siblings instead of one based on the
+    // coarse reserve seed.
+    if let Some(px) = inherit_titlebar_px {
+        state.titlebar_only_px = px;
+    }
+    // Reflow now that the (possibly visible) bar's height is known, so the grid
+    // is sized correctly on the first frame rather than after the focus event.
+    state.reflow_for_tab_bar();
     state.sync_theme_colors();
     let keep = state.config.images_in_scrollback;
     state.active_tab_mut().terminal.set_keep_placements_in_scrollback(keep);
