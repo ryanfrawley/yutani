@@ -1006,7 +1006,7 @@ const ALT_SCROLL_ANIM_SECS: f32 = 0.07;
 /// extra widening — so the cap and the buffer sizing must move together. A
 /// 1-line push (the common case) slides fully; larger bursts slide this far
 /// then snap the rest, which beats an unreadable full-distance blur.
-const SCROLL_ON_OUTPUT_MAX_ROWS: usize = 2;
+const SCROLL_ON_OUTPUT_MAX_ROWS: usize = 16;
 
 /// An in-flight alt-screen scroll animation. `total_px` is the full slide
 /// distance; the rendered offset eases from `total_px` down to 0 over
