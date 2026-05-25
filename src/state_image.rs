@@ -169,6 +169,7 @@ impl WindowState {
     pub(crate) fn feed_terminal(&mut self, bytes: &str) {
         self.active_tab_mut().terminal.feed(bytes);
         self.maybe_start_alt_scroll();
+        self.maybe_start_primary_scroll();
         self.drain_pending_image_uploads();
     }
 

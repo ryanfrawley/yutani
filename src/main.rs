@@ -543,6 +543,10 @@ struct TabState {
     /// In-flight smooth slide for an explicit alt-screen scroll captured from
     /// the running app (`Terminal::take_alt_scroll`).
     alt_scroll_anim: Option<AltScrollAnim>,
+    /// In-flight smooth scroll-on-output slide for the primary screen, started
+    /// when new output pushes lines into scrollback on the live view
+    /// (`Terminal::take_primary_scroll`).
+    primary_scroll_anim: Option<PrimaryScrollAnim>,
     /// Pixel accumulator for the PTY mouse-tracking wheel path (tmux, vim,
     /// less, htop). Drained per `line_height` like `scroll_y`.
     wheel_pty_accum: f64,
@@ -998,6 +1002,17 @@ struct AltScrollAnim {
     rows: usize,
     region_top: usize,
     region_bottom: usize,
+    total_px: f32,
+    started: std::time::Instant,
+}
+
+/// An in-flight smooth scroll-on-output slide for the primary screen. When new
+/// output pushes lines into scrollback on the live view, `scroll_y` is set to
+/// `total_px` (the departing rows fill the gap, drawn from real scrollback) and
+/// eased back to 0 over `config.scroll_on_output_secs`. Always an upward slide,
+/// so unlike `AltScrollAnim` there's no direction flag.
+#[derive(Copy, Clone)]
+struct PrimaryScrollAnim {
     total_px: f32,
     started: std::time::Instant,
 }
@@ -1741,6 +1756,7 @@ fn create_tab(
         pending_placements: Vec::new(),
         scroll_y: 0.0,
         alt_scroll_anim: None,
+        primary_scroll_anim: None,
         wheel_pty_accum: 0.0,
         scroll_suppressed: false,
         last_wheel_at: None,

@@ -9,9 +9,11 @@ impl WindowState {
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
     // and the top/bottom edge fades.
     pub(crate) fn update_vertices(&mut self) {
-        // Advance any alt-screen scroll slide first so this frame reads the
-        // freshly-eased `scroll_y`.
+        // Advance any in-flight scroll slide first so this frame reads the
+        // freshly-eased `scroll_y` (alt-screen and primary are mutually
+        // exclusive — one screen is active at a time).
         self.update_alt_scroll();
+        self.update_primary_scroll();
         let cols = self.active_tab().terminal.cols;
         let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
