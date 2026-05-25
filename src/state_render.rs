@@ -26,8 +26,7 @@ impl WindowState {
         // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
         let (line_height, cell_w, bg_h, descender, underline_thickness_px, underline_pos_px) =
             self.shared.with_font(|font| {
-                let face = font.face();
-                let metrics = face.size_metrics().unwrap();
+                let metrics = font.metrics();
                 let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
                 let cell_w = font.cell_width() as f32;
                 let bg_h = ((metrics.ascender - metrics.descender) >> 6) as f32;
@@ -47,14 +46,14 @@ impl WindowState {
                 // Fallbacks cover fonts whose `post` table is empty (some
                 // bitmap-style monospace TTFs report 0).
                 let y_scale = metrics.y_scale as f32 / 65536.0;
-                let raw_thick_px = face.underline_thickness() as f32 * y_scale / 64.0;
+                let raw_thick_px = font.underline_thickness() as f32 * y_scale / 64.0;
                 let underline_thickness_px = if raw_thick_px > 0.0 {
                     raw_thick_px
                 } else {
                     line_height * 0.06
                 };
-                let raw_pos_px = face.underline_position() as f32 * y_scale / 64.0;
-                let underline_pos_px = if face.underline_position() != 0 {
+                let raw_pos_px = font.underline_position() as f32 * y_scale / 64.0;
+                let underline_pos_px = if font.underline_position() != 0 {
                     raw_pos_px
                 } else {
                     descender * 0.5
@@ -1889,7 +1888,7 @@ impl WindowState {
             self.active_tab().terminal.scrollback_len() as f32
         };
         let view_offset = self.active_tab().terminal.view_offset() as f32;
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
@@ -2187,7 +2186,7 @@ impl WindowState {
         // anchor → pixel rect uses the same font metrics + decorator_offset
         // + scroll_y that `update_vertices` applies to cell quads, so
         // images scroll smoothly alongside text.
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
         let view_offset = self.active_tab().terminal.view_offset() as f32;

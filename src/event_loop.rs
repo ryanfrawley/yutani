@@ -146,7 +146,7 @@ pub(crate) async fn run() {
     // buffers create_window allocates match the terminal dimensions.
     let (cols, rows) = {
         let (cell_w, line_h) = shared.with_font(|f| {
-            let m = f.face().size_metrics().unwrap();
+            let m = f.metrics();
             (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
         });
         let vp = WindowState::get_viewport_size(
