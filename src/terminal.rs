@@ -13645,4 +13645,140 @@ mod tests {
         t.reresolve_palette();
         assert!(t.row_damage().iter().all(|&d| d));
     }
+
+    #[test]
+    fn resize_produces_an_all_dirty_primary_grid() {
+        // A resize rebuilds the live grid wholesale; every row must repaint.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("hi");
+        t.clear_row_damage();
+        t.resize(12, 5);
+        assert_eq!(t.row_damage().len(), 5);
+        assert!(t.row_damage().iter().all(|&d| d), "resize is all-dirty");
+    }
+
+    #[test]
+    fn resize_produces_an_all_dirty_alternate_grid() {
+        // The alternate buffer is recreated on resize too; when it later
+        // becomes the active grid its damage must reflect a fresh, all-dirty
+        // grid (the row_damage view follows the active grid).
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b[?1049h"); // enter alt screen
+        t.feed("alt");
+        t.clear_row_damage();
+        t.resize(10, 4); // recreates the (active) alternate grid
+        assert_eq!(t.row_damage().len(), 4);
+        assert!(t.row_damage().iter().all(|&d| d), "resized alt is all-dirty");
+    }
+
+    #[test]
+    fn erase_in_display_full_dirties_all_rows() {
+        // ED 2 clears the whole screen → every row repaints.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("aaa\r\nbbb\r\nccc");
+        t.clear_row_damage();
+        t.feed("\x1b[2J"); // ED 2: erase entire display
+        assert!(t.row_damage().iter().all(|&d| d), "ED 2 dirties all rows");
+    }
+
+    #[test]
+    fn erase_in_display_scrollback_leaves_screen_clean() {
+        // ED 3 (xterm "Erase Saved Lines") drops scrollback only; on-screen
+        // content is untouched, so no live row is dirtied.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne"); // push some lines into scrollback
+        t.clear_row_damage();
+        t.feed("\x1b[3J"); // ED 3: erase saved lines
+        assert!(no_rows_dirty(&t), "ED 3 must not dirty on-screen rows");
+    }
+
+    #[test]
+    fn erase_chars_dirties_only_the_cursor_row() {
+        // ECH replaces n non-blank cells with blanks on the cursor row only.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("aaa\r\nbbb\r\nccc");
+        t.clear_row_damage();
+        t.feed("\x1b[2;1H\x1b[3X"); // ECH 3 on row 2
+        assert!(!t.row_damage()[0]);
+        assert!(t.row_damage()[1]);
+        assert!(!t.row_damage()[2]);
+    }
+
+    #[test]
+    fn erase_chars_on_blank_span_stays_clean() {
+        // ECH over already-blank cells changes nothing → no damage
+        // (clear_row is change-gated).
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("ab"); // cols 2..10 already blank
+        t.clear_row_damage();
+        t.feed("\x1b[1;5H\x1b[3X"); // ECH 3 starting in the blank tail
+        assert!(no_rows_dirty(&t), "ECH on blank span must not dirty");
+    }
+
+    #[test]
+    fn clear_row_partially_nonblank_span_dirties_only_changed_row() {
+        // A span that's part text, part blank still dirties because at least
+        // one cell changes; the blank cells in the span don't matter.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\r\nab"); // row 1: "ab" then blanks, rows 0/2 blank
+        t.clear_row_damage();
+        t.feed("\x1b[2;1H\x1b[5X"); // ECH 5 over "ab___" (mixed) on row 1
+        assert!(!t.row_damage()[0]);
+        assert!(t.row_damage()[1]);
+        assert!(!t.row_damage()[2]);
+    }
+
+    #[test]
+    fn reverse_index_at_top_dirties_the_region() {
+        // RI at the top margin scrolls the whole region down; with the default
+        // full-screen region every surviving row renders differently.
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("AAA\r\nBBB\r\nCCC");
+        t.feed("\x1b[H"); // home (cursor move only)
+        t.clear_row_damage();
+        t.feed("\x1bM"); // RI: scroll region down by 1
+        assert!(t.row_damage().iter().all(|&d| d), "RI dirties its region");
+    }
+
+    #[test]
+    fn scroll_down_dirties_the_region() {
+        // SD (CSI T) shifts the region down in place; mark the whole region.
+        let mut t = Terminal::new(3, 3, 100);
+        t.feed("AAA\r\nBBB\r\nCCC");
+        t.clear_row_damage();
+        t.feed("\x1b[T"); // SD by 1
+        assert!(t.row_damage().iter().all(|&d| d), "SD dirties its region");
+    }
+
+    #[test]
+    fn writing_to_alt_marks_alt_rows_not_primary() {
+        // row_damage() reflects only the ACTIVE grid. A write on the alt
+        // screen dirties the alt row; switching back shows the primary's
+        // (unchanged) damage state, not the alt's.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("hi"); // on primary, row 0
+        t.feed("\x1b[?1049h"); // enter alt (marks alt all-dirty)
+        t.clear_row_damage(); // clear the active (alt) grid
+        t.feed("\x1b[2;1HZ"); // write 'Z' on alt row 2
+        assert!(!t.row_damage()[0]);
+        assert!(t.row_damage()[1], "alt write dirties its row");
+        assert!(!t.row_damage()[2]);
+        // Leaving alt re-marks the now-active primary all-dirty (screen swap),
+        // so the alt's per-row damage never leaks into the primary's view.
+        t.feed("\x1b[?1049l");
+        assert!(t.row_damage().iter().all(|&d| d), "primary restore all-dirty");
+    }
+
+    #[test]
+    fn repeated_identical_writes_stay_clean() {
+        // Re-feeding the same glyph at the same spot across several writes must
+        // never dirty the row after the first paint.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("A");
+        t.clear_row_damage();
+        t.feed("\x1b[HA"); // re-print 'A'
+        t.feed("\x1b[HA"); // again
+        t.feed("\x1b[HA"); // and again
+        assert!(no_rows_dirty(&t), "repeated identical writes stay clean");
+    }
 }
