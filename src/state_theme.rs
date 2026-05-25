@@ -67,6 +67,9 @@ impl WindowState {
         self.sync_terminal_cell_size();
         self.resize_buffers();
         self.active_tab_mut().cursor_anim = None;
+        // The atlas was rebuilt above, moving every glyph's UV; cached row
+        // vertices reference the old atlas layout, so drop them all.
+        self.invalidate_row_cache();
         self.invalidate();
         true
     }
@@ -148,6 +151,9 @@ impl WindowState {
         // cell; the sweep above just changed those values, so the
         // cached vertices are stale.
         self.vertices_dirty = true;
+        // Every per-row cached vertex baked the old palette's colors — drop
+        // them all so the next rebuild re-emits with the new scheme.
+        self.invalidate_row_cache();
 
         // OSC 10/11/12 reports and the title-bar appearance both need to
         // reflect the new bg / fg.
