@@ -733,6 +733,12 @@ struct WindowState {
     /// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve — see
     /// `refresh_chrome_band`. Recomputed on resize / scale-factor change.
     chrome_band_px: f64,
+    /// The chrome band height (physical px) when the native tab
+    /// bar is *not* shown — i.e. the title bar alone. Recorded by
+    /// `refresh_chrome_band` whenever the bar is hidden; the live tab-bar height
+    /// is then `chrome_band_px - titlebar_only_px`, which the grid reserves so
+    /// content sits below the bar. Seeded equal to `chrome_band_px`.
+    titlebar_only_px: f64,
     /// Program-set window title (OSC 0/2). When `Some` it wins over the
     /// cwd-derived title; cleared back to `None` by an empty OSC 0/2 payload.
     /// Per-window so each window tracks its own shell's title.
@@ -746,6 +752,14 @@ struct WindowState {
     /// window in-process. (A window can't build its sibling itself — it has no
     /// handle to the shared resources or the window map.)
     pending_new_window: bool,
+    /// Set by Cmd-T; drained like `pending_new_window` but spawns the new
+    /// window into *this* window's native tab group (shared `tabbingIdentifier`)
+    /// so AppKit draws it as a tab rather than a separate window.
+    pending_new_tab: bool,
+    /// True while this window is occluded — i.e. a background native tab whose
+    /// content AppKit isn't showing. Render is skipped while set (the shell
+    /// still parses output); reveal forces a redraw. See the event loop.
+    occluded: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -1431,9 +1445,12 @@ impl WindowState {
             // (and on every resize / scale change) replaces it with the real
             // DPI-scaled native title-bar height.
             chrome_band_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
+            titlebar_only_px: (WINDOW_PADDING + DECORATOR_HEIGHT) as f64,
             manual_title: None,
             theme: window_theme,
             pending_new_window: false,
+            pending_new_tab: false,
+            occluded: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
         }
@@ -1511,6 +1528,9 @@ impl WindowState {
         height: f32,
         advance_x: usize,
         line_height: usize,
+        // Extra top reserve for the native tab bar when shown
+        // (0 otherwise), so the bottom row never lands under the window edge.
+        extra_top: f32,
     ) -> ViewportSize {
         ViewportSize {
             char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
@@ -1535,7 +1555,8 @@ impl WindowState {
             // an even shorter window costs nothing real.
             char_height: usize::max(
                 MIN_GRID_ROWS,
-                (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT) as usize / line_height,
+                (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT - extra_top).max(0.0) as usize
+                    / line_height,
             ),
         }
     }
@@ -1548,6 +1569,7 @@ impl WindowState {
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
+            self.chrome_extra_top(),
         );
         let (vbuf_bytes, ibuf_bytes) =
             grid_buffer_byte_sizes(viewport.char_width, viewport.char_height);
@@ -1649,6 +1671,7 @@ impl WindowState {
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
+            self.chrome_extra_top(),
         );
         // Only touch the PTY winsize when the character grid actually
         // changes. macOS raises SIGWINCH on any TIOCSWINSZ whose winsize
@@ -1727,6 +1750,28 @@ fn next_tab_id() -> app_window::TabId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     app_window::TabId(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A fresh, process-unique native tab-group identifier.
+/// A window built with a brand-new id opens standalone; Cmd-T reuses the
+/// source window's id (read back via `WindowExtMacOS::tabbing_identifier`) so
+/// the new window joins that group as a native tab.
+fn next_tab_group_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("yutani-tabgroup-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Map a Cmd-`d` digit ('1'..='9') to a 0-based tab index for `num_tabs` tabs:
+/// '1'..'8' are absolute positions (clamped to the last tab) and '9' is always
+/// the last tab (the Chrome/iTerm convention). `num_tabs` is assumed ≥ 1.
+fn tab_index_for_digit(d: char, num_tabs: usize) -> usize {
+    let last = num_tabs.saturating_sub(1);
+    if d == '9' {
+        last
+    } else {
+        (d as usize - '1' as usize).min(last)
+    }
 }
 
 /// Create a new tab: open a PTY, fork `program` onto it, spawn the reader
@@ -1826,12 +1871,17 @@ fn spawn_window_in_process(
     zdotdir: &Option<std::path::PathBuf>,
     cwd: Option<String>,
     origin: Option<(f64, f64)>,
+    // The window's native tab-group id. Matching an open
+    // window's id → AppKit adds this as a tab in that group; a fresh id → a
+    // standalone window.
+    tabbing_id: &str,
 ) {
     let title = effective_title(None, cwd.as_deref());
     let transparent = false; // matches the first window (shadow bug)
     let mut builder = WindowBuilder::new()
         .with_title(&title)
         .with_titlebar_transparent(true)
+        .with_tabbing_identifier(tabbing_id)
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
@@ -1868,6 +1918,9 @@ fn spawn_window_in_process(
             surface.config.height as f32,
             cell_w,
             line_h,
+            // Brand-new window; tab-bar reserve (if it joins a group) lands via
+            // the follow-up resize/focus once it's grouped.
+            0.0,
         );
         (vp.char_width, vp.char_height)
     };
@@ -2085,6 +2138,96 @@ fn native_titlebar_height_physical(window: &Window) -> Option<f64> {
 fn native_titlebar_height_physical(_window: &Window) -> Option<f64> {
     None
 }
+
+/// Whether the window's native tab bar is currently shown (`[[window tabGroup]
+/// isTabBarVisible]`). True once a window is grouped with ≥1 sibling tab (or
+/// when the user's "always show tab bar" setting forces it). `contentLayoutRect`
+/// already excludes the bar when it's up, so `chrome_band_px` grows by the bar's
+/// height — `refresh_chrome_band` uses this to record the bar-free height and
+/// derive the bar's height as the difference.
+#[cfg(target_os = "macos")]
+fn native_tab_bar_visible(window: &Window) -> bool {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return false;
+    };
+    unsafe {
+        let ns_view = handle.ns_view as *mut Object;
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return false;
+        }
+        let tab_group: *mut Object = msg_send![ns_window, tabGroup];
+        if tab_group.is_null() {
+            return false;
+        }
+        let visible: bool = msg_send![tab_group, isTabBarVisible];
+        visible
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn native_tab_bar_visible(_window: &Window) -> bool {
+    false
+}
+
+/// Set by the native tab bar's `+` button (see `install_new_tab_action`).
+/// Polled + cleared by the event loop, which opens a tab in the key window's
+/// group. An `AtomicBool` because the AppKit action and the poll are decoupled
+/// (both run on the main thread, so no ordering subtlety beyond the flag).
+pub(crate) static NEW_TAB_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The `newWindowForTab:` implementation AppKit invokes when the `+` button is
+/// clicked. Its mere presence on the responder chain is also what makes AppKit
+/// *show* the button. We don't open the window here (no access to our state on
+/// this objc call) — just raise a flag the event loop drains.
+#[cfg(target_os = "macos")]
+extern "C" fn yutani_new_window_for_tab(
+    _this: *mut objc::runtime::Object,
+    _cmd: objc::runtime::Sel,
+    _sender: *mut objc::runtime::Object,
+) {
+    NEW_TAB_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install `newWindowForTab:` on the window's class so AppKit draws the native
+/// tab bar's `+` button and routes its clicks to us. Idempotent: the method is
+/// added to the (process-wide) window class once; later calls are no-ops.
+#[cfg(target_os = "macos")]
+fn install_new_tab_action(window: &Window) {
+    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return;
+    };
+    unsafe {
+        let ns_view = handle.ns_view as *mut Object;
+        let ns_window: *mut Object = msg_send![ns_view, window];
+        if ns_window.is_null() {
+            return;
+        }
+        ONCE.call_once(|| {
+            let cls = objc::runtime::object_getClass(ns_window) as *mut objc::runtime::Class;
+            let types = b"v@:@\0".as_ptr() as *const std::os::raw::c_char;
+            let imp: objc::runtime::Imp = std::mem::transmute(
+                yutani_new_window_for_tab
+                    as extern "C" fn(
+                        *mut Object,
+                        objc::runtime::Sel,
+                        *mut Object,
+                    ),
+            );
+            objc::runtime::class_addMethod(cls, sel!(newWindowForTab:), imp, types);
+        });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_new_tab_action(_window: &Window) {}
 
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray

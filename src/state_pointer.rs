@@ -42,6 +42,20 @@ impl WindowState {
         let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
         self.chrome_band_px =
             chrome_band_from(native_titlebar_height_physical(&self.window), reserve);
+        // When the tab bar is hidden, the chrome band is the title
+        // bar alone — record it so we can derive the tab bar's height (the
+        // difference) while it's shown. `contentLayoutRect` already excludes the
+        // bar, so `chrome_band_px` already grew to include it.
+        if !native_tab_bar_visible(&self.window) {
+            self.titlebar_only_px = self.chrome_band_px;
+        }
+    }
+
+    /// Extra vertical pixels the native tab bar consumes (0 when
+    /// it's hidden). The grid reserves this at the top so cells sit below the
+    /// bar rather than behind it.
+    pub(crate) fn chrome_extra_top(&self) -> f32 {
+        (self.chrome_band_px - self.titlebar_only_px).max(0.0) as f32
     }
 
     /// Forward a mouse event to the PTY in the host's preferred encoding,
@@ -103,8 +117,14 @@ impl WindowState {
         // Strip top = renderer's `baseline - ascender - (lh - bg_h)/2`
         // for row 0, where baseline_0 = WP + chrome + line_height.
         let strip_pad = (line_height - bg_h) * 0.5;
-        let row_strip_top =
-            WINDOW_PADDING as f64 + chrome_offset + line_height - ascender - strip_pad;
+        // Mirror the renderer's tab-bar push-down so the hit-test
+        // tracks the offset grid.
+        let row_strip_top = WINDOW_PADDING as f64
+            + chrome_offset
+            + self.chrome_extra_top() as f64
+            + line_height
+            - ascender
+            - strip_pad;
         let col = ((px - WINDOW_PADDING as f64) / cell_w).floor() as i64;
         let row = ((py - row_strip_top - self.active_tab().scroll_y) / line_height).floor() as i64;
         let col = col.clamp(0, self.active_tab().terminal.cols as i64 - 1) as usize;

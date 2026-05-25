@@ -59,6 +59,9 @@ pub(crate) async fn run() {
     let window = WindowBuilder::new()
         .with_title(&initial_title)
         .with_titlebar_transparent(true)
+        // Give the first window a known tab-group id (and
+        // thus Preferred tabbing mode) so Cmd-T tabs reliably join it.
+        .with_tabbing_identifier(&next_tab_group_id())
         .with_transparent(transparent)
         .with_has_shadow(!transparent)
         .with_fullsize_content_view(true)
@@ -67,6 +70,9 @@ pub(crate) async fn run() {
         .build(&event_loop)
         .unwrap();
     lap("after window build");
+    // Teach the window class to answer `newWindowForTab:` so the
+    // native tab bar shows its `+` button and routes clicks to us.
+    install_new_tab_action(&window);
 
     // event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -154,6 +160,7 @@ pub(crate) async fn run() {
             surface.config.height as f32,
             cell_w,
             line_h,
+            0.0, // first window opens standalone — no tab bar
         );
         (vp.char_width, vp.char_height)
     };
@@ -203,6 +210,10 @@ pub(crate) async fn run() {
     let mut tab_to_window: std::collections::HashMap<app_window::TabId, winit::window::WindowId> =
         std::collections::HashMap::new();
     tab_to_window.insert(tab_id, initial_window_id);
+    // The currently key window, so the tab bar's `+` button (which
+    // raises a global flag with no window context) opens a tab in the right
+    // group.
+    let mut focused_window: Option<winit::window::WindowId> = Some(initial_window_id);
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
@@ -317,7 +328,14 @@ pub(crate) async fn run() {
                 // during `input()`, and whether this window asked to close —
                 // both acted on after the `state` borrow is released, since
                 // they mutate the window registry.
-                let mut spawn_req: Option<(Option<String>, Option<(f64, f64)>, Config)> = None;
+                // (cwd, origin, config, tabbing_id, is_tab)
+                let mut spawn_req: Option<(
+                    Option<String>,
+                    Option<(f64, f64)>,
+                    Config,
+                    String,
+                    bool,
+                )> = None;
                 let mut close_this = false;
                 if let Some(state) = windows.get_mut(&window_id) {
                     let consumed = state.input(&event, elwt);
@@ -361,6 +379,35 @@ pub(crate) async fn run() {
                                 state.refresh_chrome_band();
                                 state.window.request_redraw();
                             }
+                            // Selecting a native tab makes its window key. The
+                            // app renders on demand, so a tab that produced no
+                            // output while hidden would show stale/blank until
+                            // the next event — force a redraw. The chrome band is
+                            // refreshed too since the tab bar's appearance (and
+                            // thus the title bar height) changes as tabs come and
+                            // go.
+                            WindowEvent::Focused(true) => {
+                                focused_window = Some(window_id);
+                                state.refresh_chrome_band();
+                                state.invalidate();
+                                state.window.request_redraw();
+                            }
+                            // Track occlusion so background tabs skip rendering
+                            // (their shells keep parsing). Reveal forces a fresh
+                            // frame since none were drawn while hidden.
+                            WindowEvent::Occluded(occ) => {
+                                state.occluded = occ;
+                                if !occ {
+                                    state.refresh_chrome_band();
+                                    state.invalidate();
+                                    state.window.request_redraw();
+                                }
+                            }
+                            WindowEvent::RedrawRequested if state.occluded => {
+                                // Background native tab — nothing is on screen,
+                                // so skip the GPU work. The reveal (Occluded
+                                // false) requests a fresh frame.
+                            }
                             WindowEvent::RedrawRequested => {
                                 state.update();
                                 state.prepare_frame();
@@ -392,14 +439,29 @@ pub(crate) async fn run() {
                     // never the startup snapshot, so passing that snapshot here
                     // would resurrect stale settings in every new window.
                     if std::mem::take(&mut state.pending_new_window) {
+                        // Fresh group id → standalone window.
                         spawn_req = Some((
                             state.active_tab().terminal.cwd().map(str::to_owned),
                             state.window_origin(),
                             state.config.clone(),
+                            next_tab_group_id(),
+                            false,
+                        ));
+                    } else if std::mem::take(&mut state.pending_new_tab) {
+                        // Reuse this window's group id so the
+                        // new window joins it as a native tab. AppKit positions
+                        // tabs itself, so pass no cascade origin.
+                        use winit::platform::macos::WindowExtMacOS;
+                        spawn_req = Some((
+                            state.active_tab().terminal.cwd().map(str::to_owned),
+                            None,
+                            state.config.clone(),
+                            state.window.tabbing_identifier(),
+                            true,
                         ));
                     }
                 }
-                if let Some((cwd, origin, cfg)) = spawn_req {
+                if let Some((cwd, origin, cfg, tabbing_id, _is_tab)) = spawn_req {
                     spawn_window_in_process(
                         elwt,
                         &shared,
@@ -410,6 +472,7 @@ pub(crate) async fn run() {
                         &zdotdir,
                         cwd,
                         origin,
+                        &tabbing_id,
                     );
                 }
                 if close_this {
@@ -428,6 +491,32 @@ pub(crate) async fn run() {
                 }
             }
             Event::AboutToWait => {
+                // Drain a `+`-button click (no window context, so
+                // it targets the key window's group — same as Cmd-T there).
+                if NEW_TAB_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    let req = focused_window.and_then(|wid| windows.get(&wid)).map(|s| {
+                        use winit::platform::macos::WindowExtMacOS;
+                        (
+                            s.active_tab().terminal.cwd().map(str::to_owned),
+                            s.config.clone(),
+                            s.window.tabbing_identifier(),
+                        )
+                    });
+                    if let Some((cwd, cfg, tabbing_id)) = req {
+                        spawn_window_in_process(
+                            elwt,
+                            &shared,
+                            &event_loop_proxy,
+                            &mut windows,
+                            &mut tab_to_window,
+                            &cfg,
+                            &zdotdir,
+                            cwd,
+                            None,
+                            &tabbing_id,
+                        );
+                    }
+                }
                 // Each window animates independently; collect the earliest
                 // wake-up across all of them and arm the loop for that.
                 let mut next_wake: Option<std::time::Instant> = None;

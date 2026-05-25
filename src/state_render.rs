@@ -155,7 +155,9 @@ impl WindowState {
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
-        let row_y = |r: isize| WINDOW_PADDING + decorator_offset + (r as f32 + 1.0) * line_height;
+        // Push the grid below the native tab bar when it's shown.
+        let top_base = WINDOW_PADDING + decorator_offset + self.chrome_extra_top();
+        let row_y = |r: isize| top_base + (r as f32 + 1.0) * line_height;
         let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
 
         // Half-open band `[r_lo, r_hi)` of grid rows to render — the visible
@@ -1164,8 +1166,7 @@ impl WindowState {
                 let block_x = WINDOW_PADDING + eased_col * cell_w;
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
-                let cur_baseline =
-                    WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
+                let cur_baseline = top_base + (eased_vis_row + 1.0) * line_height;
                 let block_y = cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5
                     + row_scroll(eased_vis_row.round() as isize);
                 // Anchor the completion popup to this cell's strip: left edge at
@@ -2202,6 +2203,9 @@ impl WindowState {
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        // Match the grid's top base so images track the tab-bar
+        // offset (see `update_vertices`).
+        let top_base = WINDOW_PADDING + decorator_offset + self.chrome_extra_top();
         let scroll_y = self.active_tab().scroll_y as f32;
 
         // Resolve store entries up front so the borrow can live alongside
@@ -2257,8 +2261,7 @@ impl WindowState {
                 let x_px = WINDOW_PADDING
                     + (p.left_col as f32) * cell_w
                     + p.pixel_offset.0 as f32;
-                let y_px = WINDOW_PADDING
-                    + decorator_offset
+                let y_px = top_base
                     + (viewport_row as f32) * line_height
                     + scroll_y
                     + p.pixel_offset.1 as f32;
@@ -2318,10 +2321,7 @@ impl WindowState {
                 // `view_offset` shift needed.
                 let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
                 let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
-                let y_px = WINDOW_PADDING
-                    + decorator_offset
-                    + (run.screen_row as f32) * line_height
-                    + scroll_y;
+                let y_px = top_base + (run.screen_row as f32) * line_height + scroll_y;
                 let w_px = cells_wide * cell_w;
                 let h_px = line_height;
                 let uv = Self::placeholder_run_uv(

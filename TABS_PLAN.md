@@ -1,5 +1,18 @@
 # Tabs — implementation plan (follow-up to in-process multi-window)
 
+> **Superseded (2026-05): we shipped native macOS tabs instead.** This document
+> describes a *custom-drawn* in-window tab bar (one window owning
+> `Vec<TabState>`, a renderer-drawn strip, manual hit-testing). That was built
+> and worked, but felt non-native. We pivoted to **AppKit native tabs**: each
+> tab is its own `NSWindow` sharing a `tabbingIdentifier` (winit's
+> `with_tabbing_identifier` / `WindowExtMacOS`), which slots cleanly onto the
+> existing in-process multi-window model and gives drag-reorder, tear-off, the
+> "Show All Tabs" overview, and Window-menu integration for free. Cmd-T joins
+> the key window's group; Cmd-N opens a new group; the native `+` button is
+> wired via a `newWindowForTab:` method installed on the window class. The grid
+> reserves the tab bar's measured height (`contentLayoutRect`) so content sits
+> below it. The custom-bar design below is kept for historical context only.
+
 You're picking up a planned feature with the groundwork already done. **Read
 this whole file first**, then skim `MULTIWINDOW_PLAN.md` (same directory) — its
 "Three-tier model", "Tab tear-off", and "PTY event routing" sections are the
