@@ -171,7 +171,13 @@ impl WindowState {
         // there). Hit-testing is unaffected: it works in screen space and
         // subtracts the same offsets regardless of where they're applied.
         let baked_vert = if anim_active { decorator_offset } else { 0.0 };
-        let row_y = |r: isize| WINDOW_PADDING + baked_vert + (r as f32 + 1.0) * line_height;
+        // The native tab bar's reserve is a *fixed* top inset — it never
+        // scrolls or animates — so it's baked into the geometry here rather
+        // than folded into the scroll camera below. The hit-test inverse adds
+        // the same constant in screen space.
+        let tab_top = self.chrome_extra_top();
+        let row_y =
+            |r: isize| WINDOW_PADDING + baked_vert + tab_top + (r as f32 + 1.0) * line_height;
         // The vertical offset `refresh_scroll_uniforms` will fold into the
         // camera (must stay in lockstep with it). Screen-fixed geometry in this
         // same buffer — the command palette / find overlays — subtracts it so
@@ -1191,7 +1197,7 @@ impl WindowState {
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
                 let cur_baseline =
-                    WINDOW_PADDING + decorator_offset + (eased_vis_row + 1.0) * line_height;
+                    WINDOW_PADDING + baked_vert + tab_top + (eased_vis_row + 1.0) * line_height;
                 let block_y = cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5
                     + row_scroll(eased_vis_row.round() as isize);
                 // Anchor the completion popup to this cell's strip: left edge at
@@ -2285,6 +2291,9 @@ impl WindowState {
             .clamp(0.0, 1.0);
         let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
         let scroll_y = self.active_tab().scroll_y as f32;
+        // Fixed tab-bar top inset, baked into image geometry exactly as it is
+        // for cells in `update_vertices` (the camera carries scroll/decorator).
+        let tab_top = self.chrome_extra_top();
         // Match `update_vertices`: in the global case the camera carries the
         // whole-grid vertical offset, so image quads are placed at rest and
         // ride the same camera. Only the alt-screen slide bakes the offset into
@@ -2351,6 +2360,7 @@ impl WindowState {
                     + p.pixel_offset.0 as f32;
                 let y_px = WINDOW_PADDING
                     + img_vert
+                    + tab_top
                     + (viewport_row as f32) * line_height
                     + p.pixel_offset.1 as f32;
                 let w_px = (p.cols as f32) * cell_w;
@@ -2411,6 +2421,7 @@ impl WindowState {
                 let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
                 let y_px = WINDOW_PADDING
                     + img_vert
+                    + tab_top
                     + (run.screen_row as f32) * line_height;
                 let w_px = cells_wide * cell_w;
                 let h_px = line_height;

@@ -693,6 +693,38 @@ impl WindowState {
                                 self.pending_new_window = true;
                                 return true;
                             }
+                            // Cmd-T: open a native tab in
+                            // this window's tab group (event loop spawns a
+                            // sibling window sharing the tabbingIdentifier).
+                            if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("t") {
+                                self.pending_new_tab = true;
+                                return true;
+                            }
+                            // Cmd-Shift-] / [ cycle native tabs; Cmd-1..8 jump,
+                            // Cmd-9 = last. These drive AppKit's tab group
+                            // directly via WindowExtMacOS.
+                            {
+                                use winit::platform::macos::WindowExtMacOS;
+                                if self.modifiers.shift_key() {
+                                    if s.as_ref() == "]" || s.as_ref() == "}" {
+                                        self.window.select_next_tab();
+                                        return true;
+                                    }
+                                    if s.as_ref() == "[" || s.as_ref() == "{" {
+                                        self.window.select_previous_tab();
+                                        return true;
+                                    }
+                                } else if let Some(d) = s
+                                    .as_ref()
+                                    .chars()
+                                    .next()
+                                    .filter(|c| ('1'..='9').contains(c))
+                                {
+                                    let target = tab_index_for_digit(d, self.window.num_tabs());
+                                    self.window.select_tab_at_index(target);
+                                    return true;
+                                }
+                            }
                             // Cmd-+ / Cmd-= zoom in, Cmd-- zooms out. macOS
                             // delivers `=` for the unshifted key and `+` when
                             // shift is held, so handle both as "increase".

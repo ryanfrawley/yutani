@@ -162,13 +162,38 @@ fn get_viewport_size_floors_rows_at_min_grid_rows() {
     // 1–2 row grid, which spills the prompt into scrollback on resize.
     // The row count must never drop below MIN_GRID_ROWS no matter how
     // short the window. cell 8px wide, 18px line height.
-    let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18);
+    let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18, 0.0);
     assert_eq!(tiny.char_height, MIN_GRID_ROWS);
-    let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18);
+    let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18, 0.0);
     assert_eq!(short.char_height, MIN_GRID_ROWS);
     // A normally-sized window is unaffected — the floor doesn't clamp it.
-    let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18);
+    let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 0.0);
     assert!(normal.char_height > MIN_GRID_ROWS);
+    // The native tab bar's extra top reserve removes rows from the same window.
+    let with_tab_bar = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 90.0);
+    assert!(with_tab_bar.char_height < normal.char_height);
+}
+
+#[test]
+fn tab_index_for_digit_maps_positions_and_clamps() {
+    // Absolute positions (0-based) for '1'..'8' when in range.
+    assert_eq!(tab_index_for_digit('1', 5), 0);
+    assert_eq!(tab_index_for_digit('3', 5), 2);
+    // '9' is always the last tab, regardless of count.
+    assert_eq!(tab_index_for_digit('9', 5), 4);
+    assert_eq!(tab_index_for_digit('9', 1), 0);
+    // Out-of-range positions clamp to the last tab.
+    assert_eq!(tab_index_for_digit('8', 3), 2);
+    assert_eq!(tab_index_for_digit('2', 1), 0);
+}
+
+#[test]
+fn next_tab_group_id_is_unique_and_prefixed() {
+    let a = next_tab_group_id();
+    let b = next_tab_group_id();
+    assert_ne!(a, b, "each group id must be distinct");
+    assert!(a.starts_with("yutani-tabgroup-"));
+    assert!(b.starts_with("yutani-tabgroup-"));
 }
 
 #[test]

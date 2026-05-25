@@ -60,6 +60,7 @@ impl WindowState {
             self.surface.config.height as f32,
             self.shared.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
+            self.chrome_extra_top(),
         );
         self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
