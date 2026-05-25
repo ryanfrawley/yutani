@@ -802,3 +802,110 @@ pub(crate) fn effective_skip_primary_bg(config: &Config, overrides: &palette::Gl
         config.glow_scanlines_skip_primary_bg
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Defaults must survive a serialize -> parse_str round-trip unchanged.
+    /// This is the persistence contract every per-window config setting (e.g.
+    /// the `autocomplete` palette toggle that a new window inherits) relies on:
+    /// what gets written to disk must parse back to exactly the same value.
+    #[test]
+    fn defaults_round_trip_unchanged() {
+        let original = Config::defaults();
+        let parsed = Config::parse_str(&original.serialize());
+
+        assert_eq!(parsed.autocomplete, original.autocomplete);
+        assert_eq!(parsed.font_size, original.font_size);
+        assert_eq!(parsed.cursor_blink, original.cursor_blink);
+        assert_eq!(parsed.scroll_on_output_secs, original.scroll_on_output_secs);
+        assert_eq!(parsed.blur_iterations, original.blur_iterations);
+        assert_eq!(parsed.auto_theme, original.auto_theme);
+        assert_eq!(parsed.images_enabled, original.images_enabled);
+        assert_eq!(parsed.images_filter, original.images_filter);
+        assert_eq!(parsed.images_memory_cap_mb, original.images_memory_cap_mb);
+        assert_eq!(parsed.shell_exit_mode, original.shell_exit_mode);
+        assert_eq!(parsed.prompt_gutter, original.prompt_gutter);
+    }
+
+    /// `autocomplete = false` must survive the round-trip. This is the
+    /// persistence half of the new-window-inherits-live-config fix: a window
+    /// that disabled autocomplete writes `false`, and reloading (or a fresh
+    /// process) must read `false` back, not the `true` default.
+    #[test]
+    fn autocomplete_false_round_trips() {
+        let mut c = Config::defaults();
+        c.autocomplete = false;
+
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(!parsed.autocomplete);
+    }
+
+    /// `autocomplete = true` (the default) is emitted explicitly and parses
+    /// back as true — guards against the field being dropped from serialize().
+    #[test]
+    fn autocomplete_true_round_trips() {
+        let mut c = Config::defaults();
+        c.autocomplete = true;
+
+        let parsed = Config::parse_str(&c.serialize());
+        assert!(parsed.autocomplete);
+    }
+
+    /// A spread of representative non-default values across the major config
+    /// sections must all survive the round-trip together, including the
+    /// `Option<String>` scheme/font slots (only emitted when `Some`) and the
+    /// enum-backed `shell_exit_mode` / `prompt_gutter` keys.
+    #[test]
+    fn representative_fields_round_trip() {
+        let mut c = Config::defaults();
+        c.autocomplete = false;
+        c.font_size = 14.5;
+        c.cursor_blink = true;
+        c.blur_iterations = 1;
+        c.color_scheme = Some("dracula".to_string());
+        c.auto_theme = true;
+        c.light_scheme = Some("ayu light".to_string());
+        c.dark_scheme = Some("spacedust".to_string());
+        c.font_family = Some("Iosevka Term".to_string());
+        c.glow_match_brightness = true;
+        c.glow_scanlines = true;
+        c.images_enabled = false;
+        c.images_filter = "nearest".to_string();
+        c.images_memory_cap_mb = 64;
+        c.shell_exit_mode = ShellExitMode::Never;
+        c.prompt_gutter = PromptGutter::Bar;
+
+        let parsed = Config::parse_str(&c.serialize());
+
+        assert!(!parsed.autocomplete);
+        assert_eq!(parsed.font_size, 14.5);
+        assert!(parsed.cursor_blink);
+        assert_eq!(parsed.blur_iterations, 1);
+        assert_eq!(parsed.color_scheme.as_deref(), Some("dracula"));
+        assert!(parsed.auto_theme);
+        assert_eq!(parsed.light_scheme.as_deref(), Some("ayu light"));
+        assert_eq!(parsed.dark_scheme.as_deref(), Some("spacedust"));
+        assert_eq!(parsed.font_family.as_deref(), Some("Iosevka Term"));
+        assert!(parsed.glow_match_brightness);
+        assert!(parsed.glow_scanlines);
+        assert!(!parsed.images_enabled);
+        assert_eq!(parsed.images_filter, "nearest");
+        assert_eq!(parsed.images_memory_cap_mb, 64);
+        assert_eq!(parsed.shell_exit_mode, ShellExitMode::Never);
+        assert_eq!(parsed.prompt_gutter, PromptGutter::Bar);
+    }
+
+    /// Cloning a live Config (what the new-window spawn path does) yields a
+    /// value indistinguishable from the source for the persisted fields — the
+    /// in-memory half of the fix, complementing the disk round-trip above.
+    #[test]
+    fn clone_preserves_autocomplete_toggle() {
+        let mut c = Config::defaults();
+        c.autocomplete = false;
+        let cloned = c.clone();
+        assert_eq!(cloned.autocomplete, c.autocomplete);
+        assert!(!cloned.autocomplete);
+    }
+}
