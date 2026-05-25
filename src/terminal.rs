@@ -13668,6 +13668,117 @@ mod tests {
     }
 
     #[test]
+    fn full_region_scroll_by_two_shifts_damage_by_two() {
+        // SU 2 shifts every row's damage up by 2: an in-place-dirtied row 3
+        // lands on row 1 carrying its flag, the clean row 2 lands on row 0
+        // staying clean, and the two freed bottom rows (3,4) are dirty.
+        let mut t = Terminal::new(10, 5, 100);
+        t.feed("a\r\nb\r\nc\r\nd\r\ne"); // rows 0..4 = a,b,c,d,e
+        t.clear_row_damage(); // all rows clean
+        t.feed("\x1b[4;1HX"); // overwrite row 3 'd' -> 'X' => only row 3 dirty
+        assert!(!t.row_damage()[0] && !t.row_damage()[1] && !t.row_damage()[2]);
+        assert!(t.row_damage()[3] && !t.row_damage()[4]); // precondition
+        t.feed("\x1b[2S"); // SU 2 (full-screen, scrollback-growing)
+        assert!(!t.row_damage()[0], "clean row 2 shifted to row 0 stays clean");
+        assert!(t.row_damage()[1], "dirtied row 3 shifted to row 1 keeps damage");
+        assert!(!t.row_damage()[2], "clean row 4 shifted to row 2 stays clean");
+        assert!(t.row_damage()[3], "freed bottom row is dirty");
+        assert!(t.row_damage()[4], "freed bottom row is dirty");
+    }
+
+    #[test]
+    fn full_region_scroll_n_equals_region_clears_all_no_panic() {
+        // Regression: SU with n >= region clamps to region; the damage-shift
+        // path must NOT compute `bottom - n` (which would underflow when
+        // n == region). It instead clears every row, leaving all dirty.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc");
+        t.clear_row_damage();
+        t.feed("\x1b[50S"); // SU 50 on a 3-row grid: clamps to 3 == region
+        assert!(
+            t.row_damage().iter().all(|&d| d),
+            "n == region clears and dirties every row"
+        );
+    }
+
+    #[test]
+    fn full_region_scroll_then_identical_reprint_stays_clean() {
+        // After a full scroll moves a clean line up (and we re-clear damage),
+        // re-printing that line's identical content must not dirty it — the
+        // change-gated `set` plus the shifted-clean flag keep the renderer's
+        // cached row valid.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc"); // rows a,b,c
+        t.feed("\r\nd"); // scroll up 1 -> rows b,c,d
+        t.clear_row_damage();
+        // 'b' is now on row 0; re-print the identical 'b' there.
+        t.feed("\x1b[1;1Hb");
+        assert!(no_rows_dirty(&t), "identical re-print of shifted line stays clean");
+    }
+
+    #[test]
+    fn alt_screen_full_scroll_marks_region_not_shift() {
+        // On the alt screen a full-screen LF scroll does NOT grow scrollback,
+        // so use_alternate disables the damage shift: the whole region is
+        // dirtied even though a clean line moved up.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b[?1049h"); // enter alt screen
+        t.feed("a\r\nb\r\nc"); // fill the alt grid, cursor at bottom
+        t.clear_row_damage();
+        t.feed("\r\nd"); // LF at bottom -> full-screen scroll up on alt
+        assert!(
+            t.row_damage().iter().all(|&d| d),
+            "alt full scroll marks the whole region dirty"
+        );
+    }
+
+    #[test]
+    fn full_region_scroll_with_zero_scrollback_marks_region() {
+        // shift_damage requires scrollback_limit > 0. With no scrollback the
+        // line has no stable absolute-line identity to carry, so the scroll
+        // falls back to marking the whole region dirty.
+        let mut t = Terminal::new(10, 3, 0);
+        t.feed("a\r\nb\r\nc");
+        t.clear_row_damage();
+        t.feed("\r\nd"); // scroll up 1 with no scrollback
+        assert!(
+            t.row_damage().iter().all(|&d| d),
+            "zero-scrollback full scroll marks the whole region dirty"
+        );
+    }
+
+    #[test]
+    fn delete_lines_dirties_its_region_not_shift() {
+        // DL (CSI M) routes through scroll_region_up with shift_damage=false:
+        // it never grows scrollback, so its region [cursor.row..=bottom] is
+        // marked dirty rather than shifting damage flags up.
+        let mut t = Terminal::new(10, 4, 100);
+        t.feed("a\r\nb\r\nc\r\nd"); // rows 0..3
+        t.clear_row_damage();
+        t.feed("\x1b[2;1H\x1b[1M"); // cursor to row 1, DL 1
+        assert!(!t.row_damage()[0], "row above DL region untouched");
+        assert!(t.row_damage()[1], "DL region row dirtied");
+        assert!(t.row_damage()[2], "DL region row dirtied");
+        assert!(t.row_damage()[3], "DL region row dirtied");
+    }
+
+    #[test]
+    fn two_lf_scrolls_in_one_feed_compose_shift_correctly() {
+        // Feeding two lines triggers two full-screen scrolls; the shift-damage
+        // path composes so only genuinely-new bottom rows are dirty and the
+        // surviving shifted lines stay clean.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc"); // rows a,b,c
+        t.clear_row_damage();
+        t.feed("\r\nd\r\ne"); // two scrolls -> rows c,d,e
+        // 'c' rode up twice from row 2 to row 0, staying clean; 'd' and 'e'
+        // are freshly written bottom rows.
+        assert!(!t.row_damage()[0], "twice-shifted clean line stays clean");
+        assert!(t.row_damage()[1], "newly written row is dirty");
+        assert!(t.row_damage()[2], "newly written row is dirty");
+    }
+
+    #[test]
     fn delete_chars_dirties_its_row() {
         let mut t = Terminal::new(10, 3, 100);
         t.feed("abcdef");
