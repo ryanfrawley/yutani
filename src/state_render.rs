@@ -1922,27 +1922,33 @@ impl WindowState {
         // blur strip pipeline in the composite pass.
         let mut strip_vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(16);
         let mut strip_indices: Vec<u16> = Vec::with_capacity(32);
+        // `tint` (0..1) selects what the strip shader mixes toward: 0 = the
+        // live blur of the scene (the soft fade), 1 = the vertex `color`'s RGB
+        // as a solid fill (the hard backing). Carried in the otherwise-unused
+        // `radii.x` vertex slot; `color.a` is the overall strip alpha.
         let push_strip = |vertices: &mut Vec<renderer::vertex::Vertex>,
                           indices: &mut Vec<u16>,
                           y0: f32,
                           y1: f32,
                           c0: [f32; 4],
-                          c1: [f32; 4]| {
+                          c1: [f32; 4],
+                          tint: f32| {
             // The strip pipeline draws through the same (scrolled) camera, but
             // edge fades are pinned to the window — cancel the camera offset.
             let y0 = y0 - camera_vert;
             let y1 = y1 - camera_vert;
             let start = vertices.len() as u16;
-            // radii = 0 so the shader skips the SDF mask; local_pos /
-            // half_size go unused but we have to populate them.
+            // radii.yzw = 0 so the shader skips the SDF mask; radii.x carries
+            // the blur-vs-solid tint. local_pos / half_size go unused.
             let stub = [0.0_f32, 0.0];
+            let radii = [tint, 0.0, 0.0, 0.0];
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y0, 0.0],
                 tex_coords: [bg_u, bg_v],
                 color: c0,
                 local_pos: stub,
                 half_size: stub,
-                radii: [0.0; 4],
+                radii,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y1, 0.0],
@@ -1950,7 +1956,7 @@ impl WindowState {
                 color: c1,
                 local_pos: stub,
                 half_size: stub,
-                radii: [0.0; 4],
+                radii,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y0, 0.0],
@@ -1958,7 +1964,7 @@ impl WindowState {
                 color: c0,
                 local_pos: stub,
                 half_size: stub,
-                radii: [0.0; 4],
+                radii,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y1, 0.0],
@@ -1966,7 +1972,7 @@ impl WindowState {
                 color: c1,
                 local_pos: stub,
                 half_size: stub,
-                radii: [0.0; 4],
+                radii,
             });
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };
@@ -1994,18 +2000,64 @@ impl WindowState {
             if dist_from_bottom > 0.0 { 1.0 } else { 0.0 },
             self.config.bottom_fade_anim_secs,
         );
-        // top_band_height / top_alpha also feed the per-fragment glyph-fade
-        // uniform below, so they're computed unconditionally. The strip quads
-        // themselves are skipped at phase=0: emitting them would draw with
-        // alpha 0 but still bump num_strip_indices, forcing render() through
-        // the slow blur+composite path.
+        // `top_alpha` (and the band geometry below) also feed the per-fragment
+        // glyph-fade uniform, so they're computed unconditionally. The strip
+        // quads themselves are skipped at phase=0: emitting them would draw with
+        // alpha 0 but still bump num_strip_indices, forcing render() through the
+        // slow blur+composite path.
         let top_alpha = self.top_fade_phase;
-        let top_band_height = top_fade_height * self.top_fade_phase;
+        // The effect holds full strength across the whole chrome band (title
+        // bar + native tab bar when shown) so rows passing *behind* the chrome
+        // — including the gap between the title and the tab bar — are fully
+        // covered, not just the top edge. The soft style then fades over an
+        // extra `top_fade_height` below the band; the hard style stops at the
+        // band edge.
+        let bar_h = self.chrome_band_px as f32;
+        let fade_h = top_fade_height;
+        let soft_band = bar_h + fade_h;
+        // The per-fragment glyph fade (below) tracks the soft band so text
+        // dissolves with the blur; the hard style occludes outright and leaves
+        // glyphs crisp.
+        let (fade_top_band, fade_top_alpha) = match self.config.scroll_edge_style {
+            ScrollEdgeStyle::Soft => (soft_band, top_alpha),
+            ScrollEdgeStyle::Hard => (0.0, 0.0),
+        };
         if self.top_fade_phase > 0.0 {
-            let top_mid = top_band_height * self.config.top_fade_solid_stop.clamp(0.0, 1.0);
-            let top_blur = [0.0_f32, 0.0, 0.0, top_alpha];
-            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, top_mid, top_blur, top_blur);
-            push_strip(&mut strip_vertices, &mut strip_indices, top_mid, top_band_height, top_blur, clear);
+            match self.config.scroll_edge_style {
+                ScrollEdgeStyle::Soft => {
+                    // One continuous smoothstep ramp from the very top edge down
+                    // over the whole band (chrome band + the fade below it) — no
+                    // full-strength plateau. The blur is alpha-composited over
+                    // the already-drawn sharp content, so the effect begins right
+                    // at the chrome band (strong but not a hard frost) and eases
+                    // to zero well below it. Because the ramp spans past the
+                    // chrome, it's still substantial across the band, so no sharp
+                    // rows show through the chrome gap; matches the native soft
+                    // scroll-edge effect. Emitted as a few linear segments.
+                    const SEGS: usize = 8;
+                    // smoothstep complement: full at the top edge (u=0), zero at
+                    // the band bottom (u=1).
+                    let a = |u: f32| top_alpha * (1.0 - u * u * (3.0 - 2.0 * u));
+                    let mut prev_y = 0.0_f32;
+                    for i in 1..=SEGS {
+                        let u0 = (i - 1) as f32 / SEGS as f32;
+                        let u1 = i as f32 / SEGS as f32;
+                        let y1 = soft_band * u1;
+                        let c0 = [0.0_f32, 0.0, 0.0, a(u0)];
+                        let c1 = [0.0_f32, 0.0, 0.0, a(u1)];
+                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 0.0);
+                        prev_y = y1;
+                    }
+                }
+                ScrollEdgeStyle::Hard => {
+                    // One opaque background-colored bar covering the chrome band,
+                    // with a crisp bottom edge — tint 1 fills with the vertex
+                    // color.
+                    let bg = palette::get().background;
+                    let solid = [bg[0], bg[1], bg[2], top_alpha];
+                    push_strip(&mut strip_vertices, &mut strip_indices, 0.0, bar_h, solid, solid, 1.0);
+                }
+            }
         }
 
         let bottom_alpha = self.bottom_fade_phase;
@@ -2019,6 +2071,7 @@ impl WindowState {
                 win_h,
                 clear,
                 bottom_blur,
+                0.0,
             );
         }
 
@@ -2041,8 +2094,9 @@ impl WindowState {
 
         // Both edges run the per-fragment glyph fade so scrollback text
         // dissolves into the blur strip instead of reaching the edge sharp.
+        // The top contribution is style-aware (zeroed for the hard backing).
         let fade_data: [f32; 16] = [
-            top_band_height, top_alpha, 0.0, 0.0,
+            fade_top_band, fade_top_alpha, 0.0, 0.0,
             bottom_band_height, bottom_alpha, 0.0, 0.0,
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,

@@ -64,10 +64,11 @@ fn fs_up(in: VsOut) -> @location(0) vec4<f32> {
 }
 
 //
-// Strip pass: takes a quad in pixel space whose vertex `color.a` is the
-// blur-mix weight (RGB ignored). Samples the upsampled blur at the
-// fragment's screen position and outputs a premultiplied RGBA so the
-// PREMULTIPLIED_ALPHA_BLENDING pipeline gives mix(scene, blur, alpha).
+// Strip pass: takes a quad in pixel space. `radii.x` is the tint (0 = sample
+// the upsampled blur at the fragment's screen position, the soft edge; 1 =
+// use the vertex `color`'s RGB as a solid fill, the hard backing). `color.a`
+// is the overall strip alpha. Output is premultiplied RGBA so the
+// PREMULTIPLIED_ALPHA_BLENDING pipeline gives mix(scene, result, alpha).
 //
 
 struct CameraUniform {
@@ -87,19 +88,20 @@ struct StripVsIn {
 
 struct StripVsOut {
     @builtin(position) clip_position: vec4<f32>,
-    // color.r = bg-tint strength (0 = pure blur, 1 = pure bg color).
-    // color.a = overall strip alpha. Tint masks blur near the toolbar so
-    // window-chrome contrast is preserved.
+    // radii.x = tint (0 = sample the scene blur, 1 = solid `fill`).
+    // color.a = overall strip alpha; color.rgb = the solid `fill` color.
     @location(0) tint: f32,
     @location(1) alpha: f32,
+    @location(2) fill: vec3<f32>,
 };
 
 @vertex
 fn vs_strip(model: StripVsIn) -> StripVsOut {
     var out: StripVsOut;
     out.clip_position = camera.view_projection * vec4<f32>(model.position, 1.0);
-    out.tint = model.color.r;
+    out.tint = model.radii.x;
     out.alpha = model.color.a;
+    out.fill = model.color.rgb;
     return out;
 }
 
@@ -107,7 +109,6 @@ fn vs_strip(model: StripVsIn) -> StripVsOut {
 fn fs_strip(in: StripVsOut) -> @location(0) vec4<f32> {
     let uv = in.clip_position.xy * strip_params.texel_size;
     let blur = textureSample(src_tex, src_smp, uv);
-    // Bg color is hardcoded to clear_color() in main.rs (white).
-    let rgb = mix(blur.rgb, vec3<f32>(1.0), in.tint);
+    let rgb = mix(blur.rgb, in.fill, in.tint);
     return vec4<f32>(rgb * in.alpha, in.alpha);
 }

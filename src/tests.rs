@@ -828,6 +828,66 @@ fn config_prompt_gutter_round_trips_through_serialize() {
 }
 
 #[test]
+fn scroll_edge_style_from_str_valid_values() {
+    assert_eq!(ScrollEdgeStyle::from_str("soft"), Some(ScrollEdgeStyle::Soft));
+    assert_eq!(ScrollEdgeStyle::from_str("hard"), Some(ScrollEdgeStyle::Hard));
+}
+
+#[test]
+fn scroll_edge_style_from_str_unknown_is_none() {
+    assert_eq!(ScrollEdgeStyle::from_str("bogus"), None);
+    assert_eq!(ScrollEdgeStyle::from_str(""), None);
+}
+
+#[test]
+fn scroll_edge_style_round_trips_through_as_str() {
+    for s in [ScrollEdgeStyle::Soft, ScrollEdgeStyle::Hard] {
+        assert_eq!(ScrollEdgeStyle::from_str(s.as_str()), Some(s));
+    }
+}
+
+#[test]
+fn config_scroll_edge_style_default_is_soft() {
+    assert_eq!(Config::defaults().scroll_edge_style, ScrollEdgeStyle::Soft);
+}
+
+#[test]
+fn config_scroll_edge_style_parses_explicit_value() {
+    let hard = Config::parse_str("scroll_edge_style = \"hard\"\n");
+    assert_eq!(hard.scroll_edge_style, ScrollEdgeStyle::Hard);
+}
+
+#[test]
+fn config_scroll_edge_style_unknown_keeps_default() {
+    let parsed = Config::parse_str("scroll_edge_style = \"squishy\"\n");
+    assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Soft);
+}
+
+#[test]
+fn config_scroll_edge_style_missing_key_defaults() {
+    let parsed = Config::parse_str("font_size = 14.0\n");
+    assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Soft);
+}
+
+#[test]
+fn config_scroll_edge_style_round_trips_through_serialize() {
+    let mut c = Config::defaults();
+    c.scroll_edge_style = ScrollEdgeStyle::Hard;
+    let parsed = Config::parse_str(&c.serialize());
+    assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Hard);
+}
+
+#[test]
+fn config_scroll_edge_style_default_soft_round_trips_through_serialize() {
+    // The default must also survive serialize -> parse_str: serialize() emits
+    // `soft` explicitly, so a reload (or fresh process) reads it back rather
+    // than silently relying on the parse-path default.
+    let c = Config::defaults();
+    let parsed = Config::parse_str(&c.serialize());
+    assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Soft);
+}
+
+#[test]
 fn config_autocomplete_default_is_on() {
     assert!(Config::defaults().autocomplete);
 }
@@ -1286,7 +1346,6 @@ fn config_full_default_round_trip_is_identity() {
     // Compare field-by-field with float tolerance; Config has no Eq.
     assert!(approx_eq(parsed.font_size, d.font_size));
     assert!(approx_eq(parsed.top_fade_height, d.top_fade_height));
-    assert!(approx_eq(parsed.top_fade_solid_stop, d.top_fade_solid_stop));
     assert!(approx_eq(parsed.top_fade_anim_secs, d.top_fade_anim_secs));
     assert!(approx_eq(parsed.bottom_fade_height, d.bottom_fade_height));
     assert!(approx_eq(parsed.bottom_fade_anim_secs, d.bottom_fade_anim_secs));
@@ -1307,19 +1366,17 @@ fn config_full_default_round_trip_is_identity() {
 
 #[test]
 fn config_round_trip_preserves_fade_fields() {
-    // The five fade knobs are floats with no clamp on the parse path, so
+    // The fade knobs are floats with no clamp on the parse path, so
     // any non-default value must survive serialize → parse_str unchanged.
     // Previously only the glow/image/font groups were round-trip tested.
     let mut c = Config::defaults();
     c.top_fade_height = 123.5;
-    c.top_fade_solid_stop = 0.625;
     c.top_fade_anim_secs = 0.5;
     c.bottom_fade_height = 64.25;
     c.bottom_fade_anim_secs = 0.75;
     c.cursor_anim_secs = 0.12;
     let parsed = Config::parse_str(&c.serialize());
     assert!(approx_eq(parsed.top_fade_height, 123.5));
-    assert!(approx_eq(parsed.top_fade_solid_stop, 0.625));
     assert!(approx_eq(parsed.top_fade_anim_secs, 0.5));
     assert!(approx_eq(parsed.bottom_fade_height, 64.25));
     assert!(approx_eq(parsed.bottom_fade_anim_secs, 0.75));

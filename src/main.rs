@@ -1363,17 +1363,19 @@ impl WindowState {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Three strip quads max (top opaque, top gradient, bottom gradient) ⇒
-        // 12 vertices, 18 indices. Sized generously so resize never reallocs.
+        // Strip quads: the soft top edge is emitted as several gradient
+        // segments plus the bottom fade. Sized for up to 16 quads (64 vertices,
+        // 96 indices) — comfortably above the current segment count so resize
+        // never reallocs.
         let strip_vertex_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip vertex buffer"),
-            size: (32 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
+            size: (64 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let strip_index_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip index buffer"),
-            size: (64 * std::mem::size_of::<u16>()) as u64,
+            size: (96 * std::mem::size_of::<u16>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });

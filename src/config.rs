@@ -113,14 +113,48 @@ impl PromptGutter {
     }
 }
 
+/// Style of the top scroll-edge effect — the band where scrollback content
+/// meets the title-bar chrome. Mirrors macOS 26's `NSScrollEdgeEffectStyle`
+/// (`.soft` / `.hard`), implemented here on the GPU since the terminal isn't an
+/// `NSScrollView` the system effect could attach to. Configured via the
+/// `scroll_edge_style` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollEdgeStyle {
+    /// A soft gradient: rows blur and dissolve toward the background as they
+    /// slide up behind the toolbar (default).
+    Soft,
+    /// A hard, opaque background-colored backing the rows pass behind, with a
+    /// crisp bottom edge — a solid separation rather than a fade.
+    Hard,
+}
+
+impl ScrollEdgeStyle {
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "soft" => Some(Self::Soft),
+            "hard" => Some(Self::Hard),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) font_size: f32,
     pub(crate) top_fade_height: f32,
-    pub(crate) top_fade_solid_stop: f32,
     pub(crate) top_fade_anim_secs: f32,
     pub(crate) bottom_fade_height: f32,
     pub(crate) bottom_fade_anim_secs: f32,
+    /// Style of the top scroll-edge effect (`soft` blur fade vs `hard` opaque
+    /// backing). See [`ScrollEdgeStyle`].
+    pub(crate) scroll_edge_style: ScrollEdgeStyle,
     /// Ease-in-out duration for cursor position changes. 0 disables the
     /// animation and the cursor snaps as before.
     pub(crate) cursor_anim_secs: f32,
@@ -295,10 +329,10 @@ impl Config {
         Self {
             font_size: DEFAULT_FONT_SIZE,
             top_fade_height: DECORATOR_HEIGHT * 3.0,
-            top_fade_solid_stop: 0.5,
             top_fade_anim_secs: 0.36,
             bottom_fade_height: DECORATOR_HEIGHT * 2.0,
             bottom_fade_anim_secs: 0.36,
+            scroll_edge_style: ScrollEdgeStyle::Soft,
             cursor_anim_secs: 0.06,
             scroll_on_output_secs: 0.08,
             cursor_blink: false,
@@ -371,7 +405,6 @@ impl Config {
         match k {
             "font_size" => if let Some(x) = cfg_f32(v) { self.font_size = x; },
             "top_fade_height" => if let Some(x) = cfg_f32(v) { self.top_fade_height = x; },
-            "top_fade_solid_stop" => if let Some(x) = cfg_f32(v) { self.top_fade_solid_stop = x; },
             "top_fade_anim_secs" => if let Some(x) = cfg_f32(v) { self.top_fade_anim_secs = x; },
             "bottom_fade_height" => if let Some(x) = cfg_f32(v) { self.bottom_fade_height = x; },
             "bottom_fade_anim_secs" => if let Some(x) = cfg_f32(v) { self.bottom_fade_anim_secs = x; },
@@ -473,6 +506,11 @@ impl Config {
                 // Silently keep the default on an unknown value — same
                 // forgiving contract as `images_filter`.
             },
+            "scroll_edge_style" => if let Some(x) = v.as_str() {
+                if let Some(s) = ScrollEdgeStyle::from_str(x) {
+                    self.scroll_edge_style = s;
+                }
+            },
             "prompt_gutter" => if let Some(x) = v.as_str() {
                 if let Some(g) = PromptGutter::from_str(x) {
                     self.prompt_gutter = g;
@@ -510,20 +548,21 @@ impl Config {
             "# Display\n\
              font_size = {}\n\
              top_fade_height = {}\n\
-             top_fade_solid_stop = {}\n\
              top_fade_anim_secs = {}\n\
              bottom_fade_height = {}\n\
              bottom_fade_anim_secs = {}\n\
+             # scroll_edge_style: \"soft\" | \"hard\"\n\
+             scroll_edge_style = {}\n\
              cursor_anim_secs = {}\n\
              scroll_on_output_secs = {}\n\
              cursor_blink = {}\n\
              blur_iterations = {}\n",
             self.font_size,
             self.top_fade_height,
-            self.top_fade_solid_stop,
             self.top_fade_anim_secs,
             self.bottom_fade_height,
             self.bottom_fade_anim_secs,
+            toml_str_lit(self.scroll_edge_style.as_str()),
             self.cursor_anim_secs,
             self.scroll_on_output_secs,
             self.cursor_blink,
@@ -876,10 +915,12 @@ mod tests {
         c.images_memory_cap_mb = 64;
         c.shell_exit_mode = ShellExitMode::Never;
         c.prompt_gutter = PromptGutter::Bar;
+        c.scroll_edge_style = ScrollEdgeStyle::Hard;
 
         let parsed = Config::parse_str(&c.serialize());
 
         assert!(!parsed.autocomplete);
+        assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Hard);
         assert_eq!(parsed.font_size, 14.5);
         assert!(parsed.cursor_blink);
         assert_eq!(parsed.blur_iterations, 1);
