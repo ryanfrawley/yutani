@@ -1556,7 +1556,7 @@ impl WindowState {
 
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
@@ -1657,7 +1657,7 @@ impl WindowState {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let size = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
@@ -1690,7 +1690,7 @@ impl WindowState {
         // discover the cell-pixel size. Zero here would make those
         // tools refuse to send images with "Terminal does not support
         // reporting screen sizes in pixels."
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
@@ -1874,7 +1874,7 @@ fn spawn_window_in_process(
     let dpi = (window.scale_factor() * 96.0) as u32;
     let (cols, rows) = {
         let (cell_w, line_h) = shared.with_font(|f| {
-            let m = f.face().size_metrics().unwrap();
+            let m = f.metrics();
             (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
         });
         let vp = WindowState::get_viewport_size(

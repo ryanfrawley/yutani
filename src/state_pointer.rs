@@ -78,7 +78,7 @@ impl WindowState {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     pub(crate) fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;

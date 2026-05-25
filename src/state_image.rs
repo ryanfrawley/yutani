@@ -95,7 +95,7 @@ impl WindowState {
         if results.is_empty() {
             return;
         }
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         let mut any_placed = false;
@@ -337,7 +337,7 @@ impl WindowState {
     /// sizing math can resolve `Npx` / `N%` / `Auto` specs. Called on
     /// init and on every font-size change.
     pub(crate) fn sync_terminal_cell_size(&mut self) {
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
         self.active_tab_mut().terminal.set_cell_size_px(cell_w, line_h);
