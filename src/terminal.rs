@@ -717,6 +717,13 @@ pub struct Terminal {
     // region top (rows sit just above, at edge_row-1 .. edge_row-d); for a
     // downward scroll it's region_bottom+1 (rows sit at edge_row .. edge_row+d-1).
     alt_anim_departing: Option<AltAnimRows>,
+    // Net rows the *primary* screen scrolled into scrollback during the
+    // current `feed` (each new line of output pushes one). Unlike the alt
+    // path this needs no snapshot or poison flag: the departing rows are real
+    // scrollback the renderer already draws via the phantom band when
+    // `scroll_y > 0`, so the front end only needs the count. Drained by
+    // `take_primary_scroll` to drive a smooth scroll-on-output slide.
+    primary_scroll_net: usize,
     // Theme-derived defaults the terminal reports back for OSC 10/11/12
     // queries. Set by the front end via `set_default_colors`.
     default_fg_rgb: [u8; 3],
@@ -991,6 +998,7 @@ impl Terminal {
             alt_scroll_region: None,
             alt_scroll_poison: false,
             alt_anim_departing: None,
+            primary_scroll_net: 0,
             default_fg_rgb: [0xcc, 0xcc, 0xcc],
             default_bg_rgb: [0x00, 0x00, 0x00],
             default_cursor_rgb: [0xcc, 0xcc, 0xcc],
@@ -1473,6 +1481,16 @@ impl Terminal {
     /// Drop the frozen departing rows once the front end's slide completes.
     pub fn clear_alt_anim(&mut self) {
         self.alt_anim_departing = None;
+    }
+
+    /// Consume the net number of rows the primary screen scrolled into
+    /// scrollback during the last `feed`, for the front end to animate as a
+    /// smooth scroll-on-output slide. Returns 0 when nothing scrolled (or only
+    /// the alt screen / a partial region did). Unlike `take_alt_scroll` there
+    /// are no frozen rows to clear afterwards — the departing content is real
+    /// scrollback the renderer already serves while `scroll_y > 0`.
+    pub fn take_primary_scroll(&mut self) -> usize {
+        std::mem::replace(&mut self.primary_scroll_net, 0)
     }
 
     /// Record an alt-screen scroll for later animation. Called from the scroll
@@ -2233,6 +2251,10 @@ impl Terminal {
         let full_width = self.scroll_left == 0 && self.scroll_right == self.cols - 1;
         self.note_alt_region_scroll(true, n, self.scroll_top, self.scroll_bottom, full_width);
         if !self.use_alternate && full_region && self.scrollback_limit > 0 {
+            // Record the slide distance for the front-end scroll-on-output
+            // animation. Capped at the grid height — the rows beyond a full
+            // screen have already scrolled past what any slide could show.
+            self.primary_scroll_net = (self.primary_scroll_net + n.min(self.rows)).min(self.rows);
             for _ in 0..n.min(self.rows) {
                 let line = self.primary.row(self.scroll_top).to_vec();
                 if self.scrollback.len() == self.scrollback_limit {
@@ -4414,6 +4436,10 @@ impl Terminal {
         self.alt_scroll_region = None;
         self.alt_scroll_poison = false;
         self.alt_anim_departing = None;
+        // RIS clears the screen and scrollback; sliding the now-stale departing
+        // rows in from the top would briefly show content that no longer
+        // exists, so drop any pending scroll-on-output distance too.
+        self.primary_scroll_net = 0;
         self.pending_response.clear();
         self.scrollback.clear();
         // Grid::clear already dropped per-grid placements above; also drop
@@ -7540,6 +7566,181 @@ mod tests {
         t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
         t.feed("\x1b[1S\x1bc");
         assert!(t.take_alt_scroll().is_none(), "RIS clears capture");
+    }
+
+    #[test]
+    fn primary_scroll_counts_lines_pushed_into_scrollback() {
+        // A 2-row grid: the first two lines fill rows 0 and 1, then each
+        // further LF rolls one line into scrollback. Four lines → 2 scrolls.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        assert_eq!(t.take_primary_scroll(), 2, "two rows rolled into scrollback");
+    }
+
+    #[test]
+    fn primary_scroll_take_is_one_shot() {
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("AAA\r\nBBB\r\nCCC");
+        assert!(t.take_primary_scroll() > 0);
+        assert_eq!(t.take_primary_scroll(), 0, "second take is drained");
+    }
+
+    #[test]
+    fn primary_scroll_accumulates_across_feeds_until_taken() {
+        // The counter sums across feeds within one animation window: two feeds
+        // of one scroll each report 2 if not drained between them.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("AAA\r\nBBB"); // fills both rows, no scroll yet
+        t.feed("\r\nCCC"); // scroll 1
+        t.feed("\r\nDDD"); // scroll 1 more
+        assert_eq!(t.take_primary_scroll(), 2, "two scrolls accumulate");
+    }
+
+    #[test]
+    fn primary_scroll_capped_at_grid_height() {
+        // A burst far taller than the grid caps at `rows` — the rows beyond a
+        // full screen have already scrolled past anything a slide could show.
+        let mut t = Terminal::new(3, 2, 100); // rows == 2
+        t.feed("A\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG");
+        assert_eq!(t.take_primary_scroll(), 2, "net distance capped at rows");
+    }
+
+    #[test]
+    fn primary_scroll_not_captured_on_alt_screen() {
+        // Alt-screen scrolls go through the alt animation path, not this one.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("\x1b[?1049h");
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        assert_eq!(t.take_primary_scroll(), 0, "alt screen uses take_alt_scroll");
+    }
+
+    #[test]
+    fn primary_scroll_not_captured_without_scrollback() {
+        // With scrollback disabled, lines don't roll into history, so there's
+        // nothing to slide in from above.
+        let mut t = Terminal::new(3, 2, 0); // scrollback_limit == 0
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD");
+        assert_eq!(t.take_primary_scroll(), 0, "no scrollback → no slide");
+    }
+
+    #[test]
+    fn primary_scroll_not_captured_for_partial_decstbm_region() {
+        // A DECSTBM scroll region narrower than the full grid shifts rows in
+        // place — nothing rolls into scrollback — so it must not register a
+        // slide. Grid is 4 rows; set the region to rows 2..3 (1-based 2;3),
+        // park the cursor at the bottom margin, then feed enough LFs to scroll
+        // the region several times.
+        let mut t = Terminal::new(4, 4, 100);
+        t.feed("\x1b[2;3r"); // DECSTBM: top margin row 2, bottom row 3 (partial)
+        t.feed("\x1b[3;1H"); // move cursor to the bottom margin (row 3)
+        t.feed("X\nY\nZ\nW"); // LFs at the bottom margin scroll the region
+        assert_eq!(
+            t.take_primary_scroll(),
+            0,
+            "partial DECSTBM region shifts in place, no scrollback push"
+        );
+        // And the grid above/below the region is untouched scrollback-wise.
+        assert_eq!(t.scrollback_len(), 0, "partial region must not grow scrollback");
+    }
+
+    #[test]
+    fn primary_scroll_not_captured_on_reverse_index() {
+        // RI (`ESC M`) at the top margin scrolls the region *down* via
+        // scroll_region_down_by, which never pushes to scrollback and so must
+        // never register a scroll-on-output slide.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("\x1b[H"); // cursor home — at the top margin
+        t.feed("\x1bM\x1bM\x1bM"); // three reverse indexes
+        assert_eq!(
+            t.take_primary_scroll(),
+            0,
+            "reverse index scrolls down, not into scrollback"
+        );
+    }
+
+    #[test]
+    fn primary_scroll_resize_shrink_spill_does_not_count() {
+        // A vertical-shrink resize spills top rows into scrollback through its
+        // own path (not scroll_region_up_by), so it must not register a slide:
+        // a window resize is not output streaming in and should never trigger
+        // the scroll-on-output animation.
+        let mut t = Terminal::new(4, 4, 100);
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD"); // fill the grid, cursor on last row
+        assert_eq!(t.take_primary_scroll(), 0, "filling without overflow: no scroll");
+        t.resize(4, 2); // shrink height → spills top rows into scrollback
+        assert!(t.scrollback_len() > 0, "shrink should have spilled rows");
+        assert_eq!(
+            t.take_primary_scroll(),
+            0,
+            "resize spill is not output streaming — must not animate"
+        );
+    }
+
+    #[test]
+    fn primary_scroll_resize_does_not_clear_pending_count() {
+        // resize retires the alt-scroll animation state, but the primary
+        // scroll-on-output count is drained per-feed by the front end, so a
+        // resize between accumulation and drain leaves the pending count
+        // intact (documents current behavior; mirrors that resize doesn't
+        // touch primary_scroll_net).
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("AAA\r\nBBB\r\nCCC"); // one scroll into scrollback, undrained
+        t.resize(3, 3); // grow — does not push primary rows into scrollback
+        assert_eq!(
+            t.take_primary_scroll(),
+            1,
+            "pending count survives an intervening resize"
+        );
+    }
+
+    #[test]
+    fn primary_scroll_resumes_after_returning_from_alt_screen() {
+        // Entering and leaving the alt screen must not leak alt scrolls into
+        // the primary count, and primary scrolls after returning still count.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("\x1b[?1049h"); // enter alt screen
+        t.feed("AAA\r\nBBB\r\nCCC\r\nDDD"); // scrolls on the alt screen
+        t.feed("\x1b[?1049l"); // leave alt screen, back to primary
+        assert_eq!(
+            t.take_primary_scroll(),
+            0,
+            "alt-screen scrolls never touch the primary count"
+        );
+        t.feed("EEE\r\nFFF\r\nGGG"); // one scroll on the primary screen
+        assert_eq!(
+            t.take_primary_scroll(),
+            1,
+            "primary scroll after returning is counted"
+        );
+    }
+
+    #[test]
+    fn primary_scroll_full_region_after_decstbm_reset() {
+        // Once DECSTBM is reset to the full grid, scrolls push into scrollback
+        // again and the slide resumes — confirms the partial-region exclusion
+        // is keyed on the *current* region, not a sticky flag.
+        let mut t = Terminal::new(4, 4, 100);
+        t.feed("\x1b[2;3r"); // partial region
+        t.feed("\x1b[3;1H");
+        t.feed("X\nY\nZ"); // scrolls within the partial region (not counted)
+        assert_eq!(t.take_primary_scroll(), 0, "partial region not counted");
+        t.feed("\x1b[r"); // DECSTBM reset → full grid is the region again
+        t.feed("\x1b[4;1H"); // cursor to the bottom row
+        t.feed("\nP\nQ\nR"); // three LFs at the bottom margin → three scrolls
+        assert_eq!(
+            t.take_primary_scroll(),
+            3,
+            "full-region scrolls counted again after DECSTBM reset"
+        );
+    }
+
+    #[test]
+    fn primary_scroll_cleared_on_ris() {
+        // RIS clears the screen + scrollback, so any pending slide distance
+        // must be dropped — its departing rows no longer exist.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("AAA\r\nBBB\r\nCCC\x1bc");
+        assert_eq!(t.take_primary_scroll(), 0, "RIS clears the pending slide");
     }
 
     #[test]

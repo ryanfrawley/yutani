@@ -124,6 +124,11 @@ pub(crate) struct Config {
     /// Ease-in-out duration for cursor position changes. 0 disables the
     /// animation and the cursor snaps as before.
     pub(crate) cursor_anim_secs: f32,
+    /// Ease-out duration for the smooth scroll-on-output slide: when new output
+    /// pushes lines into scrollback on the live (non-scrolled) primary view,
+    /// the grid slides up over this many seconds instead of snapping. 0
+    /// disables it and new lines appear instantly.
+    pub(crate) scroll_on_output_secs: f32,
     /// When false, the cursor never blinks regardless of what DECSCUSR
     /// requests. Defaults to false because steady cursors are easier on
     /// the eyes; opt back in for xterm-faithful behavior.
@@ -295,6 +300,7 @@ impl Config {
             bottom_fade_height: DECORATOR_HEIGHT * 2.0,
             bottom_fade_anim_secs: 0.36,
             cursor_anim_secs: 0.06,
+            scroll_on_output_secs: 0.08,
             cursor_blink: false,
             blur_iterations: 2,
             color_scheme: None,
@@ -370,6 +376,7 @@ impl Config {
             "bottom_fade_height" => if let Some(x) = cfg_f32(v) { self.bottom_fade_height = x; },
             "bottom_fade_anim_secs" => if let Some(x) = cfg_f32(v) { self.bottom_fade_anim_secs = x; },
             "cursor_anim_secs" => if let Some(x) = cfg_f32(v) { self.cursor_anim_secs = x; },
+            "scroll_on_output_secs" => if let Some(x) = cfg_f32(v) { self.scroll_on_output_secs = x; },
             "cursor_blink" => if let Some(x) = v.as_bool() { self.cursor_blink = x; },
             "blur_iterations" => if let Some(x) = cfg_usize(v) {
                 self.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
@@ -508,6 +515,7 @@ impl Config {
              bottom_fade_height = {}\n\
              bottom_fade_anim_secs = {}\n\
              cursor_anim_secs = {}\n\
+             scroll_on_output_secs = {}\n\
              cursor_blink = {}\n\
              blur_iterations = {}\n",
             self.font_size,
@@ -517,6 +525,7 @@ impl Config {
             self.bottom_fade_height,
             self.bottom_fade_anim_secs,
             self.cursor_anim_secs,
+            self.scroll_on_output_secs,
             self.cursor_blink,
             self.blur_iterations,
         ));

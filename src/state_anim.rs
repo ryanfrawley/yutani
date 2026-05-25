@@ -135,4 +135,90 @@ impl WindowState {
     pub(crate) fn is_alt_scroll_animating(&self) -> bool {
         self.active_tab().alt_scroll_anim.is_some()
     }
+
+    /// If the just-fed output scrolled the primary screen (new lines pushed
+    /// into scrollback), kick off a smooth scroll-on-output slide. We display
+    /// the pre-scroll frame by shifting the grid back down by the scrolled
+    /// distance (`scroll_y > 0` pulls the departing rows in from scrollback)
+    /// and let `update_primary_scroll` ease it to zero.
+    ///
+    /// Skipped when the user is viewing history (`view_offset != 0`): new
+    /// output streams into scrollback below them and the viewport is held
+    /// stable, so there's nothing to slide. Also skipped while a trackpad
+    /// scroll owns `scroll_y` (residual offset or active momentum), so the
+    /// animation never fights the user's gesture.
+    pub(crate) fn maybe_start_primary_scroll(&mut self) {
+        let rows = self.active_tab_mut().terminal.take_primary_scroll();
+        let secs = self.config.scroll_on_output_secs;
+        if secs <= 0.0 || rows == 0 || self.active_tab().terminal.view_offset() != 0 {
+            return;
+        }
+        // A non-animation slide already owns scroll_y (manual scrollback
+        // residue or momentum); don't clobber it.
+        if self.active_tab().primary_scroll_anim.is_none() && self.active_tab().scroll_y.abs() > 0.5 {
+            return;
+        }
+        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
+        let new_px = rows as f32 * line_height;
+        // Accumulate onto any in-flight slide so a fresh chunk mid-slide flows
+        // on continuously instead of snapping back. The displayed offset is
+        // hard-capped at SCROLL_ON_OUTPUT_MAX_ROWS line-heights: the renderer
+        // widens the phantom row band by `ceil(|scroll_y| / line_height)` per
+        // side, and the GPU vertex buffer is sized for only ±2 phantom rows
+        // (see `grid_buffer_byte_sizes`). A larger offset pulls more populated
+        // scrollback rows into the band than the buffer holds and
+        // `queue.write_buffer` overruns. Bursts taller than the cap snap the
+        // remainder — they'd be an unreadable blur sliding the full distance
+        // anyway.
+        let prior_remaining = self.active_tab().scroll_y.max(0.0) as f32;
+        let max_px = SCROLL_ON_OUTPUT_MAX_ROWS as f32 * line_height;
+        let total_px = (prior_remaining + new_px).min(max_px);
+        if total_px <= 0.5 {
+            return;
+        }
+        self.active_tab_mut().primary_scroll_anim = Some(PrimaryScrollAnim {
+            total_px,
+            started: std::time::Instant::now(),
+        });
+        self.active_tab_mut().scroll_y = total_px as f64;
+        self.invalidate();
+    }
+
+    /// Advance the primary scroll-on-output slide for this frame, easing
+    /// `scroll_y` toward zero. Cancels if the user has scrolled into history
+    /// (the slide is meaningless there). No-op when idle.
+    pub(crate) fn update_primary_scroll(&mut self) {
+        let Some(anim) = self.active_tab().primary_scroll_anim else {
+            return;
+        };
+        if self.active_tab().terminal.view_offset() != 0 {
+            self.active_tab_mut().primary_scroll_anim = None;
+            return;
+        }
+        let secs = self.config.scroll_on_output_secs.max(f32::EPSILON);
+        let t = (anim.started.elapsed().as_secs_f32() / secs).clamp(0.0, 1.0);
+        // Ease-out cubic: quick to start, gentle to settle — matches the
+        // alt-screen slide.
+        let eased = 1.0 - (1.0 - t).powi(3);
+        let remaining = anim.total_px * (1.0 - eased);
+        if t >= 1.0 || remaining <= 0.5 {
+            self.active_tab_mut().primary_scroll_anim = None;
+            self.active_tab_mut().scroll_y = 0.0;
+            return;
+        }
+        self.active_tab_mut().scroll_y = remaining as f64;
+    }
+
+    /// Cancel any in-flight scroll-on-output slide, leaving `scroll_y` as-is so
+    /// the caller (e.g. a trackpad gesture taking over) can set it themselves.
+    pub(crate) fn finish_primary_scroll(&mut self) {
+        self.active_tab_mut().primary_scroll_anim = None;
+    }
+
+    /// True while a scroll-on-output slide is mid-flight — keeps the event loop
+    /// ticking frames until it settles.
+    pub(crate) fn is_primary_scroll_animating(&self) -> bool {
+        self.active_tab().primary_scroll_anim.is_some()
+    }
 }

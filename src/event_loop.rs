@@ -433,7 +433,8 @@ pub(crate) async fn run() {
                     // as long as either is still chasing its target.
                     let animating = state.is_top_fade_animating()
                         || state.is_cursor_animating()
-                        || state.is_alt_scroll_animating();
+                        || state.is_alt_scroll_animating()
+                        || state.is_primary_scroll_animating();
                     if animating {
                         state.invalidate();
                     }

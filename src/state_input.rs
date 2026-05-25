@@ -546,6 +546,10 @@ impl WindowState {
                     }
                     return true;
                 }
+                // The user is taking over scrollback navigation — drop any
+                // in-flight scroll-on-output slide so it doesn't fight the
+                // gesture for `scroll_y` on the next frame.
+                self.finish_primary_scroll();
                 match delta {
                     MouseScrollDelta::LineDelta(_, d) => {
                         let n = d.round().abs() as usize;
@@ -911,9 +915,10 @@ impl WindowState {
                         // back to the live grid; passive modifiers (Cmd+C etc.)
                         // returned None and don't touch the scroll state.
                         self.active_tab_mut().terminal.scroll_to_bottom();
-                        // A keystroke cancels any alt-screen scroll slide —
+                        // A keystroke cancels any in-flight scroll slide —
                         // snap straight to the settled frame.
                         self.finish_alt_scroll();
+                        self.finish_primary_scroll();
                         self.active_tab_mut().scroll_y = 0.0;
                         // Drop any in-flight trackpad momentum so the snap
                         // sticks — otherwise the tail of the flick keeps
