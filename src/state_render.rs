@@ -4,6 +4,19 @@
 
 use crate::*;
 
+/// `YUTANI_DIRTY_AUDIT=1` disables per-row vertex reuse: every visible row is
+/// re-emitted fresh each frame. A debugging kill-switch — if a rendering
+/// artifact disappears with this set, a missed damage source (a stale cached
+/// row) is the cause. Read once and cached so the per-frame check is free.
+fn dirty_audit_enabled() -> bool {
+    static AUDIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AUDIT.get_or_init(|| {
+        std::env::var("YUTANI_DIRTY_AUDIT")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
@@ -591,20 +604,103 @@ impl WindowState {
         // boundary index, then emit all fg glyphs. The renderer issues two
         // draw_indexed calls against the resulting buffer (bg layer +
         // fg-and-overlays layer) so glow can bloom each layer independently.
-        struct ResolvedCell {
-            fg_source: GlyphSource,
-            variant: font::FaceVariant,
-            r: isize,
-            c: usize,
-            fg: [f32; 4],
-        }
-        let mut resolved: Vec<ResolvedCell> = Vec::with_capacity(rows * cols);
         // Optional per-scheme override for glyph color inside the selection.
         // Resolved once: `None` short-circuits the per-cell membership test
         // so the common (unselected / no-override) path stays branch-cheap.
         let selection_fg = pal.selection_fg;
         let selection_range = selection.as_ref().map(|s| s.range());
+
+        // ---- Dirty-row vertex cache ------------------------------------
+        // Re-emit only the rows whose rendered content changed since the last
+        // frame; reuse cached `RowVerts` for the rest. The viewport key (also
+        // consumed by the cursor-ghost logic below) gates the whole cache:
+        // resize / scrollback / alt-screen toggle / atlas rebuild / palette
+        // swap all invalidate it.
+        let viewport_key = ViewportKey {
+            rows,
+            cols,
+            view_offset: self.active_tab().terminal.view_offset(),
+            on_alt_screen: self.active_tab().terminal.on_alt_screen(),
+        };
+        // Alt-screen slides bake a per-row scroll offset into the geometry, so
+        // caching is only sound at rest (PR #130 made the global case
+        // scroll-independent). `YUTANI_DIRTY_AUDIT` forces every row fresh — a
+        // kill-switch to confirm reuse isn't the source of any corruption.
+        let caching = !anim_active && !dirty_audit_enabled();
+        let rows_key = RowCacheKey {
+            viewport: viewport_key,
+            anim_active,
+            epoch: self.row_cache_epoch,
+        };
+        if self.active_tab().row_cache_key.as_ref() != Some(&rows_key) {
+            let tab = &mut self.tabs[self.active];
+            tab.row_cache.clear();
+            tab.row_cache_key = Some(rows_key);
+        }
+        // A `selection_fg` scheme recolors glyphs inside the selection, so a
+        // range change makes the cached rows it entered/left stale. (The
+        // translucent selection background is a separate dynamic overlay below
+        // and needs no invalidation.) With no `selection_fg`, selection never
+        // touches cell colors — skip entirely.
+        if selection_fg.is_some() && self.active_tab().prev_selection_range != selection_range {
+            let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
+            for rng in [self.active_tab().prev_selection_range, selection_range] {
+                if let Some((s, e)) = rng {
+                    for line in s.0..=e.0 {
+                        self.tabs[self.active].row_cache.remove(&(line - top_abs));
+                    }
+                }
+            }
+        }
+        self.tabs[self.active].prev_selection_range = selection_range;
+
+        // Damage → visual-row test. Terminal damage is in live-grid row terms;
+        // a visual row maps to live row `r - live_off` (scrollback / phantom
+        // rows fall outside and are static within a viewport key). An
+        // out-of-range query answers "not damaged" — those rows are reused
+        // until the viewport key changes.
+        let live_off = if viewport_key.on_alt_screen {
+            0usize
+        } else {
+            viewport_key.view_offset.min(rows)
+        };
+        let row_damage_vec = self.active_tab().terminal.row_damage().to_vec();
+        let is_damaged = |r: isize| -> bool {
+            let live = r - live_off as isize;
+            if live < 0 || live as usize >= rows {
+                return false;
+            }
+            row_damage_vec.get(live as usize).copied().unwrap_or(true)
+        };
+        // Rows under an active half-block image fallback can change every frame
+        // (animation / late decode) with no cell write, so always re-emit them.
+        let forced_rows: std::collections::HashSet<isize> =
+            halfblock_overrides.keys().map(|(r, _c)| *r).collect();
+
+        // Build per-layer cell geometry; indices are regenerated at assembly.
+        let mut bg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
+        let mut fg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
+        // Rows freshly emitted this frame, inserted into the cache after the
+        // loop so the loop body never holds a `&mut self.tabs` borrow.
+        let mut fresh_rows: Vec<(isize, RowVerts)> = Vec::new();
+        let mut tmp_idx: Vec<u32> = Vec::new();
         for r in r_lo..r_hi {
+            let forced = forced_rows.contains(&r);
+            let reuse = caching
+                && !forced
+                && !is_damaged(r)
+                && self.active_tab().row_cache.contains_key(&r);
+            if reuse {
+                let rv = &self.tabs[self.active].row_cache[&r];
+                bg_verts.extend_from_slice(&rv.bg);
+                fg_verts.extend_from_slice(&rv.fg);
+                continue;
+            }
+            // Emit this row fresh into row-local buffers (one quad = 4 verts;
+            // the discarded `tmp_idx` keeps the shared emit closures happy).
+            let mut row_bg: Vec<renderer::vertex::Vertex> = Vec::new();
+            let mut row_fg: Vec<renderer::vertex::Vertex> = Vec::new();
+            tmp_idx.clear();
             let over = row_overrides.get(&r);
             // Selection strip on this row (inclusive cols), or None if the
             // row falls outside the selection. Mirrors `strip_at` further
@@ -626,7 +722,7 @@ impl WindowState {
                 // the image placement *owns* these cells — there's no
                 // real text the user expects to see here.
                 if let Some(hb) = halfblock_overrides.get(&(r, c)) {
-                    emit_bg_for_cell(&mut vertices, &mut indices, r, c, hb.bg);
+                    emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, hb.bg);
                     // Image-replacement glyphs honour selection_fg too so a
                     // selection that runs through an image preview keeps a
                     // consistent text color.
@@ -634,13 +730,15 @@ impl WindowState {
                         (Some(sfg), Some((from, to))) if c >= from && c <= to => sfg,
                         _ => hb.fg,
                     };
-                    resolved.push(ResolvedCell {
-                        fg_source: GlyphSource::Char(images::HALFBLOCK_CHAR),
-                        variant: font::FaceVariant::Regular,
+                    emit_fg_for_cell(
+                        &mut row_fg,
+                        &mut tmp_idx,
+                        GlyphSource::Char(images::HALFBLOCK_CHAR),
+                        font::FaceVariant::Regular,
                         r,
                         c,
                         fg,
-                    });
+                    );
                     continue;
                 }
                 let Some(cell) = self.active_tab().terminal.extended_cell(r, c) else { continue };
@@ -690,25 +788,43 @@ impl WindowState {
                     Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
                     None => GlyphSource::Char(cell.ch),
                 };
-                emit_bg_for_cell(&mut vertices, &mut indices, r, c, bg);
-                resolved.push(ResolvedCell { fg_source, variant, r, c, fg });
+                emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg);
+                emit_fg_for_cell(&mut row_fg, &mut tmp_idx, fg_source, variant, r, c, fg);
+            }
+            bg_verts.extend_from_slice(&row_bg);
+            fg_verts.extend_from_slice(&row_fg);
+            if caching && !forced {
+                fresh_rows.push((r, RowVerts { bg: row_bg, fg: row_fg }));
             }
         }
-        // Everything emitted before this point is the BG layer. Glow runs
-        // separately on bg vs fg, so the renderer needs this split index
-        // to know where one layer's draw call ends and the next begins.
-        let num_bg_indices = indices.len() as u32;
-        for rc in &resolved {
-            emit_fg_for_cell(
-                &mut vertices,
-                &mut indices,
-                rc.fg_source,
-                rc.variant,
-                rc.r,
-                rc.c,
-                rc.fg,
-            );
+        // Store freshly-emitted rows; consume the damage now that every row in
+        // the band has been emitted or reused.
+        for (r, rv) in fresh_rows {
+            self.tabs[self.active].row_cache.insert(r, rv);
         }
+        self.tabs[self.active].terminal.clear_row_damage();
+
+        // Assemble the cell layers into the frame buffer, regenerating indices
+        // (6 per quad, sequential — trivial and position-dependent, so not
+        // cached). BG quads first; their end is the glow-layer split recorded
+        // in `num_bg_indices`. Then every FG glyph.
+        let append_quads = |verts: &mut Vec<renderer::vertex::Vertex>,
+                            idxs: &mut Vec<u32>,
+                            src: &[renderer::vertex::Vertex]| {
+            let mut k = 0;
+            while k + 4 <= src.len() {
+                let base = verts.len() as u32;
+                verts.extend_from_slice(&src[k..k + 4]);
+                idxs.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 2, base + 3]);
+                k += 4;
+            }
+        };
+        append_quads(&mut vertices, &mut indices, &bg_verts);
+        // Everything in the BG layer ends here. Glow runs separately on bg vs
+        // fg, so the renderer needs this split to know where one layer's draw
+        // call ends and the next begins.
+        let num_bg_indices = indices.len() as u32;
+        append_quads(&mut vertices, &mut indices, &fg_verts);
 
         // 1a. Cmd-hover URL underline. Drawn on top of the glyph row so the
         // line is visible regardless of cell bg, and below the selection
@@ -1036,12 +1152,7 @@ impl WindowState {
         //    backspace overwriting with space) are captured as fading
         //    `cursor_ghosts` so the deleted glyph dissolves under the slide
         //    instead of vanishing the instant the cursor starts moving.
-        let viewport_key = ViewportKey {
-            rows,
-            cols,
-            view_offset: self.active_tab().terminal.view_offset(),
-            on_alt_screen: self.active_tab().terminal.on_alt_screen(),
-        };
+        // (`viewport_key` was computed above for the row cache and is reused.)
         // A viewport change (resize, scrollback, alt-screen toggle) makes
         // last frame's snapshot non-comparable cell-for-cell, so we drop
         // any in-flight ghosts and skip detection until we have a fresh

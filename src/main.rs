@@ -604,6 +604,19 @@ struct TabState {
     /// URL under the mouse while Cmd is held. Drives the underline overlay and
     /// the Cmd-click open behavior.
     hover_url: Option<HoverUrl>,
+    /// Per-visual-row cached cell geometry (`RowVerts`), keyed by visual row.
+    /// `update_vertices` reuses an entry whenever the row's terminal content
+    /// wasn't damaged and the cache key still matches, re-emitting only the
+    /// changed rows. Per-tab so tabs don't share geometry.
+    row_cache: std::collections::HashMap<isize, RowVerts>,
+    /// The `RowCacheKey` every current `row_cache` entry was built against. A
+    /// mismatch on the next frame drops the whole cache.
+    row_cache_key: Option<RowCacheKey>,
+    /// Last frame's selection range (absolute-line coords). Used to invalidate
+    /// the rows a `selection_fg` recolor entered/left when the scheme defines a
+    /// selection foreground (otherwise selection is a pure overlay and doesn't
+    /// touch cached cell colors).
+    prev_selection_range: Option<((isize, usize), (isize, usize))>,
 }
 
 struct WindowState {
@@ -778,6 +791,11 @@ struct WindowState {
     /// `vertices_dirty` outranks it — a content change always forces the full
     /// rebuild.
     scroll_only_dirty: bool,
+    /// Monotonic generation for the per-row vertex cache. Bumped whenever the
+    /// atlas is rebuilt (font-size / DPI change moves glyph UVs) or the palette
+    /// swaps (cell colors change) — both make every cached `RowVerts` stale.
+    /// Folded into each tab's `RowCacheKey`, so a bump drops all row caches.
+    row_cache_epoch: u64,
 }
 
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1157,6 +1175,31 @@ struct GridSnapshot {
     key: ViewportKey,
 }
 
+/// Cached cell geometry for one visual row: the background quads and the
+/// foreground glyph quads, as raw vertices (indices are regenerated at
+/// assembly since they're position-dependent). Both `Vec`s are a multiple of
+/// 4 vertices — one quad each. Reused frame-to-frame for rows whose rendered
+/// content didn't change (see `Terminal::row_damage`), so a keystroke only
+/// re-emits the cursor's row instead of every visible cell.
+#[derive(Clone)]
+struct RowVerts {
+    bg: Vec<renderer::vertex::Vertex>,
+    fg: Vec<renderer::vertex::Vertex>,
+}
+
+/// Identifies the geometry assumptions a `RowVerts` was built under. Any change
+/// invalidates every cached row: `viewport` covers grid size / scroll / screen,
+/// `anim_active` covers the alt-screen slide (which bakes a per-row offset into
+/// the geometry, making it frame-dependent), and `epoch` covers atlas rebuilds
+/// (font-size / DPI change → glyph UVs move) and palette swaps (cell colors
+/// change). When this key changes the whole `row_cache` is dropped.
+#[derive(Clone, PartialEq)]
+struct RowCacheKey {
+    viewport: ViewportKey,
+    anim_active: bool,
+    epoch: u64,
+}
+
 /// A glyph being faded out at its old cell position to bridge the gap
 /// between an instantaneous cell clear (e.g. backspace overwriting with a
 /// space) and the cursor's animated slide across that cell. Stored in
@@ -1489,7 +1532,17 @@ impl WindowState {
             perf: PerfLog::new(),
             vertices_dirty: true,
             scroll_only_dirty: false,
+            row_cache_epoch: 0,
         }
+    }
+
+    /// Invalidate every tab's per-row vertex cache by bumping the epoch. Call
+    /// after anything that changes cached cell geometry independently of the
+    /// terminal's own damage tracking: an atlas rebuild (font size / DPI moves
+    /// glyph UVs) or a palette/scheme swap (cell colors change). The next
+    /// `update_vertices` sees the epoch mismatch and re-emits all rows.
+    fn invalidate_row_cache(&mut self) {
+        self.row_cache_epoch = self.row_cache_epoch.wrapping_add(1);
     }
 
     /// The active tab (read-only). First cut: always `tabs[0]`.
@@ -1900,6 +1953,9 @@ fn create_tab(
         last_click: None,
         click_count: 0,
         hover_url: None,
+        row_cache: std::collections::HashMap::new(),
+        row_cache_key: None,
+        prev_selection_range: None,
     };
     (tab_id, tab)
 }
