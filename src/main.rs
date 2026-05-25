@@ -2340,6 +2340,97 @@ extern "C" fn yutani_new_window_for_tab(
     NEW_TAB_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Our `sendEvent:` override on the window class. AppKit calls this for every
+/// event the window receives, *synchronously*, before anything is dispatched to
+/// views.
+///
+/// We use that synchronicity to fix native-drag latency. winit doesn't deliver
+/// `mouseDown` synchronously — its view queues a `WindowEvent` that we only see
+/// at the next `kCFRunLoopBeforeWaiting` drain. By then we're outside AppKit's
+/// `mouseDown:`, so `Window::drag_window()` (which is just
+/// `performWindowDragWithEvent:` on `NSApp.currentEvent`) no longer has the live
+/// mouse-down to hand AppKit, and the drag hesitates for up to ~500ms.
+///
+/// Here we're still *inside* event delivery with the real event in hand, so a
+/// left mouse-down on the empty title-bar strip goes straight to
+/// `performWindowDragWithEvent:` and the window follows the cursor instantly.
+/// AppKit also applies the system title-bar double-click action (zoom/minimize)
+/// itself, so we don't need to detect that. Everything else — clicks on the
+/// traffic lights, the tab bar, or the terminal body — falls through to the
+/// normal `NSWindow` path (and on to winit).
+#[cfg(target_os = "macos")]
+extern "C" fn yutani_send_event(
+    this: *mut objc::runtime::Object,
+    _cmd: objc::runtime::Sel,
+    event: *mut objc::runtime::Object,
+) {
+    use objc::runtime::{Object, Sel};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSPoint {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSSize {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NSRect {
+        origin: NSPoint,
+        size: NSSize,
+    }
+
+    unsafe {
+        // `-[NSEvent type]`. The selector can't go through `sel!`/`msg_send!`:
+        // `type` is a Rust keyword, and `stringify!(r#type)` keeps the `r#`
+        // prefix, producing a bogus `r#type` selector. Register it by hand.
+        // NSEventTypeLeftMouseDown == 1.
+        let etype: u64 = if event.is_null() {
+            0
+        } else {
+            objc::__send_message(&*event, Sel::register("type"), ()).unwrap_or(0)
+        };
+        if etype == 1 {
+            let loc: NSPoint = msg_send![event, locationInWindow];
+            // winit installs its view as the window's contentView. Hit-test from
+            // the frame view (its superview) so traffic-light buttons and the tab
+            // bar — siblings layered above — are detected and left alone; only a
+            // press that lands on the bare content view is a candidate to drag.
+            let content_view: *mut Object = msg_send![this, contentView];
+            if !content_view.is_null() {
+                let frame_view: *mut Object = msg_send![content_view, superview];
+                let hit: *mut Object = if frame_view.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    msg_send![frame_view, hitTest: loc]
+                };
+                if hit == content_view {
+                    // contentLayoutRect excludes the title bar (and the tab bar
+                    // when shown); it sits at the bottom of the window's flipped
+                    // coords, so anything above its top edge is the draggable
+                    // strip.
+                    let frame: NSRect = msg_send![this, frame];
+                    let content: NSRect = msg_send![this, contentLayoutRect];
+                    let titlebar = frame.size.height - content.size.height;
+                    if titlebar > 0.0 && loc.y > content.size.height {
+                        let _: () = msg_send![this, performWindowDragWithEvent: event];
+                        return;
+                    }
+                }
+            }
+        }
+        // Default NSWindow dispatch for everything we didn't claim.
+        let this_ref: &Object = &*this;
+        let _: () = msg_send![super(this_ref, class!(NSWindow)), sendEvent: event];
+    }
+}
+
 /// Install `newWindowForTab:` on the window's class so AppKit draws the native
 /// tab bar's `+` button and routes its clicks to us. Idempotent: the method is
 /// added to the (process-wide) window class once; later calls are no-ops.
@@ -2370,6 +2461,18 @@ fn install_new_tab_action(window: &Window) {
                     ),
             );
             objc::runtime::class_addMethod(cls, sel!(newWindowForTab:), imp, types);
+            // Override sendEvent: so we can start a native title-bar drag on the
+            // live mouse-down, before winit's deferred event queue swallows it.
+            // Same `v@:@` signature (void, self, _cmd, NSEvent*).
+            let send_imp: objc::runtime::Imp = std::mem::transmute(
+                yutani_send_event
+                    as extern "C" fn(
+                        *mut Object,
+                        objc::runtime::Sel,
+                        *mut Object,
+                    ),
+            );
+            objc::runtime::class_addMethod(cls, sel!(sendEvent:), send_imp, types);
         });
     }
 }
