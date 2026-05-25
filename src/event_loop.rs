@@ -335,6 +335,7 @@ pub(crate) async fn run() {
                     Config,
                     String,
                     bool,
+                    f64,
                 )> = None;
                 let mut close_this = false;
                 if let Some(state) = windows.get_mut(&window_id) {
@@ -379,13 +380,16 @@ pub(crate) async fn run() {
                                 if focused {
                                     // Track the key window so the native tab
                                     // bar's `+` button (no window context) opens
-                                    // a tab in the right group. Refresh the chrome
-                                    // band since the tab bar's presence (and thus
-                                    // the title bar height) changes as tabs come
-                                    // and go.
+                                    // a tab in the right group.
                                     focused_window = Some(window_id);
-                                    state.refresh_chrome_band();
                                 }
+                                // Reflow on *either* transition: the tab bar's
+                                // presence (and thus the usable height) changes
+                                // as tabs come and go, and the window that
+                                // spawned a new tab sees only a focus *loss* —
+                                // without this its prompt stays stranded behind
+                                // the freshly-shown bar.
+                                state.reflow_for_tab_bar();
                                 state.invalidate();
                             }
                             WindowEvent::Occluded(occluded) => {
@@ -397,7 +401,7 @@ pub(crate) async fn run() {
                                 // selection can change the bar's height.
                                 state.occluded = occluded;
                                 if !occluded {
-                                    state.refresh_chrome_band();
+                                    state.reflow_for_tab_bar();
                                     state.invalidate();
                                 }
                             }
@@ -458,6 +462,7 @@ pub(crate) async fn run() {
                             state.config.clone(),
                             next_tab_group_id(),
                             false,
+                            state.titlebar_only_px,
                         ));
                     } else if std::mem::take(&mut state.pending_new_tab) {
                         // Reuse this window's group id so the
@@ -470,10 +475,11 @@ pub(crate) async fn run() {
                             state.config.clone(),
                             state.window.tabbing_identifier(),
                             true,
+                            state.titlebar_only_px,
                         ));
                     }
                 }
-                if let Some((cwd, origin, cfg, tabbing_id, _is_tab)) = spawn_req {
+                if let Some((cwd, origin, cfg, tabbing_id, is_tab, titlebar_px)) = spawn_req {
                     spawn_window_in_process(
                         elwt,
                         &shared,
@@ -485,6 +491,10 @@ pub(crate) async fn run() {
                         cwd,
                         origin,
                         &tabbing_id,
+                        // Only a tab is born into an existing (visible) bar and
+                        // needs the spawner's bar-free baseline; a standalone
+                        // window measures its own once it comes up bar-free.
+                        is_tab.then_some(titlebar_px),
                     );
                 }
                 if close_this {
@@ -512,9 +522,10 @@ pub(crate) async fn run() {
                             s.active_tab().terminal.cwd().map(str::to_owned),
                             s.config.clone(),
                             s.window.tabbing_identifier(),
+                            s.titlebar_only_px,
                         )
                     });
-                    if let Some((cwd, cfg, tabbing_id)) = req {
+                    if let Some((cwd, cfg, tabbing_id, titlebar_px)) = req {
                         spawn_window_in_process(
                             elwt,
                             &shared,
@@ -526,6 +537,9 @@ pub(crate) async fn run() {
                             cwd,
                             None,
                             &tabbing_id,
+                            // The `+` button always opens a tab in the key
+                            // window's group, so it inherits that window's bar.
+                            Some(titlebar_px),
                         );
                     }
                 }
