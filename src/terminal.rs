@@ -275,6 +275,15 @@ pub struct Grid {
     /// app like vim hides the primary's images and exposes the alt's
     /// (initially empty), matching how text content is segregated.
     pub placements: Vec<Placement>,
+    /// Per-row "rendered content changed since the renderer last consumed
+    /// damage" flags, sized `rows`. Set only when a write *actually* changes a
+    /// cell (re-printing the identical glyph+style does not dirty the row), so
+    /// the renderer can re-emit just the changed rows and reuse cached vertex
+    /// segments for the rest. The renderer reads this via
+    /// `Terminal::row_damage` and clears it with `clear_row_damage` after each
+    /// rebuild. A freshly built grid starts fully dirty so the first frame
+    /// emits everything.
+    dirty_rows: Vec<bool>,
 }
 
 impl Grid {
@@ -284,6 +293,7 @@ impl Grid {
             rows,
             cols,
             placements: Vec::new(),
+            dirty_rows: vec![true; rows],
         }
     }
 
@@ -295,13 +305,55 @@ impl Grid {
         self.cells[self.idx(row, col)]
     }
 
+    /// Mark a single row's rendered content as changed.
+    #[inline]
+    pub fn mark_dirty(&mut self, row: usize) {
+        if let Some(d) = self.dirty_rows.get_mut(row) {
+            *d = true;
+        }
+    }
+
+    /// Mark every row dirty — used when content shifts wholesale (resize,
+    /// reset, alt-screen toggle) or when a mutator can't cheaply localize its
+    /// damage. Always correct, just less optimal.
+    pub fn mark_all_dirty(&mut self) {
+        for d in &mut self.dirty_rows {
+            *d = true;
+        }
+    }
+
+    /// The renderer's view of which live-grid rows changed since the last
+    /// `clear_row_damage`.
+    pub fn row_damage(&self) -> &[bool] {
+        &self.dirty_rows
+    }
+
+    /// Reset all damage flags. The renderer calls this after it has finished
+    /// emitting (or reusing) every row for the frame.
+    pub fn clear_row_damage(&mut self) {
+        for d in &mut self.dirty_rows {
+            *d = false;
+        }
+    }
+
     pub fn set(&mut self, row: usize, col: usize, cell: Cell) {
         let i = self.idx(row, col);
-        self.cells[i] = cell;
+        // Change-gated: re-printing the identical cell must not dirty the row.
+        // This is the single natural choke point the renderer's per-row cache
+        // depends on, and it also kills churn from apps that repaint identical
+        // frames cell-by-cell.
+        if self.cells[i] != cell {
+            self.cells[i] = cell;
+            self.mark_dirty(row);
+        }
     }
 
     pub fn get_mut(&mut self, row: usize, col: usize) -> &mut Cell {
         let i = self.idx(row, col);
+        // The caller gets unchecked mutable access, so we can't change-gate
+        // here — conservatively mark the row dirty. Only the Kitty placeholder
+        // diacritic path uses this, which is rare and does change the cell.
+        self.mark_dirty(row);
         &mut self.cells[i]
     }
 
@@ -319,13 +371,19 @@ impl Grid {
         // chafa) lean on screen-clear as the implicit reset. Dropping all
         // placements here matches what users observe in Kitty.
         self.placements.clear();
+        self.mark_all_dirty();
     }
 
     /// Fill cells `from..to` of `row` with `blank`.
     pub fn clear_row(&mut self, row: usize, from: usize, to: usize, blank: Cell) {
         let base = row * self.cols;
+        // Change-gated like `set`: clearing an already-blank span leaves the
+        // row clean, so an app blanking lines it never wrote doesn't dirty them.
         for i in from..to.min(self.cols) {
-            self.cells[base + i] = blank;
+            if self.cells[base + i] != blank {
+                self.cells[base + i] = blank;
+                self.mark_dirty(row);
+            }
         }
     }
 
@@ -350,6 +408,12 @@ impl Grid {
         let n = n.min(region);
         if n == 0 || left > right || right >= self.cols {
             return Vec::new();
+        }
+        // Content shifts between rows across the whole region, so every row in
+        // it renders differently afterward. (`clear_row` gates the freed rows,
+        // but the copy_within'd rows above need marking too.)
+        for r in top..=bottom {
+            self.mark_dirty(r);
         }
         let width = right - left + 1;
         let full_width = left == 0 && right == self.cols - 1;
@@ -399,6 +463,9 @@ impl Grid {
         let n = n.min(region);
         if n == 0 || left > right || right >= self.cols {
             return;
+        }
+        for r in top..=bottom {
+            self.mark_dirty(r);
         }
         let width = right - left + 1;
         let full_width = left == 0 && right == self.cols - 1;
@@ -1571,6 +1638,11 @@ impl Terminal {
                 cell.style.reresolve_palette();
             }
         }
+        // Every cell's resolved color may have changed; the renderer also
+        // clears its whole row cache on a scheme swap, but mark both grids so
+        // the damage set agrees.
+        self.primary.mark_all_dirty();
+        self.alternate.mark_all_dirty();
     }
 
     /// Drain any bytes the emulator wants written back to the host. Returns
@@ -1982,6 +2054,21 @@ impl Terminal {
 
     fn blank(&self) -> Cell {
         Cell::new(' ', self.cursor.style)
+    }
+
+    /// Per-live-grid-row damage for the renderer: `row_damage()[r]` is true
+    /// when live row `r` of the active grid has changed since the last
+    /// `clear_row_damage`. Indexed in live-grid row terms (the renderer maps
+    /// its visual rows through `view_offset`); scrollback rows are static and
+    /// never appear here.
+    pub fn row_damage(&self) -> &[bool] {
+        self.active_grid().row_damage()
+    }
+
+    /// Clear the active grid's damage flags — the renderer calls this once it
+    /// has emitted (or reused a cached segment for) every row of the frame.
+    pub fn clear_row_damage(&mut self) {
+        self.active_grid_mut().clear_row_damage();
     }
 
     fn dispatch(&mut self, event: Event) {
@@ -2531,6 +2618,9 @@ impl Terminal {
         for i in col..col + n {
             grid.cells[base + i] = blank;
         }
+        // Direct copy_within bypasses the change-gated `set`; the row's content
+        // shifted, so mark it dirty for the renderer.
+        grid.mark_dirty(row);
         self.cursor.wrap_pending = false;
     }
 
@@ -2553,6 +2643,7 @@ impl Terminal {
         for i in right + 1 - n..=right {
             grid.cells[base + i] = blank;
         }
+        grid.mark_dirty(row);
         self.cursor.wrap_pending = false;
     }
 
@@ -4386,6 +4477,11 @@ impl Terminal {
         self.alt_scroll_region = None;
         self.alt_scroll_poison = false;
         self.alt_anim_departing = None;
+        // The newly-active grid's content is wholly different from what was on
+        // screen a moment ago; its damage flags are stale. (The renderer also
+        // clears its cache on the viewport_key change, but mark the grid too so
+        // damage stays self-consistent.)
+        self.active_grid_mut().mark_all_dirty();
     }
 
     fn save_cursor(&mut self) {
@@ -13400,5 +13496,153 @@ mod tests {
         t.feed("\x1b]2125;reload\x07");
         assert_eq!(t.take_preview_requests(), vec![PreviewRequest::Reload]);
         assert!(t.take_preview_requests().is_empty());
+    }
+
+    // ---- Dirty-row damage tracking (Part A of the dirty-row render work) ----
+
+    fn no_rows_dirty(t: &Terminal) -> bool {
+        t.row_damage().iter().all(|&d| !d)
+    }
+
+    #[test]
+    fn new_grid_starts_fully_dirty() {
+        // The first frame must emit every row, so a fresh grid is all-dirty.
+        let t = Terminal::new(10, 3, 100);
+        assert_eq!(t.row_damage().len(), 3);
+        assert!(t.row_damage().iter().all(|&d| d));
+    }
+
+    #[test]
+    fn clear_row_damage_resets_all_flags() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("hi");
+        t.clear_row_damage();
+        assert!(no_rows_dirty(&t));
+    }
+
+    #[test]
+    fn writing_identical_cell_does_not_dirty_row() {
+        // The user's explicit requirement: re-printing the identical glyph+style
+        // must NOT mark the row dirty.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("A");
+        t.clear_row_damage();
+        t.feed("\x1b[HA"); // home, then re-print the same 'A'
+        assert!(no_rows_dirty(&t), "identical re-print should not dirty");
+    }
+
+    #[test]
+    fn writing_changed_cell_dirties_only_that_row() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("A");
+        t.clear_row_damage();
+        t.feed("\x1b[HB"); // home, overwrite 'A' with 'B'
+        assert!(t.row_damage()[0], "changed cell must dirty its row");
+        assert!(!t.row_damage()[1]);
+        assert!(!t.row_damage()[2]);
+    }
+
+    #[test]
+    fn changing_only_style_dirties_row() {
+        // Same glyph, different color is still a rendered change.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("A");
+        t.clear_row_damage();
+        t.feed("\x1b[H\x1b[31mA"); // home, red 'A' over default 'A'
+        assert!(t.row_damage()[0]);
+    }
+
+    #[test]
+    fn cursor_move_alone_does_not_dirty() {
+        // The cursor is a renderer overlay; moving it touches no cell.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("A");
+        t.clear_row_damage();
+        t.feed("\x1b[3;5H"); // CUP to row 3 col 5, no write
+        assert!(no_rows_dirty(&t));
+    }
+
+    #[test]
+    fn erase_in_line_dirties_only_the_cursor_row() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("aaa\r\nbbb\r\nccc");
+        t.clear_row_damage();
+        t.feed("\x1b[2;1H\x1b[2K"); // EL 2 on row 2 (clear whole line)
+        assert!(!t.row_damage()[0]);
+        assert!(t.row_damage()[1]);
+        assert!(!t.row_damage()[2]);
+    }
+
+    #[test]
+    fn erase_in_line_on_blank_span_stays_clean() {
+        // EL over an already-blank tail changes nothing → no damage.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("ab"); // cols 2..10 already blank
+        t.clear_row_damage();
+        t.feed("\x1b[1;3H\x1b[0K"); // EL 0 from col 3 to EOL (all blank)
+        assert!(no_rows_dirty(&t));
+    }
+
+    #[test]
+    fn erase_in_display_below_dirties_affected_rows() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("aaa\r\nbbb\r\nccc");
+        t.clear_row_damage();
+        t.feed("\x1b[2;1H\x1b[0J"); // ED 0: clear from row 2 col 1 down
+        assert!(!t.row_damage()[0]);
+        assert!(t.row_damage()[1]);
+        assert!(t.row_damage()[2]);
+    }
+
+    #[test]
+    fn scroll_on_linefeed_dirties_the_region() {
+        // Streaming a line past the bottom scrolls the whole grid; every
+        // surviving row shows different content afterward.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("a\r\nb\r\nc"); // fills 3 rows, cursor on last
+        t.clear_row_damage();
+        t.feed("\r\nd"); // newline at bottom → scroll up by 1
+        assert!(t.row_damage().iter().all(|&d| d), "scroll dirties all rows");
+    }
+
+    #[test]
+    fn delete_chars_dirties_its_row() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("abcdef");
+        t.clear_row_damage();
+        t.feed("\x1b[1;1H\x1b[2P"); // DCH 2 on row 1
+        assert!(t.row_damage()[0]);
+        assert!(!t.row_damage()[1]);
+    }
+
+    #[test]
+    fn insert_chars_dirties_its_row() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("abcdef");
+        t.clear_row_damage();
+        t.feed("\x1b[1;1H\x1b[2@"); // ICH 2 on row 1
+        assert!(t.row_damage()[0]);
+        assert!(!t.row_damage()[1]);
+    }
+
+    #[test]
+    fn alt_screen_toggle_marks_active_grid_dirty() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("hi");
+        t.clear_row_damage();
+        t.feed("\x1b[?1049h"); // enter alt screen
+        assert!(t.row_damage().iter().all(|&d| d), "alt enter is all-dirty");
+        t.clear_row_damage();
+        t.feed("\x1b[?1049l"); // leave back to primary
+        assert!(t.row_damage().iter().all(|&d| d), "primary restore is all-dirty");
+    }
+
+    #[test]
+    fn reresolve_palette_marks_all_dirty() {
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("x");
+        t.clear_row_damage();
+        t.reresolve_palette();
+        assert!(t.row_damage().iter().all(|&d| d));
     }
 }
