@@ -465,13 +465,24 @@ pub(crate) async fn run() {
                         state.invalidate();
                     }
                     // Edge-fade and cursor-position eases: keep ticking frames
-                    // as long as either is still chasing its target.
+                    // as long as anything is still chasing its target.
                     let animating = state.is_top_fade_animating()
                         || state.is_cursor_animating()
                         || state.is_alt_scroll_animating()
                         || state.is_primary_scroll_animating();
                     if animating {
-                        state.invalidate();
+                        // The cursor quad and the alt-screen slide's per-row
+                        // offsets live in the cell geometry, so they need a full
+                        // rebuild. The global scroll slide (primary) and the
+                        // edge fades only move the camera / fade uniforms, which
+                        // `refresh_scroll_uniforms` handles on the cheap
+                        // scroll-only path — so prefer that when no
+                        // geometry-bound animation is in flight.
+                        if state.is_cursor_animating() || state.is_alt_scroll_animating() {
+                            state.invalidate();
+                        } else {
+                            state.invalidate_scroll();
+                        }
                     }
                     state.perf.maybe_flush();
                     let next_anim = if animating {

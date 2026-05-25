@@ -762,6 +762,12 @@ struct WindowState {
     /// which the redraw handler calls before drawing. Lets winit coalesce a
     /// burst of N events into one rebuild + one frame.
     vertices_dirty: bool,
+    /// Set (via `invalidate_scroll`) when only the global scroll offset eased
+    /// and grid content is unchanged. `flush_vertices` then slides the existing
+    /// geometry with a camera-uniform write instead of rebuilding every cell.
+    /// `vertices_dirty` outranks it — a content change always forces the full
+    /// rebuild.
+    scroll_only_dirty: bool,
 }
 
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
@@ -782,6 +788,11 @@ struct PerfLog {
     feed_ns: u128,
     update_ns: u128,
     update_calls: u32,
+    // Phase split of update_vertices: `shape` = the ligature/shaping pass +
+    // atlas re-upload; `body` = the rest (per-cell bg/fg quad emission +
+    // overlays). Prologue = update_ns - shape - body.
+    up_shape_ns: u128,
+    up_body_ns: u128,
     render_ns: u128,
     render_calls: u32,
     fast_calls: u32,
@@ -802,6 +813,8 @@ impl PerfLog {
             feed_ns: 0,
             update_ns: 0,
             update_calls: 0,
+            up_shape_ns: 0,
+            up_body_ns: 0,
             render_ns: 0,
             render_calls: 0,
             fast_calls: 0,
@@ -837,6 +850,15 @@ impl PerfLog {
         self.last_event = now;
         self.update_ns += dur.as_nanos();
         self.update_calls += 1;
+    }
+
+    /// Record the shape/body phase split of one `update_vertices` call.
+    fn note_update_phases(&mut self, shape: std::time::Duration, body: std::time::Duration) {
+        if !self.enabled {
+            return;
+        }
+        self.up_shape_ns += shape.as_nanos();
+        self.up_body_ns += body.as_nanos();
     }
 
     fn note_render(
@@ -888,13 +910,15 @@ impl PerfLog {
             if n == 0 { 0.0 } else { total_ns as f64 / n as f64 / 1e6 }
         };
         eprintln!(
-            "[perf] burst {:>6.1}ms wall | pty {:>2}c {:>6}B | feed {:>5.2}ms | update {:>6.2}ms x{:>2} | render {:>6.2}ms x{:>2} (fast x{:>2} avg{:>4.2} / slow x{:>2} avg{:>4.2}) | swait {:>6.2}ms | acc {:>4.1}%",
+            "[perf] burst {:>6.1}ms wall | pty {:>2}c {:>6}B | feed {:>5.2}ms | update {:>6.2}ms x{:>2} (shape {:>6.2} / body {:>6.2}) | render {:>6.2}ms x{:>2} (fast x{:>2} avg{:>4.2} / slow x{:>2} avg{:>4.2}) | swait {:>6.2}ms | acc {:>4.1}%",
             total.as_secs_f64() * 1e3,
             self.pty_chunks,
             self.pty_bytes,
             self.feed_ns as f64 / 1e6,
             self.update_ns as f64 / 1e6,
             self.update_calls,
+            self.up_shape_ns as f64 / 1e6,
+            self.up_body_ns as f64 / 1e6,
             self.render_ns as f64 / 1e6,
             self.render_calls,
             self.fast_calls,
@@ -914,6 +938,8 @@ impl PerfLog {
         self.feed_ns = 0;
         self.update_ns = 0;
         self.update_calls = 0;
+        self.up_shape_ns = 0;
+        self.up_body_ns = 0;
         self.render_ns = 0;
         self.render_calls = 0;
         self.fast_calls = 0;
@@ -1450,6 +1476,7 @@ impl WindowState {
             pending_new_window: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
+            scroll_only_dirty: false,
         }
     }
 
@@ -1471,6 +1498,26 @@ impl WindowState {
     /// us aligned with the display's vsync cadence.
     fn invalidate(&mut self) {
         self.vertices_dirty = true;
+        self.window.request_redraw();
+    }
+
+    /// Like `invalidate`, but for a frame where only the global scroll offset
+    /// eased (scroll-on-output slide, scrollback smooth-scroll) and the grid
+    /// *content* is unchanged. The renderer can then slide the existing
+    /// geometry via the camera uniform instead of rebuilding every cell — see
+    /// `WindowState::refresh_scroll_uniforms`. A pending full rebuild wins, so
+    /// this never downgrades a content invalidation.
+    fn invalidate_scroll(&mut self) {
+        // The command palette / find overlays are screen-fixed but live in the
+        // scrolled geometry buffer with a baked camera-offset compensation, so
+        // they must be rebuilt as the offset eases — take the full path while
+        // either is open. (The cursor-anchored completion popup rides the
+        // camera correctly and doesn't need this.)
+        if self.command_palette.open || self.search.open {
+            self.vertices_dirty = true;
+        } else if !self.vertices_dirty {
+            self.scroll_only_dirty = true;
+        }
         self.window.request_redraw();
     }
 
@@ -1511,13 +1558,19 @@ impl WindowState {
     /// not call this directly — the image-store snapshot has to be set up
     /// first.
     fn flush_vertices(&mut self) {
-        if !self.vertices_dirty {
-            return;
+        if self.vertices_dirty {
+            let t = std::time::Instant::now();
+            self.update_vertices();
+            self.perf.note_update(t.elapsed());
+            self.vertices_dirty = false;
+            self.scroll_only_dirty = false;
+        } else if self.scroll_only_dirty {
+            // Content unchanged; only the global scroll offset eased. Slide the
+            // existing geometry via the camera + refresh the edge fades —
+            // skipping the per-cell rebuild entirely.
+            self.refresh_scroll_uniforms();
+            self.scroll_only_dirty = false;
         }
-        let t = std::time::Instant::now();
-        self.update_vertices();
-        self.perf.note_update(t.elapsed());
-        self.vertices_dirty = false;
     }
 
     fn get_viewport_size(
