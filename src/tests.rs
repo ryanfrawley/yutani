@@ -95,13 +95,69 @@ fn grid_buffer_byte_sizes_uses_full_phantom_row_slack() {
     // two bottom, plus the cursor and edge-fade extras.
     let cols = 98;
     let rows = 35;
-    let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows);
+    let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows, 0);
     let extra_quads = (2 + SCROLL_ON_OUTPUT_MAX_ROWS) * 2 * cols + 5;
     let area = cols * rows;
     let quads = 2 * area + 2 * extra_quads;
     let v = std::mem::size_of::<renderer::vertex::Vertex>();
     assert_eq!(vbuf, quads * v * 4);
     assert_eq!(ibuf, quads * std::mem::size_of::<u32>() * 6);
+}
+
+#[test]
+fn grid_buffer_top_inset_reserves_extra_top_rows() {
+    // The native tab bar widens only the top of the phantom band, so the
+    // buffer must reserve `top_inset_rows × cols × 2` extra quads beyond the
+    // symmetric ±(2 + slide) budget — otherwise a full-band scroll with the
+    // bar up overruns `queue.write_buffer`.
+    let cols = 98;
+    let rows = 35;
+    let top_inset_rows = 3;
+    let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows, top_inset_rows);
+    let extra_quads = (2 + SCROLL_ON_OUTPUT_MAX_ROWS) * 2 * cols + 5;
+    let area = cols * rows;
+    let quads = 2 * area + 2 * extra_quads + top_inset_rows * 2 * cols;
+    let v = std::mem::size_of::<renderer::vertex::Vertex>();
+    assert_eq!(vbuf, quads * v * 4);
+    assert_eq!(ibuf, quads * std::mem::size_of::<u32>() * 6);
+}
+
+#[test]
+fn grid_buffer_top_inset_covers_phantom_band_for_same_inset() {
+    // The two halves of this fix must agree: whatever extra top rows
+    // `phantom_row_band` widens the band by for a given pixel inset,
+    // `grid_buffer_byte_sizes` must reserve at least that many. They derive
+    // the row count independently (`resize_buffers` recomputes
+    // `top_inset_rows = ceil(inset / line_height)` to mirror the band's
+    // `chrome_extra`), so a drift between the two formulas would let a
+    // full-band scroll with the tab bar up overrun `queue.write_buffer`.
+    // Sweep insets that land on, just under, and just over row boundaries.
+    let cols = 98;
+    let rows = 35;
+    let line_height = 20.0_f32;
+    for inset_px in [0.0, 1.0, 19.0, 20.0, 21.0, 39.0, 40.0, 200.0, 199.9] {
+        // What the band actually widens the top by, in rows.
+        let (r_lo, _r_hi) =
+            WindowState::phantom_row_band(0.0, rows, line_height, inset_px);
+        let band_chrome_rows = (-2 - r_lo) as usize; // band top beyond the bare -2
+
+        // What the buffer reserves, mirroring `resize_buffers`' ceil.
+        let top_inset_rows = (inset_px.max(0.0) / line_height).ceil() as usize;
+        assert_eq!(
+            top_inset_rows, band_chrome_rows,
+            "buffer row reserve ({top_inset_rows}) must equal the band's chrome \
+             widening ({band_chrome_rows}) for inset {inset_px}px",
+        );
+
+        // And the reserved buffer must be strictly larger than the no-inset
+        // buffer by exactly those rows' worth of quads (bg + glyph per cell).
+        let (vbuf0, ibuf0) = grid_buffer_byte_sizes(cols, rows, 0);
+        let (vbuf, ibuf) = grid_buffer_byte_sizes(cols, rows, top_inset_rows);
+        let extra_quads = top_inset_rows * 2 * cols;
+        let v = std::mem::size_of::<renderer::vertex::Vertex>();
+        assert_eq!(vbuf, vbuf0 + extra_quads * v * 4);
+        assert_eq!(ibuf, ibuf0 + extra_quads * std::mem::size_of::<u32>() * 6);
+    }
 }
 
 #[test]
@@ -126,7 +182,7 @@ fn grid_index_buffer_addresses_beyond_u16() {
     );
 
     // The buffer sizing must reserve 4 bytes per index (u32), not 2.
-    let (_, ibuf) = grid_buffer_byte_sizes(cols, rows);
+    let (_, ibuf) = grid_buffer_byte_sizes(cols, rows, 0);
     let quads = 2 * (cols * rows) + 2 * ((2 + SCROLL_ON_OUTPUT_MAX_ROWS) * 2 * cols + 5);
     assert_eq!(ibuf, quads * 4 * 6, "index buffer must be sized for u32 indices");
 }
@@ -135,24 +191,28 @@ fn grid_index_buffer_addresses_beyond_u16() {
 fn grid_buffer_byte_sizes_covers_full_update_vertices_walk() {
     // Symbolic upper bound on what `update_vertices` can push:
     // the row loop covers the phantom band `r_lo..r_hi`, at its
-    // widest `rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS` rows — the
-    // fixed ±2 strips plus the smooth-scroll slide widening on each
-    // side — × `cols` cells × 2 quads (bg + glyph) per cell, plus a
-    // cursor quad and two edge-fade quads. The vertex buffer must
-    // fit at least this many vertices, otherwise `queue.write_buffer`
-    // overruns at scroll time (it did: a full-screen scroll-on-output
-    // slide pulled the whole band's worth of scrollback into view).
+    // widest `rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS + top_inset_rows`
+    // rows — the fixed ±2 strips plus the smooth-scroll slide widening on
+    // each side, plus the asymmetric tab-bar inset on the top — × `cols`
+    // cells × 2 quads (bg + glyph) per cell, plus a cursor quad and two
+    // edge-fade quads. The vertex buffer must fit at least this many
+    // vertices, otherwise `queue.write_buffer` overruns at scroll time (it
+    // did: a full-screen scroll-on-output slide pulled the whole band's
+    // worth of scrollback into view).
     for (cols, rows) in [(80, 24), (98, 35), (200, 60), (32, 8)] {
-        let (vbuf, _) = grid_buffer_byte_sizes(cols, rows);
-        let worst_case_quads = (rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS) * cols * 2 + 3;
-        let worst_case_bytes =
-            worst_case_quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
-        assert!(
-            vbuf >= worst_case_bytes,
-            "grid_buffer_byte_sizes({cols}, {rows}) = {vbuf} bytes; \
-             needs at least {worst_case_bytes} to cover the worst-case \
-             walk through `update_vertices`",
-        );
+        for top_inset_rows in [0, 1, 4] {
+            let (vbuf, _) = grid_buffer_byte_sizes(cols, rows, top_inset_rows);
+            let worst_case_quads =
+                (rows + 4 + 2 * SCROLL_ON_OUTPUT_MAX_ROWS + top_inset_rows) * cols * 2 + 3;
+            let worst_case_bytes =
+                worst_case_quads * std::mem::size_of::<renderer::vertex::Vertex>() * 4;
+            assert!(
+                vbuf >= worst_case_bytes,
+                "grid_buffer_byte_sizes({cols}, {rows}, {top_inset_rows}) = {vbuf} bytes; \
+                 needs at least {worst_case_bytes} to cover the worst-case \
+                 walk through `update_vertices`",
+            );
+        }
     }
 }
 
