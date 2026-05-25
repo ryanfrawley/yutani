@@ -428,10 +428,13 @@ pub(crate) async fn run() {
                             // A background native tab still receives PTY output,
                             // which invalidates it — but nothing is on screen, so
                             // skip the GPU work. Reveal (Occluded false) repaints.
-                            WindowEvent::RedrawRequested if state.occluded => {
+                            WindowEvent::RedrawRequested if state.hidden() => {
                                 // Background native tab — nothing is on screen,
                                 // so skip the GPU work. The reveal (Occluded
-                                // false) requests a fresh frame.
+                                // false, or regaining focus) requests a fresh
+                                // frame. `hidden()` ignores a stale `occluded`
+                                // while focused so a rapid tab switch back here
+                                // still paints.
                             }
                             WindowEvent::RedrawRequested => {
                                 state.update();
@@ -561,7 +564,7 @@ pub(crate) async fn run() {
                     // pull the loop's wake-up earlier. PTY output still feeds its
                     // terminal (it just defers the repaint until Occluded(false)
                     // invalidates it). perf still flushes so its burst closes.
-                    if state.occluded {
+                    if state.hidden() {
                         state.perf.maybe_flush();
                         continue;
                     }

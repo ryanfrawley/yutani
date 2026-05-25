@@ -1575,6 +1575,18 @@ impl WindowState {
         &mut self.tabs[self.active]
     }
 
+    /// Whether this window is genuinely off-screen and so safe to skip
+    /// rendering. A *focused* window is always the foreground native tab, hence
+    /// visible — even if a stale `occluded` flag still says otherwise. macOS
+    /// coalesces and delays occlusion notifications, so on a rapid A→B→A tab
+    /// switch the `Occluded(true)` from the first switch can land on window A
+    /// *after* it's been re-selected, leaving `occluded` wrongly true. Gating on
+    /// `!focused` makes that ordering irrelevant: the foreground tab keeps
+    /// rendering regardless, so the switch never appears to stall.
+    fn hidden(&self) -> bool {
+        self.occluded && !self.focused
+    }
+
     /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls
     /// inside one event-loop turn coalesce into a single RedrawRequested,
     /// and `surface.get_current_texture()` blocks at the swapchain to keep
