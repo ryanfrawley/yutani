@@ -146,7 +146,7 @@ pub(crate) async fn run() {
     // buffers create_window allocates match the terminal dimensions.
     let (cols, rows) = {
         let (cell_w, line_h) = shared.with_font(|f| {
-            let m = f.face().size_metrics().unwrap();
+            let m = f.metrics();
             (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
         });
         let vp = WindowState::get_viewport_size(
@@ -350,6 +350,26 @@ pub(crate) async fn run() {
                             WindowEvent::CloseRequested => {
                                 close_this = true;
                             }
+                            WindowEvent::Focused(focused) => {
+                                state.focused = focused;
+                                // Snap the cursor to its solid phase on either
+                                // transition: gaining focus shouldn't catch the
+                                // cursor mid-blink-off, and losing focus parks it
+                                // steady (blinking is now disabled). Repaint so
+                                // the cursor style change shows immediately.
+                                state.reset_blink();
+                                state.invalidate();
+                            }
+                            WindowEvent::Occluded(occluded) => {
+                                // A fully hidden window neither animates nor
+                                // redraws (see the AboutToWait tick). When it
+                                // comes back into view, repaint once to catch up
+                                // on anything that changed while it was dark.
+                                state.occluded = occluded;
+                                if !occluded {
+                                    state.invalidate();
+                                }
+                            }
                             WindowEvent::Resized(size) => {
                                 state.resize(size);
                                 state.window.request_redraw();
@@ -432,6 +452,15 @@ pub(crate) async fn run() {
                 // wake-up across all of them and arm the loop for that.
                 let mut next_wake: Option<std::time::Instant> = None;
                 for state in windows.values_mut() {
+                    // A fully occluded window can't be seen, so don't spend the
+                    // shared thread animating or redrawing it — and don't let it
+                    // pull the loop's wake-up earlier. PTY output still feeds its
+                    // terminal (it just defers the repaint until Occluded(false)
+                    // invalidates it). perf still flushes so its burst closes.
+                    if state.occluded {
+                        state.perf.maybe_flush();
+                        continue;
+                    }
                     if state.maybe_blink_tick() {
                         state.invalidate();
                     }

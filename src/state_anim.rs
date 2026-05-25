@@ -5,9 +5,13 @@ use crate::*;
 
 impl WindowState {
     /// Effective blink state: DECSCUSR's request is gated by the user's
-    /// `cursor_blink` config so opting out disables blinking globally.
+    /// `cursor_blink` config so opting out disables blinking globally. An
+    /// unfocused window never blinks — it shows a steady cursor (the usual
+    /// terminal convention) and, more importantly, stops driving redraws that
+    /// would block the shared event loop's single thread on this window's vsync
+    /// while the user is typing in another window.
     pub(crate) fn cursor_blink_enabled(&self) -> bool {
-        self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
+        self.focused && self.config.cursor_blink && self.active_tab().terminal.cursor_blink()
     }
 
     /// Combined visibility check: DECTCEM (cursor_visible) gates whether the
@@ -80,7 +84,7 @@ impl WindowState {
             self.active_tab_mut().terminal.clear_alt_anim();
             return;
         }
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let total_px = scroll.rows as f32 * line_height;
         self.active_tab_mut().alt_scroll_anim = Some(AltScrollAnim {
@@ -158,7 +162,7 @@ impl WindowState {
         if self.active_tab().primary_scroll_anim.is_none() && self.active_tab().scroll_y.abs() > 0.5 {
             return;
         }
-        let metrics = self.shared.with_font(|f| f.face().size_metrics().unwrap());
+        let metrics = self.shared.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let new_px = rows as f32 * line_height;
         // Accumulate onto any in-flight slide so a fresh chunk mid-slide flows
