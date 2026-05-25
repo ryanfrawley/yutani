@@ -490,6 +490,13 @@ pub(crate) async fn run() {
                             state.titlebar_only_px,
                         ));
                     }
+                    // Drain a Cmd-W close request. The confirmation (if the
+                    // shell had a running command) already ran in `input()`,
+                    // so reaching here means "close now" — fall into the same
+                    // teardown the OS close button uses below.
+                    if std::mem::take(&mut state.pending_close) {
+                        close_this = true;
+                    }
                 }
                 if let Some((cwd, origin, cfg, tabbing_id, is_tab, titlebar_px)) = spawn_req {
                     spawn_window_in_process(

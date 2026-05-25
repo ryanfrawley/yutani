@@ -786,6 +786,11 @@ struct WindowState {
     /// window into *this* window's native tab group (shared `tabbingIdentifier`)
     /// so AppKit draws it as a tab rather than a separate window.
     pending_new_tab: bool,
+    /// Set by Cmd-W; drained in the event loop, which tears this window
+    /// (a native tab) down via the same path as the OS close button. Any
+    /// running-command confirmation has already been resolved by the time
+    /// this is set, so the event loop closes unconditionally.
+    pending_close: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -1547,6 +1552,7 @@ impl WindowState {
             theme: window_theme,
             pending_new_window: false,
             pending_new_tab: false,
+            pending_close: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
             scroll_only_dirty: false,
@@ -2007,6 +2013,25 @@ fn close_tab_pty(tab: &TabState) {
     }
 }
 
+/// Pure predicate behind [`tab_command_running`]: given a terminal's
+/// foreground process-group id and the shell's pid, decide whether a
+/// *foreign* command (anything other than the shell) holds the foreground.
+/// A non-positive `fg_pgrp` (e.g. `tcgetpgrp` failed because the shell
+/// already exited) means "nothing running".
+fn fg_is_foreign_command(fg_pgrp: i32, shell_pid: i32) -> bool {
+    fg_pgrp > 0 && fg_pgrp != shell_pid
+}
+
+/// Whether a foreground command is running in this tab's PTY. The shell was
+/// forked with `setsid()` (see `pty::fork_pty`), so it leads its own process
+/// group and that group's id equals `tab.child`. Under job control the shell
+/// hands the terminal's foreground group to each command it launches, so a
+/// foreground group differing from `tab.child` means a command is in
+/// progress. Used to decide whether Cmd-W needs to confirm before closing.
+fn tab_command_running(tab: &TabState) -> bool {
+    fg_is_foreign_command(unsafe { libc::tcgetpgrp(tab.master) }, tab.child)
+}
+
 /// Open a new window in this process (Cmd-N / palette "New window"). Builds the
 /// `NSWindow` from the live event loop, a sibling surface from the shared
 /// instance, and a fresh tab, then registers both in the window/tab maps. The
@@ -2178,6 +2203,53 @@ fn dedup_prepend(history: &mut Vec<String>, cmd: String) {
     history.retain(|c| c != &cmd);
     history.insert(0, cmd);
     history.truncate(COMMAND_HISTORY_CAP);
+}
+
+/// Build an autoreleased `NSString` from a Rust `&str` for objc calls that
+/// take text. The returned object lives until the surrounding autorelease
+/// pool drains, which outlasts the synchronous calls we hand it to.
+#[cfg(target_os = "macos")]
+fn ns_string(s: &str) -> *mut objc::runtime::Object {
+    use objc::{class, msg_send, sel, sel_impl};
+    let c = std::ffi::CString::new(s).unwrap_or_default();
+    unsafe {
+        let cls = class!(NSString);
+        msg_send![cls, stringWithUTF8String: c.as_ptr()]
+    }
+}
+
+/// Ask, via a native modal alert, whether to close a tab whose shell still
+/// has a command running. Returns `true` to close (terminating the command),
+/// `false` to keep the tab. `NSAlert.runModal` spins its own modal loop on
+/// the main thread, which is fine here: the user explicitly pressed Cmd-W and
+/// nothing else should happen until they answer.
+#[cfg(target_os = "macos")]
+fn confirm_close_running_command() -> bool {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    unsafe {
+        let alert: *mut Object = msg_send![class!(NSAlert), new];
+        let msg = ns_string("Close this tab?");
+        let info = ns_string(
+            "A process is still running in this tab. Closing it will terminate that process.",
+        );
+        let _: () = msg_send![alert, setMessageText: msg];
+        let _: () = msg_send![alert, setInformativeText: info];
+        // NSAlertStyleWarning.
+        let _: () = msg_send![alert, setAlertStyle: 0i64];
+        // The first button added is the default (rightmost, fires on Return).
+        let _: *mut Object = msg_send![alert, addButtonWithTitle: ns_string("Close Tab")];
+        let _: *mut Object = msg_send![alert, addButtonWithTitle: ns_string("Cancel")];
+        let response: i64 = msg_send![alert, runModal];
+        let _: () = msg_send![alert, release];
+        // NSAlertFirstButtonReturn == 1000 → the "Close Tab" button.
+        response == 1000
+    }
+}
+
+/// Off-macOS there's no dialog; treat Cmd-W as an unconditional close.
+#[cfg(not(target_os = "macos"))]
+fn confirm_close_running_command() -> bool {
+    true
 }
 
 /// Metal layer redraws is filled with the window's `backgroundColor`. Left

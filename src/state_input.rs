@@ -718,6 +718,23 @@ impl WindowState {
                                 self.change_font_size(-1.0);
                                 return true;
                             }
+                            // Cmd-W: close the current tab (a native tab is
+                            // its own window here). If the shell still has a
+                            // foreground command running, confirm first so an
+                            // accidental Cmd-W can't kill work in progress. The
+                            // !shift guard keeps Cmd-Shift-W for the wireframe
+                            // toggle below.
+                            if !self.modifiers.shift_key() && s.eq_ignore_ascii_case("w") {
+                                if !tab_command_running(self.active_tab())
+                                    || confirm_close_running_command()
+                                {
+                                    // The event loop owns the window map; it
+                                    // drains this flag and runs the same
+                                    // teardown as the OS close button.
+                                    self.pending_close = true;
+                                }
+                                return true;
+                            }
                             // Cmd-Shift-W: toggle wireframe debug view.
                             // Shift makes "w" arrive as "W"; check both for
                             // safety across keyboard layouts.

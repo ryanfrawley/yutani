@@ -3034,3 +3034,46 @@ fn theme_overrides_glow_defaults_off() {
     // win" switch stays off by default so they actually take effect.
     assert!(!Config::defaults().theme_overrides_glow);
 }
+
+//
+// Cmd-W close-tab: foreground-command detection. `fg_is_foreign_command`
+// is the pure predicate behind `tab_command_running` — given the PTY's
+// foreground process-group id and the shell's own pid, it decides whether
+// a foreign command (anything other than the shell) holds the foreground,
+// which is what gates the "a command is running, prompt before closing"
+// path for Cmd-W. Exercised here without a live PTY/`tcgetpgrp`.
+//
+
+#[test]
+fn fg_is_foreign_command_false_when_shell_owns_foreground() {
+    // Shell sitting at its prompt: the foreground pgrp *is* the shell's
+    // own pid, so nothing foreign is running and Cmd-W must close without
+    // a prompt. Use a few representative pids to avoid pinning on one value.
+    for pid in [1, 42, 12345] {
+        assert!(
+            !fg_is_foreign_command(pid, pid),
+            "shell pgrp == shell pid ({pid}) must read as no foreign command",
+        );
+    }
+}
+
+#[test]
+fn fg_is_foreign_command_true_when_a_command_holds_foreground() {
+    // A command running in the shell forms its own foreground process group
+    // distinct from the shell's pid (both positive) — this is the case that
+    // makes Cmd-W prompt before terminating it.
+    assert!(fg_is_foreign_command(2001, 2000));
+    assert!(fg_is_foreign_command(7, 9999));
+}
+
+#[test]
+fn fg_is_foreign_command_false_when_no_controlling_foreground_group() {
+    // `tcgetpgrp` returns -1 on failure (e.g. the slave side isn't the
+    // controlling terminal yet) and the doc contract treats any
+    // non-positive pgrp as "nothing running". Neither -1 nor 0 may report a
+    // foreign command, even though both differ from the shell pid — a sign
+    // flip or a `>= 0` slip would otherwise spuriously prompt on every Cmd-W.
+    assert!(!fg_is_foreign_command(-1, 2000));
+    assert!(!fg_is_foreign_command(0, 2000));
+}
+
