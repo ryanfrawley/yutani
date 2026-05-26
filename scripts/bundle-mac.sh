@@ -38,4 +38,14 @@ echo ">> installing Assets.car + patching Info.plist in $APP"
 cp "$ICON_OUT/Assets.car" "$APP/Contents/Resources/Assets.car"
 /usr/bin/plutil -replace CFBundleIconName -string yutani "$APP/Contents/Info.plist"
 
+# Sign with a stable identity so the bundle keeps the same code-signing
+# designated requirement across rebuilds. Without this, cargo-bundle leaves the
+# app ad-hoc/unsigned and macOS TCC keys permission grants to the binary hash,
+# which changes every build -- forcing you to re-approve all permissions each
+# time. Must run last: codesign seals the bundle, so it has to come after the
+# Assets.car copy and the Info.plist edit above.
+SIGN_IDENTITY="${SIGN_IDENTITY:-502CA6B5458E9BB53423DD9ACB6D9F2447081003}"
+echo ">> codesigning $APP (identity: $SIGN_IDENTITY)"
+codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+
 echo ">> done: $APP"

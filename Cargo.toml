@@ -40,14 +40,33 @@ winapi = { version = "0.3", default-features = false, features = ["winuser", "wi
 core-text = "19"
 core-foundation = "0.9"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSGeometry",
+    "NSNotification",
+    "NSIndexSet",
+] }
 objc2-app-kit = { version = "0.3", features = [
     "NSAlert",
+    "NSApplication",
     "NSColor",
+    "NSControl",
     "NSCursor",
-    "NSResponder",
-    "NSView",
-    "NSWindow",
     "NSEvent",
+    "NSFont",
+    "NSGlassEffectView",
+    "NSGraphics",
+    "NSPanel",
+    "NSResponder",
+    "NSScrollView",
+    "NSShadow",
+    "NSTableColumn",
+    "NSTableRowView",
+    "NSTableView",
+    "NSText",
+    "NSTextField",
+    "NSView",
+    "NSVisualEffectView",
+    "NSWindow",
 ] }
 raw-window-handle = "0.5"
