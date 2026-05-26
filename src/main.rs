@@ -1072,7 +1072,11 @@ const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
 /// stays responsive — the final frame is reached this many seconds after the
 /// scroll lands, regardless of distance.
-const ALT_SCROLL_ANIM_SECS: f32 = 0.07;
+///
+/// EXPERIMENTAL: set to 0 to disable the alt-screen slide entirely. With it
+/// off, `maybe_start_alt_scroll` returns early and the scroll snaps into place
+/// instead of animating.
+const ALT_SCROLL_ANIM_SECS: f32 = 0.0;
 
 /// Maximum displayed offset, in whole line-heights, for the primary
 /// scroll-on-output slide. The renderer widens its phantom row band by
