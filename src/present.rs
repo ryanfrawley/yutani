@@ -115,6 +115,13 @@ impl FreePool {
         self.free.push(idx);
     }
 
+    /// Whether a target is free to render into right now, without taking it.
+    /// Lets the renderer cheaply decide to skip a frame (and its ~7ms vertex
+    /// rebuild) before doing any work, when every target is still in flight.
+    pub fn has_free(&self) -> bool {
+        !self.free.is_empty()
+    }
+
 }
 
 enum Msg {
