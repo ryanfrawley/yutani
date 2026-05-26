@@ -206,7 +206,7 @@ impl WindowState {
         } else {
             winit::window::CursorIcon::Text
         };
-        self.window.set_cursor_icon(icon);
+        self.window.set_cursor(icon);
         self.active_tab_mut().hover_url = new;
         self.invalidate();
     }
