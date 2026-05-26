@@ -642,6 +642,20 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 );
             }
         }
+        // Drain a native command-palette signal (accept / dismiss). Like the
+        // `+` button it carries no window context, so it targets the focused
+        // window — the palette is always a child of (and key over) that window.
+        #[cfg(target_os = "macos")]
+        if let Some(sig) = glass_palette::take_palette_signal() {
+            if let Some(state) = self.focused_window.and_then(|w| self.windows.get_mut(&w)) {
+                match sig {
+                    glass_palette::PaletteSignal::Accept(s) => state.palette_accept(s),
+                    glass_palette::PaletteSignal::Dismiss => state.palette_dismiss(),
+                    glass_palette::PaletteSignal::Close => state.close_glass_palette(),
+                }
+            }
+        }
+
         // Each window animates independently; collect the earliest
         // wake-up across all of them and arm the loop for that.
         let mut next_wake: Option<std::time::Instant> = None;
