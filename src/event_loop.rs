@@ -499,6 +499,23 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         // still paints.
                     }
                     WindowEvent::RedrawRequested => {
+                        // Two cheap gates before the ~7ms vertex rebuild, so a
+                        // frame we shouldn't render yet costs the main thread
+                        // nothing (leaving the run loop free for AppKit's native
+                        // tab bar). `about_to_wait` re-arms the redraw when due.
+                        //   1. Frame pacing: don't render faster than
+                        //      MIN_FRAME_INTERVAL — the present thread vsync-paces
+                        //      the display anyway, and rendering flat-out starves
+                        //      AppKit during a flood of output.
+                        //   2. Backpressure: if every present target is still in
+                        //      flight, the frame would just be dropped.
+                        let paced = state.last_render_at.elapsed() >= MIN_FRAME_INTERVAL;
+                        if !paced || !state.present_target_available() {
+                            state.render_pending = true;
+                            return;
+                        }
+                        state.render_pending = false;
+                        state.last_render_at = std::time::Instant::now();
                         state.update();
                         state.prepare_frame();
                         let t0 = std::time::Instant::now();
@@ -638,6 +655,17 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 state.perf.maybe_flush();
                 continue;
             }
+            // Re-arm a deferred redraw once it's due: the pacing interval has
+            // elapsed *and* a present target is free. Requesting the redraw only
+            // when both hold means the loop sleeps (idle, AppKit-available) until
+            // then instead of spinning on a frame it can't draw.
+            if state.render_pending
+                && state.last_render_at.elapsed() >= MIN_FRAME_INTERVAL
+                && state.present_target_available()
+            {
+                state.render_pending = false;
+                state.window.request_redraw();
+            }
             if state.maybe_blink_tick() {
                 state.invalidate();
             }
@@ -678,10 +706,26 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             if next_image_anim.is_some() {
                 state.invalidate();
             }
+            // A deferred frame needs a wake to actually land: at the pacing
+            // deadline if we're still inside MIN_FRAME_INTERVAL, else a short
+            // poll while we wait for the present pool to free a target (the
+            // present thread doesn't wake the loop itself).
+            let next_deferred = if state.render_pending {
+                let since = state.last_render_at.elapsed();
+                Some(match MIN_FRAME_INTERVAL.checked_sub(since) {
+                    Some(remaining) if !remaining.is_zero() => {
+                        std::time::Instant::now() + remaining
+                    }
+                    _ => std::time::Instant::now() + std::time::Duration::from_millis(2),
+                })
+            } else {
+                None
+            };
             let this = [
                 state.next_blink_wake(),
                 next_anim,
                 next_image_anim,
+                next_deferred,
                 state.perf.next_wake(),
             ]
             .into_iter()

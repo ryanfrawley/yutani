@@ -647,6 +647,14 @@ struct WindowState {
     /// has finished with and the renderer may draw into. A frame is skipped
     /// when none are free (every target still in flight).
     free_targets: present::FreePool,
+    /// A redraw was requested but deferred — either the frame-pacing throttle
+    /// hadn't elapsed or no present target was free. Rather than do the ~7ms
+    /// vertex rebuild now, the event loop re-arms the redraw when it's due,
+    /// keeping the main thread idle (and AppKit's native tab bar responsive).
+    render_pending: bool,
+    /// When the last frame was actually rendered, for the [`MIN_FRAME_INTERVAL`]
+    /// pacing gate.
+    last_render_at: std::time::Instant,
 
     window: Window,
 
@@ -1082,6 +1090,15 @@ const WINDOW_CASCADE_STEP: f64 = 28.0;
 
 const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Minimum wall-clock spacing between main-thread frame renders (~62fps). The
+/// present thread vsync-paces what actually reaches the display, so rendering
+/// faster than this on the main thread just burns CPU and — crucially — starves
+/// AppKit's run loop, leaving no gap to repaint the native tab bar or service a
+/// tab switch. Pacing renders here guarantees that gap even under a flood of
+/// output. Text at 62fps is indistinguishable from higher rates.
+pub(crate) const MIN_FRAME_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(16);
 /// Duration of the smooth-scroll slide for an explicit alt-screen scroll
 /// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
 /// stays responsive — the final frame is reached this many seconds after the
@@ -1539,6 +1556,9 @@ impl WindowState {
             presenter,
             present_pool,
             free_targets: present::FreePool::new(present::POOL_SIZE),
+            render_pending: false,
+            // In the past, so the first frame paints immediately.
+            last_render_at: std::time::Instant::now() - MIN_FRAME_INTERVAL,
             window,
             shared,
             atlas,
@@ -1644,7 +1664,23 @@ impl WindowState {
     /// us aligned with the display's vsync cadence.
     fn invalidate(&mut self) {
         self.vertices_dirty = true;
-        self.window.request_redraw();
+        // While a frame is already deferred (waiting on the pacing deadline /
+        // present pool), don't re-request a redraw on every PTY chunk — that
+        // floods the loop with cheap no-op RedrawRequested round-trips.
+        // `about_to_wait` arms exactly one redraw when the deferred frame is
+        // due, so the marked-dirty state is picked up then.
+        if !self.render_pending {
+            self.window.request_redraw();
+        }
+    }
+
+    /// Whether a present-source target is free to render into right now. Drains
+    /// any the present thread has finished with first. The redraw handler calls
+    /// this *before* the vertex rebuild so a frame that would just be dropped
+    /// (every target still in flight) costs nothing on the main thread.
+    fn present_target_available(&mut self) -> bool {
+        self.presenter.drain_free(&mut self.free_targets);
+        self.free_targets.has_free()
     }
 
     /// Like `invalidate`, but for a frame where only the global scroll offset
