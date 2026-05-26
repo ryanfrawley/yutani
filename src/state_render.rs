@@ -1916,7 +1916,6 @@ impl WindowState {
         // premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
         let top_fade_height = self.config.top_fade_height;
         let bottom_fade_height_max = self.config.bottom_fade_height;
-        let clear = [0.0, 0.0, 0.0, 0.0];
 
         // Strip quads live in their own vertex/index buffer — drawn by the
         // blur strip pipeline in the composite pass.
@@ -2066,21 +2065,29 @@ impl WindowState {
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
-            let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
-            push_strip(
-                &mut strip_vertices,
-                &mut strip_indices,
-                win_h - bottom_band_height,
-                win_h,
-                clear,
-                bottom_blur,
-                0.0,
-            );
+            // Mirror the top Soft fade: dissolve into the background color
+            // (tint = 1, solid bg fill) rather than sampling the scene blur.
+            // Same smoothstep ramp, flipped — zero at the band top, full
+            // strength at the very bottom edge — emitted as linear segments.
+            const SEGS: usize = 8;
+            let bg = palette::get().background;
+            let a = |u: f32| bottom_alpha * (u * u * (3.0 - 2.0 * u));
+            let band_top = win_h - bottom_band_height;
+            let mut prev_y = band_top;
+            for i in 1..=SEGS {
+                let u0 = (i - 1) as f32 / SEGS as f32;
+                let u1 = i as f32 / SEGS as f32;
+                let y1 = band_top + bottom_band_height * u1;
+                let c0 = [bg[0], bg[1], bg[2], a(u0)];
+                let c1 = [bg[0], bg[1], bg[2], a(u1)];
+                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 1.0);
+                prev_y = y1;
+            }
         }
 
-        // Strip overlay: blur-only (tint = 0). The glyph fade already pulls
-        // foreground text toward the bg color near each edge; the blur softens
-        // whatever's still visible in the gradient region.
+        // Strip overlay: both edges now dissolve into the background color
+        // (tint = 1). The per-fragment glyph fade additionally pulls
+        // foreground text toward the bg color across each gradient region.
         if !strip_indices.is_empty() {
             self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
