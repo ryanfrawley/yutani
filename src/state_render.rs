@@ -4,6 +4,16 @@
 
 use crate::*;
 
+/// Whether the edge-fade strips sample the dual-Kawase blur of the scene
+/// (`tint = 0`) instead of dissolving into a solid background color
+/// (`tint = 1`). Both edges currently use the solid-color fade, so the blur
+/// output is never read — gating `blur.run()` on this skips ~5 wasted
+/// fullscreen passes per frame while a fade is on screen. Flip to `true` to
+/// bring the blurred-strip look back; the `BlurChain` machinery is kept intact
+/// for exactly that. (A blur-sampling strip would also need its `tint` set to
+/// 0 — see `update_vertices`.)
+const STRIP_BLUR: bool = false;
+
 /// `YUTANI_DIRTY_AUDIT=1` disables per-row vertex reuse: every visible row is
 /// re-emitted fresh each frame. A debugging kill-switch — if a rendering
 /// artifact disappears with this set, a missed damage source (a stale cached
@@ -2788,10 +2798,10 @@ impl WindowState {
             // so the bright pass extracts crisp colour, not post-blur smear.
             self.glow.run(&mut encoder, &self.shared.glow_pipelines);
             self.glow_fg.run(&mut encoder, &self.shared.glow_pipelines);
-            // Strip blur still samples the bg scene — strips live near
-            // the window edges where there's rarely text, so a bg-only
-            // blur source reads close to the legacy combined-scene blur.
-            if needs_strips {
+            // Strip blur source (only consumed when STRIP_BLUR is on). Strips
+            // live near the window edges where there's rarely text, so a
+            // bg-only blur reads close to the legacy combined-scene blur.
+            if needs_strips && STRIP_BLUR {
                 self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
@@ -2911,7 +2921,9 @@ impl WindowState {
                     "scene pass",
                 );
             }
-            self.blur.run(&mut encoder, &self.shared.blur_pipelines);
+            if STRIP_BLUR {
+                self.blur.run(&mut encoder, &self.shared.blur_pipelines);
+            }
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),
