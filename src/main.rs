@@ -1434,14 +1434,13 @@ impl WindowState {
             mapped_at_creation: false,
         });
 
-        let mut blur = renderer::blur::BlurChain::new(
+        let blur = renderer::blur::BlurChain::new(
             &shared.gpu.device,
             &shared.blur_pipelines,
             surface.config.width,
             surface.config.height,
         );
         blur.write_uniforms(&shared.gpu.queue, surface.config.width, surface.config.height);
-        blur.iterations = config.blur_iterations.max(1);
         sub!("BlurChain::new");
 
         let mut glow = renderer::glow::Glow::new(

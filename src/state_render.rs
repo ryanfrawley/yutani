@@ -4,6 +4,16 @@
 
 use crate::*;
 
+/// Whether the edge-fade strips sample the dual-Kawase blur of the scene
+/// (`tint = 0`) instead of dissolving into a solid background color
+/// (`tint = 1`). Both edges currently use the solid-color fade, so the blur
+/// output is never read — gating `blur.run()` on this skips ~5 wasted
+/// fullscreen passes per frame while a fade is on screen. Flip to `true` to
+/// bring the blurred-strip look back; the `BlurChain` machinery is kept intact
+/// for exactly that. (A blur-sampling strip would also need its `tint` set to
+/// 0 — see `update_vertices`.)
+const STRIP_BLUR: bool = false;
+
 /// `YUTANI_DIRTY_AUDIT=1` disables per-row vertex reuse: every visible row is
 /// re-emitted fresh each frame. A debugging kill-switch — if a rendering
 /// artifact disappears with this set, a missed damage source (a stale cached
@@ -773,13 +783,13 @@ impl WindowState {
                 // that the swap can move to fg (otherwise reverse-video text
                 // and Claude Code's reverse-space cursor render invisible).
                 let (fg, bg) = if cell.style.reverse {
-                    let rfg = cell.style.color_fg.unwrap_or(default_fg);
-                    let rbg = cell.style.color_bg.unwrap_or(default_bg_solid);
+                    let rfg = cell.style.fg.resolve(default_fg);
+                    let rbg = cell.style.bg.resolve(default_bg_solid);
                     (rbg, rfg)
                 } else {
                     (
-                        cell.style.color_fg.unwrap_or(default_fg),
-                        cell.style.color_bg.unwrap_or(default_bg),
+                        cell.style.fg.resolve(default_fg),
+                        cell.style.bg.resolve(default_bg),
                     )
                 };
                 // Quantise to whatever the scheme advertises (e.g. Mono /
@@ -894,9 +904,9 @@ impl WindowState {
                         .extended_cell(r, from)
                         .map(|cell| {
                             if cell.style.reverse {
-                                cell.style.color_bg.unwrap_or(default_bg_solid)
+                                cell.style.bg.resolve(default_bg_solid)
                             } else {
-                                cell.style.color_fg.unwrap_or(default_fg)
+                                cell.style.fg.resolve(default_fg)
                             }
                         })
                         .unwrap_or(default_fg);
@@ -1304,7 +1314,7 @@ impl WindowState {
             for ghost in &self.active_tab().cursor_ghosts {
                 let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
                 let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
-                let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
+                let mut fg = ghost.style.fg.resolve(default_fg);
                 // Premultiplied alpha to match the pipeline's blend mode.
                 fg[0] *= alpha;
                 fg[1] *= alpha;
@@ -1916,7 +1926,6 @@ impl WindowState {
         // premultiplied with alpha to match PREMULTIPLIED_ALPHA_BLENDING.
         let top_fade_height = self.config.top_fade_height;
         let bottom_fade_height_max = self.config.bottom_fade_height;
-        let clear = [0.0, 0.0, 0.0, 0.0];
 
         // Strip quads live in their own vertex/index buffer — drawn by the
         // blur strip pipeline in the composite pass.
@@ -2066,21 +2075,29 @@ impl WindowState {
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
-            let bottom_blur = [0.0_f32, 0.0, 0.0, bottom_alpha];
-            push_strip(
-                &mut strip_vertices,
-                &mut strip_indices,
-                win_h - bottom_band_height,
-                win_h,
-                clear,
-                bottom_blur,
-                0.0,
-            );
+            // Mirror the top Soft fade: dissolve into the background color
+            // (tint = 1, solid bg fill) rather than sampling the scene blur.
+            // Same smoothstep ramp, flipped — zero at the band top, full
+            // strength at the very bottom edge — emitted as linear segments.
+            const SEGS: usize = 8;
+            let bg = palette::get().background;
+            let a = |u: f32| bottom_alpha * (u * u * (3.0 - 2.0 * u));
+            let band_top = win_h - bottom_band_height;
+            let mut prev_y = band_top;
+            for i in 1..=SEGS {
+                let u0 = (i - 1) as f32 / SEGS as f32;
+                let u1 = i as f32 / SEGS as f32;
+                let y1 = band_top + bottom_band_height * u1;
+                let c0 = [bg[0], bg[1], bg[2], a(u0)];
+                let c1 = [bg[0], bg[1], bg[2], a(u1)];
+                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 1.0);
+                prev_y = y1;
+            }
         }
 
-        // Strip overlay: blur-only (tint = 0). The glyph fade already pulls
-        // foreground text toward the bg color near each edge; the blur softens
-        // whatever's still visible in the gradient region.
+        // Strip overlay: both edges now dissolve into the background color
+        // (tint = 1). The per-fragment glyph fade additionally pulls
+        // foreground text toward the bg color across each gradient region.
         if !strip_indices.is_empty() {
             self.shared.gpu.queue.write_buffer(
                 &self.strip_vertex_buffer,
@@ -2781,10 +2798,10 @@ impl WindowState {
             // so the bright pass extracts crisp colour, not post-blur smear.
             self.glow.run(&mut encoder, &self.shared.glow_pipelines);
             self.glow_fg.run(&mut encoder, &self.shared.glow_pipelines);
-            // Strip blur still samples the bg scene — strips live near
-            // the window edges where there's rarely text, so a bg-only
-            // blur source reads close to the legacy combined-scene blur.
-            if needs_strips {
+            // Strip blur source (only consumed when STRIP_BLUR is on). Strips
+            // live near the window edges where there's rarely text, so a
+            // bg-only blur reads close to the legacy combined-scene blur.
+            if needs_strips && STRIP_BLUR {
                 self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
@@ -2904,7 +2921,9 @@ impl WindowState {
                     "scene pass",
                 );
             }
-            self.blur.run(&mut encoder, &self.shared.blur_pipelines);
+            if STRIP_BLUR {
+                self.blur.run(&mut encoder, &self.shared.blur_pipelines);
+            }
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("composite pass"),

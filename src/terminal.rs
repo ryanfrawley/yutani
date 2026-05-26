@@ -265,6 +265,17 @@ pub struct KittyAnimationControl {
     pub edit_gap_ms: Option<u32>,
 }
 
+/// `YUTANI_NO_RING=1` disables the ring-buffer scroll fast path, forcing the
+/// old `copy_within` memmove on every full-screen scroll. A correctness/perf
+/// A-B kill-switch: identical behavior with it set means the ring is sound.
+fn no_ring_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("YUTANI_NO_RING").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    })
+}
+
 #[derive(Clone)]
 pub struct Grid {
     pub cells: Vec<Cell>,
@@ -284,6 +295,16 @@ pub struct Grid {
     /// rebuild. A freshly built grid starts fully dirty so the first frame
     /// emits everything.
     dirty_rows: Vec<bool>,
+    /// Ring-buffer rotation: logical row `r` lives at physical row
+    /// `(r + row_offset) % rows`. A full-screen scroll-up just advances this
+    /// (O(cols)) instead of memmoving the whole cell array (O(rows*cols)) — the
+    /// dominant cost under streaming output. All cell access goes through
+    /// `idx`/`row_base` (offset-aware); multi-row physical ops `linearize`
+    /// first. `YUTANI_NO_RING=1` forces the old memmove path for A/B checks.
+    row_offset: usize,
+    /// When true, the ring scroll fast path is disabled (always memmove). Seeded
+    /// from `YUTANI_NO_RING`; tests flip it to diff the two paths.
+    disable_ring: bool,
 }
 
 impl Grid {
@@ -294,11 +315,35 @@ impl Grid {
             cols,
             placements: Vec::new(),
             dirty_rows: vec![true; rows],
+            row_offset: 0,
+            disable_ring: no_ring_enabled(),
+        }
+    }
+
+    /// Physical storage row for a logical row, through the ring rotation.
+    #[inline]
+    fn phys_row(&self, row: usize) -> usize {
+        (row + self.row_offset) % self.rows.max(1)
+    }
+
+    /// First cell index of a logical row in the (rotated) backing store.
+    #[inline]
+    fn row_base(&self, row: usize) -> usize {
+        self.phys_row(row) * self.cols
+    }
+
+    /// Rotate the backing store so logical row 0 is at physical 0 again
+    /// (`row_offset == 0`), restoring the linear layout the multi-row
+    /// `copy_within` operations assume. No-op when already linear.
+    fn linearize(&mut self) {
+        if self.row_offset != 0 {
+            self.cells.rotate_left(self.row_offset * self.cols);
+            self.row_offset = 0;
         }
     }
 
     fn idx(&self, row: usize, col: usize) -> usize {
-        row * self.cols + col
+        self.row_base(row) + col
     }
 
     pub fn get(&self, row: usize, col: usize) -> Cell {
@@ -358,7 +403,7 @@ impl Grid {
     }
 
     pub fn row(&self, row: usize) -> &[Cell] {
-        let start = row * self.cols;
+        let start = self.row_base(row);
         &self.cells[start..start + self.cols]
     }
 
@@ -366,6 +411,8 @@ impl Grid {
         for c in &mut self.cells {
             *c = blank;
         }
+        // Whole grid is blank now; collapse the ring so the layout is linear.
+        self.row_offset = 0;
         // ED 2 / full-reset path: an image-aware terminal usually exposes
         // explicit delete commands, but most TUI image users (icat / imgcat /
         // chafa) lean on screen-clear as the implicit reset. Dropping all
@@ -376,7 +423,7 @@ impl Grid {
 
     /// Fill cells `from..to` of `row` with `blank`.
     pub fn clear_row(&mut self, row: usize, from: usize, to: usize, blank: Cell) {
-        let base = row * self.cols;
+        let base = self.row_base(row);
         // Change-gated like `set`: clearing an already-blank span leaves the
         // row clean, so an app blanking lines it never wrote doesn't dirty them.
         for i in from..to.min(self.cols) {
@@ -418,6 +465,17 @@ impl Grid {
         }
         let width = right - left + 1;
         let full_width = left == 0 && right == self.cols - 1;
+        let full_screen = top == 0 && bottom == self.rows - 1;
+        // O(1) scroll-up: when the whole screen scrolls, relabel rows by
+        // advancing the ring offset instead of memmoving the cell array (the
+        // dominant cost under streaming output). The freed rows are cleared
+        // below; `clear_row` is offset-aware, so it blanks the right cells.
+        let use_ring = full_width && full_screen && n < region && !self.disable_ring;
+        if !use_ring {
+            // The `copy_within` paths below address cells by `r * cols`, which
+            // is only valid for a linear (offset 0) layout.
+            self.linearize();
+        }
         if shift_damage && full_width {
             // Move each row's damage up with its content; the freed rows at the
             // bottom are re-marked by `clear_row` below. Read-ahead (r+n) is
@@ -436,9 +494,12 @@ impl Grid {
                 self.mark_dirty(r);
             }
         }
-        // Copy only if there's something to shift. When n == region, every
-        // row of the region gets cleared and nothing moves.
-        if n < region {
+        if use_ring {
+            // Rows `n..rows` become `0..rows-n`; rows `0..n` roll off the top.
+            self.row_offset = (self.row_offset + n) % self.rows;
+        } else if n < region {
+            // Copy only if there's something to shift. When n == region, every
+            // row of the region gets cleared and nothing moves.
             for r in top..=bottom - n {
                 let src = (r + n) * self.cols + left;
                 let dst = r * self.cols + left;
@@ -483,6 +544,9 @@ impl Grid {
         if n == 0 || left > right || right >= self.cols {
             return;
         }
+        // The `copy_within` below addresses cells by `r * cols` — collapse the
+        // ring first. (Scroll-down is rare; no ring fast path for it.)
+        self.linearize();
         for r in top..=bottom {
             self.mark_dirty(r);
         }
@@ -1468,13 +1532,19 @@ impl Terminal {
     }
 
     pub fn feed(&mut self, s: &str) {
-        let mut events = Vec::new();
+        // Dispatch each event inline as it's parsed, rather than collecting a
+        // per-call `Vec<Event>` and re-iterating. `Event` is ~32 bytes (its
+        // `Osc(String)`/`Sgr(Vec<u16>)` variants), so under heavy output that
+        // Vec — one slot per character — dominated `feed` (~85% of its cost was
+        // building/moving/dropping it, measured). The parser is moved out of
+        // `self` for the call so the emit closure can borrow the rest of `self`
+        // (the dummy left behind is a no-alloc `Parser::default()`); its state
+        // is restored after, preserving mid-sequence parsing across calls.
+        let mut parser = std::mem::take(&mut self.parser);
         for ch in s.chars() {
-            self.parser.feed(ch, |e| events.push(e));
+            parser.feed(ch, |e| self.dispatch(e));
         }
-        for e in events {
-            self.dispatch(e);
-        }
+        self.parser = parser;
     }
 
     pub fn cursor(&self) -> Cursor {
@@ -1646,20 +1716,10 @@ impl Terminal {
     /// only cells that get re-printed afterward pick up the new
     /// scheme.
     pub fn reresolve_palette(&mut self) {
-        for cell in self.primary.cells.iter_mut() {
-            cell.style.reresolve_palette();
-        }
-        for cell in self.alternate.cells.iter_mut() {
-            cell.style.reresolve_palette();
-        }
-        for row in self.scrollback.iter_mut() {
-            for cell in row.iter_mut() {
-                cell.style.reresolve_palette();
-            }
-        }
-        // Every cell's resolved color may have changed; the renderer also
-        // clears its whole row cache on a scheme swap, but mark both grids so
-        // the damage set agrees.
+        // Cell colors are stored as `CellColor` sources now and resolved
+        // against the live palette at render time, so a scheme swap needs no
+        // per-cell rewrite — just force a full re-emit (the renderer also bumps
+        // its row-cache epoch) so the new palette is picked up.
         self.primary.mark_all_dirty();
         self.alternate.mark_all_dirty();
     }
@@ -2638,7 +2698,7 @@ impl Terminal {
         let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
-        let base = row * cols;
+        let base = grid.row_base(row);
         if col + n <= right {
             grid.cells.copy_within(base + col..base + right + 1 - n, base + col + n);
         }
@@ -2663,7 +2723,7 @@ impl Terminal {
         let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
-        let base = row * cols;
+        let base = grid.row_base(row);
         if col + n <= right {
             grid.cells.copy_within(base + col + n..base + right + 1, base + col);
         }
@@ -5085,7 +5145,10 @@ pub(crate) fn kitty_placeholder_diacritic_index(ch: char) -> Option<u32> {
 }
 
 fn decode_kitty_placeholder_image_id(style: &crate::style::Style) -> Option<u32> {
-    let fg = style.color_fg?;
+    let fg = match style.fg {
+        crate::style::CellColor::Default => return None,
+        c => c.resolve([0.0, 0.0, 0.0, 1.0]),
+    };
     let r = crate::palette::linear_to_srgb_u8(fg[0]) as u32;
     let g = crate::palette::linear_to_srgb_u8(fg[1]) as u32;
     let b = crate::palette::linear_to_srgb_u8(fg[2]) as u32;
@@ -5731,86 +5794,51 @@ mod tests {
         t.feed("\x1b[31mA");
         let c = t.primary.get(0, 0);
         assert_eq!(c.ch, 'A');
-        assert_eq!(c.style.color_fg_source, crate::style::ColorSource::Indexed(1));
-        assert!(c.style.color_fg.is_some());
+        assert_eq!(c.style.fg, crate::style::CellColor::Indexed(1));
     }
 
     #[test]
-    fn reresolve_palette_updates_all_grids_and_scrollback() {
+    fn cell_colors_resolve_against_live_palette_no_rewrite() {
+        // CellColor stores the source; a scheme swap is reflected at render via
+        // `resolve`, with no per-cell rewrite. Verify across the live grid,
+        // the alt grid, and scrollback, and that truecolor is palette-independent.
         use crate::palette;
-        use crate::style::ColorSource;
-        // Serialize against other palette-touching tests; install is
-        // global state.
+        use crate::style::CellColor;
         let _guard = palette::TEST_LOCK.lock().expect("test lock");
-        // Set palette to a known baseline so the test isn't sensitive
-        // to whatever palette the previous test left installed.
         palette::install(palette::Palette::defaults());
-        // 10×5 grid with generous headroom so the paints below don't
-        // trigger autowrap/scroll into scrollback unintentionally.
-        // The scrollback case is exercised explicitly further down.
         let mut t = Terminal::new(10, 5, 10);
 
-        // Paint cell (0, 0) with red fg, cell (1, 0) with truecolor
-        // bg. `\r\n` keeps the cursor inside the grid bounds.
+        // Cell (0,0) red indexed fg; cell (1,0) truecolor bg.
         t.feed("\x1b[31mA\r\n\x1b[48;2;200;100;50mB");
+        assert_eq!(t.primary.get(0, 0).style.fg, CellColor::Indexed(1));
 
-        // Sanity-check the fixture before the palette swap.
-        let painted = t.primary.get(0, 0);
-        assert_eq!(
-            painted.style.color_fg_source,
-            ColorSource::Indexed(1),
-            "fixture: red A should carry Indexed(1) fg",
-        );
-        assert!(painted.style.color_fg.is_some());
-
-        // Paint the alternate grid too — alt cells must also re-resolve.
+        // Alt grid: yellow (slot 3).
         t.feed("\x1b[?1049h\x1b[33mC\x1b[?1049l");
 
-        // Drive one cell into scrollback by feeding enough LFs to
-        // scroll past the grid's row count. With rows=5, we need 5+
-        // LFs from the current position to push the first painted
-        // row off the top.
+        // Push the first painted row into scrollback.
         t.feed("\r\n\n\n\n\n\n");
+        assert!(!t.scrollback.is_empty(), "fixture: row 0 should have scrolled off");
+        assert_eq!(t.scrollback[0][0].ch, 'A');
+        assert_eq!(t.scrollback[0][0].style.fg, CellColor::Indexed(1));
 
-        // Snapshot the indexed-red fg under the OLD palette.
-        let red_before = palette::get().ansi(1, false);
-
-        // Swap palette: rewrite slot 1 to bright green.
+        // Swap slot 1 to bright green.
         let mut new_palette = palette::Palette::defaults();
         new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
         palette::install(new_palette);
 
-        // Scrollback row 0 is the displaced first-paint row. Before
-        // re-resolve, it still carries the OLD red.
-        assert!(!t.scrollback.is_empty(), "fixture: row 0 should have scrolled off");
-        let sb_row = &t.scrollback[0];
-        assert_eq!(sb_row[0].ch, 'A');
-        assert_eq!(sb_row[0].style.color_fg_source, ColorSource::Indexed(1));
-        assert_eq!(sb_row[0].style.color_fg, Some(red_before));
+        // The scrollback cell's *source* is unchanged but resolves to the new
+        // color — no rewrite happened.
+        assert_eq!(t.scrollback[0][0].style.fg, CellColor::Indexed(1));
+        assert_eq!(t.scrollback[0][0].style.fg.resolve([0.0; 4]), [0.0, 1.0, 0.0, 1.0]);
 
-        t.reresolve_palette();
+        // Truecolor bg (now at scrollback[1][0]) resolves palette-independently.
+        let tc = &t.scrollback[1][0];
+        assert_eq!(tc.ch, 'B');
+        assert_eq!(tc.style.bg, CellColor::Rgb([200, 100, 50]));
+        assert_eq!(palette::linear_to_srgb_u8(tc.style.bg.resolve([0.0; 4])[0]), 200);
 
-        // Scrollback row 0 updated.
-        let sb_row = &t.scrollback[0];
-        assert_eq!(sb_row[0].style.color_fg, Some([0.0, 1.0, 0.0, 1.0]));
-
-        // Truecolor cell (originally cell (1, 0); after scrolling
-        // it's at scrollback[1][0]) stays put.
-        assert!(t.scrollback.len() >= 2);
-        let tc_cell = &t.scrollback[1][0];
-        assert_eq!(tc_cell.ch, 'B');
-        assert_eq!(tc_cell.style.color_bg_source, ColorSource::Truecolor);
-        let tc_bg_after = tc_cell.style.color_bg.expect("bg set");
-        assert_eq!(
-            crate::palette::linear_to_srgb_u8(tc_bg_after[0]),
-            200,
-            "truecolor R component preserved across re-resolve",
-        );
-
-        // Alt grid was also painted; SGR 33 = yellow = slot 3.
-        let cell = t.alternate.get(0, 0);
-        assert_eq!(cell.style.color_fg_source, ColorSource::Indexed(3));
-        assert_eq!(cell.style.color_fg, Some(palette::get().ansi(3, false)));
+        // Alt grid cell tracks the live palette too (slot 3 unchanged here).
+        assert_eq!(t.alternate.get(0, 0).style.fg, CellColor::Indexed(3));
 
         palette::install(palette::Palette::defaults());
     }
@@ -5926,8 +5954,8 @@ mod tests {
     fn sgr_styles_cells() {
         let mut t = Terminal::new(5, 1, 100);
         t.feed("\x1b[31mA\x1b[0mB");
-        assert!(t.row(0)[0].style.color_fg.is_some());
-        assert_eq!(t.row(0)[1].style.color_fg, None);
+        assert_eq!(t.row(0)[0].style.fg, crate::style::CellColor::Indexed(1));
+        assert_eq!(t.row(0)[1].style.fg, crate::style::CellColor::Default);
     }
 
     #[test]
@@ -6552,6 +6580,80 @@ mod tests {
     }
 
     #[test]
+    fn ring_buffer_matches_memmove_path() {
+        // Differential torture test: the ring scroll fast path must produce the
+        // exact same logical buffer (live grid + scrollback + cursor) as the
+        // old `copy_within` memmove path, for arbitrary input. `a` uses the
+        // ring; `b` is forced onto the memmove path. They must never diverge.
+        fn snapshot(t: &Terminal) -> (usize, usize, Vec<String>, (usize, usize)) {
+            let total = t.scrollback_len() + t.rows;
+            let lines: Vec<String> = (0..total as isize)
+                .map(|abs| {
+                    t.line_at(abs)
+                        .map(|row| row.iter().map(|c| c.ch).collect())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let c = t.cursor();
+            (t.rows, t.cols, lines, (c.row, c.col))
+        }
+        let mut a = Terminal::new(20, 6, 50); // ring enabled (default)
+        let mut b = Terminal::new(20, 6, 50);
+        b.primary.disable_ring = true;
+        b.alternate.disable_ring = true;
+        assert!(!a.primary.disable_ring, "test assumes ring on for `a`");
+
+        let mut step = 0;
+        let both = |a: &mut Terminal, b: &mut Terminal, s: &str, step: &mut i32| {
+            a.feed(s);
+            b.feed(s);
+            *step += 1;
+            assert_eq!(snapshot(a), snapshot(b), "ring vs memmove diverged at step {step}");
+        };
+
+        // Phase 1: plain lines -> repeated full-screen scroll-up (ring path) +
+        // scrollback growth.
+        for i in 0..30 {
+            both(&mut a, &mut b, &format!("row number {i:02} xyz
+"), &mut step);
+        }
+        // Phase 2: DECSTBM sub-region scroll (memmove/linearize path) while the
+        // ring offset is non-zero on `a`.
+        both(&mut a, &mut b, "\x1b[2;5r", &mut step);
+        for i in 0..8 {
+            both(&mut a, &mut b, &format!("sub{i}\r\n"), &mut step);
+        }
+        // Phase 3: insert / delete lines (linearize path).
+        both(&mut a, &mut b, "\x1b[3;1H\x1b[3L", &mut step);
+        both(&mut a, &mut b, "\x1b[2M", &mut step);
+        // Phase 4: reset region, more full-screen scrolls (ring path again).
+        both(&mut a, &mut b, "\x1b[r", &mut step);
+        for i in 0..12 {
+            both(&mut a, &mut b, &format!("again {i:02}\r\n"), &mut step);
+        }
+        // Phase 5: insert/delete chars within a row.
+        both(&mut a, &mut b, "\x1b[1;3H\x1b[4@inserted\x1b[2P", &mut step);
+        // Phase 6: erase display.
+        both(&mut a, &mut b, "\x1b[2J\x1b[H", &mut step);
+        for i in 0..10 {
+            both(&mut a, &mut b, &format!("post-erase {i}\r\n"), &mut step);
+        }
+        // Phase 7: alt screen full-screen scroll (ring) then back to primary.
+        both(&mut a, &mut b, "\x1b[?1049h", &mut step);
+        for i in 0..10 {
+            both(&mut a, &mut b, &format!("alt line {i}\r\n"), &mut step);
+        }
+        both(&mut a, &mut b, "\x1b[?1049l", &mut step);
+        // Phase 8: resize while ring offset is non-zero, then more output.
+        a.resize(12, 4);
+        b.resize(12, 4);
+        assert_eq!(snapshot(&a), snapshot(&b), "ring vs memmove diverged after resize");
+        for i in 0..15 {
+            both(&mut a, &mut b, &format!("rsz {i:02}\r\n"), &mut step);
+        }
+    }
+
+    #[test]
     fn line_at_returns_scrollback_then_grid() {
         let mut t = Terminal::new(5, 2, 100);
         t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\nDDDDD");
@@ -6647,8 +6749,8 @@ mod tests {
         let cell = t.row(0)[0];
         assert_eq!(cell.ch, 'A');
         assert_eq!(
-            cell.style.color_fg_source,
-            crate::style::ColorSource::Indexed(1),
+            cell.style.fg,
+            crate::style::CellColor::Indexed(1),
             "wrapped SGR must have reached apply_sgr",
         );
     }
@@ -6678,8 +6780,8 @@ mod tests {
         let cell = t.row(0)[0];
         assert_eq!(cell.ch, 'A', "inner Print event must dispatch even when outer parser is mid-DCS");
         assert_eq!(
-            cell.style.color_fg_source,
-            crate::style::ColorSource::Indexed(1),
+            cell.style.fg,
+            crate::style::CellColor::Indexed(1),
             "inner SGR 31 must reach apply_sgr",
         );
         // Finish DCS#2 with a no-op body so the outer parser returns
@@ -13133,14 +13235,9 @@ mod tests {
         // not perturb the result. Build a Style directly so we can poke
         // an arbitrary alpha without going through the SGR parser.
         let mut style = crate::style::Style::new();
-        // 0xA1B2C3 in sRGB, then linearize (matches what the parser stores).
-        let r = crate::palette::srgb_to_linear(0xA1);
-        let g = crate::palette::srgb_to_linear(0xB2);
-        let b = crate::palette::srgb_to_linear(0xC3);
-        style.color_fg = Some([r, g, b, 0.25]); // weird alpha
-        assert_eq!(decode_kitty_placeholder_image_id(&style), Some(0xA1B2C3));
-        // And alpha=0 — still extracted from RGB.
-        style.color_fg = Some([r, g, b, 0.0]);
+        // The id is encoded in the fg truecolor RGB; `CellColor::Rgb` carries no
+        // alpha at all, so the decode is alpha-agnostic by construction.
+        style.fg = crate::style::CellColor::Rgb([0xA1, 0xB2, 0xC3]);
         assert_eq!(decode_kitty_placeholder_image_id(&style), Some(0xA1B2C3));
     }
 
