@@ -5,6 +5,25 @@
 use crate::*;
 
 impl WindowState {
+    /// Open or close the command palette. On macOS this shows/hides the native
+    /// Liquid Glass panel (built lazily on first use); elsewhere it falls back
+    /// to the pure model + GPU overlay.
+    pub(crate) fn toggle_command_palette(&mut self) {
+        if self.glass_palette.is_none() {
+            self.glass_palette = glass_palette::new();
+        }
+        match self.glass_palette.as_mut() {
+            Some(gp) => {
+                if gp.visible() {
+                    gp.hide();
+                } else {
+                    gp.show(&self.window);
+                }
+            }
+            None => self.command_palette.toggle(),
+        }
+    }
+
     /// Drive the command palette from a key press while it's open. Always
     /// consumes the event (returns `true`): the palette owns the keyboard, so
     /// nothing here reaches the PTY. Cmd-Shift-P (open/close) is handled by the
@@ -615,7 +634,7 @@ impl WindowState {
                     if self.modifiers.super_key() && self.modifiers.shift_key() {
                         if let winit::keyboard::Key::Character(s) = &event.logical_key {
                             if s.eq_ignore_ascii_case("p") {
-                                self.command_palette.toggle();
+                                self.toggle_command_palette();
                                 self.invalidate();
                                 return true;
                             }

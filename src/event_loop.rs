@@ -262,6 +262,16 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         }
         state.invalidate();
 
+        // TEMP (Slice 1 visual check): auto-open the palette so it can be
+        // screenshotted without Accessibility keystroke injection.
+        if std::env::var_os("YUTANI_PALETTE_DEMO").is_some() {
+            state.toggle_command_palette();
+            #[cfg(target_os = "macos")]
+            if let Some(gp) = state.glass_palette.as_ref() {
+                eprintln!("[palette-demo] {}", gp.debug_report());
+            }
+        }
+
         let initial_window_id = state.window.id();
         self.windows.insert(initial_window_id, state);
         self.tab_to_window.insert(tab_id, initial_window_id);
