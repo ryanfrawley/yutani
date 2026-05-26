@@ -262,31 +262,6 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         }
         state.invalidate();
 
-        // TEMP (Slice 1 visual check): auto-open the palette so it can be
-        // screenshotted without Accessibility keystroke injection.
-        if std::env::var_os("YUTANI_PALETTE_DEMO").is_some() {
-            state.toggle_command_palette();
-            #[cfg(target_os = "macos")]
-            {
-                let report = |state: &WindowState, tag: &str| {
-                    if let Some(gp) = state.glass_palette.as_ref() {
-                        eprintln!("[palette-demo] {tag}: {}", gp.debug_report(None));
-                    }
-                };
-                report(&state, "open (commands)");
-                // Accept a chooser command -> should enter choose mode and list
-                // the available schemes.
-                state.palette_accept(Some("Set theme".to_string()));
-                report(&state, "after accept 'Set theme'");
-                // Escape -> back out to the command list.
-                state.palette_dismiss();
-                report(&state, "after dismiss");
-                // Accept an immediate command -> runs and closes the panel.
-                state.palette_accept(Some("Toggle wireframe".to_string()));
-                report(&state, "after accept 'Toggle wireframe'");
-            }
-        }
-
         let initial_window_id = state.window.id();
         self.windows.insert(initial_window_id, state);
         self.tab_to_window.insert(tab_id, initial_window_id);

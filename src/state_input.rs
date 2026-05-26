@@ -12,15 +12,18 @@ impl WindowState {
         if self.glass_palette.is_none() {
             self.glass_palette = glass_palette::new();
         }
-        // The model's `mode` tracks the palette phase (commands / argument /
-        // choose); the native panel mirrors it. `open()` resets to commands.
+        // The native panel tracks the palette phase via the model's `mode`
+        // (commands / argument / choose) but leaves `open` false, so the GPU
+        // overlay (the off-macOS fallback) stays dormant while it drives input.
+        let dark = theme_for_bg(palette::get().background) == winit::window::Theme::Dark;
         match self.glass_palette.as_mut() {
             Some(gp) => {
                 if gp.visible() {
                     gp.hide();
                     self.command_palette.close();
                 } else {
-                    self.command_palette.open();
+                    self.command_palette.mode = command_palette::Mode::Commands;
+                    gp.set_appearance(dark);
                     gp.show(&self.window);
                 }
             }

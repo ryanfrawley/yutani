@@ -1953,6 +1953,13 @@ impl WindowState {
         }
         self.resize_buffers();
         self.active_tab_mut().cursor_anim = None;
+        // Keep the native palette centred: a child window tracks the parent's
+        // moves automatically, but not its resizes.
+        if let Some(gp) = self.glass_palette.as_ref() {
+            if gp.visible() {
+                gp.reposition(&self.window);
+            }
+        }
         self.invalidate();
     }
 

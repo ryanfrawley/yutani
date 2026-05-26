@@ -33,6 +33,8 @@ mod imp {
         pub fn enter_commands(&self) {}
         pub fn enter_argument(&self, _prompt: &str) {}
         pub fn enter_choose(&self, _prompt: &str, _choices: Vec<String>) {}
+        pub fn set_appearance(&self, _dark: bool) {}
+        pub fn reposition(&self, _parent: &Window) {}
     }
 
     /// Always `None` off macOS; the palette falls back to the GPU overlay.
@@ -509,13 +511,23 @@ mod imp {
             self.set_mode(prompt, choices, true);
         }
 
-        /// Position over `parent` (centered, near the top), attach as a child
-        /// window, show it, and focus the search field on the command list.
-        pub fn show(&mut self, parent: &Window) {
-            let Some(parent_ns) = parent_nswindow(parent) else {
-                return;
-            };
-            self.enter_commands();
+        /// Match the panel's appearance (and thus its glass + label colors) to
+        /// the terminal's light/dark theme, so text stays legible on the glass.
+        pub fn set_appearance(&self, dark: bool) {
+            unsafe {
+                let name = NSString::from_str(if dark {
+                    "NSAppearanceNameDarkAqua"
+                } else {
+                    "NSAppearanceNameAqua"
+                });
+                let appearance: *mut AnyObject =
+                    msg_send![class!(NSAppearance), appearanceNamed: &*name];
+                let _: () = msg_send![&*self.panel, setAppearance: appearance];
+            }
+        }
+
+        /// Centre the panel near the top of the parent window's frame.
+        fn place(&self, parent_ns: *mut AnyObject) {
             unsafe {
                 let pf: NSRect = msg_send![parent_ns, frame];
                 let w = PANEL_WIDTH;
@@ -525,7 +537,26 @@ mod imp {
                 let y = pf.origin.y + pf.size.height - h - TOP_INSET;
                 let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
                 let _: () = msg_send![&*self.panel, setFrame: frame, display: true];
+            }
+        }
 
+        /// Re-centre over the parent (e.g. after a window resize). A child
+        /// window already tracks the parent's *moves*, but not its resizes.
+        pub fn reposition(&self, parent: &Window) {
+            if let Some(parent_ns) = parent_nswindow(parent) {
+                self.place(parent_ns);
+            }
+        }
+
+        /// Position over `parent` (centered, near the top), attach as a child
+        /// window, show it, and focus the search field on the command list.
+        pub fn show(&mut self, parent: &Window) {
+            let Some(parent_ns) = parent_nswindow(parent) else {
+                return;
+            };
+            self.enter_commands();
+            self.place(parent_ns);
+            unsafe {
                 let _: () = msg_send![parent_ns, addChildWindow: &*self.panel, ordered: 1isize];
                 let _: () = msg_send![
                     &*self.panel,
@@ -546,33 +577,6 @@ mod imp {
                 let _: () = msg_send![&*self.panel, orderOut: std::ptr::null_mut::<AnyObject>()];
             }
             self.visible = false;
-        }
-
-        /// Introspect live AppKit state for non-visual verification (used by
-        /// the `YUTANI_PALETTE_DEMO` smoke check, since screen capture is
-        /// sandboxed). Reports the panel state plus the row count after an
-        /// optional simulated query.
-        pub fn debug_report(&self, simulated_query: Option<&str>) -> String {
-            unsafe {
-                if let Some(q) = simulated_query {
-                    self.controller.apply_query(q);
-                }
-                let visible: bool = msg_send![&*self.panel, isVisible];
-                let content: *mut AnyObject = msg_send![&*self.panel, contentView];
-                let cls: *const AnyClass = msg_send![content, class];
-                let cls_name = if cls.is_null() {
-                    "<null>".to_string()
-                } else {
-                    (*cls).name().to_string_lossy().into_owned()
-                };
-                let rows = self.controller.ivars().filtered.borrow().len();
-                let frame: NSRect = msg_send![&*self.panel, frame];
-                format!(
-                    "visible={visible} contentView={cls_name} rows={rows} \
-                     query={simulated_query:?} frame=({:.0},{:.0} {:.0}x{:.0})",
-                    frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
-                )
-            }
         }
     }
 }
