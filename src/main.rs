@@ -2,6 +2,7 @@ mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
+mod glass_palette;
 mod search;
 mod font;
 mod font_loader;
@@ -770,6 +771,10 @@ struct WindowState {
     /// its own search/argument text field and selection state; see
     /// `command_palette.rs`.
     command_palette: command_palette::CommandPalette,
+    /// The native Liquid Glass palette panel (macOS). `None` until first
+    /// opened; a no-op stub off macOS. Built lazily because it needs a
+    /// main-thread AppKit context. See `glass_palette.rs`.
+    glass_palette: Option<glass_palette::GlassPalette>,
     /// The find-in-scrollback overlay (Cmd-F). While `open`, it owns the
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
@@ -1605,6 +1610,7 @@ impl WindowState {
             bottom_fade_phase: 0.0,
             last_anim_tick: std::time::Instant::now(),
             command_palette: command_palette::CommandPalette::default(),
+            glass_palette: None,
             search: search::Search::default(),
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
@@ -1946,6 +1952,12 @@ impl WindowState {
         }
         self.resize_buffers();
         self.active_tab_mut().cursor_anim = None;
+        // Resizing the window (e.g. dragging its resize handle) doesn't make the
+        // palette resign key, so dismiss it here instead of leaving it floating
+        // over a now-differently-sized window.
+        if self.glass_palette.as_ref().is_some_and(|gp| gp.visible()) {
+            self.close_glass_palette();
+        }
         self.invalidate();
     }
 
