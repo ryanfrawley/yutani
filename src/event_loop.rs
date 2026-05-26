@@ -154,7 +154,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
 
         // GPU bring-up is async; `resumed` is sync, so block on it here exactly
         // as the old pre-`run()` path did with `.await`.
-        let (gpu, surface) = pollster::block_on(gpu::Gpu::new(&window));
+        let (gpu, surface, surface_raw) = pollster::block_on(gpu::Gpu::new(&window));
         lap("after Gpu::new (concurrent with font load)");
 
         let fd = font_handle.join().expect("font loader thread panicked");
@@ -242,7 +242,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         );
         lap("after create_tab (fork)");
         let mut state =
-            WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, initial_tab);
+            WindowState::create_window(shared.clone(), window, surface, surface_raw, config.clone(), dpi, initial_tab);
         lap("after create_window (GPU/atlas/pipelines)");
         state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
         // Size the chrome band to the real native title bar now that the window
