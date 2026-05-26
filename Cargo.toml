@@ -9,7 +9,7 @@ edition = "2021"
 
 [package.metadata.bundle]
 name = "Yutani"
-identifier = "co.frawley.yutani"
+identifier = "sh.yutani"
 category = "public.app-category.developer-tools"
 short_description = "Yutani terminal"
 # yutani.icns and Assets.car are produced from yutani.icon by
