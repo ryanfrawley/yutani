@@ -2307,17 +2307,12 @@ fn dedup_prepend(history: &mut Vec<String>, cmd: String) {
     history.truncate(COMMAND_HISTORY_CAP);
 }
 
-/// Build an autoreleased `NSString` from a Rust `&str` for objc calls that
-/// take text. The returned object lives until the surrounding autorelease
-/// pool drains, which outlasts the synchronous calls we hand it to.
+/// Build an `NSString` from a Rust `&str` for objc calls that take text. The
+/// returned `Retained` keeps the string alive for the duration of the calls we
+/// hand it to; bind it to a local so it outlives those calls.
 #[cfg(target_os = "macos")]
-fn ns_string(s: &str) -> *mut objc::runtime::Object {
-    use objc::{class, msg_send, sel, sel_impl};
-    let c = std::ffi::CString::new(s).unwrap_or_default();
-    unsafe {
-        let cls = class!(NSString);
-        msg_send![cls, stringWithUTF8String: c.as_ptr()]
-    }
+fn ns_string(s: &str) -> objc2::rc::Retained<objc2_foundation::NSString> {
+    objc2_foundation::NSString::from_str(s)
 }
 
 /// Ask, via a native modal alert, whether to close a tab whose shell still
@@ -2327,22 +2322,24 @@ fn ns_string(s: &str) -> *mut objc::runtime::Object {
 /// nothing else should happen until they answer.
 #[cfg(target_os = "macos")]
 fn confirm_close_running_command() -> bool {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     unsafe {
-        let alert: *mut Object = msg_send![class!(NSAlert), new];
+        // `new` is +1; the `Retained` releases it when this scope ends.
+        let alert: Retained<AnyObject> = msg_send![class!(NSAlert), new];
         let msg = ns_string("Close this tab?");
         let info = ns_string(
             "A process is still running in this tab. Closing it will terminate that process.",
         );
-        let _: () = msg_send![alert, setMessageText: msg];
-        let _: () = msg_send![alert, setInformativeText: info];
+        let _: () = msg_send![&*alert, setMessageText: &*msg];
+        let _: () = msg_send![&*alert, setInformativeText: &*info];
         // NSAlertStyleWarning.
-        let _: () = msg_send![alert, setAlertStyle: 0i64];
+        let _: () = msg_send![&*alert, setAlertStyle: 0usize];
         // The first button added is the default (rightmost, fires on Return).
-        let _: *mut Object = msg_send![alert, addButtonWithTitle: ns_string("Close Tab")];
-        let _: *mut Object = msg_send![alert, addButtonWithTitle: ns_string("Cancel")];
-        let response: i64 = msg_send![alert, runModal];
-        let _: () = msg_send![alert, release];
+        let _: *mut AnyObject = msg_send![&*alert, addButtonWithTitle: &*ns_string("Close Tab")];
+        let _: *mut AnyObject = msg_send![&*alert, addButtonWithTitle: &*ns_string("Cancel")];
+        let response: isize = msg_send![&*alert, runModal];
         // NSAlertFirstButtonReturn == 1000 → the "Close Tab" button.
         response == 1000
     }
@@ -2360,7 +2357,9 @@ fn confirm_close_running_command() -> bool {
 /// re-encode each channel to sRGB for `NSColor`, which expects sRGB components.
 #[cfg(target_os = "macos")]
 fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
@@ -2368,17 +2367,19 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     };
     let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
     unsafe {
-        let ns_view = handle.ns_view as *mut Object;
-        let ns_window: *mut Object = msg_send![ns_view, window];
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![ns_view, window];
         if ns_window.is_null() {
             return;
         }
-        let color: *mut Object = msg_send![class!(NSColor),
-            colorWithSRGBRed: chan(bg[0])
-            green: chan(bg[1])
-            blue: chan(bg[2])
-            alpha: bg[3] as f64];
-        let _: () = msg_send![ns_window, setBackgroundColor: color];
+        let color: Retained<AnyObject> = msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: chan(bg[0]),
+            green: chan(bg[1]),
+            blue: chan(bg[2]),
+            alpha: bg[3] as f64,
+        ];
+        let _: () = msg_send![ns_window, setBackgroundColor: &*color];
     }
 }
 
@@ -2398,14 +2399,16 @@ fn set_native_window_bg(_window: &Window, _bg: [f32; 4]) {}
 /// later `cursorUpdate:` re-applied something, the next move re-asserts it.
 #[cfg(target_os = "macos")]
 fn force_native_arrow_cursor(window: &Window) {
-    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 
     let RawWindowHandle::AppKit(_handle) = window.raw_window_handle() else {
         return;
     };
     unsafe {
-        let cursor: *mut Object = msg_send![class!(NSCursor), arrowCursor];
+        // Shared cursor (+0); a raw pointer avoids needlessly retaining it.
+        let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         if cursor.is_null() {
             return;
         }
@@ -2437,34 +2440,17 @@ const CHROME_BAND_MARGIN_PX: f64 = 4.0;
 /// bar height in points; scale to physical.
 #[cfg(target_os = "macos")]
 fn native_titlebar_height_physical(window: &Window) -> Option<f64> {
-    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSRect;
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSPoint {
-        x: f64,
-        y: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSSize {
-        width: f64,
-        height: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSRect {
-        origin: NSPoint,
-        size: NSSize,
-    }
 
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return None;
     };
     unsafe {
-        let ns_view = handle.ns_view as *mut Object;
-        let ns_window: *mut Object = msg_send![ns_view, window];
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![ns_view, window];
         if ns_window.is_null() {
             return None;
         }
@@ -2492,18 +2478,19 @@ fn native_titlebar_height_physical(_window: &Window) -> Option<f64> {
 /// derive the bar's height as the difference.
 #[cfg(target_os = "macos")]
 fn native_tab_bar_visible(window: &Window) -> bool {
-    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return false;
     };
     unsafe {
-        let ns_view = handle.ns_view as *mut Object;
-        let ns_window: *mut Object = msg_send![ns_view, window];
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![ns_view, window];
         if ns_window.is_null() {
             return false;
         }
-        let tab_group: *mut Object = msg_send![ns_window, tabGroup];
+        let tab_group: *mut AnyObject = msg_send![ns_window, tabGroup];
         if tab_group.is_null() {
             return false;
         }
@@ -2530,9 +2517,9 @@ pub(crate) static NEW_TAB_REQUESTED: std::sync::atomic::AtomicBool =
 /// this objc call) — just raise a flag the event loop drains.
 #[cfg(target_os = "macos")]
 extern "C" fn yutani_new_window_for_tab(
-    _this: *mut objc::runtime::Object,
-    _cmd: objc::runtime::Sel,
-    _sender: *mut objc::runtime::Object,
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut objc2::runtime::AnyObject,
 ) {
     NEW_TAB_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
@@ -2557,52 +2544,34 @@ extern "C" fn yutani_new_window_for_tab(
 /// normal `NSWindow` path (and on to winit).
 #[cfg(target_os = "macos")]
 extern "C" fn yutani_send_event(
-    this: *mut objc::runtime::Object,
-    _cmd: objc::runtime::Sel,
-    event: *mut objc::runtime::Object,
+    this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    event: *mut objc2::runtime::AnyObject,
 ) {
-    use objc::runtime::{Object, Sel};
-    use objc::{class, msg_send, sel, sel_impl};
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSPoint {
-        x: f64,
-        y: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSSize {
-        width: f64,
-        height: f64,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct NSRect {
-        origin: NSPoint,
-        size: NSSize,
-    }
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_app_kit::{NSEvent, NSEventType};
+    use objc2_foundation::{NSPoint, NSRect};
 
     unsafe {
-        // `-[NSEvent type]`. The selector can't go through `sel!`/`msg_send!`:
-        // `type` is a Rust keyword, and `stringify!(r#type)` keeps the `r#`
-        // prefix, producing a bogus `r#type` selector. Register it by hand.
-        // NSEventTypeLeftMouseDown == 1.
-        let etype: u64 = if event.is_null() {
-            0
-        } else {
-            objc::__send_message(&*event, Sel::register("type"), ()).unwrap_or(0)
+        // A left mouse-down is the only event we ever intercept; let `NSEvent`'s
+        // typed `r#type()` read it (the bare `type` selector can't go through the
+        // macro — `type` is a Rust keyword).
+        let is_left_down = !event.is_null() && {
+            let ns_event: &NSEvent = &*event.cast();
+            ns_event.r#type() == NSEventType::LeftMouseDown
         };
-        if etype == 1 {
-            let loc: NSPoint = msg_send![event, locationInWindow];
+        if is_left_down {
+            let ns_event: &NSEvent = &*event.cast();
+            let loc: NSPoint = ns_event.locationInWindow();
             // winit installs its view as the window's contentView. Hit-test from
             // the frame view (its superview) so traffic-light buttons and the tab
             // bar — siblings layered above — are detected and left alone; only a
             // press that lands on the bare content view is a candidate to drag.
-            let content_view: *mut Object = msg_send![this, contentView];
+            let content_view: *mut AnyObject = msg_send![this, contentView];
             if !content_view.is_null() {
-                let frame_view: *mut Object = msg_send![content_view, superview];
-                let hit: *mut Object = if frame_view.is_null() {
+                let frame_view: *mut AnyObject = msg_send![content_view, superview];
+                let hit: *mut AnyObject = if frame_view.is_null() {
                     std::ptr::null_mut()
                 } else {
                     msg_send![frame_view, hitTest: loc]
@@ -2623,7 +2592,7 @@ extern "C" fn yutani_send_event(
             }
         }
         // Default NSWindow dispatch for everything we didn't claim.
-        let this_ref: &Object = &*this;
+        let this_ref: &AnyObject = &*this;
         let _: () = msg_send![super(this_ref, class!(NSWindow)), sendEvent: event];
     }
 }
@@ -2633,43 +2602,48 @@ extern "C" fn yutani_send_event(
 /// added to the (process-wide) window class once; later calls are no-ops.
 #[cfg(target_os = "macos")]
 fn install_new_tab_action(window: &Window) {
-    use objc::{msg_send, runtime::Object, sel, sel_impl};
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use objc2::sel;
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
     use std::sync::Once;
     static ONCE: Once = Once::new();
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return;
     };
+
+    // `v@:@` — void return; self, _cmd, and one object argument (the sender /
+    // the NSEvent). Both methods we add share this signature.
+    type ImpAbi = extern "C" fn(*mut AnyObject, Sel, *mut AnyObject);
+
     unsafe {
-        let ns_view = handle.ns_view as *mut Object;
-        let ns_window: *mut Object = msg_send![ns_view, window];
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![ns_view, window];
         if ns_window.is_null() {
             return;
         }
         ONCE.call_once(|| {
-            let cls = objc::runtime::object_getClass(ns_window) as *mut objc::runtime::Class;
-            let types = b"v@:@\0".as_ptr() as *const std::os::raw::c_char;
-            let imp: objc::runtime::Imp = std::mem::transmute(
-                yutani_new_window_for_tab
-                    as extern "C" fn(
-                        *mut Object,
-                        objc::runtime::Sel,
-                        *mut Object,
-                    ),
+            let cls =
+                objc2::ffi::object_getClass(ns_window.cast()) as *mut AnyClass;
+            let types = c"v@:@".as_ptr();
+            objc2::ffi::class_addMethod(
+                cls,
+                sel!(newWindowForTab:),
+                std::mem::transmute::<ImpAbi, unsafe extern "C-unwind" fn()>(
+                    yutani_new_window_for_tab,
+                ),
+                types,
             );
-            objc::runtime::class_addMethod(cls, sel!(newWindowForTab:), imp, types);
             // Override sendEvent: so we can start a native title-bar drag on the
             // live mouse-down, before winit's deferred event queue swallows it.
-            // Same `v@:@` signature (void, self, _cmd, NSEvent*).
-            let send_imp: objc::runtime::Imp = std::mem::transmute(
-                yutani_send_event
-                    as extern "C" fn(
-                        *mut Object,
-                        objc::runtime::Sel,
-                        *mut Object,
-                    ),
+            objc2::ffi::class_addMethod(
+                cls,
+                sel!(sendEvent:),
+                std::mem::transmute::<ImpAbi, unsafe extern "C-unwind" fn()>(
+                    yutani_send_event,
+                ),
+                types,
             );
-            objc::runtime::class_addMethod(cls, sel!(sendEvent:), send_imp, types);
         });
     }
 }
