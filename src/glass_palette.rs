@@ -11,7 +11,9 @@
 //! native view + input front end. Per-keystroke filtering runs natively in
 //! the controller (calling the pure `command_palette` fuzzy functions
 //! directly), so it stays responsive without round-tripping to the event
-//! loop. Accept / dismiss are bridged back to the loop (see slice 3).
+//! loop. Accept / dismiss are posted to a signal channel the event loop
+//! drains in `about_to_wait` (like `NEW_TAB_REQUESTED`), where it drives the
+//! model and reconfigures or closes the panel.
 //!
 //! On non-macOS targets this is a no-op stub so `WindowState` stays uniform.
 
@@ -28,6 +30,9 @@ mod imp {
         pub fn visible(&self) -> bool {
             false
         }
+        pub fn enter_commands(&self) {}
+        pub fn enter_argument(&self, _prompt: &str) {}
+        pub fn enter_choose(&self, _prompt: &str, _choices: Vec<String>) {}
     }
 
     /// Always `None` off macOS; the palette falls back to the GPU overlay.
@@ -38,8 +43,8 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::cell::RefCell;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::cell::{Cell, RefCell};
+    use std::sync::Mutex;
 
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject, Sel};
@@ -59,10 +64,31 @@ mod imp {
 
     use crate::command_palette;
 
-    /// Raised by the panel's `cancelOperation:` (Escape) or an accept so the
-    /// event loop can sync the Rust-side open state and tear the panel down.
-    /// Polled like `NEW_TAB_REQUESTED`.
-    pub static PALETTE_DISMISS_REQUESTED: AtomicBool = AtomicBool::new(false);
+    /// What the user did in the native panel, handed to the event loop (which
+    /// owns `WindowState`) to drive the model. Resolved to the focused window,
+    /// like `NEW_TAB_REQUESTED`.
+    pub enum PaletteSignal {
+        /// Enter: run the selected row's text (list modes) or the field's free
+        /// text (argument mode). `None` = nothing selected → no-op.
+        Accept(Option<String>),
+        /// Escape / cancel: back out a step or close.
+        Dismiss,
+    }
+
+    /// Single-slot mailbox from the AppKit controller (main thread) to the
+    /// event loop (also main thread); the `Mutex` is just for `'static` safety.
+    static PALETTE_SIGNAL: Mutex<Option<PaletteSignal>> = Mutex::new(None);
+
+    fn post(sig: PaletteSignal) {
+        if let Ok(mut slot) = PALETTE_SIGNAL.lock() {
+            *slot = Some(sig);
+        }
+    }
+
+    /// Drain the pending palette signal, if any. Called by the event loop.
+    pub fn take_palette_signal() -> Option<PaletteSignal> {
+        PALETTE_SIGNAL.lock().ok().and_then(|mut slot| slot.take())
+    }
 
     // Geometry (points). The panel is a fixed-width card near the top of the
     // window: a search field above a fixed-height results list.
@@ -74,11 +100,8 @@ mod imp {
     const ROW_HEIGHT: f64 = 26.0;
     const TOP_INSET: f64 = 96.0;
 
-    fn max_rows() -> f64 {
-        command_palette::PALETTE_MAX_VISIBLE as f64
-    }
     fn list_height() -> f64 {
-        max_rows() * ROW_HEIGHT
+        command_palette::PALETTE_MAX_VISIBLE as f64 * ROW_HEIGHT
     }
     fn panel_height() -> f64 {
         PAD + list_height() + GAP + FIELD_HEIGHT + PAD
@@ -117,26 +140,26 @@ mod imp {
             }
 
             // Fallback dismiss path when the field editor isn't focused; the
-            // controller handles Escape while typing.
+            // controller handles Escape while typing. Let the event loop decide
+            // whether to back out a step or close, so don't order out here.
             #[unsafe(method(cancelOperation:))]
             fn cancel_operation(&self, _sender: *mut AnyObject) {
-                unsafe {
-                    let _: () = msg_send![self, orderOut: std::ptr::null_mut::<AnyObject>()];
-                }
-                PALETTE_DISMISS_REQUESTED.store(true, Ordering::SeqCst);
+                post(PaletteSignal::Dismiss);
             }
         }
     }
 
     // ---- Controller: field delegate + table data source ----
 
-    #[derive(Default)]
     struct ControllerIvars {
         /// All candidate display strings for the current mode (command titles
-        /// or, later, the chooser's options).
+        /// or the chooser's options). Empty in argument mode.
         candidates: RefCell<Vec<String>>,
         /// Indices into `candidates`, best match first (current filter result).
         filtered: RefCell<Vec<usize>>,
+        /// True in command / choose mode (Enter accepts the selected row),
+        /// false in argument mode (Enter accepts the field's free text).
+        list_mode: Cell<bool>,
         field: RefCell<Option<Retained<NSTextField>>>,
         table: RefCell<Option<Retained<NSTableView>>>,
     }
@@ -177,11 +200,10 @@ mod imp {
                     self.move_selection(1);
                     true
                 } else if command == sel!(insertNewline:) {
-                    // Slice 3 wires this to the model + run_palette_action.
-                    PALETTE_DISMISS_REQUESTED.store(true, Ordering::SeqCst);
+                    self.accept();
                     true
                 } else if command == sel!(cancelOperation:) {
-                    PALETTE_DISMISS_REQUESTED.store(true, Ordering::SeqCst);
+                    post(PaletteSignal::Dismiss);
                     true
                 } else {
                     false
@@ -219,7 +241,13 @@ mod imp {
     impl PaletteController {
         fn new(mtm: MainThreadMarker) -> Retained<Self> {
             let this = mtm.alloc::<PaletteController>();
-            let this = this.set_ivars(ControllerIvars::default());
+            let this = this.set_ivars(ControllerIvars {
+                candidates: RefCell::new(Vec::new()),
+                filtered: RefCell::new(Vec::new()),
+                list_mode: Cell::new(true),
+                field: RefCell::new(None),
+                table: RefCell::new(None),
+            });
             unsafe { msg_send![super(this), init] }
         }
 
@@ -268,6 +296,37 @@ mod imp {
                 let _: () = msg_send![&**table, scrollRowToVisible: row];
             }
         }
+
+        /// Enter: post the selection (or, in argument mode, the field text) so
+        /// the event loop can drive the model. No-op if nothing is selected.
+        fn accept(&self) {
+            let signal = if self.ivars().list_mode.get() {
+                let table = self.ivars().table.borrow();
+                let Some(table) = table.as_ref() else { return };
+                let sel = table.selectedRow();
+                if sel < 0 {
+                    return;
+                }
+                let chosen = {
+                    let filtered = self.ivars().filtered.borrow();
+                    let candidates = self.ivars().candidates.borrow();
+                    filtered
+                        .get(sel as usize)
+                        .and_then(|&i| candidates.get(i))
+                        .cloned()
+                };
+                PaletteSignal::Accept(chosen)
+            } else {
+                let text = self
+                    .ivars()
+                    .field
+                    .borrow()
+                    .as_ref()
+                    .map(|f| f.stringValue().to_string());
+                PaletteSignal::Accept(text)
+            };
+            post(signal);
+        }
     }
 
     /// Owns the live AppKit objects for one window's palette.
@@ -277,6 +336,7 @@ mod imp {
         /// `setContentView:`); slice 4 reads it to apply the theme tint.
         #[allow(dead_code)]
         glass: Retained<NSView>,
+        scroll: Retained<NSScrollView>,
         field: Retained<NSTextField>,
         controller: Retained<PaletteController>,
         visible: bool,
@@ -319,8 +379,6 @@ mod imp {
             let _: () = msg_send![&*field, setBordered: false];
             let _: () = msg_send![&*field, setDrawsBackground: false];
             let _: () = msg_send![&*field, setFocusRingType: 1isize]; // None
-            let placeholder = NSString::from_str("Run a command…");
-            let _: () = msg_send![&*field, setPlaceholderString: &*placeholder];
             let font: Retained<NSFont> = msg_send![class!(NSFont), systemFontOfSize: 18.0f64];
             let _: () = msg_send![&*field, setFont: &*font];
             field.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
@@ -348,21 +406,23 @@ mod imp {
             let _: () = msg_send![&*scroll, setDrawsBackground: false];
             container.addSubview(&scroll);
 
-            // Hand the controller its views and seed the full command list.
+            // Hand the controller its views.
             *controller.ivars().field.borrow_mut() = Some(field.clone());
             *controller.ivars().table.borrow_mut() = Some(table.clone());
-            controller.set_candidates(command_titles());
 
             let glass = make_glass(content, &container);
             let _: () = msg_send![&*panel, setContentView: &*glass];
 
-            Some(GlassPalette {
+            let palette = GlassPalette {
                 panel,
                 glass,
+                scroll,
                 field,
                 controller,
                 visible: false,
-            })
+            };
+            palette.enter_commands();
+            Some(palette)
         }
     }
 
@@ -419,19 +479,43 @@ mod imp {
             self.visible
         }
 
+        /// Configure the field placeholder + candidate list + accept semantics
+        /// for the current mode, clearing the query.
+        fn set_mode(&self, placeholder: &str, candidates: Vec<String>, list_mode: bool) {
+            unsafe {
+                let ph = NSString::from_str(placeholder);
+                let _: () = msg_send![&*self.field, setPlaceholderString: &*ph];
+                let empty = NSString::from_str("");
+                let _: () = msg_send![&*self.field, setStringValue: &*empty];
+                // The list is meaningless in free-text argument mode.
+                let _: () = msg_send![&*self.scroll, setHidden: !list_mode];
+            }
+            self.controller.ivars().list_mode.set(list_mode);
+            self.controller.set_candidates(candidates);
+        }
+
+        /// Browse the full command list (the default mode on open).
+        pub fn enter_commands(&self) {
+            self.set_mode("Run a command…", command_titles(), true);
+        }
+
+        /// Collect a free-text argument (e.g. a window title).
+        pub fn enter_argument(&self, prompt: &str) {
+            self.set_mode(prompt, Vec::new(), false);
+        }
+
+        /// Pick from a host-supplied list (e.g. color schemes).
+        pub fn enter_choose(&self, prompt: &str, choices: Vec<String>) {
+            self.set_mode(prompt, choices, true);
+        }
+
         /// Position over `parent` (centered, near the top), attach as a child
-        /// window, show it, and focus the search field with an empty query.
+        /// window, show it, and focus the search field on the command list.
         pub fn show(&mut self, parent: &Window) {
             let Some(parent_ns) = parent_nswindow(parent) else {
                 return;
             };
-            // Reset to a fresh, unfiltered command list.
-            unsafe {
-                let empty = NSString::from_str("");
-                let _: () = msg_send![&*self.field, setStringValue: &*empty];
-            }
-            self.controller.set_candidates(command_titles());
-
+            self.enter_commands();
             unsafe {
                 let pf: NSRect = msg_send![parent_ns, frame];
                 let w = PANEL_WIDTH;
@@ -481,12 +565,7 @@ mod imp {
                 } else {
                     (*cls).name().to_string_lossy().into_owned()
                 };
-                let rows = self
-                    .controller
-                    .ivars()
-                    .filtered
-                    .borrow()
-                    .len();
+                let rows = self.controller.ivars().filtered.borrow().len();
                 let frame: NSRect = msg_send![&*self.panel, frame];
                 format!(
                     "visible={visible} contentView={cls_name} rows={rows} \

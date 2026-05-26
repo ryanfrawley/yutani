@@ -267,9 +267,23 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         if std::env::var_os("YUTANI_PALETTE_DEMO").is_some() {
             state.toggle_command_palette();
             #[cfg(target_os = "macos")]
-            if let Some(gp) = state.glass_palette.as_ref() {
-                eprintln!("[palette-demo] open: {}", gp.debug_report(None));
-                eprintln!("[palette-demo] filter 'theme': {}", gp.debug_report(Some("theme")));
+            {
+                let report = |state: &WindowState, tag: &str| {
+                    if let Some(gp) = state.glass_palette.as_ref() {
+                        eprintln!("[palette-demo] {tag}: {}", gp.debug_report(None));
+                    }
+                };
+                report(&state, "open (commands)");
+                // Accept a chooser command -> should enter choose mode and list
+                // the available schemes.
+                state.palette_accept(Some("Set theme".to_string()));
+                report(&state, "after accept 'Set theme'");
+                // Escape -> back out to the command list.
+                state.palette_dismiss();
+                report(&state, "after dismiss");
+                // Accept an immediate command -> runs and closes the panel.
+                state.palette_accept(Some("Toggle wireframe".to_string()));
+                report(&state, "after accept 'Toggle wireframe'");
             }
         }
 
@@ -653,6 +667,19 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 );
             }
         }
+        // Drain a native command-palette signal (accept / dismiss). Like the
+        // `+` button it carries no window context, so it targets the focused
+        // window — the palette is always a child of (and key over) that window.
+        #[cfg(target_os = "macos")]
+        if let Some(sig) = glass_palette::take_palette_signal() {
+            if let Some(state) = self.focused_window.and_then(|w| self.windows.get_mut(&w)) {
+                match sig {
+                    glass_palette::PaletteSignal::Accept(s) => state.palette_accept(s),
+                    glass_palette::PaletteSignal::Dismiss => state.palette_dismiss(),
+                }
+            }
+        }
+
         // Each window animates independently; collect the earliest
         // wake-up across all of them and arm the loop for that.
         let mut next_wake: Option<std::time::Instant> = None;

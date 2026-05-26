@@ -12,17 +12,95 @@ impl WindowState {
         if self.glass_palette.is_none() {
             self.glass_palette = glass_palette::new();
         }
+        // The model's `mode` tracks the palette phase (commands / argument /
+        // choose); the native panel mirrors it. `open()` resets to commands.
         match self.glass_palette.as_mut() {
             Some(gp) => {
                 if gp.visible() {
                     gp.hide();
+                    self.command_palette.close();
                 } else {
+                    self.command_palette.open();
                     gp.show(&self.window);
                 }
             }
             None => self.command_palette.toggle(),
         }
     }
+
+    /// Hide the native panel (if any) and reset the model to closed.
+    pub(crate) fn close_glass_palette(&mut self) {
+        if let Some(gp) = self.glass_palette.as_mut() {
+            gp.hide();
+        }
+        self.command_palette.close();
+    }
+
+    /// Handle Enter in the native palette. `selected` is the highlighted row's
+    /// text (command title / chosen value) or, in argument mode, the field's
+    /// free text. Drives the same command/argument/choose state machine the
+    /// pure model encodes, then runs the action or reconfigures the panel for
+    /// the next step.
+    pub(crate) fn palette_accept(&mut self, selected: Option<String>) {
+        use command_palette::Mode;
+        match self.command_palette.mode.clone() {
+            Mode::Commands => {
+                let Some(title) = selected else { return };
+                let Some(cmd) = command_palette::COMMANDS.iter().find(|c| c.title == title) else {
+                    return;
+                };
+                let action = cmd.action;
+                match (cmd.arg_prompt, cmd.choose) {
+                    (Some(prompt), true) => {
+                        let choices = self.palette_choices(action);
+                        self.command_palette.mode = Mode::Choose { action, prompt };
+                        if let Some(gp) = self.glass_palette.as_ref() {
+                            gp.enter_choose(prompt, choices);
+                        }
+                    }
+                    (Some(prompt), false) => {
+                        self.command_palette.mode = Mode::Argument { action, prompt };
+                        if let Some(gp) = self.glass_palette.as_ref() {
+                            gp.enter_argument(prompt);
+                        }
+                    }
+                    (None, _) => {
+                        self.close_glass_palette();
+                        self.run_palette_action(action, None);
+                    }
+                }
+            }
+            Mode::Argument { action, .. } => {
+                let arg = selected.unwrap_or_default();
+                self.close_glass_palette();
+                self.run_palette_action(action, Some(arg));
+            }
+            Mode::Choose { action, .. } => {
+                let Some(choice) = selected else { return };
+                self.close_glass_palette();
+                self.run_palette_action(action, Some(choice));
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Handle Escape / cancel in the native palette: back out of argument /
+    /// choose mode to the command list, or close from the command list.
+    pub(crate) fn palette_dismiss(&mut self) {
+        use command_palette::Mode;
+        match self.command_palette.mode {
+            Mode::Argument { .. } | Mode::Choose { .. } => {
+                self.command_palette.mode = Mode::Commands;
+                if let Some(gp) = self.glass_palette.as_ref() {
+                    gp.enter_commands();
+                }
+            }
+            Mode::Commands => self.close_glass_palette(),
+        }
+        self.invalidate();
+    }
+
+    /// Drive the command palette from a key press while it's open. Always
 
     /// Drive the command palette from a key press while it's open. Always
     /// consumes the event (returns `true`): the palette owns the keyboard, so
