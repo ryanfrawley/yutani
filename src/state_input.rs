@@ -311,7 +311,7 @@ impl WindowState {
     pub(crate) fn input(
         &mut self,
         event: &WindowEvent,
-        _elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+        _elwt: &winit::event_loop::ActiveEventLoop,
     ) -> bool {
         match event {
             WindowEvent::CursorMoved { position, .. } => {
@@ -331,7 +331,7 @@ impl WindowState {
                     // while the pointer is up here. See force_native_arrow_cursor.
                     self.over_toolbar = true;
                     self.window
-                        .set_cursor_icon(winit::window::CursorIcon::Default);
+                        .set_cursor(winit::window::CursorIcon::Default);
                     force_native_arrow_cursor(&self.window);
                     if self.active_tab_mut().hover_url.take().is_some() {
                         self.invalidate();
@@ -344,7 +344,7 @@ impl WindowState {
                     // cursor is over a Cmd-hovered URL.
                     self.over_toolbar = false;
                     self.window
-                        .set_cursor_icon(winit::window::CursorIcon::Text);
+                        .set_cursor(winit::window::CursorIcon::Text);
                 }
                 // Mouse-mode reporting takes precedence unless the user is
                 // shift-overriding it for local selection.

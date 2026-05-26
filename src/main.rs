@@ -34,11 +34,10 @@ mod event_loop;
 
 use winit::{
     event::*,
-    event_loop::EventLoopBuilder,
-    event_loop::EventLoopWindowTarget,
-    platform::macos::WindowBuilderExtMacOS,
+    event_loop::ActiveEventLoop,
+    platform::macos::WindowAttributesExtMacOS,
     platform::modifier_supplement::KeyEventExtModifierSupplement,
-    window::{Window, WindowBuilder},
+    window::Window,
 };
 
 extern crate libc;
@@ -2043,7 +2042,7 @@ fn tab_command_running(tab: &TabState) -> bool {
 /// logical points) and its shell opens in `cwd` (the spawner's shell cwd).
 #[allow(clippy::too_many_arguments)]
 fn spawn_window_in_process(
-    elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    elwt: &ActiveEventLoop,
     shared: &Rc<AppShared>,
     proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
     windows: &mut std::collections::HashMap<winit::window::WindowId, WindowState>,
@@ -2068,7 +2067,7 @@ fn spawn_window_in_process(
 ) {
     let title = effective_title(None, cwd.as_deref());
     let transparent = false; // matches the first window (shadow bug)
-    let mut builder = WindowBuilder::new()
+    let mut attrs = Window::default_attributes()
         .with_title(&title)
         .with_titlebar_transparent(true)
         .with_tabbing_identifier(tabbing_id)
@@ -2078,12 +2077,12 @@ fn spawn_window_in_process(
         .with_decorations(true)
         .with_blur(transparent);
     if let Some((x, y)) = origin {
-        builder = builder.with_position(winit::dpi::LogicalPosition::new(
+        attrs = attrs.with_position(winit::dpi::LogicalPosition::new(
             x + WINDOW_CASCADE_STEP,
             y + WINDOW_CASCADE_STEP,
         ));
     }
-    let window = match builder.build(elwt) {
+    let window = match elwt.create_window(attrs) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("new window: build failed: {e}");
@@ -2094,7 +2093,7 @@ fn spawn_window_in_process(
     // exactly as the first window does, so it doesn't flash a wrong fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     set_native_window_bg(&window, palette::get().background);
-    window.set_cursor_icon(winit::window::CursorIcon::Text);
+    window.set_cursor(winit::window::CursorIcon::Text);
 
     let surface = shared.gpu.create_surface(&window);
     let dpi = (window.scale_factor() * 96.0) as u32;
@@ -2633,7 +2632,7 @@ fn main() {
     if std::env::args().skip(1).any(|a| a == "--onboard") {
         onboard::run();
     }
-    pollster::block_on(run());
+    run();
 }
 
 #[cfg(test)]
