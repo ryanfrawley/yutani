@@ -1468,13 +1468,19 @@ impl Terminal {
     }
 
     pub fn feed(&mut self, s: &str) {
-        let mut events = Vec::new();
+        // Dispatch each event inline as it's parsed, rather than collecting a
+        // per-call `Vec<Event>` and re-iterating. `Event` is ~32 bytes (its
+        // `Osc(String)`/`Sgr(Vec<u16>)` variants), so under heavy output that
+        // Vec — one slot per character — dominated `feed` (~85% of its cost was
+        // building/moving/dropping it, measured). The parser is moved out of
+        // `self` for the call so the emit closure can borrow the rest of `self`
+        // (the dummy left behind is a no-alloc `Parser::default()`); its state
+        // is restored after, preserving mid-sequence parsing across calls.
+        let mut parser = std::mem::take(&mut self.parser);
         for ch in s.chars() {
-            self.parser.feed(ch, |e| events.push(e));
+            parser.feed(ch, |e| self.dispatch(e));
         }
-        for e in events {
-            self.dispatch(e);
-        }
+        self.parser = parser;
     }
 
     pub fn cursor(&self) -> Cursor {
