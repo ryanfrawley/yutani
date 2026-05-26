@@ -651,6 +651,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 match sig {
                     glass_palette::PaletteSignal::Accept(s) => state.palette_accept(s),
                     glass_palette::PaletteSignal::Dismiss => state.palette_dismiss(),
+                    glass_palette::PaletteSignal::Close => state.close_glass_palette(),
                 }
             }
         }
