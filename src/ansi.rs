@@ -149,6 +149,26 @@ pub struct Parser {
     apc_buf: String,
 }
 
+impl Default for Parser {
+    /// A no-allocation empty parser. Used as the cheap stand-in
+    /// `Terminal::feed` leaves in `self.parser` (`mem::take`) while it borrows
+    /// the rest of `self` to dispatch inline; the real parser is restored after.
+    /// Differs from `new()` only in not pre-reserving `params` capacity.
+    fn default() -> Self {
+        Self {
+            state: State::Ground,
+            params: Vec::new(),
+            cur_param: None,
+            private: false,
+            intro_gt: false,
+            intermediate: None,
+            osc_buf: String::new(),
+            dcs_buf: String::new(),
+            apc_buf: String::new(),
+        }
+    }
+}
+
 impl Parser {
     pub fn new() -> Self {
         Self {
