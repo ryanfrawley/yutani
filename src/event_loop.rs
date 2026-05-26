@@ -268,7 +268,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             state.toggle_command_palette();
             #[cfg(target_os = "macos")]
             if let Some(gp) = state.glass_palette.as_ref() {
-                eprintln!("[palette-demo] {}", gp.debug_report());
+                eprintln!("[palette-demo] open: {}", gp.debug_report(None));
+                eprintln!("[palette-demo] filter 'theme': {}", gp.debug_report(Some("theme")));
             }
         }
 
