@@ -265,6 +265,17 @@ pub struct KittyAnimationControl {
     pub edit_gap_ms: Option<u32>,
 }
 
+/// `YUTANI_NO_RING=1` disables the ring-buffer scroll fast path, forcing the
+/// old `copy_within` memmove on every full-screen scroll. A correctness/perf
+/// A-B kill-switch: identical behavior with it set means the ring is sound.
+fn no_ring_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("YUTANI_NO_RING").map(|v| !v.is_empty() && v != "0").unwrap_or(false)
+    })
+}
+
 #[derive(Clone)]
 pub struct Grid {
     pub cells: Vec<Cell>,
@@ -284,6 +295,16 @@ pub struct Grid {
     /// rebuild. A freshly built grid starts fully dirty so the first frame
     /// emits everything.
     dirty_rows: Vec<bool>,
+    /// Ring-buffer rotation: logical row `r` lives at physical row
+    /// `(r + row_offset) % rows`. A full-screen scroll-up just advances this
+    /// (O(cols)) instead of memmoving the whole cell array (O(rows*cols)) — the
+    /// dominant cost under streaming output. All cell access goes through
+    /// `idx`/`row_base` (offset-aware); multi-row physical ops `linearize`
+    /// first. `YUTANI_NO_RING=1` forces the old memmove path for A/B checks.
+    row_offset: usize,
+    /// When true, the ring scroll fast path is disabled (always memmove). Seeded
+    /// from `YUTANI_NO_RING`; tests flip it to diff the two paths.
+    disable_ring: bool,
 }
 
 impl Grid {
@@ -294,11 +315,35 @@ impl Grid {
             cols,
             placements: Vec::new(),
             dirty_rows: vec![true; rows],
+            row_offset: 0,
+            disable_ring: no_ring_enabled(),
+        }
+    }
+
+    /// Physical storage row for a logical row, through the ring rotation.
+    #[inline]
+    fn phys_row(&self, row: usize) -> usize {
+        (row + self.row_offset) % self.rows.max(1)
+    }
+
+    /// First cell index of a logical row in the (rotated) backing store.
+    #[inline]
+    fn row_base(&self, row: usize) -> usize {
+        self.phys_row(row) * self.cols
+    }
+
+    /// Rotate the backing store so logical row 0 is at physical 0 again
+    /// (`row_offset == 0`), restoring the linear layout the multi-row
+    /// `copy_within` operations assume. No-op when already linear.
+    fn linearize(&mut self) {
+        if self.row_offset != 0 {
+            self.cells.rotate_left(self.row_offset * self.cols);
+            self.row_offset = 0;
         }
     }
 
     fn idx(&self, row: usize, col: usize) -> usize {
-        row * self.cols + col
+        self.row_base(row) + col
     }
 
     pub fn get(&self, row: usize, col: usize) -> Cell {
@@ -358,7 +403,7 @@ impl Grid {
     }
 
     pub fn row(&self, row: usize) -> &[Cell] {
-        let start = row * self.cols;
+        let start = self.row_base(row);
         &self.cells[start..start + self.cols]
     }
 
@@ -366,6 +411,8 @@ impl Grid {
         for c in &mut self.cells {
             *c = blank;
         }
+        // Whole grid is blank now; collapse the ring so the layout is linear.
+        self.row_offset = 0;
         // ED 2 / full-reset path: an image-aware terminal usually exposes
         // explicit delete commands, but most TUI image users (icat / imgcat /
         // chafa) lean on screen-clear as the implicit reset. Dropping all
@@ -376,7 +423,7 @@ impl Grid {
 
     /// Fill cells `from..to` of `row` with `blank`.
     pub fn clear_row(&mut self, row: usize, from: usize, to: usize, blank: Cell) {
-        let base = row * self.cols;
+        let base = self.row_base(row);
         // Change-gated like `set`: clearing an already-blank span leaves the
         // row clean, so an app blanking lines it never wrote doesn't dirty them.
         for i in from..to.min(self.cols) {
@@ -418,6 +465,17 @@ impl Grid {
         }
         let width = right - left + 1;
         let full_width = left == 0 && right == self.cols - 1;
+        let full_screen = top == 0 && bottom == self.rows - 1;
+        // O(1) scroll-up: when the whole screen scrolls, relabel rows by
+        // advancing the ring offset instead of memmoving the cell array (the
+        // dominant cost under streaming output). The freed rows are cleared
+        // below; `clear_row` is offset-aware, so it blanks the right cells.
+        let use_ring = full_width && full_screen && n < region && !self.disable_ring;
+        if !use_ring {
+            // The `copy_within` paths below address cells by `r * cols`, which
+            // is only valid for a linear (offset 0) layout.
+            self.linearize();
+        }
         if shift_damage && full_width {
             // Move each row's damage up with its content; the freed rows at the
             // bottom are re-marked by `clear_row` below. Read-ahead (r+n) is
@@ -436,9 +494,12 @@ impl Grid {
                 self.mark_dirty(r);
             }
         }
-        // Copy only if there's something to shift. When n == region, every
-        // row of the region gets cleared and nothing moves.
-        if n < region {
+        if use_ring {
+            // Rows `n..rows` become `0..rows-n`; rows `0..n` roll off the top.
+            self.row_offset = (self.row_offset + n) % self.rows;
+        } else if n < region {
+            // Copy only if there's something to shift. When n == region, every
+            // row of the region gets cleared and nothing moves.
             for r in top..=bottom - n {
                 let src = (r + n) * self.cols + left;
                 let dst = r * self.cols + left;
@@ -483,6 +544,9 @@ impl Grid {
         if n == 0 || left > right || right >= self.cols {
             return;
         }
+        // The `copy_within` below addresses cells by `r * cols` — collapse the
+        // ring first. (Scroll-down is rare; no ring fast path for it.)
+        self.linearize();
         for r in top..=bottom {
             self.mark_dirty(r);
         }
@@ -2644,7 +2708,7 @@ impl Terminal {
         let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
-        let base = row * cols;
+        let base = grid.row_base(row);
         if col + n <= right {
             grid.cells.copy_within(base + col..base + right + 1 - n, base + col + n);
         }
@@ -2669,7 +2733,7 @@ impl Terminal {
         let n = n.min(right + 1 - col);
         let blank = self.blank();
         let grid = self.active_grid_mut();
-        let base = row * cols;
+        let base = grid.row_base(row);
         if col + n <= right {
             grid.cells.copy_within(base + col + n..base + right + 1, base + col);
         }
@@ -6555,6 +6619,80 @@ mod tests {
             t.take_response(),
             b"\x1b]12;rgb:7777/8888/9999\x1b\\".to_vec(),
         );
+    }
+
+    #[test]
+    fn ring_buffer_matches_memmove_path() {
+        // Differential torture test: the ring scroll fast path must produce the
+        // exact same logical buffer (live grid + scrollback + cursor) as the
+        // old `copy_within` memmove path, for arbitrary input. `a` uses the
+        // ring; `b` is forced onto the memmove path. They must never diverge.
+        fn snapshot(t: &Terminal) -> (usize, usize, Vec<String>, (usize, usize)) {
+            let total = t.scrollback_len() + t.rows;
+            let lines: Vec<String> = (0..total as isize)
+                .map(|abs| {
+                    t.line_at(abs)
+                        .map(|row| row.iter().map(|c| c.ch).collect())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let c = t.cursor();
+            (t.rows, t.cols, lines, (c.row, c.col))
+        }
+        let mut a = Terminal::new(20, 6, 50); // ring enabled (default)
+        let mut b = Terminal::new(20, 6, 50);
+        b.primary.disable_ring = true;
+        b.alternate.disable_ring = true;
+        assert!(!a.primary.disable_ring, "test assumes ring on for `a`");
+
+        let mut step = 0;
+        let both = |a: &mut Terminal, b: &mut Terminal, s: &str, step: &mut i32| {
+            a.feed(s);
+            b.feed(s);
+            *step += 1;
+            assert_eq!(snapshot(a), snapshot(b), "ring vs memmove diverged at step {step}");
+        };
+
+        // Phase 1: plain lines -> repeated full-screen scroll-up (ring path) +
+        // scrollback growth.
+        for i in 0..30 {
+            both(&mut a, &mut b, &format!("row number {i:02} xyz
+"), &mut step);
+        }
+        // Phase 2: DECSTBM sub-region scroll (memmove/linearize path) while the
+        // ring offset is non-zero on `a`.
+        both(&mut a, &mut b, "\x1b[2;5r", &mut step);
+        for i in 0..8 {
+            both(&mut a, &mut b, &format!("sub{i}\r\n"), &mut step);
+        }
+        // Phase 3: insert / delete lines (linearize path).
+        both(&mut a, &mut b, "\x1b[3;1H\x1b[3L", &mut step);
+        both(&mut a, &mut b, "\x1b[2M", &mut step);
+        // Phase 4: reset region, more full-screen scrolls (ring path again).
+        both(&mut a, &mut b, "\x1b[r", &mut step);
+        for i in 0..12 {
+            both(&mut a, &mut b, &format!("again {i:02}\r\n"), &mut step);
+        }
+        // Phase 5: insert/delete chars within a row.
+        both(&mut a, &mut b, "\x1b[1;3H\x1b[4@inserted\x1b[2P", &mut step);
+        // Phase 6: erase display.
+        both(&mut a, &mut b, "\x1b[2J\x1b[H", &mut step);
+        for i in 0..10 {
+            both(&mut a, &mut b, &format!("post-erase {i}\r\n"), &mut step);
+        }
+        // Phase 7: alt screen full-screen scroll (ring) then back to primary.
+        both(&mut a, &mut b, "\x1b[?1049h", &mut step);
+        for i in 0..10 {
+            both(&mut a, &mut b, &format!("alt line {i}\r\n"), &mut step);
+        }
+        both(&mut a, &mut b, "\x1b[?1049l", &mut step);
+        // Phase 8: resize while ring offset is non-zero, then more output.
+        a.resize(12, 4);
+        b.resize(12, 4);
+        assert_eq!(snapshot(&a), snapshot(&b), "ring vs memmove diverged after resize");
+        for i in 0..15 {
+            both(&mut a, &mut b, &format!("rsz {i:02}\r\n"), &mut step);
+        }
     }
 
     #[test]
