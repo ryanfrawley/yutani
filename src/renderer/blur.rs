@@ -12,9 +12,8 @@ use wgpu::util::DeviceExt;
 const CHAIN_LEVELS: usize = 2;
 // Default extra inner down/up passes. Each iteration adds one down
 // (chain[0]→chain[1]) and one up (chain[1]→chain[0]), compounding the
-// kernel at chain[0]'s resolution. Runtime-tunable via BlurChain::iterations.
+// kernel at chain[0]'s resolution.
 const DEFAULT_BLUR_ITERATIONS: usize = 2;
-pub const MAX_BLUR_ITERATIONS: usize = 12;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]

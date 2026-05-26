@@ -1411,7 +1411,6 @@ fn config_full_default_round_trip_is_identity() {
     assert!(approx_eq(parsed.bottom_fade_anim_secs, d.bottom_fade_anim_secs));
     assert!(approx_eq(parsed.cursor_anim_secs, d.cursor_anim_secs));
     assert_eq!(parsed.cursor_blink, d.cursor_blink);
-    assert_eq!(parsed.blur_iterations, d.blur_iterations);
     assert_eq!(parsed.color_scheme, d.color_scheme);
     assert_eq!(parsed.font_family, d.font_family);
     assert_eq!(parsed.theme_overrides_glow, d.theme_overrides_glow);
@@ -1441,27 +1440,6 @@ fn config_round_trip_preserves_fade_fields() {
     assert!(approx_eq(parsed.bottom_fade_height, 64.25));
     assert!(approx_eq(parsed.bottom_fade_anim_secs, 0.75));
     assert!(approx_eq(parsed.cursor_anim_secs, 0.12));
-}
-
-#[test]
-fn config_round_trip_preserves_blur_iterations() {
-    // blur_iterations is a usize clamped to MAX_BLUR_ITERATIONS on parse.
-    // A non-default in-range value must round-trip exactly.
-    let mut c = Config::defaults();
-    c.blur_iterations = 5;
-    let parsed = Config::parse_str(&c.serialize());
-    assert_eq!(parsed.blur_iterations, 5);
-}
-
-#[test]
-fn config_blur_iterations_clamped_to_max() {
-    // Same clamp the renderer relies on: an over-large request is capped
-    // at MAX_BLUR_ITERATIONS so the blur chain stays bounded.
-    let parsed = Config::parse_str(&format!(
-        "blur_iterations = {}\n",
-        renderer::blur::MAX_BLUR_ITERATIONS + 10
-    ));
-    assert_eq!(parsed.blur_iterations, renderer::blur::MAX_BLUR_ITERATIONS);
 }
 
 #[test]
@@ -1732,7 +1710,7 @@ fn config_toml_str_lit_escapes_quotes_and_backslashes() {
 
 #[test]
 fn config_cfg_usize_rejects_negative_and_non_integer() {
-    // cfg_usize underpins blur_iterations / images_memory_cap_mb. A
+    // cfg_usize underpins glow_iterations / images_memory_cap_mb. A
     // negative or non-integer value must yield None so the slot keeps its
     // default rather than panicking on the `try_from`.
     assert_eq!(cfg_usize(&toml::Value::Integer(-1)), None);
