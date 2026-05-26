@@ -2,6 +2,7 @@ mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
+mod glass_find;
 mod glass_palette;
 mod search;
 mod font;
@@ -779,6 +780,10 @@ struct WindowState {
     /// keyboard like the command palette; holds the query field and the
     /// list of matches across the buffer. See `search.rs`.
     search: search::Search,
+    /// The native Liquid Glass find bar (macOS). `None` until first opened; a
+    /// no-op stub off macOS. The `search` model + in-terminal match highlights
+    /// are unchanged — this is just the native input + counter.
+    glass_find: Option<glass_find::GlassFind>,
     // Whether the pointer is currently in the title-bar band. Tracked so a
     // crossing back into the grid can restore the I-beam exactly once.
     over_toolbar: bool,
@@ -1612,6 +1617,7 @@ impl WindowState {
             command_palette: command_palette::CommandPalette::default(),
             glass_palette: None,
             search: search::Search::default(),
+            glass_find: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
@@ -1957,6 +1963,9 @@ impl WindowState {
         // over a now-differently-sized window.
         if self.glass_palette.as_ref().is_some_and(|gp| gp.visible()) {
             self.close_glass_palette();
+        }
+        if self.glass_find.as_ref().is_some_and(|gf| gf.visible()) {
+            self.find_close();
         }
         self.invalidate();
     }
