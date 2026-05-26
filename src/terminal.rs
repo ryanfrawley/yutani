@@ -1646,20 +1646,10 @@ impl Terminal {
     /// only cells that get re-printed afterward pick up the new
     /// scheme.
     pub fn reresolve_palette(&mut self) {
-        for cell in self.primary.cells.iter_mut() {
-            cell.style.reresolve_palette();
-        }
-        for cell in self.alternate.cells.iter_mut() {
-            cell.style.reresolve_palette();
-        }
-        for row in self.scrollback.iter_mut() {
-            for cell in row.iter_mut() {
-                cell.style.reresolve_palette();
-            }
-        }
-        // Every cell's resolved color may have changed; the renderer also
-        // clears its whole row cache on a scheme swap, but mark both grids so
-        // the damage set agrees.
+        // Cell colors are stored as `CellColor` sources now and resolved
+        // against the live palette at render time, so a scheme swap needs no
+        // per-cell rewrite — just force a full re-emit (the renderer also bumps
+        // its row-cache epoch) so the new palette is picked up.
         self.primary.mark_all_dirty();
         self.alternate.mark_all_dirty();
     }
@@ -5085,7 +5075,10 @@ pub(crate) fn kitty_placeholder_diacritic_index(ch: char) -> Option<u32> {
 }
 
 fn decode_kitty_placeholder_image_id(style: &crate::style::Style) -> Option<u32> {
-    let fg = style.color_fg?;
+    let fg = match style.fg {
+        crate::style::CellColor::Default => return None,
+        c => c.resolve([0.0, 0.0, 0.0, 1.0]),
+    };
     let r = crate::palette::linear_to_srgb_u8(fg[0]) as u32;
     let g = crate::palette::linear_to_srgb_u8(fg[1]) as u32;
     let b = crate::palette::linear_to_srgb_u8(fg[2]) as u32;
@@ -5731,86 +5724,51 @@ mod tests {
         t.feed("\x1b[31mA");
         let c = t.primary.get(0, 0);
         assert_eq!(c.ch, 'A');
-        assert_eq!(c.style.color_fg_source, crate::style::ColorSource::Indexed(1));
-        assert!(c.style.color_fg.is_some());
+        assert_eq!(c.style.fg, crate::style::CellColor::Indexed(1));
     }
 
     #[test]
-    fn reresolve_palette_updates_all_grids_and_scrollback() {
+    fn cell_colors_resolve_against_live_palette_no_rewrite() {
+        // CellColor stores the source; a scheme swap is reflected at render via
+        // `resolve`, with no per-cell rewrite. Verify across the live grid,
+        // the alt grid, and scrollback, and that truecolor is palette-independent.
         use crate::palette;
-        use crate::style::ColorSource;
-        // Serialize against other palette-touching tests; install is
-        // global state.
+        use crate::style::CellColor;
         let _guard = palette::TEST_LOCK.lock().expect("test lock");
-        // Set palette to a known baseline so the test isn't sensitive
-        // to whatever palette the previous test left installed.
         palette::install(palette::Palette::defaults());
-        // 10×5 grid with generous headroom so the paints below don't
-        // trigger autowrap/scroll into scrollback unintentionally.
-        // The scrollback case is exercised explicitly further down.
         let mut t = Terminal::new(10, 5, 10);
 
-        // Paint cell (0, 0) with red fg, cell (1, 0) with truecolor
-        // bg. `\r\n` keeps the cursor inside the grid bounds.
+        // Cell (0,0) red indexed fg; cell (1,0) truecolor bg.
         t.feed("\x1b[31mA\r\n\x1b[48;2;200;100;50mB");
+        assert_eq!(t.primary.get(0, 0).style.fg, CellColor::Indexed(1));
 
-        // Sanity-check the fixture before the palette swap.
-        let painted = t.primary.get(0, 0);
-        assert_eq!(
-            painted.style.color_fg_source,
-            ColorSource::Indexed(1),
-            "fixture: red A should carry Indexed(1) fg",
-        );
-        assert!(painted.style.color_fg.is_some());
-
-        // Paint the alternate grid too — alt cells must also re-resolve.
+        // Alt grid: yellow (slot 3).
         t.feed("\x1b[?1049h\x1b[33mC\x1b[?1049l");
 
-        // Drive one cell into scrollback by feeding enough LFs to
-        // scroll past the grid's row count. With rows=5, we need 5+
-        // LFs from the current position to push the first painted
-        // row off the top.
+        // Push the first painted row into scrollback.
         t.feed("\r\n\n\n\n\n\n");
+        assert!(!t.scrollback.is_empty(), "fixture: row 0 should have scrolled off");
+        assert_eq!(t.scrollback[0][0].ch, 'A');
+        assert_eq!(t.scrollback[0][0].style.fg, CellColor::Indexed(1));
 
-        // Snapshot the indexed-red fg under the OLD palette.
-        let red_before = palette::get().ansi(1, false);
-
-        // Swap palette: rewrite slot 1 to bright green.
+        // Swap slot 1 to bright green.
         let mut new_palette = palette::Palette::defaults();
         new_palette.ansi[1] = [0.0, 1.0, 0.0, 1.0];
         palette::install(new_palette);
 
-        // Scrollback row 0 is the displaced first-paint row. Before
-        // re-resolve, it still carries the OLD red.
-        assert!(!t.scrollback.is_empty(), "fixture: row 0 should have scrolled off");
-        let sb_row = &t.scrollback[0];
-        assert_eq!(sb_row[0].ch, 'A');
-        assert_eq!(sb_row[0].style.color_fg_source, ColorSource::Indexed(1));
-        assert_eq!(sb_row[0].style.color_fg, Some(red_before));
+        // The scrollback cell's *source* is unchanged but resolves to the new
+        // color — no rewrite happened.
+        assert_eq!(t.scrollback[0][0].style.fg, CellColor::Indexed(1));
+        assert_eq!(t.scrollback[0][0].style.fg.resolve([0.0; 4]), [0.0, 1.0, 0.0, 1.0]);
 
-        t.reresolve_palette();
+        // Truecolor bg (now at scrollback[1][0]) resolves palette-independently.
+        let tc = &t.scrollback[1][0];
+        assert_eq!(tc.ch, 'B');
+        assert_eq!(tc.style.bg, CellColor::Rgb([200, 100, 50]));
+        assert_eq!(palette::linear_to_srgb_u8(tc.style.bg.resolve([0.0; 4])[0]), 200);
 
-        // Scrollback row 0 updated.
-        let sb_row = &t.scrollback[0];
-        assert_eq!(sb_row[0].style.color_fg, Some([0.0, 1.0, 0.0, 1.0]));
-
-        // Truecolor cell (originally cell (1, 0); after scrolling
-        // it's at scrollback[1][0]) stays put.
-        assert!(t.scrollback.len() >= 2);
-        let tc_cell = &t.scrollback[1][0];
-        assert_eq!(tc_cell.ch, 'B');
-        assert_eq!(tc_cell.style.color_bg_source, ColorSource::Truecolor);
-        let tc_bg_after = tc_cell.style.color_bg.expect("bg set");
-        assert_eq!(
-            crate::palette::linear_to_srgb_u8(tc_bg_after[0]),
-            200,
-            "truecolor R component preserved across re-resolve",
-        );
-
-        // Alt grid was also painted; SGR 33 = yellow = slot 3.
-        let cell = t.alternate.get(0, 0);
-        assert_eq!(cell.style.color_fg_source, ColorSource::Indexed(3));
-        assert_eq!(cell.style.color_fg, Some(palette::get().ansi(3, false)));
+        // Alt grid cell tracks the live palette too (slot 3 unchanged here).
+        assert_eq!(t.alternate.get(0, 0).style.fg, CellColor::Indexed(3));
 
         palette::install(palette::Palette::defaults());
     }
@@ -5926,8 +5884,8 @@ mod tests {
     fn sgr_styles_cells() {
         let mut t = Terminal::new(5, 1, 100);
         t.feed("\x1b[31mA\x1b[0mB");
-        assert!(t.row(0)[0].style.color_fg.is_some());
-        assert_eq!(t.row(0)[1].style.color_fg, None);
+        assert_eq!(t.row(0)[0].style.fg, crate::style::CellColor::Indexed(1));
+        assert_eq!(t.row(0)[1].style.fg, crate::style::CellColor::Default);
     }
 
     #[test]
@@ -6647,8 +6605,8 @@ mod tests {
         let cell = t.row(0)[0];
         assert_eq!(cell.ch, 'A');
         assert_eq!(
-            cell.style.color_fg_source,
-            crate::style::ColorSource::Indexed(1),
+            cell.style.fg,
+            crate::style::CellColor::Indexed(1),
             "wrapped SGR must have reached apply_sgr",
         );
     }
@@ -6678,8 +6636,8 @@ mod tests {
         let cell = t.row(0)[0];
         assert_eq!(cell.ch, 'A', "inner Print event must dispatch even when outer parser is mid-DCS");
         assert_eq!(
-            cell.style.color_fg_source,
-            crate::style::ColorSource::Indexed(1),
+            cell.style.fg,
+            crate::style::CellColor::Indexed(1),
             "inner SGR 31 must reach apply_sgr",
         );
         // Finish DCS#2 with a no-op body so the outer parser returns
@@ -13133,14 +13091,9 @@ mod tests {
         // not perturb the result. Build a Style directly so we can poke
         // an arbitrary alpha without going through the SGR parser.
         let mut style = crate::style::Style::new();
-        // 0xA1B2C3 in sRGB, then linearize (matches what the parser stores).
-        let r = crate::palette::srgb_to_linear(0xA1);
-        let g = crate::palette::srgb_to_linear(0xB2);
-        let b = crate::palette::srgb_to_linear(0xC3);
-        style.color_fg = Some([r, g, b, 0.25]); // weird alpha
-        assert_eq!(decode_kitty_placeholder_image_id(&style), Some(0xA1B2C3));
-        // And alpha=0 — still extracted from RGB.
-        style.color_fg = Some([r, g, b, 0.0]);
+        // The id is encoded in the fg truecolor RGB; `CellColor::Rgb` carries no
+        // alpha at all, so the decode is alpha-agnostic by construction.
+        style.fg = crate::style::CellColor::Rgb([0xA1, 0xB2, 0xC3]);
         assert_eq!(decode_kitty_placeholder_image_id(&style), Some(0xA1B2C3));
     }
 

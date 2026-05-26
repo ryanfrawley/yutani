@@ -773,13 +773,13 @@ impl WindowState {
                 // that the swap can move to fg (otherwise reverse-video text
                 // and Claude Code's reverse-space cursor render invisible).
                 let (fg, bg) = if cell.style.reverse {
-                    let rfg = cell.style.color_fg.unwrap_or(default_fg);
-                    let rbg = cell.style.color_bg.unwrap_or(default_bg_solid);
+                    let rfg = cell.style.fg.resolve(default_fg);
+                    let rbg = cell.style.bg.resolve(default_bg_solid);
                     (rbg, rfg)
                 } else {
                     (
-                        cell.style.color_fg.unwrap_or(default_fg),
-                        cell.style.color_bg.unwrap_or(default_bg),
+                        cell.style.fg.resolve(default_fg),
+                        cell.style.bg.resolve(default_bg),
                     )
                 };
                 // Quantise to whatever the scheme advertises (e.g. Mono /
@@ -894,9 +894,9 @@ impl WindowState {
                         .extended_cell(r, from)
                         .map(|cell| {
                             if cell.style.reverse {
-                                cell.style.color_bg.unwrap_or(default_bg_solid)
+                                cell.style.bg.resolve(default_bg_solid)
                             } else {
-                                cell.style.color_fg.unwrap_or(default_fg)
+                                cell.style.fg.resolve(default_fg)
                             }
                         })
                         .unwrap_or(default_fg);
@@ -1304,7 +1304,7 @@ impl WindowState {
             for ghost in &self.active_tab().cursor_ghosts {
                 let elapsed = now.duration_since(ghost.started_at).as_secs_f32();
                 let alpha = (1.0 - (elapsed / anim_secs).clamp(0.0, 1.0)).max(0.0);
-                let mut fg = ghost.style.color_fg.unwrap_or(default_fg);
+                let mut fg = ghost.style.fg.resolve(default_fg);
                 // Premultiplied alpha to match the pipeline's blend mode.
                 fg[0] *= alpha;
                 fg[1] *= alpha;

@@ -594,7 +594,7 @@ fn is_blank_cell_ignores_style() {
     // A space with bold + a foreground color is still blank — only `ch` matters.
     let mut style = style::Style::new();
     style.bold = true;
-    style.color_fg = Some([1.0; 4]);
+    style.fg = crate::style::CellColor::Rgb([255, 255, 255]);
     let cell = style::Cell::new(' ', style);
     assert!(is_blank_cell(&cell));
 }
