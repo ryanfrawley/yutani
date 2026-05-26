@@ -167,9 +167,6 @@ pub(crate) struct Config {
     /// requests. Defaults to false because steady cursors are easier on
     /// the eyes; opt back in for xterm-faithful behavior.
     pub(crate) cursor_blink: bool,
-    /// Shared by top and bottom strips — both sample the same blur output.
-    /// Per-edge would need a second blur chain.
-    pub(crate) blur_iterations: usize,
     /// Name of a TOML scheme under ~/.config/yutani/schemes/. `None` keeps
     /// the built-in defaults; a missing file with `Some(_)` warns and falls
     /// back to defaults. Used as the active scheme when `auto_theme` is off,
@@ -336,7 +333,6 @@ impl Config {
             cursor_anim_secs: 0.06,
             scroll_on_output_secs: 0.08,
             cursor_blink: false,
-            blur_iterations: 2,
             color_scheme: None,
             auto_theme: false,
             light_scheme: None,
@@ -411,9 +407,6 @@ impl Config {
             "cursor_anim_secs" => if let Some(x) = cfg_f32(v) { self.cursor_anim_secs = x; },
             "scroll_on_output_secs" => if let Some(x) = cfg_f32(v) { self.scroll_on_output_secs = x; },
             "cursor_blink" => if let Some(x) = v.as_bool() { self.cursor_blink = x; },
-            "blur_iterations" => if let Some(x) = cfg_usize(v) {
-                self.blur_iterations = x.min(renderer::blur::MAX_BLUR_ITERATIONS);
-            },
             "color_scheme" => if let Some(x) = v.as_str() {
                 self.color_scheme = if x.is_empty() { None } else { Some(x.to_string()) };
             },
@@ -555,8 +548,7 @@ impl Config {
              scroll_edge_style = {}\n\
              cursor_anim_secs = {}\n\
              scroll_on_output_secs = {}\n\
-             cursor_blink = {}\n\
-             blur_iterations = {}\n",
+             cursor_blink = {}\n",
             self.font_size,
             self.top_fade_height,
             self.top_fade_anim_secs,
@@ -566,7 +558,6 @@ impl Config {
             self.cursor_anim_secs,
             self.scroll_on_output_secs,
             self.cursor_blink,
-            self.blur_iterations,
         ));
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", toml_str_lit(name)));
@@ -859,7 +850,6 @@ mod tests {
         assert_eq!(parsed.font_size, original.font_size);
         assert_eq!(parsed.cursor_blink, original.cursor_blink);
         assert_eq!(parsed.scroll_on_output_secs, original.scroll_on_output_secs);
-        assert_eq!(parsed.blur_iterations, original.blur_iterations);
         assert_eq!(parsed.auto_theme, original.auto_theme);
         assert_eq!(parsed.images_enabled, original.images_enabled);
         assert_eq!(parsed.images_filter, original.images_filter);
@@ -902,7 +892,6 @@ mod tests {
         c.autocomplete = false;
         c.font_size = 14.5;
         c.cursor_blink = true;
-        c.blur_iterations = 1;
         c.color_scheme = Some("dracula".to_string());
         c.auto_theme = true;
         c.light_scheme = Some("ayu light".to_string());
@@ -923,7 +912,6 @@ mod tests {
         assert_eq!(parsed.scroll_edge_style, ScrollEdgeStyle::Hard);
         assert_eq!(parsed.font_size, 14.5);
         assert!(parsed.cursor_blink);
-        assert_eq!(parsed.blur_iterations, 1);
         assert_eq!(parsed.color_scheme.as_deref(), Some("dracula"));
         assert!(parsed.auto_theme);
         assert_eq!(parsed.light_scheme.as_deref(), Some("ayu light"));

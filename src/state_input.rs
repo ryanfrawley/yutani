@@ -784,26 +784,6 @@ impl WindowState {
                                 self.select_last_command_output();
                                 return true;
                             }
-                            // Cmd-[ / Cmd-] tune the dual-Kawase iteration
-                            // count live so the user can scrub through blur
-                            // radii without recompiling.
-                            if s.as_ref() == "[" || s.as_ref() == "{" {
-                                self.blur.iterations = self.blur.iterations.saturating_sub(1).max(1);
-                                self.config.blur_iterations = self.blur.iterations;
-                                self.config.save();
-                                println!("blur iterations: {}", self.blur.iterations);
-                                self.window.request_redraw();
-                                return true;
-                            }
-                            if s.as_ref() == "]" || s.as_ref() == "}" {
-                                self.blur.iterations = (self.blur.iterations + 1)
-                                    .min(renderer::blur::MAX_BLUR_ITERATIONS);
-                                self.config.blur_iterations = self.blur.iterations;
-                                self.config.save();
-                                println!("blur iterations: {}", self.blur.iterations);
-                                self.window.request_redraw();
-                                return true;
-                            }
                         }
                     }
                     // Ctrl+Space manually summons/refreshes the completion popup
