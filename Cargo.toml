@@ -16,14 +16,6 @@ short_description = "Yutani terminal"
 # scripts/bundle-mac.sh; do not invoke `cargo bundle` directly on macOS.
 icon = ["target/macos-icon/yutani.icns"]
 
-[lints.rust]
-# The `objc` 0.2 `msg_send!` / `sel_impl!` macros expand to
-# `cfg!(feature = "cargo-clippy")`, which trips rustc's `unexpected_cfgs`
-# lint with no way to fix it from our code (the crate is unmaintained).
-# Declare that feature value as known so the macro stops warning, without
-# blanket-allowing every unexpected cfg.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
-
 [dependencies]
 bytemuck = { version = "1.14.0", features = ["derive"] }
 env_logger = "0.10.1"
@@ -47,5 +39,15 @@ winapi = { version = "0.3", default-features = false, features = ["winuser", "wi
 [target.'cfg(target_os = "macos")'.dependencies]
 core-text = "19"
 core-foundation = "0.9"
-objc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSAlert",
+    "NSColor",
+    "NSCursor",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSEvent",
+] }
 raw-window-handle = "0.5"
