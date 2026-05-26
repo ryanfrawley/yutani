@@ -6,9 +6,11 @@
 /// their surfaces from the same `instance`. It lives behind an `Rc` in
 /// `AppShared` so the cost of bringing up the adapter/device is paid once.
 ///
-/// `WindowSurface` (surface + its config + size) is per-window: the surface is
-/// tied to one `NSView`, so each window owns its own and reconfigures it on
-/// resize.
+/// The live `wgpu::Surface` for a window is *not* held here: it's owned by that
+/// window's present thread (see [`crate::present`]), which drives the swapchain
+/// acquire/present off the main thread so a frame waiting on vsync can't stall
+/// AppKit (and the native tab bar). The main thread keeps only [`WindowSurface`],
+/// a lightweight config/size mirror that layout code reads.
 pub struct Gpu {
     /// Kept so additional windows can create their surfaces from the same
     /// instance the device was built against (see [`Gpu::create_surface`]).
@@ -16,24 +18,31 @@ pub struct Gpu {
     /// Kept alongside the instance so a new window's surface config can be
     /// derived from the same adapter's capabilities as the first window's.
     pub adapter: wgpu::Adapter,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    /// `Arc` (not bare) so each window's present thread can hold its own handle
+    /// to the same device/queue. `&self.device` still coerces to
+    /// `&wgpu::Device` at call sites, so existing uses are unchanged.
+    pub device: std::sync::Arc<wgpu::Device>,
+    pub queue: std::sync::Arc<wgpu::Queue>,
 }
 
-/// The surface for one window, plus the config it was last configured with and
-/// the physical size that config encodes.
+/// Per-window swapchain *configuration* mirror: the config the surface was last
+/// configured with and the physical size it encodes. The live `wgpu::Surface`
+/// lives on the present thread; this mirror stays on the main thread because
+/// lots of layout code reads `config.width/height`.
 pub struct WindowSurface {
-    pub surface: wgpu::Surface,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl Gpu {
     /// Bring up the instance, adapter, device, and queue, and build the first
-    /// window's surface. Returns the shared `Gpu` and that window's
-    /// `WindowSurface`. Subsequent windows reuse the `Gpu` and call
+    /// window's surface. Returns the shared `Gpu`, that window's config mirror,
+    /// and the raw `wgpu::Surface` (which the caller hands to the window's
+    /// present thread). Subsequent windows reuse the `Gpu` and call
     /// [`Gpu::create_surface`].
-    pub async fn new(window: &winit::window::Window) -> (Self, WindowSurface) {
+    pub async fn new(
+        window: &winit::window::Window,
+    ) -> (Self, WindowSurface, wgpu::Surface) {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -75,32 +84,29 @@ impl Gpu {
         let gpu = Self {
             instance,
             adapter,
-            device,
-            queue,
+            device: std::sync::Arc::new(device),
+            queue: std::sync::Arc::new(queue),
         };
-        let window_surface = WindowSurface {
-            surface,
-            config,
-            size,
-        };
-        (gpu, window_surface)
+        let window_surface = WindowSurface { config, size };
+        (gpu, window_surface, surface)
     }
 
     /// Build a surface for an additional window from the shared instance,
-    /// configured against the same device/adapter as the first window. The
-    /// returned surface holds an unsafe reference to `window`, so the caller
-    /// must keep `window` alive at least as long as the surface (and drop the
-    /// surface first) — `WindowState`'s field order enforces this.
-    pub fn create_surface(&self, window: &winit::window::Window) -> WindowSurface {
+    /// configured against the same device/adapter as the first window. Returns
+    /// the config mirror plus the raw surface for the window's present thread.
+    /// The surface holds an unsafe reference to `window`, so the caller must
+    /// keep `window` alive at least as long as the surface (and drop the
+    /// surface first) — the present thread is stopped/joined in
+    /// `WindowState`'s `Drop` before the window field drops.
+    pub fn create_surface(
+        &self,
+        window: &winit::window::Window,
+    ) -> (WindowSurface, wgpu::Surface) {
         let size = window.inner_size();
         let surface = unsafe { self.instance.create_surface(window) }.unwrap();
         let config = surface_config(&surface, &self.adapter, size);
         surface.configure(&self.device, &config);
-        WindowSurface {
-            surface,
-            config,
-            size,
-        }
+        (WindowSurface { config, size }, surface)
     }
 }
 
@@ -128,20 +134,5 @@ fn surface_config(
         present_mode: surface_caps.present_modes[0],
         alpha_mode: wgpu::CompositeAlphaMode::PostMultiplied,
         view_formats: vec![],
-    }
-}
-
-impl WindowSurface {
-    /// Reconfigure the surface for a new physical size. No-op if either
-    /// dimension is zero (minimized window). Takes the shared device since the
-    /// surface no longer owns it.
-    pub fn resize(&mut self, device: &wgpu::Device, size: winit::dpi::PhysicalSize<u32>) {
-        if size.width == 0 || size.height == 0 {
-            return;
-        }
-        self.size = size;
-        self.config.width = size.width;
-        self.config.height = size.height;
-        self.surface.configure(device, &self.config);
     }
 }

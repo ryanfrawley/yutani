@@ -3077,3 +3077,82 @@ fn fg_is_foreign_command_false_when_no_controlling_foreground_group() {
     assert!(!fg_is_foreign_command(0, 2000));
 }
 
+// ---------------------------------------------------------------------------
+// present::FreePool — pure free-list bookkeeping for the present-source pool.
+//
+// Everything else in src/present.rs (PresentTarget, build_blit, the present
+// thread / Presenter channels) needs a live wgpu::Device, a surface, and a
+// background thread, so it is exercised by running the app, not here. FreePool
+// is the one piece of deterministic logic: which target indices are free to
+// render into, and the frame-drop signal when none are. Its invariants back a
+// GPU-correctness guarantee (never hand a target back out while the present
+// thread is still reading it), so they are worth pinning.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn free_pool_acquires_distinct_in_range_indices_until_empty() {
+    // A fresh pool offers every target exactly once, only valid indices, and
+    // no repeats — handing the same index out twice would let the renderer
+    // overwrite a target the present thread is still blitting.
+    use std::collections::HashSet;
+    let mut pool = present::FreePool::new(present::POOL_SIZE);
+    let mut seen = HashSet::new();
+    for _ in 0..present::POOL_SIZE {
+        let idx = pool.acquire().expect("a target should be free");
+        assert!(idx < present::POOL_SIZE, "index {idx} out of pool range");
+        assert!(seen.insert(idx), "index {idx} handed out twice");
+    }
+    assert_eq!(seen.len(), present::POOL_SIZE);
+}
+
+#[test]
+fn free_pool_acquire_is_none_exactly_when_all_targets_in_flight() {
+    // The drop-frame signal: once every target has been acquired (all in
+    // flight on the present thread), acquire() reports None so the renderer
+    // skips the frame instead of aliasing a busy target — and stays None on a
+    // repeat call rather than conjuring a spurious target.
+    let mut pool = present::FreePool::new(present::POOL_SIZE);
+    for _ in 0..present::POOL_SIZE {
+        assert!(pool.acquire().is_some());
+    }
+    assert!(pool.acquire().is_none(), "pool must drop frames when full");
+    assert!(pool.acquire().is_none());
+}
+
+#[test]
+fn free_pool_released_target_becomes_acquirable_again() {
+    // When the presenter returns a finished target, it must be reusable, and
+    // it is the only thing acquire can hand back while the rest are in flight.
+    let mut pool = present::FreePool::new(present::POOL_SIZE);
+    let mut taken = Vec::new();
+    while let Some(idx) = pool.acquire() {
+        taken.push(idx);
+    }
+    assert!(pool.acquire().is_none());
+
+    let returned = taken[0];
+    pool.release(returned);
+    assert_eq!(
+        pool.acquire(),
+        Some(returned),
+        "the just-released target should be the one handed back"
+    );
+    assert!(pool.acquire().is_none());
+}
+
+#[test]
+fn free_pool_releasing_every_target_restores_full_capacity() {
+    // Mirrors draining the presenter's finished-channel one index at a time:
+    // releasing all in-flight targets restores the original acquire capacity,
+    // no more and no fewer.
+    let mut pool = present::FreePool::new(present::POOL_SIZE);
+    let drained: Vec<usize> = std::iter::from_fn(|| pool.acquire()).collect();
+    assert_eq!(drained.len(), present::POOL_SIZE);
+    assert!(pool.acquire().is_none());
+
+    for idx in &drained {
+        pool.release(*idx);
+    }
+    let regained = std::iter::from_fn(|| pool.acquire()).count();
+    assert_eq!(regained, present::POOL_SIZE);
+}

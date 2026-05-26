@@ -87,7 +87,7 @@ pub(crate) async fn run() {
     let config_for_fonts = config.clone();
     let font_handle = std::thread::spawn(move || load_font_data(&config_for_fonts));
 
-    let (gpu, surface) = gpu::Gpu::new(&window).await;
+    let (gpu, surface, surface_raw) = gpu::Gpu::new(&window).await;
     lap("after Gpu::new (concurrent with font load)");
 
     let fd = font_handle.join().expect("font loader thread panicked");
@@ -175,7 +175,7 @@ pub(crate) async fn run() {
     );
     lap("after create_tab (fork)");
     let mut state =
-        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, initial_tab);
+        WindowState::create_window(shared.clone(), window, surface, surface_raw, config.clone(), dpi, initial_tab);
     lap("after create_window (GPU/atlas/pipelines)");
     state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // Size the chrome band to the real native title bar now that the window

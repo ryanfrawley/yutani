@@ -6,6 +6,7 @@ mod search;
 mod font;
 mod font_loader;
 mod renderer;
+mod present;
 
 mod ansi;
 mod gpu;
@@ -634,6 +635,19 @@ struct WindowState {
     /// Per-window GPU surface. Declared first so it drops before `window` —
     /// the surface holds unsafe references to the window's resources.
     surface: gpu::WindowSurface,
+
+    /// Drives swapchain presentation on a dedicated thread so the blocking
+    /// vsync wait never parks the main run loop AppKit uses to draw the native
+    /// tab bar. Declared before `window`: its `Drop` joins the present thread
+    /// (dropping the live `wgpu::Surface`) before the window's NSView is gone.
+    presenter: present::Presenter,
+    /// Offscreen, surface-format targets the renderer draws into and the
+    /// presenter blits to the swapchain. Recreated on resize.
+    present_pool: Vec<present::PresentTarget>,
+    /// Free-list bookkeeping for `present_pool`: which targets the presenter
+    /// has finished with and the renderer may draw into. A frame is skipped
+    /// when none are free (every target still in flight).
+    free_targets: present::FreePool,
 
     window: Window,
 
@@ -1268,6 +1282,8 @@ impl WindowState {
         shared: Rc<AppShared>,
         window: Window,
         surface: gpu::WindowSurface,
+        // The live surface, handed straight to this window's present thread.
+        surface_raw: wgpu::Surface,
         config: Config,
         dpi: u32,
         initial_tab: TabState,
@@ -1492,8 +1508,34 @@ impl WindowState {
         );
         sub!("ImagePipeline::new");
 
+        // Present-source pool + the thread that owns the live surface and does
+        // the blocking acquire/present off the main thread.
+        let present_pool: Vec<present::PresentTarget> = (0..present::POOL_SIZE)
+            .map(|i| {
+                present::PresentTarget::new(
+                    &shared.gpu.device,
+                    surface.config.format,
+                    surface.config.width,
+                    surface.config.height,
+                    &format!("present source {i}"),
+                )
+            })
+            .collect();
+        let present_views = present_pool.iter().map(|t| t.view.clone()).collect();
+        let presenter = present::Presenter::spawn(
+            shared.gpu.device.clone(),
+            shared.gpu.queue.clone(),
+            surface_raw,
+            surface.config.clone(),
+            present_views,
+        );
+        sub!("Presenter::spawn");
+
         Self {
             surface,
+            presenter,
+            present_pool,
+            free_targets: present::FreePool::new(present::POOL_SIZE),
             window,
             shared,
             atlas,
@@ -1752,7 +1794,28 @@ impl WindowState {
         // A move to a display with a different scale factor changes the native
         // title bar's physical height; keep the chrome band in step.
         self.refresh_chrome_band();
-        self.surface.resize(&self.shared.gpu.device, size);
+        if size.width > 0 && size.height > 0 {
+            // Update the config/size mirror (the live surface is reconfigured
+            // on the present thread, below) and recreate the present-source
+            // pool at the new size.
+            self.surface.size = size;
+            self.surface.config.width = size.width;
+            self.surface.config.height = size.height;
+            self.present_pool = (0..present::POOL_SIZE)
+                .map(|i| {
+                    present::PresentTarget::new(
+                        &self.shared.gpu.device,
+                        self.surface.config.format,
+                        size.width,
+                        size.height,
+                        &format!("present source {i}"),
+                    )
+                })
+                .collect();
+            self.free_targets = present::FreePool::new(present::POOL_SIZE);
+            let views = self.present_pool.iter().map(|t| t.view.clone()).collect();
+            self.presenter.resize(size.width, size.height, views);
+        }
         if size.width > 0 && size.height > 0 {
             self.blur.resize(
                 &self.shared.gpu.device,
@@ -2092,7 +2155,7 @@ fn spawn_window_in_process(
     set_native_window_bg(&window, palette::get().background);
     window.set_cursor_icon(winit::window::CursorIcon::Text);
 
-    let surface = shared.gpu.create_surface(&window);
+    let (surface, surface_raw) = shared.gpu.create_surface(&window);
     let dpi = (window.scale_factor() * 96.0) as u32;
     let (cols, rows) = {
         let (cell_w, line_h) = shared.with_font(|f| {
@@ -2121,7 +2184,7 @@ fn spawn_window_in_process(
         config.images_memory_cap_mb * 1024 * 1024,
     );
     let mut state =
-        WindowState::create_window(shared.clone(), window, surface, config.clone(), dpi, tab);
+        WindowState::create_window(shared.clone(), window, surface, surface_raw, config.clone(), dpi, tab);
     // Mirror the post-construction setup `run()` does for the first window.
     state.notify_pty_size(state.active_tab().terminal.cols, state.active_tab().terminal.rows);
     // A tab born into an already-visible bar can't measure its own bar-free

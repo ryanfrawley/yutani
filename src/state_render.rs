@@ -2416,26 +2416,25 @@ impl WindowState {
         &mut self,
         clear: wgpu::Color,
     ) -> Result<(std::time::Duration, bool), wgpu::SurfaceError> {
-        let surface_t0 = std::time::Instant::now();
-        let output = match self.surface.surface.get_current_texture() {
-            Ok(o) => o,
-            // A backgrounded / occluded / just-resized surface returns
-            // `Outdated` (and `Lost`) routinely once there's more than one
-            // window — reconfigure and skip this frame rather than panicking;
-            // the next redraw re-acquires. (With one window this only tripped
-            // on resize, which is why the old `unwrap` survived.)
-            Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
-                self.surface
-                    .surface
-                    .configure(&self.shared.gpu.device, &self.surface.config);
-                return Ok((surface_t0.elapsed(), true));
-            }
-            Err(e) => return Err(e),
+        // Pick a present-source target the present thread has finished with.
+        // The main thread renders into it and hands it off; the blocking
+        // swapchain acquire/present runs on the present thread, so the run loop
+        // (and AppKit's native tab bar) stays responsive even while a tab is
+        // busy rendering. If every target is still in flight, skip this frame —
+        // the content catches up on the next one rather than blocking here.
+        self.presenter.drain_free(&mut self.free_targets);
+        let Some(idx) = self.free_targets.acquire() else {
+            return Ok((std::time::Duration::ZERO, true));
         };
-        let surface_wait = surface_t0.elapsed();
-        let view = output
+        // Fresh view of the pooled target's texture; every render pass below
+        // still writes `&view`, only now it's an offscreen surface-format
+        // target rather than the swapchain image.
+        let view = self.present_pool[idx]
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // The vsync wait now lives on the present thread, so the main thread no
+        // longer blocks at the swapchain — report zero.
+        let surface_wait = std::time::Duration::ZERO;
         let mut encoder =
             self.shared.gpu
                 .device
@@ -2948,7 +2947,12 @@ impl WindowState {
         }
 
         self.shared.gpu.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        // Hand the finished target to the present thread, which acquires the
+        // swapchain image, blits this target onto it, presents, and waits for
+        // vsync. Submission order (this submit happens-before the `present`
+        // send, which happens-before the presenter's blit submit) guarantees
+        // the GPU runs this render before the blit reads the target.
+        self.presenter.present(idx);
 
         Ok((surface_wait, !needs_offscreen))
     }
