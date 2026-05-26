@@ -35,11 +35,10 @@ mod event_loop;
 
 use winit::{
     event::*,
-    event_loop::EventLoopBuilder,
-    event_loop::EventLoopWindowTarget,
-    platform::macos::WindowBuilderExtMacOS,
+    event_loop::ActiveEventLoop,
+    platform::macos::WindowAttributesExtMacOS,
     platform::modifier_supplement::KeyEventExtModifierSupplement,
-    window::{Window, WindowBuilder},
+    window::Window,
 };
 
 extern crate libc;
@@ -1087,7 +1086,11 @@ const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
 /// stays responsive — the final frame is reached this many seconds after the
 /// scroll lands, regardless of distance.
-const ALT_SCROLL_ANIM_SECS: f32 = 0.07;
+///
+/// EXPERIMENTAL: set to 0 to disable the alt-screen slide entirely. With it
+/// off, `maybe_start_alt_scroll` returns early and the scroll snaps into place
+/// instead of animating.
+const ALT_SCROLL_ANIM_SECS: f32 = 0.0;
 
 /// Maximum displayed offset, in whole line-heights, for the primary
 /// scroll-on-output slide. The renderer widens its phantom row band by
@@ -2102,7 +2105,7 @@ fn tab_command_running(tab: &TabState) -> bool {
 /// logical points) and its shell opens in `cwd` (the spawner's shell cwd).
 #[allow(clippy::too_many_arguments)]
 fn spawn_window_in_process(
-    elwt: &EventLoopWindowTarget<app_window::CustomEvent>,
+    elwt: &ActiveEventLoop,
     shared: &Rc<AppShared>,
     proxy: &winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
     windows: &mut std::collections::HashMap<winit::window::WindowId, WindowState>,
@@ -2127,7 +2130,7 @@ fn spawn_window_in_process(
 ) {
     let title = effective_title(None, cwd.as_deref());
     let transparent = false; // matches the first window (shadow bug)
-    let mut builder = WindowBuilder::new()
+    let mut attrs = Window::default_attributes()
         .with_title(&title)
         .with_titlebar_transparent(true)
         .with_tabbing_identifier(tabbing_id)
@@ -2137,12 +2140,12 @@ fn spawn_window_in_process(
         .with_decorations(true)
         .with_blur(transparent);
     if let Some((x, y)) = origin {
-        builder = builder.with_position(winit::dpi::LogicalPosition::new(
+        attrs = attrs.with_position(winit::dpi::LogicalPosition::new(
             x + WINDOW_CASCADE_STEP,
             y + WINDOW_CASCADE_STEP,
         ));
     }
-    let window = match builder.build(elwt) {
+    let window = match elwt.create_window(attrs) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("new window: build failed: {e}");
@@ -2153,7 +2156,7 @@ fn spawn_window_in_process(
     // exactly as the first window does, so it doesn't flash a wrong fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     set_native_window_bg(&window, palette::get().background);
-    window.set_cursor_icon(winit::window::CursorIcon::Text);
+    window.set_cursor(winit::window::CursorIcon::Text);
 
     let (surface, surface_raw) = shared.gpu.create_surface(&window);
     let dpi = (window.scale_factor() * 96.0) as u32;
@@ -2692,7 +2695,7 @@ fn main() {
     if std::env::args().skip(1).any(|a| a == "--onboard") {
         onboard::run();
     }
-    pollster::block_on(run());
+    run();
 }
 
 #[cfg(test)]

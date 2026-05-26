@@ -2025,16 +2025,19 @@ impl WindowState {
         if self.top_fade_phase > 0.0 {
             match self.config.scroll_edge_style {
                 ScrollEdgeStyle::Soft => {
-                    // One continuous smoothstep ramp from the very top edge down
-                    // over the whole band (chrome band + the fade below it) — no
-                    // full-strength plateau. The blur is alpha-composited over
-                    // the already-drawn sharp content, so the effect begins right
-                    // at the chrome band (strong but not a hard frost) and eases
-                    // to zero well below it. Because the ramp spans past the
-                    // chrome, it's still substantial across the band, so no sharp
-                    // rows show through the chrome gap; matches the native soft
-                    // scroll-edge effect. Emitted as a few linear segments.
+                    // EXPERIMENTAL: instead of blurring the scene behind the
+                    // chrome, dissolve it into the background color. Same
+                    // continuous smoothstep ramp from the very top edge down over
+                    // the whole band (chrome band + the fade below it) — full
+                    // strength at the edge, zero at the band bottom — but each
+                    // strip is a solid fill of the background color (tint = 1),
+                    // alpha-composited over the sharp content, rather than a blur
+                    // sample (tint = 0). Because the ramp spans past the chrome,
+                    // coverage is still substantial across the band, so no sharp
+                    // rows show through the chrome gap. Emitted as a few linear
+                    // segments.
                     const SEGS: usize = 8;
+                    let bg = palette::get().background;
                     // smoothstep complement: full at the top edge (u=0), zero at
                     // the band bottom (u=1).
                     let a = |u: f32| top_alpha * (1.0 - u * u * (3.0 - 2.0 * u));
@@ -2043,9 +2046,9 @@ impl WindowState {
                         let u0 = (i - 1) as f32 / SEGS as f32;
                         let u1 = i as f32 / SEGS as f32;
                         let y1 = soft_band * u1;
-                        let c0 = [0.0_f32, 0.0, 0.0, a(u0)];
-                        let c1 = [0.0_f32, 0.0, 0.0, a(u1)];
-                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 0.0);
+                        let c0 = [bg[0], bg[1], bg[2], a(u0)];
+                        let c1 = [bg[0], bg[1], bg[2], a(u1)];
+                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 1.0);
                         prev_y = y1;
                     }
                 }
