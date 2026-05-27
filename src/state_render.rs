@@ -1702,7 +1702,9 @@ impl WindowState {
         // a dim backdrop, a rounded box, the "Find:" input line with a caret,
         // and — once there's a query — a separator and a result counter
         // ("3 / 17" or "No results"). Reuses the palette's quad/glyph helpers.
-        if self.search.open {
+        // Skipped when the native glass find bar is handling input (macOS); the
+        // in-terminal match highlights above still render off `search.open`.
+        if self.search.open && self.glass_find.is_none() {
             let premul = |rgb: [f32; 3], a: f32| [rgb[0] * a, rgb[1] * a, rgb[2] * a, a];
             let screen_w = self.surface.config.width as f32;
             let screen_h = self.surface.config.height as f32;

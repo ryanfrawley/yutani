@@ -31,6 +31,77 @@ impl WindowState {
         }
     }
 
+    /// Open or close the find bar. On macOS this shows/hides the native glass
+    /// bar (the `search` model + in-terminal match highlights are unchanged);
+    /// elsewhere it falls back to the model + GPU overlay.
+    pub(crate) fn toggle_find(&mut self) {
+        if self.glass_find.is_none() {
+            self.glass_find = glass_find::new();
+        }
+        let dark = theme_for_bg(palette::get().background) == winit::window::Theme::Dark;
+        match self.glass_find.as_mut() {
+            Some(gf) => {
+                if gf.visible() {
+                    gf.hide();
+                    self.search.close();
+                } else {
+                    // `search.open` drives the in-terminal match highlights, so
+                    // keep it set while the native bar is up.
+                    self.search.open();
+                    gf.set_appearance(dark);
+                    gf.show(&self.window);
+                }
+            }
+            None => self.search.toggle(),
+        }
+        self.invalidate();
+    }
+
+    /// The find result counter shown in the native bar.
+    fn find_counter_text(&self) -> String {
+        if self.search.input.value.is_empty() {
+            String::new()
+        } else if self.search.matches.is_empty() {
+            "No results".to_string()
+        } else {
+            format!("{} / {}", self.search.current + 1, self.search.matches.len())
+        }
+    }
+
+    /// Native find: the query changed — re-run the search and refresh the count.
+    pub(crate) fn find_query(&mut self, query: String) {
+        self.search.input.cursor = query.len();
+        self.search.input.value = query;
+        self.run_search();
+        let text = self.find_counter_text();
+        if let Some(gf) = self.glass_find.as_ref() {
+            gf.set_counter(&text);
+        }
+    }
+
+    /// Native find: step to the next / previous match and refresh the count.
+    pub(crate) fn find_step(&mut self, forward: bool) {
+        if forward {
+            self.search.next();
+        } else {
+            self.search.prev();
+        }
+        self.focus_current_match();
+        let text = self.find_counter_text();
+        if let Some(gf) = self.glass_find.as_ref() {
+            gf.set_counter(&text);
+        }
+    }
+
+    /// Native find: close the bar (leaving the viewport where it is).
+    pub(crate) fn find_close(&mut self) {
+        if let Some(gf) = self.glass_find.as_mut() {
+            gf.hide();
+        }
+        self.search.close();
+        self.invalidate();
+    }
+
     /// Hide the native panel (if any) and reset the model to closed.
     pub(crate) fn close_glass_palette(&mut self) {
         if let Some(gp) = self.glass_palette.as_mut() {
@@ -698,14 +769,15 @@ impl WindowState {
                     {
                         if let winit::keyboard::Key::Character(s) = &event.logical_key {
                             if s.eq_ignore_ascii_case("f") {
-                                self.search.toggle();
-                                self.invalidate();
+                                self.toggle_find();
                                 return true;
                             }
                         }
                     }
-                    // While the find overlay is open it owns the keyboard.
-                    if self.search.open {
+                    // While the find overlay is open it owns the keyboard — but
+                    // on macOS the native bar (a key child window) handles input,
+                    // so only the GPU-overlay fallback drives search_key here.
+                    if self.search.open && self.glass_find.is_none() {
                         return self.search_key(&event);
                     }
                     // Cmd-Shift-P toggles the command palette. Checked before

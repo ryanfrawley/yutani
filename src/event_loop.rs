@@ -676,6 +676,20 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             }
         }
 
+        // Drain a native find-bar signal (query / next / prev / close), like the
+        // palette, routed to the focused window.
+        #[cfg(target_os = "macos")]
+        if let Some(sig) = glass_find::take_find_signal() {
+            if let Some(state) = self.focused_window.and_then(|w| self.windows.get_mut(&w)) {
+                match sig {
+                    glass_find::FindSignal::Query(q) => state.find_query(q),
+                    glass_find::FindSignal::Next => state.find_step(true),
+                    glass_find::FindSignal::Prev => state.find_step(false),
+                    glass_find::FindSignal::Close => state.find_close(),
+                }
+            }
+        }
+
         // Each window animates independently; collect the earliest
         // wake-up across all of them and arm the loop for that.
         let mut next_wake: Option<std::time::Instant> = None;
