@@ -45,25 +45,24 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use std::cell::{Cell, RefCell};
-    use std::sync::Mutex;
 
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject, Sel};
+    use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
     use objc2::{
         class, define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly,
     };
     use objc2_app_kit::{
         NSColor, NSControl, NSControlTextEditingDelegate, NSFont, NSPanel, NSScrollView,
-        NSShadow, NSTableColumn, NSTableRowView, NSTableView, NSTableViewDataSource,
+        NSTableColumn, NSTableRowView, NSTableView, NSTableViewDataSource,
         NSTableViewDelegate, NSText, NSTextField, NSTextFieldDelegate, NSView, NSWindowDelegate,
     };
     use objc2_foundation::{
         NSEdgeInsets, NSIndexSet, NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString,
     };
-    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
     use winit::window::Window;
 
     use crate::command_palette;
+    use crate::glass::{self, SignalSlot};
 
     /// What the user did in the native panel, handed to the event loop (which
     /// owns `WindowState`) to drive the model. Resolved to the focused window,
@@ -79,18 +78,16 @@ mod imp {
     }
 
     /// Single-slot mailbox from the AppKit controller (main thread) to the
-    /// event loop (also main thread); the `Mutex` is just for `'static` safety.
-    static PALETTE_SIGNAL: Mutex<Option<PaletteSignal>> = Mutex::new(None);
+    /// event loop (also main thread).
+    static PALETTE_SIGNAL: SignalSlot<PaletteSignal> = SignalSlot::new();
 
     fn post(sig: PaletteSignal) {
-        if let Ok(mut slot) = PALETTE_SIGNAL.lock() {
-            *slot = Some(sig);
-        }
+        PALETTE_SIGNAL.post(sig);
     }
 
     /// Drain the pending palette signal, if any. Called by the event loop.
     pub fn take_palette_signal() -> Option<PaletteSignal> {
-        PALETTE_SIGNAL.lock().ok().and_then(|mut slot| slot.take())
+        PALETTE_SIGNAL.take()
     }
 
     // Geometry (points). The panel is a fixed-width card near the top of the
@@ -196,7 +193,7 @@ mod imp {
             // event-loop callbacks commits without animating.
             #[unsafe(method(yutaniFadeIn))]
             fn yutani_fade_in(&self) {
-                unsafe { animate_alpha(self, 1.0, 0.18) }
+                unsafe { glass::animate_alpha(self, 1.0, 0.18) }
             }
 
             // Animate the panel to a new frame (carried as an NSValue, since
@@ -218,7 +215,7 @@ mod imp {
             #[unsafe(method(yutaniFadeOut))]
             fn yutani_fade_out(&self) {
                 unsafe {
-                    animate_alpha(self, 0.0, 0.16);
+                    glass::animate_alpha(self, 0.0, 0.16);
                     // Order out once the fade finishes.
                     let _: () = msg_send![
                         self,
@@ -595,16 +592,10 @@ mod imp {
                 backing: 2usize, // NSBackingStoreBuffered
                 defer: false,
             ];
-            let _: () = msg_send![&*panel, setReleasedWhenClosed: false];
-            let _: () = msg_send![&*panel, setOpaque: false];
-            // Force programmatic key activation rather than wait for a click.
-            let _: () = msg_send![&*panel, setBecomesKeyOnlyIfNeeded: false];
+            // Borderless, transparent, key-on-demand, floating, no system shadow
+            // (we render our own deeper rounded shadow into the window gutter).
+            glass::configure_panel(&*panel);
             let clear = NSColor::clearColor();
-            let _: () = msg_send![&*panel, setBackgroundColor: &*clear];
-            // No system shadow: we render our own deeper, rounded shadow into the
-            // window's transparent gutter (see shadow_view).
-            let _: () = msg_send![&*panel, setHasShadow: false];
-            let _: () = msg_send![&*panel, setLevel: 3isize]; // NSFloatingWindowLevel
 
             // The glass's content view is card-local (origin 0); the field and
             // results list are positioned within it. Clip it to the rounded card
@@ -715,30 +706,16 @@ mod imp {
             *controller.ivars().table.borrow_mut() = Some(table.clone());
 
             // The glass card, positioned within the window's shadow gutter.
-            let glass = make_glass(card_rect(), &container);
+            let glass = glass::make_glass(card_rect(), &container, CORNER_RADIUS);
             // Fixed margins, sizable — resizes with the window, staying inset.
             let _: () = msg_send![&*glass, setAutoresizingMask: 18usize];
-
             // The glass casts its own shadow — nothing opaque sits behind it, so
-            // it still refracts the terminal (the liquid-glass effect). Strength
-            // is the shadow color's alpha.
-            let shadow_color: Retained<NSColor> = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 0.0f64, green: 0.0f64, blue: 0.0f64, alpha: 0.8f64,
-            ];
-            let ns_shadow: Retained<NSShadow> = msg_send![class!(NSShadow), new];
-            let _: () = msg_send![&*ns_shadow, setShadowColor: &*shadow_color];
-            let _: () = msg_send![&*ns_shadow, setShadowOffset: NSSize::new(0.0, -10.0)];
-            let _: () = msg_send![&*ns_shadow, setShadowBlurRadius: 20.0f64];
-            let _: () = msg_send![&*glass, setShadow: Some(&*ns_shadow)];
+            // it still refracts the terminal (the liquid-glass effect).
+            glass::apply_drop_shadow(&glass);
 
-            // Wrapper fills the whole window (the card is inset by the shadow
-            // gutter). Layer-backed so the glass's shadow composites.
-            let wrapper: Retained<NSView> =
-                msg_send![mtm.alloc::<NSView>(), initWithFrame: content];
-            let _: () = msg_send![&*wrapper, setWantsLayer: true];
-            wrapper.addSubview(&glass);
-            let _: () = msg_send![&*panel, setContentView: &*wrapper];
+            // Wrapper fills the whole window (card inset by the shadow gutter),
+            // layer-backed so the glass's shadow composites.
+            glass::set_glass_content_view(&*panel, &glass, content, mtm);
             // Focus the search field as soon as the panel becomes key.
             let _: () = msg_send![&*panel, setInitialFirstResponder: &*field];
             // Observe resign-key so a click outside / app switch closes it.
@@ -764,36 +741,6 @@ mod imp {
             .iter()
             .map(|c| c.title.to_string())
             .collect()
-    }
-
-    /// Create the glass backing view embedding `content`. Prefers the real
-    /// Liquid Glass material; falls back to a rounded vibrancy view.
-    unsafe fn make_glass(frame: NSRect, content: &NSView) -> Retained<NSView> {
-        if let Some(cls) = AnyClass::get(c"NSGlassEffectView") {
-            let v: *mut AnyObject = msg_send![cls, alloc];
-            let v: *mut AnyObject = msg_send![v, initWithFrame: frame];
-            let _: () = msg_send![v, setCornerRadius: CORNER_RADIUS];
-            let _: () = msg_send![v, setContentView: content];
-            // NB: do *not* clip the layer to bounds — masksToBounds would clip the
-            // glass's own drop shadow. The glass renders rounded from
-            // setCornerRadius alone.
-            return Retained::from_raw(v as *mut NSView).expect("glass view");
-        }
-        let cls = class!(NSVisualEffectView);
-        let v: *mut AnyObject = msg_send![cls, alloc];
-        let v: *mut AnyObject = msg_send![v, initWithFrame: frame];
-        let _: () = msg_send![v, setMaterial: 18isize]; // HUDWindow
-        let _: () = msg_send![v, setBlendingMode: 0isize]; // BehindWindow
-        let _: () = msg_send![v, setState: 1isize]; // Active
-        let _: () = msg_send![v, setWantsLayer: true];
-        let layer: *mut AnyObject = msg_send![v, layer];
-        if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: CORNER_RADIUS];
-            let _: () = msg_send![layer, setMasksToBounds: true];
-        }
-        let glass = Retained::from_raw(v as *mut NSView).expect("visual effect view");
-        glass.addSubview(content);
-        glass
     }
 
     /// Install a 4-stop vertical gradient mask on the scroll view. The two end
@@ -841,30 +788,6 @@ mod imp {
         let _: () = msg_send![colors, addObject: opaque];
         let _: () = msg_send![colors, addObject: bottom];
         colors
-    }
-
-    /// Animate a window's alpha to `to` over `duration` seconds (via the
-    /// animator proxy + an NSAnimationContext group). The window must already be
-    /// on screen; the animator drives `alphaValue` over the run loop.
-    unsafe fn animate_alpha(panel: &PalettePanel, to: f64, duration: f64) {
-        let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-        let ctx: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-        let _: () = msg_send![ctx, setDuration: duration];
-        let anim: *mut AnyObject = msg_send![panel, animator];
-        let _: () = msg_send![anim, setAlphaValue: to];
-        let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-    }
-
-    /// Read the parent terminal window's `NSWindow*` via its raw handle.
-    fn parent_nswindow(window: &Window) -> Option<*mut AnyObject> {
-        let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
-            return None;
-        };
-        unsafe {
-            let ns_view = handle.ns_view as *mut AnyObject;
-            let ns_window: *mut AnyObject = msg_send![ns_view, window];
-            (!ns_window.is_null()).then_some(ns_window)
-        }
     }
 
     impl GlassPalette {
@@ -931,40 +854,23 @@ mod imp {
         /// Match the panel's appearance (and thus its glass + label colors) to
         /// the terminal's light/dark theme, so text stays legible on the glass.
         pub fn set_appearance(&self, dark: bool) {
-            unsafe {
-                let name = NSString::from_str(if dark {
-                    "NSAppearanceNameDarkAqua"
-                } else {
-                    "NSAppearanceNameAqua"
-                });
-                let appearance: *mut AnyObject =
-                    msg_send![class!(NSAppearance), appearanceNamed: &*name];
-                let _: () = msg_send![&*self.panel, setAppearance: appearance];
-            }
+            unsafe { glass::set_panel_appearance(&*self.panel, dark) }
         }
 
         /// Centre the card near the top of the parent window's frame. The window
         /// is bigger than the card by SHADOW_MARGIN all around, so its origin is
         /// the card's desired origin shifted by the gutter.
         fn place(&self, parent_ns: *mut AnyObject) {
+            let card = NSSize::new(PANEL_WIDTH, card_height());
             unsafe {
-                let pf: NSRect = msg_send![parent_ns, frame];
-                let card_x = pf.origin.x + (pf.size.width - PANEL_WIDTH) / 2.0;
-                // Screen coords are y-up: subtract from the top edge.
-                let card_y = pf.origin.y + pf.size.height - card_height() - TOP_INSET;
-                let win = window_size();
-                let frame = NSRect::new(
-                    NSPoint::new(card_x - SHADOW_MARGIN, card_y - SHADOW_MARGIN),
-                    win,
-                );
-                let _: () = msg_send![&*self.panel, setFrame: frame, display: true];
+                glass::place_card(&*self.panel, parent_ns, card, window_size(), TOP_INSET, SHADOW_MARGIN);
             }
         }
 
         /// Position over `parent` (centered, near the top), attach as a child
         /// window, show it, and focus the search field on the command list.
         pub fn show(&mut self, parent: &Window) {
-            let Some(parent_ns) = parent_nswindow(parent) else {
+            let Some(parent_ns) = glass::parent_nswindow(parent) else {
                 return;
             };
             self.enter_commands();
@@ -1003,21 +909,9 @@ mod imp {
             if !self.visible {
                 return;
             }
-            unsafe {
-                // Detach now (the window stays visible, independent, during the
-                // fade); a re-show re-attaches it as a child.
-                let parent: *mut AnyObject = msg_send![&*self.panel, parentWindow];
-                if !parent.is_null() {
-                    let _: () = msg_send![parent, removeChildWindow: &*self.panel];
-                }
-                // Defer the fade so it isn't committed inside a run-loop callback.
-                let _: () = msg_send![
-                    &*self.panel,
-                    performSelector: sel!(yutaniFadeOut),
-                    withObject: std::ptr::null_mut::<AnyObject>(),
-                    afterDelay: 0.0f64,
-                ];
-            }
+            // Detach now (the window stays visible, independent, during the
+            // fade); a re-show re-attaches it as a child.
+            unsafe { glass::detach_and_fade_out(&*self.panel) }
             self.visible = false;
         }
     }

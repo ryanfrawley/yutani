@@ -2,6 +2,7 @@ mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
+mod glass;
 mod glass_find;
 mod glass_palette;
 mod search;

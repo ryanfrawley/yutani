@@ -32,20 +32,20 @@ mod imp {
 #[cfg(target_os = "macos")]
 mod imp {
     use std::cell::RefCell;
-    use std::sync::Mutex;
 
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject, NSObjectProtocol, ProtocolObject, Sel};
+    use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
     use objc2::{
         class, define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly,
     };
     use objc2_app_kit::{
-        NSColor, NSControl, NSControlTextEditingDelegate, NSFont, NSPanel, NSShadow, NSTextField,
+        NSColor, NSControl, NSControlTextEditingDelegate, NSFont, NSPanel, NSTextField,
         NSTextFieldDelegate, NSView, NSWindowDelegate,
     };
     use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString};
-    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
     use winit::window::Window;
+
+    use crate::glass::{self, SignalSlot};
 
     /// What the user did in the find bar, drained by the event loop.
     pub enum FindSignal {
@@ -58,16 +58,14 @@ mod imp {
         Close,
     }
 
-    static FIND_SIGNAL: Mutex<Option<FindSignal>> = Mutex::new(None);
+    static FIND_SIGNAL: SignalSlot<FindSignal> = SignalSlot::new();
 
     fn post(sig: FindSignal) {
-        if let Ok(mut slot) = FIND_SIGNAL.lock() {
-            *slot = Some(sig);
-        }
+        FIND_SIGNAL.post(sig);
     }
 
     pub fn take_find_signal() -> Option<FindSignal> {
-        FIND_SIGNAL.lock().ok().and_then(|mut slot| slot.take())
+        FIND_SIGNAL.take()
     }
 
     // Geometry (points). A single compact row: field on the left, counter on
@@ -135,13 +133,13 @@ mod imp {
 
             #[unsafe(method(yutaniFadeIn))]
             fn yutani_fade_in(&self) {
-                unsafe { animate_alpha(self, 1.0, 0.16) }
+                unsafe { glass::animate_alpha(self, 1.0, 0.16) }
             }
 
             #[unsafe(method(yutaniFadeOut))]
             fn yutani_fade_out(&self) {
                 unsafe {
-                    animate_alpha(self, 0.0, 0.14);
+                    glass::animate_alpha(self, 0.0, 0.14);
                     let _: () = msg_send![
                         self,
                         performSelector: sel!(orderOut:),
@@ -255,13 +253,7 @@ mod imp {
                 backing: 2usize,
                 defer: false,
             ];
-            let _: () = msg_send![&*panel, setReleasedWhenClosed: false];
-            let _: () = msg_send![&*panel, setOpaque: false];
-            let _: () = msg_send![&*panel, setBecomesKeyOnlyIfNeeded: false];
-            let _: () = msg_send![&*panel, setHasShadow: false];
-            let clear = NSColor::clearColor();
-            let _: () = msg_send![&*panel, setBackgroundColor: &*clear];
-            let _: () = msg_send![&*panel, setLevel: 3isize];
+            glass::configure_panel(&*panel);
 
             let container: Retained<NSView> =
                 msg_send![mtm.alloc::<NSView>(), initWithFrame: card_bounds()];
@@ -303,23 +295,11 @@ mod imp {
 
             *controller.ivars().field.borrow_mut() = Some(field.clone());
 
-            let glass = make_glass(card_rect(), &container);
+            let glass = glass::make_glass(card_rect(), &container, CORNER_RADIUS);
             // The glass casts its own shadow (nothing opaque behind it).
-            let shadow_color: Retained<NSColor> = msg_send![
-                class!(NSColor),
-                colorWithSRGBRed: 0.0f64, green: 0.0f64, blue: 0.0f64, alpha: 0.8f64,
-            ];
-            let ns_shadow: Retained<NSShadow> = msg_send![class!(NSShadow), new];
-            let _: () = msg_send![&*ns_shadow, setShadowColor: &*shadow_color];
-            let _: () = msg_send![&*ns_shadow, setShadowOffset: NSSize::new(0.0, -10.0)];
-            let _: () = msg_send![&*ns_shadow, setShadowBlurRadius: 20.0f64];
-            let _: () = msg_send![&*glass, setShadow: Some(&*ns_shadow)];
+            glass::apply_drop_shadow(&glass);
 
-            let wrapper: Retained<NSView> =
-                msg_send![mtm.alloc::<NSView>(), initWithFrame: content];
-            let _: () = msg_send![&*wrapper, setWantsLayer: true];
-            wrapper.addSubview(&glass);
-            let _: () = msg_send![&*panel, setContentView: &*wrapper];
+            glass::set_glass_content_view(&*panel, &glass, content, mtm);
             let _: () = msg_send![&*panel, setInitialFirstResponder: &*field];
             panel.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
 
@@ -331,52 +311,6 @@ mod imp {
                 controller,
                 visible: false,
             })
-        }
-    }
-
-    /// Glass backing view (Liquid Glass on macOS 26+, vibrancy fallback).
-    unsafe fn make_glass(frame: NSRect, content: &NSView) -> Retained<NSView> {
-        if let Some(cls) = AnyClass::get(c"NSGlassEffectView") {
-            let v: *mut AnyObject = msg_send![cls, alloc];
-            let v: *mut AnyObject = msg_send![v, initWithFrame: frame];
-            let _: () = msg_send![v, setCornerRadius: CORNER_RADIUS];
-            let _: () = msg_send![v, setContentView: content];
-            return Retained::from_raw(v as *mut NSView).expect("glass view");
-        }
-        let cls = class!(NSVisualEffectView);
-        let v: *mut AnyObject = msg_send![cls, alloc];
-        let v: *mut AnyObject = msg_send![v, initWithFrame: frame];
-        let _: () = msg_send![v, setMaterial: 18isize];
-        let _: () = msg_send![v, setBlendingMode: 0isize];
-        let _: () = msg_send![v, setState: 1isize];
-        let _: () = msg_send![v, setWantsLayer: true];
-        let layer: *mut AnyObject = msg_send![v, layer];
-        if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: CORNER_RADIUS];
-            let _: () = msg_send![layer, setMasksToBounds: true];
-        }
-        let glass = Retained::from_raw(v as *mut NSView).expect("visual effect view");
-        glass.addSubview(content);
-        glass
-    }
-
-    unsafe fn animate_alpha(panel: &FindPanel, to: f64, duration: f64) {
-        let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-        let ctx: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-        let _: () = msg_send![ctx, setDuration: duration];
-        let anim: *mut AnyObject = msg_send![panel, animator];
-        let _: () = msg_send![anim, setAlphaValue: to];
-        let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-    }
-
-    fn parent_nswindow(window: &Window) -> Option<*mut AnyObject> {
-        let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
-            return None;
-        };
-        unsafe {
-            let ns_view = handle.ns_view as *mut AnyObject;
-            let ns_window: *mut AnyObject = msg_send![ns_view, window];
-            (!ns_window.is_null()).then_some(ns_window)
         }
     }
 
@@ -394,34 +328,18 @@ mod imp {
         }
 
         pub fn set_appearance(&self, dark: bool) {
-            unsafe {
-                let name = NSString::from_str(if dark {
-                    "NSAppearanceNameDarkAqua"
-                } else {
-                    "NSAppearanceNameAqua"
-                });
-                let appearance: *mut AnyObject =
-                    msg_send![class!(NSAppearance), appearanceNamed: &*name];
-                let _: () = msg_send![&*self.panel, setAppearance: appearance];
-            }
+            unsafe { glass::set_panel_appearance(&*self.panel, dark) }
         }
 
         fn place(&self, parent_ns: *mut AnyObject) {
+            let card = NSSize::new(CARD_WIDTH, card_height());
             unsafe {
-                let pf: NSRect = msg_send![parent_ns, frame];
-                let card_x = pf.origin.x + (pf.size.width - CARD_WIDTH) / 2.0;
-                let card_y = pf.origin.y + pf.size.height - card_height() - TOP_INSET;
-                let win = window_size();
-                let frame = NSRect::new(
-                    NSPoint::new(card_x - SHADOW_MARGIN, card_y - SHADOW_MARGIN),
-                    win,
-                );
-                let _: () = msg_send![&*self.panel, setFrame: frame, display: true];
+                glass::place_card(&*self.panel, parent_ns, card, window_size(), TOP_INSET, SHADOW_MARGIN);
             }
         }
 
         pub fn show(&mut self, parent: &Window) {
-            let Some(parent_ns) = parent_nswindow(parent) else {
+            let Some(parent_ns) = glass::parent_nswindow(parent) else {
                 return;
             };
             unsafe {
@@ -452,18 +370,7 @@ mod imp {
             if !self.visible {
                 return;
             }
-            unsafe {
-                let parent: *mut AnyObject = msg_send![&*self.panel, parentWindow];
-                if !parent.is_null() {
-                    let _: () = msg_send![parent, removeChildWindow: &*self.panel];
-                }
-                let _: () = msg_send![
-                    &*self.panel,
-                    performSelector: sel!(yutaniFadeOut),
-                    withObject: std::ptr::null_mut::<AnyObject>(),
-                    afterDelay: 0.0f64,
-                ];
-            }
+            unsafe { glass::detach_and_fade_out(&*self.panel) }
             self.visible = false;
         }
     }
