@@ -401,13 +401,15 @@ impl WindowState {
     ) {
         use command_palette::PaletteAction as A;
         match action {
-            // Route through the OSC-0/2 path so the existing title plumbing
-            // (take_title_update -> effective_title) applies uniformly; the
-            // event loop picks the change up after this returns.
+            // Route through set_manual_title so the title is pinned: it shares
+            // the same dirty/take_title_update -> effective_title plumbing the
+            // event loop polls after this returns, but also locks out the
+            // shell's OSC 0/2 requests until the title is cleared. Clearing
+            // (empty arg) unlocks and falls back to the cwd-derived title.
             A::SetTitle => self.active_tab_mut()
                 .terminal
-                .set_window_title(arg.as_deref().unwrap_or("")),
-            A::ClearTitle => self.active_tab_mut().terminal.set_window_title(""),
+                .set_manual_title(arg.as_deref().unwrap_or("")),
+            A::ClearTitle => self.active_tab_mut().terminal.set_manual_title(""),
             A::ReloadConfig => self.reload_config(),
             // The picker hands back a label; map it to a scheme slot value
             // ("Default (built-in)" / empty -> None, revert to built-in).
