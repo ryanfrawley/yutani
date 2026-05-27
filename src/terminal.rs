@@ -894,6 +894,11 @@ pub struct Terminal {
     // the front end pulls changes via `take_title_update()` after each feed.
     title: Option<String>,
     title_dirty: bool,
+    // When the user pins a title via the command palette, this locks out the
+    // shell: subsequent OSC 0/2 title requests are ignored until the title is
+    // cleared from the palette, which unlocks it. Programmatic OSC titles never
+    // set this — only `set_manual_title` does.
+    title_locked: bool,
     parser: ansi::Parser,
     scrollback: VecDeque<Vec<Cell>>,
     scrollback_limit: usize,
@@ -1164,6 +1169,7 @@ impl Terminal {
             cwd_dirty: false,
             title: None,
             title_dirty: false,
+            title_locked: false,
             parser: ansi::Parser::new(),
             scrollback: VecDeque::new(),
             scrollback_limit,
@@ -2971,15 +2977,32 @@ impl Terminal {
         self.cwd.as_deref()
     }
 
-    /// Record (or clear) the manually-set window title from OSC 0/2. An empty
-    /// payload clears it so the front end falls back to the cwd-derived title.
-    /// Re-setting the same title doesn't mark it dirty, so a program that
-    /// re-emits its title every prompt is free for the front end.
+    /// Record (or clear) the window title from OSC 0/2. An empty payload clears
+    /// it so the front end falls back to the cwd-derived title. Re-setting the
+    /// same title doesn't mark it dirty, so a program that re-emits its title
+    /// every prompt is free for the front end.
     ///
-    /// Also called by the command palette's "Set title" action, so a manual
-    /// title set from the palette flows through exactly the same path as one a
-    /// program emits via OSC 0/2.
+    /// Ignored entirely while the title is locked by `set_manual_title`: once
+    /// the user pins a title from the command palette, the shell can't move it.
     pub fn set_window_title(&mut self, title: &str) {
+        if self.title_locked {
+            return;
+        }
+        self.apply_window_title(title);
+    }
+
+    /// Set the window title from the command palette's "Set title" action. A
+    /// non-empty title *locks* it, so subsequent OSC 0/2 requests from the
+    /// shell are ignored. An empty title clears the override and unlocks, so
+    /// the shell (and cwd fallback) take over again.
+    pub fn set_manual_title(&mut self, title: &str) {
+        self.title_locked = !title.is_empty();
+        self.apply_window_title(title);
+    }
+
+    /// Shared core of the OSC and palette title paths: stores the title and
+    /// marks it dirty when it actually changed.
+    fn apply_window_title(&mut self, title: &str) {
         let new = if title.is_empty() {
             None
         } else {
@@ -6999,6 +7022,54 @@ mod tests {
         assert_eq!(t.take_title_update(), Some(Some("same".to_string())));
         // Re-emitting the identical title doesn't re-flag dirty.
         t.feed("\x1b]2;same\x07");
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn manual_title_locks_out_osc() {
+        let mut t = Terminal::new(5, 3, 100);
+        // Pin a title via the palette path.
+        t.set_manual_title("pinned");
+        assert_eq!(t.title(), Some("pinned"));
+        assert_eq!(t.take_title_update(), Some(Some("pinned".to_string())));
+        // The shell now tries to set the title via OSC 0/2 — both ignored.
+        t.feed("\x1b]2;from shell\x07");
+        t.feed("\x1b]0;from shell\x07");
+        assert_eq!(t.title(), Some("pinned"));
+        assert_eq!(t.take_title_update(), None);
+        // Even an empty OSC clear is ignored while locked.
+        t.feed("\x1b]2;\x07");
+        assert_eq!(t.title(), Some("pinned"));
+        assert_eq!(t.take_title_update(), None);
+    }
+
+    #[test]
+    fn clearing_manual_title_unlocks_osc() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.set_manual_title("pinned");
+        assert_eq!(t.take_title_update(), Some(Some("pinned".to_string())));
+        // Clearing from the palette (empty) drops the override and unlocks.
+        t.set_manual_title("");
+        assert_eq!(t.title(), None);
+        assert_eq!(t.take_title_update(), Some(None));
+        // The shell can drive the title again.
+        t.feed("\x1b]2;shell again\x07");
+        assert_eq!(t.title(), Some("shell again"));
+        assert_eq!(t.take_title_update(), Some(Some("shell again".to_string())));
+    }
+
+    #[test]
+    fn manual_title_overrides_prior_osc_title() {
+        let mut t = Terminal::new(5, 3, 100);
+        // Shell sets a title first; then the user pins their own over it.
+        t.feed("\x1b]2;shell\x07");
+        assert_eq!(t.take_title_update(), Some(Some("shell".to_string())));
+        t.set_manual_title("pinned");
+        assert_eq!(t.title(), Some("pinned"));
+        assert_eq!(t.take_title_update(), Some(Some("pinned".to_string())));
+        // Subsequent shell requests stay locked out.
+        t.feed("\x1b]2;shell again\x07");
+        assert_eq!(t.title(), Some("pinned"));
         assert_eq!(t.take_title_update(), None);
     }
 
