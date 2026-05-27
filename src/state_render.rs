@@ -647,17 +647,24 @@ impl WindowState {
             tab.row_cache.clear();
             tab.row_cache_key = Some(rows_key);
         }
+        // The row cache is keyed by a *stable* per-line id: abs-line folded
+        // with the lifetime scrollback eviction count. Plain abs-line shifts
+        // down by one each time scrollback evicts its front (it pins at the
+        // limit once full), which would alias a cached row onto a different
+        // line and reuse stale geometry — visible as a frozen upper screen
+        // under heavy output. Selection coords below are in the unfolded abs
+        // space, so they add `evicted` to reach the same key.
+        let evicted = self.active_tab().terminal.scrollback_evicted() as isize;
         // A `selection_fg` scheme recolors glyphs inside the selection, so a
         // range change makes the cached lines it entered/left stale. (The
         // translucent selection background is a separate dynamic overlay below
         // and needs no invalidation.) With no `selection_fg`, selection never
-        // touches cell colors — skip entirely. The cache is keyed by absolute
-        // line, which is exactly the selection's coordinate space.
+        // touches cell colors — skip entirely.
         if selection_fg.is_some() && self.active_tab().prev_selection_range != selection_range {
             for rng in [self.active_tab().prev_selection_range, selection_range] {
                 if let Some((s, e)) = rng {
                     for abs_line in s.0..=e.0 {
-                        self.tabs[self.active].row_cache.remove(&abs_line);
+                        self.tabs[self.active].row_cache.remove(&(evicted + abs_line));
                     }
                 }
             }
@@ -686,10 +693,10 @@ impl WindowState {
         // (animation / late decode) with no cell write, so always re-emit them.
         let forced_rows: std::collections::HashSet<isize> =
             halfblock_overrides.keys().map(|(r, _c)| *r).collect();
-        // Visual row `r` shows absolute line `top_abs + r` (the mapping is
-        // linear). The cache is keyed by that abs line so a line scrolling into
-        // scrollback keeps its entry.
-        let top_abs = self.active_tab().terminal.visual_to_abs_line(0);
+        // Visual row `r` shows the line with stable id `top_abs + r` (the
+        // mapping is linear); `evicted` (above) folds the eviction count into
+        // the abs line so the key survives scrollback eviction.
+        let top_abs = evicted + self.active_tab().terminal.visual_to_abs_line(0);
 
         // Build per-layer cell geometry; indices are regenerated at assembly.
         let mut bg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
