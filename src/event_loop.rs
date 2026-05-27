@@ -272,7 +272,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, n: app_window::CustomEvent) {
         match n {
-            app_window::CustomEvent::PtyInput(ev_tab, z) => {
+            app_window::CustomEvent::PtyInput(ev_tab) => {
                 // Resolve the tab's window. A just-closed tab can still
                 // deliver one last event — treat an unknown id as a no-op.
                 let Some(state) = self
@@ -282,6 +282,19 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 else {
                     return;
                 };
+                // Drain a bounded slice of this tab's buffered output. The
+                // reader coalesces a burst of reads into one wake, so one
+                // `PtyInput` can stand for tens of MB; capping the feed per
+                // turn (and self-waking for the rest, below) keeps the loop
+                // free to repaint and service clicks/keystrokes mid-flood
+                // instead of blocking for the whole burst. (Each window owns
+                // exactly one tab, so `active_tab` is `ev_tab`'s tab.)
+                let (z, more) = state.active_tab().pty_outbox.drain_up_to(PTY_FEED_CAP);
+                if z.is_empty() {
+                    // A duplicate/stale wake whose bytes a prior drain already
+                    // took — nothing to do.
+                    return;
+                }
                 let bytes = z.len();
                 let t0 = std::time::Instant::now();
                 state.feed_terminal(&z);
@@ -340,6 +353,13 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 // New / removed cells may have changed which URL (if any)
                 // sits under the pointer.
                 state.update_hover_url();
+                // More was buffered than we fed this turn: post a fresh wake so
+                // the loop renders this slice and handles input before coming
+                // back for the rest. (`state`'s borrow ends above, freeing
+                // `self.proxy`.)
+                if more {
+                    let _ = self.proxy.send_event(app_window::CustomEvent::PtyInput(ev_tab));
+                }
             }
             app_window::CustomEvent::PtyExit(ev_tab, code) => {
                 let Some(&wid) = self.tab_to_window.get(&ev_tab) else { return };

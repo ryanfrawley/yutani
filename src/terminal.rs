@@ -897,6 +897,13 @@ pub struct Terminal {
     parser: ansi::Parser,
     scrollback: VecDeque<Vec<Cell>>,
     scrollback_limit: usize,
+    // Total lines evicted from the *front* of scrollback over the terminal's
+    // life. `scrollback.len()` pins at `scrollback_limit` once full, so the
+    // abs-line space (`scrollback.len() - view_offset + r`) shifts down by one
+    // per eviction. This monotonic count lets the renderer form a *stable*
+    // per-line id (`scrollback_evicted + abs_line`) for its row-vertex cache,
+    // so a cached row can't be reused for a different line after eviction.
+    scrollback_evicted: u64,
     // Scrollback viewport offset: number of history lines currently shifted
     // into view at the top of the viewport. 0 == showing the live grid.
     view_offset: usize,
@@ -1160,6 +1167,7 @@ impl Terminal {
             parser: ansi::Parser::new(),
             scrollback: VecDeque::new(),
             scrollback_limit,
+            scrollback_evicted: 0,
             view_offset: 0,
             scrollback_placements: VecDeque::new(),
             semantic_marks: Vec::new(),
@@ -1815,6 +1823,14 @@ impl Terminal {
         self.scrollback.len() as isize - self.view_offset as isize + visual_row
     }
 
+    /// Lines evicted from the front of scrollback so far. Added to an abs-line
+    /// index, it yields an id that's stable for the life of a line — abs-line
+    /// alone shifts down by one each eviction once scrollback is full, so it
+    /// can't safely key a cross-frame cache. See the renderer's row cache.
+    pub fn scrollback_evicted(&self) -> u64 {
+        self.scrollback_evicted
+    }
+
     /// Borrow a row's cells by absolute-line index. Returns `None` for indices
     /// outside the buffer (scrolled-off rows, or below the live grid).
     pub fn line_at(&self, abs_line: isize) -> Option<&[Cell]> {
@@ -1975,6 +1991,7 @@ impl Terminal {
                 let line = self.primary.row(r).to_vec();
                 if self.scrollback.len() == self.scrollback_limit {
                     self.scrollback.pop_front();
+                    self.scrollback_evicted += 1;
                     self.evict_scrollback_placement_front();
                     self.evict_scrollback_mark_front();
                 }
@@ -2425,6 +2442,7 @@ impl Terminal {
                 let line = self.primary.row(self.scroll_top).to_vec();
                 if self.scrollback.len() == self.scrollback_limit {
                     self.scrollback.pop_front();
+                    self.scrollback_evicted += 1;
                     self.evict_scrollback_placement_front();
                     self.evict_scrollback_mark_front();
                 }
@@ -7385,6 +7403,49 @@ mod tests {
         assert_eq!(t.view_offset(), 3);
         assert_eq!(t.visible_cell(0, 0).ch, 'C');
         assert_eq!(t.visible_cell(1, 0).ch, 'D');
+    }
+
+    #[test]
+    fn scrollback_evicted_counts_front_evictions() {
+        // 2-row grid, scrollback limit 2. The grid holds 2 lines before any
+        // spill, so it takes 4 fed lines to fill scrollback to the limit.
+        let mut t = Terminal::new(5, 2, 2);
+        assert_eq!(t.scrollback_evicted(), 0);
+        t.feed("AAAAA\r\nBBBBB\r\nCCCCC\r\n"); // sb=[AAAAA, BBBBB], grid=[CCCCC,_]
+        assert_eq!(t.scrollback_len(), 2);
+        assert_eq!(t.scrollback_evicted(), 0, "filling to the limit evicts nothing");
+        t.feed("DDDDD\r\n"); // spill CCCCC → evict AAAAA
+        assert_eq!(t.scrollback_evicted(), 1);
+        t.feed("EEEEE\r\nFFFFF\r\n"); // spill DDDDD, EEEEE → evict BBBBB, CCCCC
+        assert_eq!(t.scrollback_evicted(), 3);
+        assert_eq!(t.scrollback_len(), 2, "len pins at the limit");
+    }
+
+    #[test]
+    fn stable_abs_line_is_monotonic_across_eviction() {
+        // The renderer keys its row cache by `scrollback_evicted + abs_line`.
+        // Plain abs-line (`scrollback_len - view_offset + r`) pins once
+        // scrollback is full, so it would alias distinct lines onto one key;
+        // the folded id must keep advancing instead. This guards that invariant.
+        let mut t = Terminal::new(5, 2, 3);
+        let stable_top = |t: &Terminal| t.scrollback_evicted() as isize + t.visual_to_abs_line(0);
+        let mut prev = stable_top(&t);
+        let mut saw_eviction = false;
+        for line in ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE", "FFFFF", "GGGGG"] {
+            t.feed(line);
+            t.feed("\r\n");
+            let now = stable_top(&t);
+            assert!(now >= prev, "stable top-line id must never go backwards");
+            if t.scrollback_evicted() > 0 {
+                saw_eviction = true;
+                // Once full, plain abs-line is pinned at the limit…
+                assert_eq!(t.visual_to_abs_line(0), t.scrollback_len() as isize);
+                // …yet the folded id keeps climbing as content streams.
+                assert!(now > prev, "folded id must advance even after eviction");
+            }
+            prev = now;
+        }
+        assert!(saw_eviction, "test should exercise the eviction path");
     }
 
     #[test]
