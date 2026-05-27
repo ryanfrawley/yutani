@@ -13,10 +13,8 @@ Decisions locked in with the user:
 - **Install mode:** check in the background, *notify and require confirmation*
   before downloading/swapping (no silent auto-install).
 - **Update source:** abstract behind one `update_feed_url` config knob so the
-  concrete host (Forgejo Releases API vs. a plain static URL) can be chosen
-  during implementation. Caveat to resolve then: `git.frawley.co` HTTPS needs a
-  keychain client cert per `CLAUDE.md` — if that also gates release downloads,
-  use a cert-free static URL for the feed.
+  concrete host (a releases API vs. a plain static URL) can be chosen during
+  implementation. Prefer a feed URL that needs no special client credentials.
 - **Code signing:** add `codesign` + `notarytool` steps to the bundle/release
   flow as part of this work; the updater verifies the downloaded build's
   signature before swapping.
@@ -66,8 +64,7 @@ A small JSON document at `update_feed_url`:
   `--version` CLI flag in `main()` (`src/main.rs:8700`, alongside the existing
   `--onboard` branch) so the running version is inspectable.
 - Add to `Cargo.toml` `[dependencies]`: `ureq` (blocking HTTP; pick TLS backend
-  during impl — `rustls` if the feed is cert-free, `native-tls` if the keychain
-  client cert is needed) and `serde` + `serde_json` for manifest parsing.
+  during impl, e.g. `rustls` or `native-tls`) and `serde` + `serde_json` for manifest parsing.
 - New module `src/update.rs` holding: manifest fetch/parse, the `Version`
   comparator, the checker thread, and the installer thread. Keep all
   update logic out of the already-massive `main.rs`.
@@ -137,8 +134,7 @@ from `src/main.rs:101-152`.
   errors if unset (these are a release-time prerequisite, not a build-time one).
 - The release script then: tar+gzip the stapled `.app`, compute its SHA-256,
   emit the manifest JSON (§Manifest), and upload artifact + manifest to the
-  chosen host (Forgejo Releases API per `CLAUDE.md`'s `curl` recipe, or a static
-  path). Bump `Cargo.toml` version + git tag as part of release.
+  chosen host (a releases API or a static path). Bump `Cargo.toml` version + git tag as part of release.
 
 ## Files touched
 - `src/main.rs` — `VERSION` const, `--version` flag, 4 config sites, `WindowState`
