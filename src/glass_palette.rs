@@ -642,6 +642,11 @@ mod imp {
             let _: () = msg_send![&*table, setRowHeight: ROW_HEIGHT];
             let _: () = msg_send![&*table, setBackgroundColor: &*clear];
             let _: () = msg_send![&*table, setOpaque: false];
+            // No focus ring: the accent-blue ring AppKit draws around a focused
+            // table/scroll shimmers over the live glass (which re-blurs every
+            // frame as the terminal behind it animates), reading as a flickering
+            // blue line at the panel's top edge. Match the search field (None).
+            let _: () = msg_send![&*table, setFocusRingType: 1isize]; // None
             // No grid lines / alternating fills (they'd paint over the glass).
             let _: () = msg_send![&*table, setGridStyleMask: 0usize];
             let _: () = msg_send![&*table, setUsesAlternatingRowBackgroundColors: false];
@@ -660,6 +665,7 @@ mod imp {
             let _: () = msg_send![&*scroll, setDocumentView: &*table];
             let _: () = msg_send![&*scroll, setHasVerticalScroller: true];
             let _: () = msg_send![&*scroll, setDrawsBackground: false];
+            let _: () = msg_send![&*scroll, setFocusRingType: 1isize]; // None
             let clip: *mut AnyObject = msg_send![&*scroll, contentView];
             if !clip.is_null() {
                 let _: () = msg_send![clip, setDrawsBackground: false];
