@@ -37,7 +37,16 @@ started.
   down-and-right from its spawner. (This is separate windows, not in-window
   tabs/splits — see below.)
 - First-run onboarding wizard rendered in the PTY (color / theme / font /
-  autocomplete setup).
+  autocomplete / Touch-ID-for-sudo setup).
+- **Touch ID for `sudo`** (macOS) — opt-in, reversible. `sudo` authenticates
+  through PAM, so an `auth sufficient pam_tid.so` line in `/etc/pam.d/sudo_local`
+  makes the fingerprint a sufficient factor. Yutani offers to add it — via the
+  "Touch ID for sudo…" command-palette entry and a first-run onboarding step —
+  performing the root-owned edit with one admin authorization (`osascript … with
+  administrator privileges`, whose dialog itself supports Touch ID). State is
+  read from the world-readable PAM files with no privilege; the same command
+  turns it back off. Only ever edits `sudo_local` (the upgrade-safe location),
+  never `/etc/pam.d/sudo`. See `src/touchid.rs`.
 - Rendering: wgpu pipeline, glyph atlas, programming ligatures, procedural
   box-drawing, glow/bloom, CRT scanlines, blur.
 - Config: TOML config + color schemes, hot-reload (Cmd-Shift-R) of palette/glow.
@@ -108,6 +117,14 @@ this is low priority — listed for completeness.
     Yutani-managed `$__fish_config_dir`; needs a `yutani.fish` script.
   - Opt-out (`YUTANI_SHELL_INTEGRATION=0`) and manual sourcing already work for
     every shell today.
+
+- **Touch ID for `sudo` doesn't work inside tmux/screen.** The Touch-ID-for-sudo
+  feature relies on `pam_tid.so`, which needs a connection to the GUI login
+  session to draw its prompt. Terminal multiplexers run a server that detaches
+  from that session, so `sudo` inside tmux/screen silently falls back to a
+  password. The standard fix is the third-party `pam_reattach.so` placed *before*
+  `pam_tid.so` in `sudo_local`; Yutani doesn't install or manage it. Likewise it
+  never engages over SSH (no GUI session), which is correct behavior.
 
 *(Hyperlink support is complete — the OSC 8 `id=` co-highlighting follow-up has
 landed.)*
