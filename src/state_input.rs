@@ -993,6 +993,48 @@ impl WindowState {
                     // open, and only steer the popup while it is.
                     let popup_active =
                         !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
+                    // Ctrl+N / Ctrl+P mirror ArrowDown / ArrowUp while the popup
+                    // is open (emacs-style next/prev), so the hands can stay on
+                    // the home row. Handled before the encode_key path so the
+                    // control bytes don't reach the shell, but only while a
+                    // popup is genuinely active.
+                    if popup_active
+                        && self.modifiers.control_key()
+                        && !self.modifiers.alt_key()
+                        && !self.modifiers.super_key()
+                    {
+                        use winit::keyboard::Key;
+                        let len = self.active_tab().completions.len();
+                        if let Key::Character(s) = &event.logical_key {
+                            match s.as_str() {
+                                "n" => {
+                                    self.active_tab_mut().selected_completion =
+                                        completion::select_next(self.active_tab().selected_completion, len);
+                                    self.active_tab_mut().completion_scroll =
+                                        completion::visible_window_start(
+                                            self.active_tab().selected_completion,
+                                            self.active_tab().completion_scroll,
+                                            COMPLETION_MAX_VISIBLE,
+                                        );
+                                    self.invalidate();
+                                    return true;
+                                }
+                                "p" => {
+                                    self.active_tab_mut().selected_completion =
+                                        completion::select_prev(self.active_tab().selected_completion);
+                                    self.active_tab_mut().completion_scroll =
+                                        completion::visible_window_start(
+                                            self.active_tab().selected_completion,
+                                            self.active_tab().completion_scroll,
+                                            COMPLETION_MAX_VISIBLE,
+                                        );
+                                    self.invalidate();
+                                    return true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     let plain = !self.modifiers.control_key()
                         && !self.modifiers.alt_key()
                         && !self.modifiers.super_key();
@@ -1002,7 +1044,7 @@ impl WindowState {
                         match &event.logical_key {
                             Key::Named(NamedKey::ArrowDown) => {
                                 self.active_tab_mut().selected_completion =
-                                    (self.active_tab().selected_completion + 1).min(len - 1);
+                                    completion::select_next(self.active_tab().selected_completion, len);
                                 self.active_tab_mut().completion_scroll = completion::visible_window_start(
                                     self.active_tab().selected_completion,
                                     self.active_tab().completion_scroll,
@@ -1014,7 +1056,7 @@ impl WindowState {
                             // ArrowUp, and Shift-Tab, move the selection up.
                             Key::Named(NamedKey::ArrowUp) => {
                                 self.active_tab_mut().selected_completion =
-                                    self.active_tab().selected_completion.saturating_sub(1);
+                                    completion::select_prev(self.active_tab().selected_completion);
                                 self.active_tab_mut().completion_scroll = completion::visible_window_start(
                                     self.active_tab().selected_completion,
                                     self.active_tab().completion_scroll,
@@ -1025,7 +1067,7 @@ impl WindowState {
                             }
                             Key::Named(NamedKey::Tab) if self.modifiers.shift_key() => {
                                 self.active_tab_mut().selected_completion =
-                                    self.active_tab().selected_completion.saturating_sub(1);
+                                    completion::select_prev(self.active_tab().selected_completion);
                                 self.active_tab_mut().completion_scroll = completion::visible_window_start(
                                     self.active_tab().selected_completion,
                                     self.active_tab().completion_scroll,

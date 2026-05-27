@@ -509,6 +509,20 @@ pub fn accept_suffix<'a>(buffer: &str, cursor: usize, sug: &'a Suggestion) -> Op
     sug.text.strip_prefix(typed)
 }
 
+/// Move the popup selection to the next item, clamped at the last row. Used by
+/// both ArrowDown and Ctrl+N. `len` is the suggestion count; with an empty list
+/// (`len == 0`) the selection stays at 0 (the callers never invoke this with an
+/// empty popup, but the floor keeps the math panic-free regardless).
+pub fn select_next(selected: usize, len: usize) -> usize {
+    (selected + 1).min(len.saturating_sub(1))
+}
+
+/// Move the popup selection to the previous item, floored at the first row.
+/// Used by both ArrowUp / Shift-Tab and Ctrl+P.
+pub fn select_prev(selected: usize) -> usize {
+    selected.saturating_sub(1)
+}
+
 /// New scroll-window start so row `selected` stays within a `max_visible`-row
 /// viewport that currently starts at `current_start`. Scrolls just enough to
 /// bring `selected` into view (no centering).
@@ -952,6 +966,84 @@ mod tests {
     #[test]
     fn visible_window_zero_max_is_noop() {
         assert_eq!(visible_window_start(5, 2, 0), 2);
+    }
+
+    // ---- popup selection navigation (Ctrl+N/Ctrl+P, ArrowDown/ArrowUp,
+    // Shift-Tab) ----
+
+    #[test]
+    fn select_next_advances_within_list() {
+        // Mid-list: selection moves down by one (ArrowDown / Ctrl+N).
+        assert_eq!(select_next(0, 5), 1);
+        assert_eq!(select_next(2, 5), 3);
+    }
+
+    #[test]
+    fn select_next_clamps_at_last_row() {
+        // Already on the last item: stays put rather than running past the end.
+        assert_eq!(select_next(4, 5), 4);
+        // One step from the end still lands exactly on the last row.
+        assert_eq!(select_next(3, 5), 4);
+    }
+
+    #[test]
+    fn select_next_single_item_stays() {
+        // A one-entry popup has nowhere to advance to.
+        assert_eq!(select_next(0, 1), 0);
+    }
+
+    #[test]
+    fn select_next_empty_list_does_not_underflow() {
+        // Defensive: with len == 0, `len - 1` would underflow a usize; the
+        // saturating floor keeps it at 0 instead of panicking/wrapping. The
+        // event handler never calls this on an empty popup, but the helper
+        // must be panic-free regardless.
+        assert_eq!(select_next(0, 0), 0);
+    }
+
+    #[test]
+    fn select_prev_moves_up_within_list() {
+        // Mid-list: selection moves up by one (ArrowUp / Shift-Tab / Ctrl+P).
+        assert_eq!(select_prev(3), 2);
+        assert_eq!(select_prev(1), 0);
+    }
+
+    #[test]
+    fn select_prev_floors_at_first_row() {
+        // Already on the first item: stays at 0 (no wrap-around to the bottom).
+        assert_eq!(select_prev(0), 0);
+    }
+
+    #[test]
+    fn select_next_then_prev_round_trips() {
+        // Down then up returns to the original row in the interior of the list.
+        let len = 4;
+        let s = 1;
+        assert_eq!(select_prev(select_next(s, len)), s);
+    }
+
+    #[test]
+    fn select_navigation_pairs_with_scroll_window() {
+        // Integration of the two helpers used together at each keypress:
+        // stepping the selection down past the visible window also scrolls.
+        // max_visible = 3, list of 6, starting selected = 0, scroll = 0.
+        let max = 3;
+        let len = 6;
+        let mut sel = 0;
+        let mut scroll = 0;
+        // Three ArrowDowns/Ctrl+Ns: 0 -> 1 -> 2 -> 3. Row 3 falls below the
+        // [0,3) window, so the window scrolls down to start at 1.
+        for _ in 0..3 {
+            sel = select_next(sel, len);
+            scroll = visible_window_start(sel, scroll, max);
+        }
+        assert_eq!(sel, 3);
+        assert_eq!(scroll, 1);
+        // One ArrowUp/Ctrl+P: 3 -> 2. Row 2 is still within [1,4), no scroll.
+        sel = select_prev(sel);
+        scroll = visible_window_start(sel, scroll, max);
+        assert_eq!(sel, 2);
+        assert_eq!(scroll, 1);
     }
 
     // ---- command completion (slice K15) ----
