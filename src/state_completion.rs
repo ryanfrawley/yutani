@@ -52,6 +52,54 @@ impl WindowState {
         true
     }
 
+    /// Sync the native glass autocomplete popup (macOS) to the current
+    /// completion model + cursor anchor: show/position/refresh it below the
+    /// cursor, or hide it when there's nothing to show. Called after each render
+    /// (the anchor is captured there). No-op off macOS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_completion_popup(&mut self) {
+        // Also require focus: the popup is an independent floating panel, so
+        // hide it on app-switch rather than leave it over other apps.
+        let visible = self.config.autocomplete
+            && self.focused
+            && self.completion_anchor.is_some()
+            && !self.active_tab().completions.is_empty()
+            && self.active_tab().terminal.view_offset() == 0;
+        if !visible {
+            if let Some(gc) = self.glass_complete.as_mut() {
+                gc.hide();
+            }
+            return;
+        }
+        if self.glass_complete.is_none() {
+            self.glass_complete = glass_complete::new();
+        }
+        let Some((x_phys, top_phys, lh_phys)) = self.completion_anchor else {
+            return;
+        };
+        let scale = self.window.scale_factor();
+        let (x, row_top, row_h) = (
+            x_phys as f64 / scale,
+            top_phys as f64 / scale,
+            lh_phys as f64 / scale,
+        );
+        let len = self.active_tab().completions.len();
+        let start = self.active_tab().completion_scroll.min(len);
+        let end = (start + COMPLETION_MAX_VISIBLE).min(len);
+        let rows: Vec<String> = self.active_tab().completions[start..end]
+            .iter()
+            .map(|s| s.text.clone())
+            .collect();
+        let selected = self.active_tab().selected_completion.saturating_sub(start);
+        let dark = theme_for_bg(palette::get().background) == winit::window::Theme::Dark;
+        if let Some(gc) = self.glass_complete.as_mut() {
+            gc.update(&self.window, x, row_top, row_h, &rows, selected, dark);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn update_completion_popup(&mut self) {}
+
     /// Manually (re)open the completion popup for the current input — the
     /// Ctrl+Space command. Unlike the automatic path, this bypasses the
     /// `has_path_token` gate, so triggering on an empty token lists the whole

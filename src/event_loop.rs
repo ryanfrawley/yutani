@@ -481,6 +481,12 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         // without this its prompt stays stranded behind
                         // the freshly-shown bar.
                         state.reflow_for_tab_bar();
+                        // The native autocomplete popup is an independent
+                        // floating panel; hide it on focus loss (a render may
+                        // not follow to do it) so it doesn't sit over other apps.
+                        if !focused {
+                            state.update_completion_popup();
+                        }
                         state.invalidate();
                     }
                     WindowEvent::Occluded(occluded) => {
@@ -541,6 +547,9 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         let t0 = std::time::Instant::now();
                         let result = state.render(clear_color(state.theme));
                         let render_dur = t0.elapsed();
+                        // Sync the native autocomplete popup to the cursor
+                        // anchor captured during the render just completed.
+                        state.update_completion_popup();
                         if !self.first_frame_done {
                             self.first_frame_done = true;
                             if self.timing {

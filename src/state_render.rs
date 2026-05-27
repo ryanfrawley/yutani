@@ -1398,7 +1398,16 @@ impl WindowState {
         // the FG index range means it participates in the glow/bloom pass when
         // glow is on; acceptable for K10.
         let popup_visible = !self.active_tab().completions.is_empty() && self.active_tab().terminal.view_offset() == 0;
-        if let Some((anchor_x, cursor_row_top)) = popup_anchor.filter(|_| popup_visible) {
+        // Stash the cursor anchor (physical px) so the native popup can position
+        // itself after render; cleared when the popup shouldn't show.
+        self.completion_anchor = popup_anchor
+            .filter(|_| popup_visible)
+            .map(|(x, top)| (x, top, line_height));
+        // The native glass popup (macOS) handles display when present; only the
+        // GPU fallback draws here.
+        if let Some((anchor_x, cursor_row_top)) =
+            popup_anchor.filter(|_| popup_visible && self.glass_complete.is_none())
+        {
             let len = self.active_tab().completions.len();
             // The visible window: `COMPLETION_MAX_VISIBLE` rows starting at the
             // scroll offset, clamped to the list. `n` is how many rows render.
