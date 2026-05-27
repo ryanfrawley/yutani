@@ -298,4 +298,4 @@ tests on computed values plus manual checks via `run`.
   the `resize` spill loop, and `full_reset`. No existing behavior changes if
   OSC 133 is never received, so any slice rolls back cleanly.
 - **Per CLAUDE.md:** do all work in a dedicated worktree; one PR per slice via
-  the Forgejo HTTPS flow.
+  the `git push` + `gh pr create` flow.

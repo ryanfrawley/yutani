@@ -39,7 +39,7 @@ was designed so you shouldn't have to.
 - **Branch:** continue on `tabs` (this branch, which carries the multi-window
   work + this plan), or branch fresh off `multi-window` (or off `main` once the
   multi-window PR #117 has merged). Per the repo's `CLAUDE.md`, do all edits in
-  a **git worktree**, never the primary checkout `/Users/ry/projects/terminal`.
+  a **git worktree**, never the primary checkout.
 - **Build/test:** `cargo build`, `cargo test` (no lib target; tests are inline
   `#[cfg(test)] mod tests`). Baseline is green at **1124 tests**.
 - **Run:** `./target/debug/yutani` — it's a macOS GUI; launch it backgrounded
@@ -51,8 +51,7 @@ was designed so you shouldn't have to.
   `with_font(|face| …)`, atlas fills are single-statement
   `ensure_*(&mut *shared.font.borrow_mut(), …)`. `cargo test` does **not**
   exercise the `RefCell`, so verify any hot-path change with a real run.
-- **PRs:** self-hosted Forgejo at `git.frawley.co` — see `CLAUDE.md` for the
-  exact `git push` (HTTPS + keychain cert) and `curl` API recipe. After
+- **PRs:** see `CLAUDE.md` for the `git push` + `gh pr create` flow. After
   significant changes, run the `unit-test-writer` agent (per `CLAUDE.md`),
   though note most of this feature is GPU/windowing/PTY side-effect code with
   little pure logic to unit-test.
