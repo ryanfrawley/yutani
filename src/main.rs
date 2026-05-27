@@ -539,6 +539,9 @@ struct TabState {
     /// Process-unique id this tab's PTY reader thread tags its events with.
     /// The event loop resolves it to the owning window via `tab_to_window`.
     tab_id: app_window::TabId,
+    /// Shared buffer the reader thread appends decoded output to; the event
+    /// loop drains it (capped per turn) on each `PtyInput` wake.
+    pty_outbox: app_window::PtyOutbox,
     /// PTY master fd. The reader thread owns its own copy (reads + reaps);
     /// this copy lets the main thread `close()` it to unblock that read on
     /// tab close.
@@ -1104,6 +1107,14 @@ const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 /// output. Text at 62fps is indistinguishable from higher rates.
 pub(crate) const MIN_FRAME_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(16);
+
+/// Max bytes of buffered PTY output fed to the terminal in a single event-loop
+/// turn. A flood (e.g. `seq 1 2000000`) can queue tens of MB; feeding it all at
+/// once pins the main thread for seconds, freezing renders and input. Capping
+/// the slice lets the loop feed ≤this, repaint, service a click/keystroke, then
+/// self-wake for the rest — so the UI stays live through the burst. ~128 KiB is
+/// roughly one frame's worth of parse work at observed feed throughput.
+pub(crate) const PTY_FEED_CAP: usize = 128 * 1024;
 /// Duration of the smooth-scroll slide for an explicit alt-screen scroll
 /// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
 /// stays responsive — the final frame is reached this many seconds after the
@@ -2067,10 +2078,16 @@ fn create_tab(
     let master = pty.master;
     let child = pty.child;
     let proxy = proxy.clone();
+    // Shared output buffer: the reader appends decoded text here and only
+    // posts a wake when the loop isn't already due to drain, so a burst of
+    // reads collapses to ~one event per drain instead of one per read.
+    let outbox = app_window::PtyOutbox::new();
+    let reader_outbox = outbox.clone();
     std::thread::spawn(move || {
         let code = pty.run(|data| {
-            let _ = proxy
-                .send_event(app_window::CustomEvent::PtyInput(tab_id, data.to_owned()));
+            if reader_outbox.push(data) {
+                let _ = proxy.send_event(app_window::CustomEvent::PtyInput(tab_id));
+            }
         });
         // `run` returns once the shell has exited and been reaped; tell the
         // loop so it reacts instead of leaving a frozen tab.
@@ -2078,6 +2095,7 @@ fn create_tab(
     });
     let tab = TabState {
         tab_id,
+        pty_outbox: outbox,
         master,
         child,
         terminal: terminal::Terminal::new(cols, rows, 10000),
