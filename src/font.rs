@@ -841,6 +841,23 @@ fn pack_glyph(
 mod tests {
     use super::*;
 
+    /// Locate an installed font for real-system tests. Probes
+    /// `~/Library/Fonts/<name>` for each `user_names` entry (derived from
+    /// `$HOME`, so no developer home path is hardcoded), then the absolute
+    /// `fallbacks`, returning the first path that exists.
+    fn find_installed_font(
+        user_names: &[&str],
+        fallbacks: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::Path::new(&home).join("Library/Fonts");
+            candidates.extend(user_names.iter().map(|n| dir.join(n)));
+        }
+        candidates.extend(fallbacks.iter().map(std::path::PathBuf::from));
+        candidates.into_iter().find(|c| c.exists())
+    }
+
     fn entry(tag: usize) -> AtlasEntry {
         AtlasEntry {
             x: tag,
@@ -926,17 +943,18 @@ mod tests {
         // Skip when no Iosevka TTC is installed (CI / dev machines
         // without the fonts) — this is a smoke test against the real
         // user-visible behavior, not a load-bearing assertion.
-        let candidates = [
-            "/Users/ry/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
-            "/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
-            "/System/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
-        ];
-        let Some(path) = candidates.iter().find(|p| std::path::Path::new(p).exists()) else {
+        let Some(path) = find_installed_font(
+            &["SGr-IosevkaTerm-Regular.ttc"],
+            &[
+                "/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
+                "/System/Library/Fonts/SGr-IosevkaTerm-Regular.ttc",
+            ],
+        ) else {
             eprintln!("skipping: no Iosevka Term TTC installed");
             return;
         };
-        let Ok(data) = std::fs::read(path) else {
-            eprintln!("skipping: failed to read {path}");
+        let Ok(data) = std::fs::read(&path) else {
+            eprintln!("skipping: failed to read {}", path.display());
             return;
         };
 
@@ -1226,14 +1244,14 @@ mod tests {
     /// the pattern used by `find_face_index_picks_matching_style_when_available`
     /// and `assert_strict_match` in `font_loader::macos::tests`.
     fn load_test_font() -> Option<Font> {
-        let candidates = [
-            "/Users/ry/Library/Fonts/HackNerdFont-Regular.ttf",
-            "/Users/ry/Library/Fonts/FiraCode-Regular.ttf",
-            "/Library/Fonts/HackNerdFont-Regular.ttf",
-            "/System/Library/Fonts/Menlo.ttc",
-        ];
-        let path = candidates.iter().find(|p| std::path::Path::new(p).exists())?;
-        let data = std::fs::read(path).ok()?;
+        let path = find_installed_font(
+            &["HackNerdFont-Regular.ttf", "FiraCode-Regular.ttf"],
+            &[
+                "/Library/Fonts/HackNerdFont-Regular.ttf",
+                "/System/Library/Fonts/Menlo.ttc",
+            ],
+        )?;
+        let data = std::fs::read(&path).ok()?;
         let mut font = Font::new(data);
         font.set_char_size(14.0, 96);
         Some(font)
@@ -1243,13 +1261,11 @@ mod tests {
     /// the styled-variant branches of `ensure_char` can be exercised.
     fn load_test_font_with_bold() -> Option<Font> {
         let mut font = load_test_font()?;
-        let bold_candidates = [
-            "/Users/ry/Library/Fonts/HackNerdFont-Bold.ttf",
-            "/Users/ry/Library/Fonts/FiraCode-Bold.ttf",
-            "/Library/Fonts/HackNerdFont-Bold.ttf",
-        ];
-        let bold_path = bold_candidates.iter().find(|p| std::path::Path::new(p).exists())?;
-        let bold_data = std::fs::read(bold_path).ok()?;
+        let bold_path = find_installed_font(
+            &["HackNerdFont-Bold.ttf", "FiraCode-Bold.ttf"],
+            &["/Library/Fonts/HackNerdFont-Bold.ttf"],
+        )?;
+        let bold_data = std::fs::read(&bold_path).ok()?;
         if !font.set_variant(FaceVariant::Bold, bold_data, 0, 14.0, 96) {
             return None;
         }
