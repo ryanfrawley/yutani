@@ -377,6 +377,33 @@ mod tests {
         );
     }
 
+    // Ctrl+Tab / Ctrl+Shift+Tab are claimed by the state_input handler for
+    // tab navigation *before* they reach encode_key. These cases pin down why
+    // that interception is required: encode_key has no special handling for
+    // them, so it would otherwise emit a bare TAB to the PTY. The Shift+Tab
+    // `\e[Z` form only triggers for shift *alone* (mod_param == 2); adding
+    // Ctrl pushes mod_param to 5/6 and falls through to control(b'\t').
+    #[test]
+    fn ctrl_tab_is_bare_tab() {
+        assert_eq!(
+            encode_key(&Key::Named(NamedKey::Tab), None, ModifiersState::CONTROL, false),
+            Some(b"\t".to_vec()),
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_tab_is_bare_tab_not_cbt() {
+        assert_eq!(
+            encode_key(
+                &Key::Named(NamedKey::Tab),
+                None,
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                false,
+            ),
+            Some(b"\t".to_vec()),
+        );
+    }
+
     #[test]
     fn function_keys() {
         assert_eq!(
