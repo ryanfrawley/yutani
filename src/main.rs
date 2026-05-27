@@ -27,6 +27,7 @@ mod config;
 mod url;
 mod font_data;
 mod paths;
+mod touchid;
 mod state_completion;
 mod state_anim;
 mod state_theme;

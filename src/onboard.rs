@@ -62,6 +62,23 @@ pub fn run() -> ! {
         Some(b) => b,
         None => skip(),
     };
+    // Offer Touch ID for sudo only when it can actually be turned on (macOS,
+    // module present, sudo includes sudo_local). Skipped silently otherwise so
+    // setup stays the same length everywhere.
+    if matches!(crate::touchid::status(), crate::touchid::Status::Disabled) {
+        match ask_touch_id() {
+            // The native authorization dialog (which itself supports Touch ID)
+            // is the user's feedback; a failure only lands in the log, since
+            // `finish` repaints over this screen immediately.
+            Some(true) => {
+                if let crate::touchid::Outcome::Failed(e) = crate::touchid::enable() {
+                    eprintln!("onboarding: enabling Touch ID for sudo failed: {e}");
+                }
+            }
+            Some(false) => {}
+            None => skip(),
+        }
+    }
     finish(scheme, crt, font_size, autocomplete)
 }
 
@@ -129,6 +146,23 @@ fn ask_autocomplete() -> Option<bool> {
         .map(|s| s.to_string())
         .collect();
     let pick = ask("  Autocomplete (as-you-type suggestions)", &labels, 0, |_| {})?;
+    Some(pick == 0)
+}
+
+/// Optional final step: offer Touch ID for `sudo`. No live preview — picking
+/// "Yes" triggers a native authorization dialog (handled by the caller), not a
+/// terminal change. Defaults to On. Returns the choice, or `None` on skip.
+fn ask_touch_id() -> Option<bool> {
+    let labels: Vec<String> = ["Yes, enable it (recommended)", "Not now"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let pick = ask(
+        "  Use Touch ID for sudo?  \x1b[2m(authenticate sudo with your fingerprint)\x1b[0m",
+        &labels,
+        0,
+        |_| {},
+    )?;
     Some(pick == 0)
 }
 

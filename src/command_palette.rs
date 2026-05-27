@@ -56,6 +56,11 @@ pub enum PaletteAction {
     /// Toggle the filesystem/history autocomplete popup (`autocomplete`) on or
     /// off, persisting the new value so it sticks across restarts.
     ToggleAutocomplete,
+    /// macOS only: enable or disable Touch ID as a `sudo` auth factor. Drives a
+    /// native, opt-in alert flow that runs a privileged PAM edit (see the
+    /// `touchid` module); reversible from the same command. Hidden off macOS by
+    /// [`filter`].
+    ToggleTouchIdSudo,
 }
 
 /// One entry in the palette's command list.
@@ -164,6 +169,12 @@ pub const COMMANDS: &[Command] = &[
     Command {
         title: "Toggle autocomplete",
         action: PaletteAction::ToggleAutocomplete,
+        arg_prompt: None,
+        choose: false,
+    },
+    Command {
+        title: "Touch ID for sudo…",
+        action: PaletteAction::ToggleTouchIdSudo,
         arg_prompt: None,
         choose: false,
     },
@@ -307,6 +318,12 @@ pub fn filter(query: &str) -> Vec<usize> {
     let mut scored: Vec<(usize, i32)> = COMMANDS
         .iter()
         .enumerate()
+        // Touch ID for sudo is a macOS-only PAM feature; never surface it
+        // elsewhere. Every list the palette shows flows through `filter`, so
+        // excluding the index here hides the command entirely off macOS.
+        .filter(|(_, c)| {
+            cfg!(target_os = "macos") || c.action != PaletteAction::ToggleTouchIdSudo
+        })
         .filter_map(|(i, c)| fuzzy_score(c.title, query).map(|s| (i, s)))
         .collect();
     scored.sort_by(|a, b| b.1.cmp(&a.1)); // stable: equal scores keep order
@@ -1449,5 +1466,63 @@ mod tests {
                 arg: None
             }
         );
+    }
+
+    // ----- Touch ID for sudo command registry entry (macOS only) -----
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn touch_id_sudo_command_is_registered() {
+        // The command must exist in the registry, carry the expected title, and
+        // map to the ToggleTouchIdSudo action.
+        let cmd = COMMANDS
+            .iter()
+            .find(|c| c.action == PaletteAction::ToggleTouchIdSudo)
+            .expect("Touch ID for sudo command should be registered");
+        assert_eq!(cmd.title, "Touch ID for sudo…");
+        // It runs a native alert flow with no palette-collected argument.
+        assert_eq!(cmd.arg_prompt, None);
+        assert!(!cmd.choose);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn touch_id_sudo_is_discoverable_and_runs_immediately() {
+        let mut p = CommandPalette::default();
+        p.open();
+        p.input.value = "touch id".into();
+        p.refilter();
+        let titles: Vec<&str> = p.filtered.iter().map(|&i| COMMANDS[i].title).collect();
+        assert!(
+            titles.contains(&"Touch ID for sudo…"),
+            "query \"touch id\" should surface the Touch ID command; got {titles:?}"
+        );
+
+        // Takes no argument, so accepting runs it straight away (the privileged
+        // flow itself lives in the touchid module, not here).
+        let out = p.accept();
+        assert_eq!(
+            out,
+            Outcome::Run {
+                action: PaletteAction::ToggleTouchIdSudo,
+                arg: None
+            }
+        );
+    }
+
+    /// Off macOS the command is filtered out entirely (it edits macOS PAM), so
+    /// it must never appear in any list `filter` produces — even for an exact
+    /// title query.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn touch_id_sudo_is_hidden_off_macos() {
+        for query in ["", "touch id", "Touch ID for sudo…", "sudo"] {
+            let res = filter(query);
+            let titles: Vec<&str> = res.iter().map(|&i| COMMANDS[i].title).collect();
+            assert!(
+                !titles.contains(&"Touch ID for sudo…"),
+                "query {query:?} must not surface the Touch ID command off macOS; got {titles:?}"
+            );
+        }
     }
 }

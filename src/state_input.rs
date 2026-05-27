@@ -475,6 +475,10 @@ impl WindowState {
                 self.config.autocomplete = !self.config.autocomplete;
                 self.config.save();
             }
+            // Native, opt-in alert flow that runs the privileged PAM edit. The
+            // result lives in /etc/pam.d, not our config, so there's nothing to
+            // persist here. macOS-only; the command is hidden elsewhere.
+            A::ToggleTouchIdSudo => crate::touchid::run_palette_command(),
         }
         self.invalidate();
     }
