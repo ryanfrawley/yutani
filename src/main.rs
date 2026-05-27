@@ -3,6 +3,7 @@ mod box_drawing;
 mod command_palette;
 mod completion;
 mod glass;
+mod glass_complete;
 mod glass_find;
 mod glass_palette;
 mod search;
@@ -789,6 +790,14 @@ struct WindowState {
     /// no-op stub off macOS. The `search` model + in-terminal match highlights
     /// are unchanged — this is just the native input + counter.
     glass_find: Option<glass_find::GlassFind>,
+    /// The native Liquid Glass autocomplete popup (macOS). `None` until first
+    /// needed; a non-activating panel that never takes focus. Driven passively
+    /// by the completion model. See `glass_complete.rs`.
+    glass_complete: Option<glass_complete::GlassComplete>,
+    /// Cursor anchor captured during render for positioning the native popup:
+    /// `(left_x, row_top, line_height)` in physical px, or `None` when the
+    /// cursor is off-screen / the popup shouldn't show.
+    completion_anchor: Option<(f32, f32, f32)>,
     // Whether the pointer is currently in the title-bar band. Tracked so a
     // crossing back into the grid can restore the I-beam exactly once.
     over_toolbar: bool,
@@ -1631,6 +1640,8 @@ impl WindowState {
             glass_palette: None,
             search: search::Search::default(),
             glass_find: None,
+            glass_complete: None,
+            completion_anchor: None,
             over_toolbar: false,
             // Seeded with the renderer's reserve; refresh_chrome_band() below
             // (and on every resize / scale change) replaces it with the real
