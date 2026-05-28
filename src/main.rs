@@ -310,11 +310,16 @@ struct AppShared {
     gpu: Rc<gpu::Gpu>,
     /// FreeType faces. `Rc<RefCell>` because faces aren't `Send` but every
     /// window lives on the one event-loop thread. Borrow discipline is
-    /// load-bearing: read through [`AppShared::with_font`], and fill via a
-    /// single-statement `atlas.ensure_*(&mut shared.font.borrow_mut(), …)` so
-    /// no `Ref`/`RefMut` is held across the overlapping borrow in
-    /// `update_vertices` (which would panic at runtime — and the test suite,
-    /// using `Font` directly, wouldn't catch it).
+    /// load-bearing: access through [`AppShared::with_font_at`] /
+    /// [`AppShared::with_font_mut_at`], never the raw `font.borrow*()`. Those
+    /// accessors do two things on every entry: (1) re-tune the shared faces
+    /// to the caller's `(pt, dpi)` so a second window on a different monitor
+    /// can't observe glyphs sized for the first one's DPI — see
+    /// [`font::Font::tune_to`]; and (2) hand the closure a `&Font` /
+    /// `&mut Font` rather than a `Ref` / `RefMut`, so no borrow leaks past
+    /// the call. That second part guards the overlapping borrow in
+    /// `update_vertices` that would otherwise panic at runtime (and the test
+    /// suite, using `Font` directly, wouldn't catch it).
     font: Rc<RefCell<font::Font>>,
     /// rustybuzz shaper, used during update_vertices to detect programming
     /// ligatures (`->`, `=>`, `!=`, …) so the renderer can draw them as a
@@ -524,12 +529,32 @@ impl AppShared {
         }
     }
 
-    /// Borrow the shared font for the duration of `f` and no longer. Callers
-    /// receive a `&Font`, never the `Ref`, so the borrow scope can't be
-    /// widened past the call — the structural guard against the borrow-overlap
-    /// panic described on the `font` field.
-    fn with_font<R>(&self, f: impl FnOnce(&font::Font) -> R) -> R {
-        f(&self.font.borrow())
+    /// Re-tune the shared faces to `(pt, dpi)` and borrow the font immutably
+    /// for the duration of `f`. The tune is idempotent (no-op when already
+    /// matching, the common single-DPI case), and the returned reference is
+    /// a `&Font` — not a `Ref` — so the borrow can't be widened past the
+    /// call. Two windows on differently-scaled monitors share one `Font`;
+    /// every read of metrics / cell-width / faces must funnel through here
+    /// so the cache mirror and FreeType state both belong to the caller's
+    /// tune. See [`font::Font::tune_to`] for the underlying contract.
+    fn with_font_at<R>(&self, pt: f32, dpi: u32, f: impl FnOnce(&font::Font) -> R) -> R {
+        let mut font = self.font.borrow_mut();
+        font.tune_to(pt, dpi);
+        // Downgrade to a shared reference for the closure — `tune_to`
+        // already did the only mutation we needed.
+        f(&*font)
+    }
+
+    /// Mutable counterpart to [`with_font_at`]: re-tunes, then hands `f` a
+    /// `&mut Font`. Used by the few sites that mutate the font directly —
+    /// `build_atlas`, `Atlas::ensure_char`, `Atlas::ensure_glyph_id` — every
+    /// one of which calls `face.load_char` / `face.load_glyph`, so the
+    /// pre-tune is what stops a window-A rasterization from landing into
+    /// window-B's atlas with the wrong pixel size.
+    fn with_font_mut_at<R>(&self, pt: f32, dpi: u32, f: impl FnOnce(&mut font::Font) -> R) -> R {
+        let mut font = self.font.borrow_mut();
+        font.tune_to(pt, dpi);
+        f(&mut *font)
     }
 }
 
@@ -1347,7 +1372,10 @@ impl WindowState {
         let window_theme = window.theme().unwrap_or(winit::window::Theme::Light);
 
         // Per-window glyph atlas, rasterized on demand from the shared faces.
-        let atlas = shared.font.borrow_mut().build_atlas();
+        // Tune to this window's (pt, dpi) first so the initial pack matches
+        // its monitor's scale even if another window built last at a
+        // different DPI.
+        let atlas = shared.with_font_mut_at(pt_size, dpi, |f| f.build_atlas());
         sub!("build_atlas");
 
         let font_texture = renderer::texture::Texture::from_memory(
@@ -1828,14 +1856,31 @@ impl WindowState {
         }
     }
 
+    /// Read the shared font at *this window's* current `(pt_size, dpi)`. Thin
+    /// wrapper over [`AppShared::with_font_at`] that supplies the tune so call
+    /// sites don't repeat `self.pt_size, self.dpi`. Use this for every font
+    /// read (metrics, cell width, line height) so a sibling window on a
+    /// different-DPI monitor can't leave the faces tuned to its size.
+    fn with_font<R>(&self, f: impl FnOnce(&font::Font) -> R) -> R {
+        self.shared.with_font_at(self.pt_size, self.dpi, f)
+    }
+
+    /// Mutable counterpart to [`with_font`] for the sites that rasterize
+    /// (`build_atlas`). Re-tunes to this window's `(pt_size, dpi)` first, so
+    /// the glyphs land at the right pixel size regardless of which sibling
+    /// window last touched the shared faces.
+    fn with_font_mut<R>(&self, f: impl FnOnce(&mut font::Font) -> R) -> R {
+        self.shared.with_font_mut_at(self.pt_size, self.dpi, f)
+    }
+
     fn resize_buffers(&mut self) {
         // Calculate console viewport & buffer sizes
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as usize;
         let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
-            self.shared.with_font(|f| f.cell_width()),
+            self.with_font(|f| f.cell_width()),
             line_height,
             self.chrome_extra_top(),
         );
@@ -1957,11 +2002,11 @@ impl WindowState {
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let size = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
-            self.shared.with_font(|f| f.cell_width()),
+            self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
         );
@@ -2000,8 +2045,8 @@ impl WindowState {
         // discover the cell-pixel size. Zero here would make those
         // tools refuse to send images with "Terminal does not support
         // reporting screen sizes in pixels."
-        let metrics = self.shared.with_font(|f| f.metrics());
-        let cell_w = self.shared.with_font(|f| f.cell_width()) as u32;
+        let metrics = self.with_font(|f| f.metrics());
+        let cell_w = self.with_font(|f| f.cell_width()) as u32;
         let line_h = ((metrics.ascender - metrics.descender) >> 6) as u32;
         let xpixel = (cols as u32).saturating_mul(cell_w).min(u16::MAX as u32) as u16;
         let ypixel = (rows as u32).saturating_mul(line_h).min(u16::MAX as u32) as u16;
@@ -2248,7 +2293,7 @@ fn spawn_window_in_process(
     let (surface, surface_raw) = shared.gpu.create_surface(&window);
     let dpi = (window.scale_factor() * 96.0) as u32;
     let (cols, rows) = {
-        let (cell_w, line_h) = shared.with_font(|f| {
+        let (cell_w, line_h) = shared.with_font_at(config.font_size, dpi, |f| {
             let m = f.metrics();
             (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
         });

@@ -27,8 +27,40 @@ impl WindowState {
         }
         self.pt_size = new_pt;
         self.config.font_size = self.pt_size;
-        self.shared.font.borrow_mut().set_char_size(self.pt_size, self.dpi);
-        self.atlas = self.shared.font.borrow_mut().build_atlas();
+        self.rebuild_font_resources();
+        true
+    }
+
+    /// React to a `WindowEvent::ScaleFactorChanged` — the window crossed onto a
+    /// monitor with a different backing-scale (e.g. retina ↔ non-retina). The
+    /// font is rasterized in physical pixels at `pt_size * dpi / 72`, so if we
+    /// kept the old DPI the bitmaps would occupy the same pixel count on a
+    /// screen with twice as many inches per pixel — doubling the apparent
+    /// size. Recomputes `self.dpi = scale_factor * 96` and rebuilds the atlas
+    /// + grid so the apparent point size stays constant across monitors.
+    /// Returns whether the DPI actually changed.
+    pub(crate) fn set_dpi_from_scale(&mut self, scale_factor: f64) -> bool {
+        let new_dpi = (scale_factor * 96.0) as u32;
+        if new_dpi == self.dpi {
+            return false;
+        }
+        self.dpi = new_dpi;
+        self.rebuild_font_resources();
+        true
+    }
+
+    /// Re-apply the current `pt_size` / `dpi` to the shared FreeType faces and
+    /// rebuild everything downstream of the cell metrics: glyph atlas, font
+    /// texture + bind group, terminal grid dims, vertex/index buffers, cursor
+    /// anim, row cache. Shared by [`set_font_size`] and [`set_dpi_from_scale`]
+    /// — either field changing means the rasterizer produces different pixels
+    /// and every cached glyph + per-row vertex segment is stale.
+    fn rebuild_font_resources(&mut self) {
+        // `with_font_mut` re-tunes the shared faces to this window's
+        // (pt, dpi) before `build_atlas` rasterizes, so the atlas is packed
+        // at the right pixel size even when a sibling window left the faces
+        // tuned to a different monitor's scale.
+        self.atlas = self.with_font_mut(|f| f.build_atlas());
         self.font_texture = renderer::texture::Texture::from_memory(
             &self.shared.gpu.device,
             &self.shared.gpu.queue,
@@ -54,11 +86,11 @@ impl WindowState {
         });
         // Resize the grid to match the new cell dimensions, then refill the
         // vertex/index buffers (their capacity depends on grid size too).
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let viewport = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
-            self.shared.with_font(|f| f.cell_width()),
+            self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
         );
@@ -71,7 +103,6 @@ impl WindowState {
         // vertices reference the old atlas layout, so drop them all.
         self.invalidate_row_cache();
         self.invalidate();
-        true
     }
 
     /// Write the current in-memory config to disk and re-apply the scheme that

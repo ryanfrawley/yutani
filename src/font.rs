@@ -125,13 +125,15 @@ impl Variant {
 
 pub struct Font {
     pub variants: [Variant; 4],
-    // Grid metrics cached from the Regular face, refreshed only when the face
-    // is (re)sized via `set_char_size`. Reading these from the face directly
-    // would call `load_char('M')` / touch `FT_Size`, which mutates the shared
-    // glyph slot and is unsound to do from a render thread — and it happened
-    // on every frame. Cache once per size change so the per-frame layout path
-    // never touches the face. Both are zeroed until the first `set_char_size`
-    // (which bring-up always calls before any glyph work).
+    // Grid metrics for the *current* tune, mirrored out of the per-tune
+    // [`metric_cache`] so the per-frame hot path (`cell_width()`, `metrics()`,
+    // `underline_*()`) is a plain field read with no hashmap lookup. The
+    // mirror is refreshed inside [`tune_to`] every time the active
+    // `(pt, dpi)` changes. Reading the face directly here would call
+    // `load_char('M')` / touch `FT_Size`, which mutates the shared glyph slot
+    // and is unsound to do from a render thread — and it happened on every
+    // frame. Cache once per (pt, dpi) so the per-frame layout path never
+    // touches the face. All zeroed until the first `tune_to`.
     cached_cell_width: usize,
     cached_metrics: ft::ffi::FT_Size_Metrics,
     // Underline geometry from the Regular face's `post` table, in font design
@@ -139,6 +141,26 @@ pub struct Font {
     // alongside the metrics so the per-frame underline path reads no face.
     cached_underline_position: ft::ffi::FT_Short,
     cached_underline_thickness: ft::ffi::FT_Short,
+    // The `(pt, dpi)` the variant faces are currently sized to and that the
+    // `cached_*` mirror reflects. Keyed by `f32::to_bits()` of pt so the pair
+    // is `Eq` / `Hash`-able without ordered-float gymnastics (our inputs are
+    // never NaN — clamped in `set_font_size`, sourced from `scale_factor * 96`
+    // in `set_dpi_from_scale`). `None` until the first `tune_to`.
+    current_tune: Option<(u32, u32)>,
+    // Per-tune grid metrics, populated lazily by `tune_to`. With one window
+    // (or all windows on the same monitor) this carries a single entry and
+    // the active tune always hits it; the multi-DPI case grows it to one
+    // entry per distinct (pt, dpi) seen so transitions between windows skip
+    // the `load_char('M')` re-measurement in `refresh_grid_metrics`.
+    metric_cache: HashMap<(u32, u32), CachedMetrics>,
+}
+
+#[derive(Copy, Clone)]
+struct CachedMetrics {
+    cell_width: usize,
+    metrics: ft::ffi::FT_Size_Metrics,
+    underline_position: ft::ffi::FT_Short,
+    underline_thickness: ft::ffi::FT_Short,
 }
 
 // A zeroed `FT_Size_Metrics` for the pre-sizing window. `FT_Size_Metrics` is a
@@ -393,12 +415,14 @@ impl Font {
             cached_metrics: ZERO_METRICS,
             cached_underline_position: 0,
             cached_underline_thickness: 0,
+            current_tune: None,
+            metric_cache: HashMap::new(),
         }
     }
 
     // Install the primary face for a styled variant (Bold/Italic/BoldItalic).
     // Returns false if the data can't be opened or sized at the current
-    // `set_char_size` — typically a bitmap-only face we can't currently render.
+    // current tune — typically a bitmap-only face we can't currently render.
     //
     // `face_index` selects which face inside a TTC collection to open.
     // Iosevka and other large families ship as TTCs that pack multiple
@@ -429,11 +453,17 @@ impl Font {
             return false;
         }
         self.variants[variant as usize].face = Some(face);
+        // This face was sized to the passed (pt, dpi), which the caller is
+        // trusted to match the active tune at startup. Drop `current_tune`
+        // anyway so that if a variant is ever installed *after* a DPI change,
+        // the next `tune_to` re-sizes the whole face set together rather than
+        // short-circuiting and leaving this one out of step.
+        self.current_tune = None;
         true
     }
 
     // Append a fallback face onto the given variant. Returns false (and drops
-    // the data) if the font can't be sized to the current `set_char_size` —
+    // the data) if the font can't be sized to the current tune —
     // typically a bitmap-only face like Apple Color Emoji that we can't
     // currently render anyway.
     //
@@ -460,6 +490,9 @@ impl Font {
             return false;
         }
         self.variants[variant as usize].fallbacks.push(face);
+        // See `set_variant`: force a full re-tune on next access so a fallback
+        // added after a DPI change can't stay sized to the wrong scale.
+        self.current_tune = None;
         true
     }
 
@@ -511,7 +544,7 @@ impl Font {
     }
 
     // Recompute the cached cell width + size metrics from the freshly-sized
-    // Regular face. Called after every `set_char_size`; nothing else changes
+    // Regular face. Called by `tune_to` on a tune miss; nothing else changes
     // the grid geometry (styled variants and fallbacks are sized to match).
     fn refresh_grid_metrics(&mut self) {
         self.cached_cell_width = self.measure_cell_width();
@@ -524,7 +557,24 @@ impl Font {
         self.cached_underline_thickness = underline_thickness;
     }
 
-    pub fn set_char_size(&mut self, height_points: f32, dpi: u32) {
+    /// Re-tune the shared FreeType faces to `(height_points, dpi)`. Idempotent
+    /// — when the requested tune matches `current_tune`, returns immediately
+    /// (the common case in single-DPI setups, and a same-window re-tune in
+    /// multi-DPI setups). On a real transition, calls `FT_Set_Char_Size` on
+    /// every installed variant + fallback face, then mirrors per-tune metrics
+    /// out of `metric_cache` (or computes + caches them on first miss) so the
+    /// cached read path stays correct without re-running
+    /// `refresh_grid_metrics`'s `load_char('M')`.
+    ///
+    /// Two distinct windows on monitors with different scale factors share one
+    /// `Font`; whichever window is about to touch the faces must call this
+    /// first via [`AppShared::with_font_at`] / [`with_font_mut_at`] so every
+    /// `load_char` / `load_glyph` happens at the right size.
+    pub fn tune_to(&mut self, height_points: f32, dpi: u32) {
+        let key = (height_points.to_bits(), dpi);
+        if self.current_tune == Some(key) {
+            return;
+        }
         let size = (height_points * 64.0) as isize;
         for variant in &mut self.variants {
             if let Some(face) = variant.face.as_mut() {
@@ -534,7 +584,24 @@ impl Font {
                 let _ = face.set_char_size(size, 0, dpi, dpi);
             }
         }
-        self.refresh_grid_metrics();
+        self.current_tune = Some(key);
+        if let Some(c) = self.metric_cache.get(&key) {
+            self.cached_cell_width = c.cell_width;
+            self.cached_metrics = c.metrics;
+            self.cached_underline_position = c.underline_position;
+            self.cached_underline_thickness = c.underline_thickness;
+        } else {
+            self.refresh_grid_metrics();
+            self.metric_cache.insert(
+                key,
+                CachedMetrics {
+                    cell_width: self.cached_cell_width,
+                    metrics: self.cached_metrics,
+                    underline_position: self.cached_underline_position,
+                    underline_thickness: self.cached_underline_thickness,
+                },
+            );
+        }
     }
 
     pub fn build_atlas(&mut self) -> Atlas {
@@ -1253,7 +1320,7 @@ mod tests {
         )?;
         let data = std::fs::read(&path).ok()?;
         let mut font = Font::new(data);
-        font.set_char_size(14.0, 96);
+        font.tune_to(14.0, 96);
         Some(font)
     }
 
@@ -1307,6 +1374,229 @@ mod tests {
                 HashSet::new(),
             ],
         }
+    }
+
+    // `tune_to` short-circuits when the requested (pt, dpi) already matches the
+    // active tune — the common single-DPI case where every per-frame font read
+    // must not re-run `FT_Set_Char_Size` + the `load_char('M')` re-measure.
+    #[test]
+    fn tune_to_is_idempotent_for_same_pt_dpi() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        // load_test_font already tuned to (14, 96).
+        assert_eq!(font.current_tune, Some((14.0f32.to_bits(), 96)));
+        let cw = font.cell_width();
+        let metrics_height = font.metrics().height;
+        // A no-op re-tune leaves the cache with the single entry it had and
+        // the mirrored metrics untouched.
+        assert_eq!(font.metric_cache.len(), 1);
+        font.tune_to(14.0, 96);
+        assert_eq!(font.metric_cache.len(), 1);
+        assert_eq!(font.cell_width(), cw);
+        assert_eq!(font.metrics().height, metrics_height);
+    }
+
+    // The whole point of the per-window DPI work: at a fixed point size, the
+    // glyph's *pixel* size scales with DPI. A window dragged from a 1x to a 2x
+    // monitor (dpi 96 → 192) must produce ~twice-as-wide cells — that's what
+    // keeps the *apparent* size constant on a screen with twice the pixel
+    // density.
+    #[test]
+    fn tune_to_scales_cell_width_with_dpi() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        font.tune_to(14.0, 96);
+        let cw_lo = font.cell_width() as f32;
+        font.tune_to(14.0, 192);
+        let cw_hi = font.cell_width() as f32;
+        assert!(cw_hi > cw_lo, "doubling DPI must widen the cell");
+        // ~2x, with slack for hinting / integer rounding at small sizes.
+        let ratio = cw_hi / cw_lo;
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "cell width should roughly double (got ratio {ratio})"
+        );
+    }
+
+    // Returning to a previously-seen tune reproduces its metrics exactly,
+    // served from `metric_cache` rather than recomputed — and a round trip
+    // leaves exactly the two distinct tunes cached. This is what makes a
+    // two-window / two-DPI render loop cheap: each window's tune is a cache
+    // hit after the first frame.
+    #[test]
+    fn tune_to_round_trips_metrics_from_cache() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        font.tune_to(14.0, 96);
+        let cw_96 = font.cell_width();
+        let h_96 = font.metrics().height;
+        let ulp_96 = font.underline_position();
+
+        font.tune_to(14.0, 192); // different tune
+        assert_ne!(font.cell_width(), cw_96);
+
+        font.tune_to(14.0, 96); // back again
+        assert_eq!(font.cell_width(), cw_96);
+        assert_eq!(font.metrics().height, h_96);
+        assert_eq!(font.underline_position(), ulp_96);
+        assert_eq!(
+            font.metric_cache.len(),
+            2,
+            "only the two distinct tunes should be cached"
+        );
+    }
+
+    // `set_variant` installs a face sized to a caller-supplied (pt, dpi) and
+    // deliberately drops `current_tune` to `None` (see the comment in
+    // `set_variant`) so a later `tune_to` re-sizes the *whole* face set
+    // together rather than short-circuiting and leaving the new variant out of
+    // step. `load_test_font_with_bold` installs a Bold variant via
+    // `set_variant` after `load_test_font` has already tuned to (14, 96), so by
+    // the time it returns `current_tune` must be cleared.
+    #[test]
+    fn set_variant_resets_current_tune_to_none() {
+        let Some(mut font) = load_test_font_with_bold() else {
+            eprintln!("skipping: no bold test font installed");
+            return;
+        };
+        // load_test_font tuned to (14, 96); set_variant(Bold, ...) then cleared it.
+        assert_eq!(
+            font.current_tune, None,
+            "installing a variant must clear current_tune"
+        );
+        // A subsequent tune_to must actually re-tune (not short-circuit) and
+        // re-establish a valid tune + mirrored metrics.
+        font.tune_to(14.0, 96);
+        assert_eq!(font.current_tune, Some((14.0f32.to_bits(), 96)));
+        assert!(font.cell_width() > 0, "re-tune must measure a real cell");
+    }
+
+    // `add_fallback` has the same `current_tune = None` contract as
+    // `set_variant`: a fallback added after a DPI change must not stay sized to
+    // the wrong scale, so the next `tune_to` is forced to re-size everything.
+    // Append a fallback onto the Regular variant (reusing a real, sizable face)
+    // and confirm the tune is dropped.
+    #[test]
+    fn add_fallback_resets_current_tune_to_none() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        let fallback_candidates = [
+            "/Users/ry/Library/Fonts/HackNerdFont-Bold.ttf",
+            "/Users/ry/Library/Fonts/FiraCode-Bold.ttf",
+            "/Library/Fonts/HackNerdFont-Bold.ttf",
+            "/Users/ry/Library/Fonts/HackNerdFont-Regular.ttf",
+            "/Users/ry/Library/Fonts/FiraCode-Regular.ttf",
+            "/Library/Fonts/HackNerdFont-Regular.ttf",
+            "/System/Library/Fonts/Menlo.ttc",
+        ];
+        let Some(path) = fallback_candidates
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("skipping: no fallback font installed");
+            return;
+        };
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("skipping: could not read fallback font");
+            return;
+        };
+        // Sanity: load_test_font left us tuned.
+        assert_eq!(font.current_tune, Some((14.0f32.to_bits(), 96)));
+        if !font.add_fallback(FaceVariant::Regular, data, 0, 14.0, 96) {
+            eprintln!("skipping: fallback face not sizable (bitmap-only?)");
+            return;
+        }
+        assert_eq!(
+            font.current_tune, None,
+            "adding a fallback must clear current_tune"
+        );
+        // And the next tune_to re-tunes successfully.
+        font.tune_to(14.0, 96);
+        assert_eq!(font.current_tune, Some((14.0f32.to_bits(), 96)));
+        assert!(font.cell_width() > 0);
+    }
+
+    // The cache key is (pt, dpi) -- point size is a first-class axis, not just
+    // DPI. At a fixed DPI, a larger point size must produce a wider cell and be
+    // stored as its own cache entry distinct from the smaller size, so a font
+    // resize (Cmd-+ / Cmd--) doesn't collide with the previous size's metrics.
+    #[test]
+    fn tune_to_distinguishes_point_size_at_fixed_dpi() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        font.tune_to(14.0, 96);
+        let cw_small = font.cell_width() as f32;
+        assert_eq!(font.metric_cache.len(), 1);
+
+        font.tune_to(28.0, 96); // same dpi, double the point size
+        let cw_large = font.cell_width() as f32;
+        assert!(
+            cw_large > cw_small,
+            "doubling point size at fixed dpi must widen the cell \
+             (small {cw_small}, large {cw_large})"
+        );
+        let ratio = cw_large / cw_small;
+        assert!(
+            (1.8..=2.2).contains(&ratio),
+            "cell width should roughly double with point size (got ratio {ratio})"
+        );
+        assert_eq!(
+            font.metric_cache.len(),
+            2,
+            "a distinct point size at the same dpi must be cached separately"
+        );
+        assert_eq!(font.current_tune, Some((28.0f32.to_bits(), 96)));
+    }
+
+    // Flipping back and forth between two already-seen tunes (the steady state
+    // of a two-window / two-DPI render loop) must be pure cache hits: every
+    // tune after the first two finds its entry in `metric_cache`, so the map
+    // never grows past the two distinct tunes. A leak here would mean the cache
+    // is keyed wrong (or re-inserting on hit) and would grow without bound as
+    // the windows alternate frames.
+    #[test]
+    fn tune_to_does_not_grow_cache_when_alternating_seen_tunes() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        font.tune_to(14.0, 96);
+        font.tune_to(14.0, 192);
+        assert_eq!(
+            font.metric_cache.len(),
+            2,
+            "two distinct tunes seen so far"
+        );
+        let cw_96 = {
+            font.tune_to(14.0, 96);
+            font.cell_width()
+        };
+        let cw_192 = {
+            font.tune_to(14.0, 192);
+            font.cell_width()
+        };
+        // Alternate several more times -- each is a cache hit.
+        for _ in 0..5 {
+            font.tune_to(14.0, 96);
+            assert_eq!(font.cell_width(), cw_96);
+            font.tune_to(14.0, 192);
+            assert_eq!(font.cell_width(), cw_192);
+        }
+        assert_eq!(
+            font.metric_cache.len(),
+            2,
+            "alternating between two seen tunes must not grow the cache"
+        );
     }
 
     // Regression: box-drawing / block-element codepoints are synthesized on

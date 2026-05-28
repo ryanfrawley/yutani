@@ -77,11 +77,11 @@ impl WindowState {
         if (self.chrome_extra_top() - before).abs() < 0.5 {
             return;
         }
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let size = WindowState::get_viewport_size(
             self.surface.config.width as f32,
             self.surface.config.height as f32,
-            self.shared.with_font(|f| f.cell_width()),
+            self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
         );
@@ -130,12 +130,12 @@ impl WindowState {
     /// any in-progress smooth-scroll offset is folded in too so the mapping
     /// stays consistent during sub-line slides.
     pub(crate) fn pixel_to_visual_cell(&self, px: f64, py: f64) -> (usize, isize) {
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f64;
         let ascender = (metrics.ascender >> 6) as f64;
         let descender = (metrics.descender >> 6) as f64;
         let bg_h = ascender - descender;
-        let cell_w = self.shared.with_font(|f| f.cell_width()) as f64;
+        let cell_w = self.with_font(|f| f.cell_width()) as f64;
         // Mirror the renderer's dynamic decorator offset: full DECORATOR_HEIGHT
         // at both scroll-range boundaries (live grid and top of scrollback),
         // easing to 0 over one line in either direction. Out-of-sync formulas

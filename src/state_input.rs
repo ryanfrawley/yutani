@@ -617,7 +617,7 @@ impl WindowState {
                 if self.in_top_toolbar(self.mouse_y) {
                     return true;
                 }
-                let m = self.shared.with_font(|f| f.metrics());
+                let m = self.with_font(|f| f.metrics());
                 let line_height = ((m.ascender - m.descender) >> 6) as f64;
                 // A `Started` after a real idle gap is the user putting fingers
                 // back on the trackpad — that supersedes any prior suppression.
