@@ -51,7 +51,7 @@ impl WindowState {
         // font's `Ref` is dropped before the `ensure_*` fill calls below
         // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
         let (line_height, cell_w, bg_h, descender, underline_thickness_px, underline_pos_px) =
-            self.shared.with_font(|font| {
+            self.with_font(|font| {
                 let metrics = font.metrics();
                 let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
                 let cell_w = font.cell_width() as f32;
@@ -253,7 +253,9 @@ impl WindowState {
                         cell.style.bold,
                         cell.style.italic,
                     );
-                    self.atlas.ensure_char(&mut *self.shared.font.borrow_mut(), variant, ch);
+                    self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
+                        self.atlas.ensure_char(f, variant, ch)
+                    });
                 }
                 row_chars.push(ch);
             }
@@ -293,7 +295,9 @@ impl WindowState {
                 // span (better to render the chars than render half a
                 // ligature).
                 let all_ok = lig.output_glyphs.iter().all(|gid| {
-                    self.atlas.ensure_glyph_id(&mut *self.shared.font.borrow_mut(), variant, *gid)
+                    self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
+                        self.atlas.ensure_glyph_id(f, variant, *gid)
+                    })
                 });
                 if !all_ok {
                     c += 1;
@@ -326,8 +330,9 @@ impl WindowState {
                 .chain(std::iter::once('…'))
                 .collect();
             for ch in chars {
-                self.atlas
-                    .ensure_char(&mut *self.shared.font.borrow_mut(), font::FaceVariant::Regular, ch);
+                self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
+                    self.atlas.ensure_char(f, font::FaceVariant::Regular, ch)
+                });
             }
         }
 
@@ -1896,7 +1901,7 @@ impl WindowState {
         self.update_alt_scroll();
         self.update_primary_scroll();
 
-        let line_height = self.shared.with_font(|font| {
+        let line_height = self.with_font(|font| {
             let m = font.face().size_metrics().unwrap();
             ((m.ascender - m.descender) >> 6) as f32
         });
@@ -2217,7 +2222,7 @@ impl WindowState {
             self.active_tab().terminal.scrollback_len() as f32
         };
         let view_offset = self.active_tab().terminal.view_offset() as f32;
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
         let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
@@ -2514,9 +2519,9 @@ impl WindowState {
         // anchor → pixel rect uses the same font metrics + decorator_offset
         // + scroll_y that `update_vertices` applies to cell quads, so
         // images scroll smoothly alongside text.
-        let metrics = self.shared.with_font(|f| f.metrics());
+        let metrics = self.with_font(|f| f.metrics());
         let line_height = ((metrics.ascender - metrics.descender) >> 6) as f32;
-        let cell_w = self.shared.with_font(|f| f.cell_width()) as f32;
+        let cell_w = self.with_font(|f| f.cell_width()) as f32;
         let view_offset = self.active_tab().terminal.view_offset() as f32;
         let scrollback_len = if self.active_tab().terminal.on_alt_screen() {
             0.0

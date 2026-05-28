@@ -183,7 +183,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         let mut shaper = shaper::Shaper::new();
         shaper.set_variant(font::FaceVariant::Regular, &fd.primary_data, 0);
         let mut font = font::Font::new(fd.primary_data);
-        font.set_char_size(pt_size, dpi);
+        font.tune_to(pt_size, dpi);
 
         for (variant, data, face_index) in fd.styled {
             shaper.set_variant(variant, &data, face_index as u32);
@@ -218,7 +218,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         // Size the initial tab's grid to this window's viewport so the vertex
         // buffers create_window allocates match the terminal dimensions.
         let (cols, rows) = {
-            let (cell_w, line_h) = shared.with_font(|f| {
+            let (cell_w, line_h) = shared.with_font_at(pt_size, dpi, |f| {
                 let m = f.metrics();
                 (f.cell_width(), ((m.ascender - m.descender) >> 6) as usize)
             });
@@ -506,10 +506,16 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         state.resize(size);
                         state.window.request_redraw();
                     }
-                    WindowEvent::ScaleFactorChanged {
-                        scale_factor: _scale_factor,
-                        ..
-                    } => {
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        // The window crossed onto a monitor with a different
+                        // backing-scale. Re-rasterize the font at the new DPI
+                        // so its apparent size stays the same in inches — see
+                        // [`WindowState::set_dpi_from_scale`]. The title bar's
+                        // height is also DPI-scaled, so refresh the chrome
+                        // band whether or not the DPI actually changed (some
+                        // ScaleFactorChanged events round to the same u32 DPI
+                        // but still resize the bar).
+                        state.set_dpi_from_scale(scale_factor);
                         state.refresh_chrome_band();
                         state.window.request_redraw();
                     }
