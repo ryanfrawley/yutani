@@ -880,8 +880,11 @@ impl WindowState {
                                     .next()
                                     .filter(|c| ('1'..='9').contains(c))
                                 {
-                                    let target = tab_index_for_digit(d, self.window.num_tabs());
-                                    self.window.select_tab_at_index(target);
+                                    if let Some(target) =
+                                        tab_index_for_digit(d, self.window.num_tabs())
+                                    {
+                                        self.window.select_tab_at_index(target);
+                                    }
                                     return true;
                                 }
                             }

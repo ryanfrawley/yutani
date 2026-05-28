@@ -2109,15 +2109,15 @@ fn next_tab_group_id() -> String {
 }
 
 /// Map a Cmd-`d` digit ('1'..='9') to a 0-based tab index for `num_tabs` tabs:
-/// '1'..'8' are absolute positions (clamped to the last tab) and '9' is always
-/// the last tab (the Chrome/iTerm convention). `num_tabs` is assumed ≥ 1.
-fn tab_index_for_digit(d: char, num_tabs: usize) -> usize {
-    let last = num_tabs.saturating_sub(1);
+/// '1'..'8' are absolute positions, returning `None` when the position doesn't
+/// exist, and '9' is always the last tab (the Chrome/iTerm convention).
+/// `num_tabs` is assumed ≥ 1.
+fn tab_index_for_digit(d: char, num_tabs: usize) -> Option<usize> {
     if d == '9' {
-        last
-    } else {
-        (d as usize - '1' as usize).min(last)
+        return Some(num_tabs.saturating_sub(1));
     }
+    let idx = d as usize - '1' as usize;
+    (idx < num_tabs).then_some(idx)
 }
 
 /// Create a new tab: open a PTY, fork `program` onto it, spawn the reader
