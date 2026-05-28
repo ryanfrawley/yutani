@@ -1,7 +1,7 @@
 # Dirty-row rendering plan (Step 2 of the render-perf work)
 
 Implementation plan for a fresh agent/session. Branch: `dirty-rows` (off `main`).
-Worktree: `/Users/ry/projects/yutani-dirty-rows`.
+Worktree: `../yutani-dirty-rows`.
 
 ## Why
 

@@ -6,10 +6,18 @@
 //! the fingerprint isn't recognised). This is purely a system-config change —
 //! Yutani itself does nothing at the PTY level — but doing it for the user
 //! means writing a root-owned file under `/etc/pam.d`, which needs an admin
-//! authorization. We get that authorization (and the convenience) the only way
-//! macOS allows: an explicit, opt-in prompt that runs the edit with
-//! administrator privileges via `osascript`. That authorization dialog itself
-//! supports Touch ID, so on capable Macs the whole flow is touch-only.
+//! authorization. We get that authorization (and the convenience) through
+//! Apple's setuid `/usr/libexec/authopen` helper, which presents the native
+//! Authorization Services dialog and, on success, hands back a writable fd to
+//! the file. That authorization dialog itself supports Touch ID, so on capable
+//! Macs the whole flow is touch-only.
+//!
+//! We deliberately *don't* use `osascript … with administrator privileges`
+//! here: despite running as root, that elevation can't create files under
+//! `/etc/pam.d` (it returns "Operation not permitted"), whereas `authopen` —
+//! like a real `sudo` — can. `authopen -w` truncates and reads the new file
+//! contents from stdin, so `enable`/`disable` compute the *complete* desired
+//! file (the existing `sudo_local` is world-readable) and write it back.
 //!
 //! Since macOS Sonoma the supported, upgrade-safe place for this line is
 //! `/etc/pam.d/sudo_local` (OS updates reset `/etc/pam.d/sudo` but leave
@@ -42,8 +50,8 @@ pub enum Status {
 pub enum Outcome {
     /// The PAM file now matches the requested state.
     Done,
-    /// The user dismissed the authorization dialog (osascript `-128`). Not an
-    /// error — callers stay silent.
+    /// The user dismissed the authorization dialog (authopen exits non-zero
+    /// with no diagnostic). Not an error — callers stay silent.
     Cancelled,
     /// The privileged step ran but failed; the string is for surfacing/logging.
     Failed(String),
@@ -58,12 +66,45 @@ const PAM_LINE: &str = "auth       sufficient     pam_tid.so";
 // Pure parsers — no IO, so they're unit-testable without touching /etc.
 // ---------------------------------------------------------------------------
 
+/// Whether a single line is an *active* (non-commented) `auth … pam_tid.so`
+/// directive — the thing that makes Touch ID a sudo factor.
+fn is_active_pam_tid_line(line: &str) -> bool {
+    let t = line.trim_start();
+    !t.starts_with('#') && first_word(t) == Some("auth") && t.contains("pam_tid.so")
+}
+
 /// Whether `contents` has an *active* (non-commented) `auth … pam_tid.so` line.
 fn has_active_pam_tid(contents: &str) -> bool {
-    contents.lines().any(|line| {
-        let t = line.trim_start();
-        !t.starts_with('#') && first_word(t) == Some("auth") && t.contains("pam_tid.so")
-    })
+    contents.lines().any(is_active_pam_tid_line)
+}
+
+/// The `sudo_local` contents that *enable* Touch ID: `contents` with our
+/// [`PAM_LINE`] appended, unless an active `pam_tid` line is already present
+/// (then it's returned unchanged, so enabling is idempotent). A trailing
+/// newline is ensured before appending. `authopen -w` replaces the whole file,
+/// so we preserve any existing local config rather than just appending in place.
+fn add_pam_tid(contents: &str) -> String {
+    if has_active_pam_tid(contents) {
+        return contents.to_string();
+    }
+    let mut out = contents.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(PAM_LINE);
+    out.push('\n');
+    out
+}
+
+/// The `sudo_local` contents that *disable* Touch ID: `contents` with every
+/// active `pam_tid` line removed (commented lines and unrelated config are
+/// kept). Line endings are normalised to `\n` since we rewrite the whole file.
+fn strip_active_pam_tid(contents: &str) -> String {
+    contents
+        .lines()
+        .filter(|line| !is_active_pam_tid_line(line))
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 /// Whether `contents` (the `/etc/pam.d/sudo` file) has an active
@@ -85,12 +126,6 @@ fn first_word(s: &str) -> Option<&str> {
     s.split_whitespace().next()
 }
 
-/// AppleScript string-literal escaping: backslash and double-quote. Used to
-/// embed a filesystem path inside the `do shell script "…"` literal.
-fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 // ---------------------------------------------------------------------------
 // macOS implementation
 // ---------------------------------------------------------------------------
@@ -99,7 +134,7 @@ fn applescript_escape(s: &str) -> String {
 mod imp {
     use super::*;
     use std::io::Write;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     /// Read a PAM file, treating any read error as "no such line".
     fn read(path: &str) -> String {
@@ -132,76 +167,71 @@ mod imp {
         }
     }
 
-    /// Run `script` as root via `osascript`'s authorization dialog. The script
-    /// is written to a 0700 temp file and executed by `/bin/sh`, so we never
-    /// have to nest shell quoting inside AppleScript. `prompt` is the sentence
-    /// shown in the auth dialog.
-    fn run_privileged(script: &str, prompt: &str) -> Outcome {
-        // Unique temp path; pid is enough since this is a one-shot, main-thread
-        // call. Under our own dir-less temp file in the system temp dir.
-        let path = std::env::temp_dir().join(format!("yutani-touchid-{}.sh", std::process::id()));
+    /// Write `content` as the complete contents of the root-owned `path` via
+    /// Apple's setuid `/usr/libexec/authopen` helper. `-c` creates the file if
+    /// needed; `-w` opens it for writing (truncating) and reads the new bytes
+    /// from our stdin. The helper presents the native, Touch-ID-capable
+    /// Authorization Services dialog; we handle no password ourselves.
+    ///
+    /// We use `authopen` rather than `osascript … with administrator
+    /// privileges` because the latter, despite running as root, gets
+    /// "Operation not permitted" creating files under `/etc/pam.d`.
+    fn authopen_write(path: &str, content: &str) -> Outcome {
+        let mut child = match Command::new("/usr/libexec/authopen")
+            .args(["-c", "-w", path])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
         {
-            let mut f = match std::fs::File::create(&path) {
-                Ok(f) => f,
-                Err(e) => return Outcome::Failed(format!("temp file: {e}")),
-            };
-            if let Err(e) = f.write_all(script.as_bytes()) {
-                let _ = std::fs::remove_file(&path);
-                return Outcome::Failed(format!("temp write: {e}"));
+            Ok(c) => c,
+            Err(e) => return Outcome::Failed(format!("authopen: {e}")),
+        };
+
+        // authopen writes whatever it reads from stdin, up to EOF; dropping the
+        // handle after the write closes the pipe and signals EOF.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(content.as_bytes()) {
+                // Reap the child so we don't leak it, then report.
+                let _ = child.wait();
+                return Outcome::Failed(format!("authopen stdin: {e}"));
             }
         }
 
-        let path_str = path.to_string_lossy().into_owned();
-        let apple = format!(
-            "do shell script \"/bin/sh '{}'\" with administrator privileges with prompt \"{}\"",
-            applescript_escape(&path_str),
-            applescript_escape(prompt),
-        );
-        let result = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&apple)
-            .output();
-        let _ = std::fs::remove_file(&path);
-
-        match result {
+        match child.wait_with_output() {
             Ok(out) if out.status.success() => Outcome::Done,
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                // The user dismissed the dialog: AppleScript error -128.
-                if stderr.contains("-128") || stderr.contains("User canceled") {
+                let trimmed = stderr.trim();
+                // authopen exits non-zero with no diagnostic when the user
+                // dismisses the auth dialog (errAuthorizationCanceled); a real
+                // failure prints a reason. Treat the silent case as a cancel.
+                if trimmed.is_empty() {
                     Outcome::Cancelled
                 } else {
-                    Outcome::Failed(stderr.trim().to_string())
+                    Outcome::Failed(trimmed.to_string())
                 }
             }
-            Err(e) => Outcome::Failed(format!("osascript: {e}")),
+            Err(e) => Outcome::Failed(format!("authopen: {e}")),
         }
     }
 
     pub fn enable() -> Outcome {
-        // Idempotent append. `set -e` won't trip on the `if !` test (grep's
-        // exit code is consumed by the condition).
-        let script = format!(
-            "set -e\n\
-             F={SUDO_LOCAL}\n\
-             if ! grep -Eq '^[[:space:]]*auth[[:space:]].*pam_tid\\.so' \"$F\" 2>/dev/null; then\n\
-             \tprintf '%s\\n' '{PAM_LINE}' >> \"$F\"\n\
-             fi\n",
-        );
-        run_privileged(&script, "Yutani wants to enable Touch ID for sudo.")
+        let current = read(SUDO_LOCAL);
+        // Already enabled: don't bother the user with an auth prompt.
+        if has_active_pam_tid(&current) {
+            return Outcome::Done;
+        }
+        authopen_write(SUDO_LOCAL, &add_pam_tid(&current))
     }
 
     pub fn disable() -> Outcome {
-        // Strip the active pam_tid auth line(s) we'd have added. We only ever
-        // edit sudo_local, so this is the exact inverse of enable(); a missing
-        // file is already "disabled".
-        let script = format!(
-            "set -e\n\
-             F={SUDO_LOCAL}\n\
-             [ -f \"$F\" ] || exit 0\n\
-             /usr/bin/sed -i '' -E '/^[[:space:]]*auth[[:space:]].*pam_tid\\.so/d' \"$F\"\n",
-        );
-        run_privileged(&script, "Yutani wants to turn off Touch ID for sudo.")
+        let current = read(SUDO_LOCAL);
+        // Already off (covers a missing/empty file): nothing to authorize.
+        if !has_active_pam_tid(&current) {
+            return Outcome::Done;
+        }
+        authopen_write(SUDO_LOCAL, &strip_active_pam_tid(&current))
     }
 }
 
@@ -354,13 +384,6 @@ mod tests {
         assert!(!includes_sudo_local("session optional sudo_local\n"));
     }
 
-    #[test]
-    fn applescript_escaping_quotes_and_backslashes() {
-        assert_eq!(applescript_escape("a/b/c"), "a/b/c");
-        assert_eq!(applescript_escape("a\"b"), "a\\\"b");
-        assert_eq!(applescript_escape("a\\b"), "a\\\\b");
-    }
-
     // ----- has_active_pam_tid: whitespace, ordering, and the exact line -----
 
     #[test]
@@ -485,34 +508,156 @@ mod tests {
         assert!(!includes_sudo_local("account include sudo_local\n"));
     }
 
-    // ----- applescript_escape: ordering and combined characters -----
+    // ----- add_pam_tid / strip_active_pam_tid: the content transforms -----
 
     #[test]
-    fn applescript_escape_handles_backslash_before_quote() {
-        // A backslash immediately followed by a quote: each is escaped exactly
-        // once, and the backslash-doubling must not re-escape the quote's added
-        // backslash. Input `\"` -> `\\` + `\"` == `\\\"`.
-        assert_eq!(applescript_escape("\\\""), "\\\\\\\"");
+    fn add_pam_tid_appends_the_line_to_an_empty_file() {
+        // A fresh/missing sudo_local (empty contents) becomes just our line,
+        // with no stray leading newline.
+        assert_eq!(add_pam_tid(""), format!("{PAM_LINE}\n"));
     }
 
     #[test]
-    fn applescript_escape_is_identity_on_plain_text_and_empty() {
-        assert_eq!(applescript_escape(""), "");
+    fn add_pam_tid_preserves_existing_content_and_fixes_missing_newline() {
+        // Apple's template (comments, no active line) is kept verbatim and our
+        // line is appended after a newline is ensured.
+        let template = "# sudo_local: local config\n# uncomment to enable\n";
+        assert_eq!(add_pam_tid(template), format!("{template}{PAM_LINE}\n"));
+        // No trailing newline on the input: one is added before appending.
         assert_eq!(
-            applescript_escape("/etc/pam.d/sudo_local"),
-            "/etc/pam.d/sudo_local"
-        );
-        // A realistic temp path with spaces needs no escaping (no quotes/slashes
-        // of the escaped kind).
-        assert_eq!(
-            applescript_escape("/var/folders/yutani touchid"),
-            "/var/folders/yutani touchid"
+            add_pam_tid("auth include sudo_local"),
+            format!("auth include sudo_local\n{PAM_LINE}\n")
         );
     }
 
     #[test]
-    fn applescript_escape_handles_multiple_quotes_and_backslashes() {
-        assert_eq!(applescript_escape("\"\""), "\\\"\\\"");
-        assert_eq!(applescript_escape("\\\\"), "\\\\\\\\");
+    fn add_pam_tid_is_idempotent_when_already_enabled() {
+        // Already-active contents are returned byte-for-byte: enabling twice
+        // must not duplicate the line (and lets enable() skip the auth prompt).
+        let already = format!("# comment\n{PAM_LINE}\n");
+        assert_eq!(add_pam_tid(&already), already);
+    }
+
+    #[test]
+    fn add_pam_tid_output_is_detected_as_active() {
+        // Round-trip: whatever add_pam_tid produces must read back as enabled.
+        assert!(has_active_pam_tid(&add_pam_tid("")));
+        assert!(has_active_pam_tid(&add_pam_tid("# only comments\n")));
+    }
+
+    #[test]
+    fn strip_active_pam_tid_removes_only_the_active_line() {
+        // The active pam_tid line goes; surrounding config and commented-out
+        // pam_tid lines stay. Output reads back as disabled.
+        let contents = "# sudo_local\n\
+                        auth       sufficient     pam_smartcard.so\n\
+                        auth       sufficient     pam_tid.so\n\
+                        # auth sufficient pam_tid.so\n";
+        let out = strip_active_pam_tid(contents);
+        assert_eq!(
+            out,
+            "# sudo_local\n\
+             auth       sufficient     pam_smartcard.so\n\
+             # auth sufficient pam_tid.so\n"
+        );
+        assert!(!has_active_pam_tid(&out));
+    }
+
+    #[test]
+    fn strip_active_pam_tid_removes_every_active_duplicate() {
+        // More than one active line (shouldn't happen, but be safe) are all
+        // removed, leaving the file fully disabled.
+        let contents = format!("{PAM_LINE}\nauth sufficient pam_tid.so.2\nfoo bar\n");
+        let out = strip_active_pam_tid(&contents);
+        assert_eq!(out, "foo bar\n");
+        assert!(!has_active_pam_tid(&out));
+    }
+
+    #[test]
+    fn strip_active_pam_tid_leaves_an_already_disabled_file_unchanged() {
+        // No active line: every (normalised) line survives.
+        let contents = "# auth sufficient pam_tid.so\nauth include sudo_local\n";
+        assert_eq!(strip_active_pam_tid(contents), contents);
+    }
+
+    #[test]
+    fn is_active_pam_tid_line_predicate_classifies_single_lines() {
+        // The refactored-out predicate, tested directly: an uncommented `auth`
+        // line mentioning the module is active; comments, leading-`#`, and
+        // non-`auth` facilities are not.
+        assert!(is_active_pam_tid_line("auth sufficient pam_tid.so"));
+        assert!(is_active_pam_tid_line(
+            "\tauth\tsufficient\tpam_tid.so\t# touch id"
+        ));
+        assert!(!is_active_pam_tid_line("# auth sufficient pam_tid.so"));
+        assert!(!is_active_pam_tid_line("   #auth sufficient pam_tid.so"));
+        assert!(!is_active_pam_tid_line("account required pam_tid.so"));
+        assert!(!is_active_pam_tid_line("auth sufficient pam_opendirectory.so"));
+        assert!(!is_active_pam_tid_line(""));
+    }
+
+    #[test]
+    fn strip_active_pam_tid_normalises_crlf_line_endings() {
+        // The doc promises endings are normalised to `\n` (we rewrite the whole
+        // file). CRLF input comes back LF-only, with the active line removed.
+        let contents = "# sudo_local\r\nauth sufficient pam_tid.so\r\nfoo bar\r\n";
+        let out = strip_active_pam_tid(contents);
+        assert_eq!(out, "# sudo_local\nfoo bar\n");
+        assert!(!has_active_pam_tid(&out));
+    }
+
+    #[test]
+    fn strip_active_pam_tid_on_empty_input_yields_empty() {
+        // A missing/empty sudo_local stays empty (no stray newline introduced).
+        assert_eq!(strip_active_pam_tid(""), "");
+    }
+
+    #[test]
+    fn strip_active_pam_tid_appends_trailing_newline_to_a_no_newline_file() {
+        // `lines()` drops the final missing newline; we re-emit one per surviving
+        // line, so a file with no trailing newline gains one (whole-file rewrite).
+        assert_eq!(strip_active_pam_tid("foo bar"), "foo bar\n");
+    }
+
+    #[test]
+    fn add_pam_tid_idempotent_for_a_whitespace_variant_active_line() {
+        // Idempotency keys off `has_active_pam_tid`, not an exact `PAM_LINE`
+        // match: an existing tab-delimited active line is left untouched even
+        // though it differs from the constant we'd otherwise append.
+        let already = "auth\tsufficient\tpam_tid.so\n";
+        assert_eq!(add_pam_tid(already), already);
+    }
+
+    #[test]
+    fn enable_then_disable_round_trips_to_disabled() {
+        // add_pam_tid and strip_active_pam_tid are inverses with respect to the
+        // "is it active?" predicate: enabling then disabling leaves the file
+        // not-active again.
+        let base = "# sudo_local: local config\nauth include sudo_local\n";
+        let enabled = add_pam_tid(base);
+        assert!(has_active_pam_tid(&enabled));
+        let disabled = strip_active_pam_tid(&enabled);
+        assert!(!has_active_pam_tid(&disabled));
+    }
+
+    #[test]
+    fn disable_then_enable_round_trips_to_enabled() {
+        // The other inverse direction: stripping a file that's already off and
+        // re-adding leaves it active again (and readable as enabled).
+        let base = "# sudo_local: local config\nauth include sudo_local\n";
+        let disabled = strip_active_pam_tid(base);
+        assert!(!has_active_pam_tid(&disabled));
+        let enabled = add_pam_tid(&disabled);
+        assert!(has_active_pam_tid(&enabled));
+    }
+
+    #[test]
+    fn strip_then_add_is_a_stable_fixpoint() {
+        // Disabling already-disabled and enabling already-enabled are no-ops at
+        // the predicate level, so a second pass changes nothing.
+        let enabled = add_pam_tid("auth include sudo_local\n");
+        assert_eq!(add_pam_tid(&enabled), enabled);
+        let disabled = strip_active_pam_tid(&enabled);
+        assert_eq!(strip_active_pam_tid(&disabled), disabled);
     }
 }

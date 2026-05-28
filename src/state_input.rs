@@ -985,6 +985,21 @@ impl WindowState {
                             self.trigger_completion();
                             return true;
                         }
+                        // Ctrl-Tab / Ctrl-Shift-Tab cycle native tabs (next/prev),
+                        // the conventional browser-style binding alongside the
+                        // Cmd-Shift-] / [ pair above. Drives AppKit's tab group
+                        // directly. Intercepting here (before the encode_key path)
+                        // claims the chord for navigation; otherwise plain Ctrl-Tab
+                        // would be encoded as a bare TAB and sent to the shell.
+                        if let Key::Named(NamedKey::Tab) = &event.logical_key {
+                            use winit::platform::macos::WindowExtMacOS;
+                            if self.modifiers.shift_key() {
+                                self.window.select_previous_tab();
+                            } else {
+                                self.window.select_next_tab();
+                            }
+                            return true;
+                        }
                     }
                     // Completion popup keyboard interaction (autocomplete slice
                     // K11). Only acts when the popup is genuinely active (cached

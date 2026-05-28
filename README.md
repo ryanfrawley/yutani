@@ -127,11 +127,6 @@ never `/etc/pam.d/sudo`.
 It only affects `sudo`, not arbitrary password prompts that don't go through
 PAM.
 
-## Repository
-
-Yutani is developed on a self-hosted [Forgejo](https://forgejo.org/) instance
-at `git.frawley.co`; the default branch is `main`.
-
 ## License
 
 Not yet specified.
