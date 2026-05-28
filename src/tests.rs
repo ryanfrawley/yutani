@@ -326,14 +326,17 @@ fn chrome_extra_top_formula_is_band_minus_baseline_floored_at_zero() {
 #[test]
 fn tab_index_for_digit_maps_positions_and_clamps() {
     // Absolute positions (0-based) for '1'..'8' when in range.
-    assert_eq!(tab_index_for_digit('1', 5), 0);
-    assert_eq!(tab_index_for_digit('3', 5), 2);
+    assert_eq!(tab_index_for_digit('1', 5), Some(0));
+    assert_eq!(tab_index_for_digit('3', 5), Some(2));
     // '9' is always the last tab, regardless of count.
-    assert_eq!(tab_index_for_digit('9', 5), 4);
-    assert_eq!(tab_index_for_digit('9', 1), 0);
-    // Out-of-range positions clamp to the last tab.
-    assert_eq!(tab_index_for_digit('8', 3), 2);
-    assert_eq!(tab_index_for_digit('2', 1), 0);
+    assert_eq!(tab_index_for_digit('9', 5), Some(4));
+    assert_eq!(tab_index_for_digit('9', 1), Some(0));
+    // Out-of-range positions ('1'..'8' beyond the tab count) are a no-op.
+    assert_eq!(tab_index_for_digit('8', 3), None);
+    assert_eq!(tab_index_for_digit('2', 1), None);
+    assert_eq!(tab_index_for_digit('4', 3), None);
+    // The last in-range position still maps.
+    assert_eq!(tab_index_for_digit('3', 3), Some(2));
 }
 
 #[test]
