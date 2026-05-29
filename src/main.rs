@@ -2273,6 +2273,11 @@ fn spawn_window_in_process(
         rows,
         config.images_memory_cap_mb * 1024 * 1024,
     );
+    // SPIKE: give every window (native tab) its own scroll view.
+    #[cfg(target_os = "macos")]
+    {
+        install_scrollview_spike(&window);
+    }
     let mut state =
         WindowState::create_window(shared.clone(), window, surface, surface_raw, config.clone(), dpi, tab);
     // Mirror the post-construction setup `run()` does for the first window.
@@ -2734,6 +2739,329 @@ fn chrome_band_from(native: Option<f64>, reserve: f64) -> f64 {
         .map(|h| h + CHROME_BAND_MARGIN_PX)
         .filter(|band| *band >= reserve)
         .unwrap_or(reserve)
+}
+
+// ---------------------------------------------------------------------------
+// SPIKE: native NSScrollView overscroll. Reparent winit's Metal-backed view
+// into an NSScrollView so we get the native scroller + elastic rubber-band for
+// free, then mirror the scroll offset into our own viewport. This block is
+// exploratory; it lives behind `install_scrollview_spike`, called once for the
+// first window.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// Per-window spike NSScrollViews, keyed by the `NSWindow` pointer. Each
+    /// window (native tab) gets its own scroll view; the poll drives only the
+    /// focused window from its *own* scroll view.
+    static SPIKE_SCROLLVIEWS: std::cell::RefCell<
+        std::collections::HashMap<usize, *mut objc2::runtime::AnyObject>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Per-window last-synced `(scroll_origin_points, view_offset)`, to tell a
+    /// user scroll (origin moved) from the terminal scrolling itself (view_offset
+    /// moved) so the two stay in sync without fighting.
+    static SPIKE_LAST: std::cell::RefCell<std::collections::HashMap<usize, (f64, usize)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Read `window`'s last-synced `(origin_points, view_offset)`.
+#[cfg(target_os = "macos")]
+fn spike_last(window: &Window) -> Option<(f64, usize)> {
+    let key = ns_window_key(window);
+    SPIKE_LAST.with(|m| m.borrow().get(&key).copied())
+}
+
+/// Record `window`'s last-synced `(origin_points, view_offset)`.
+#[cfg(target_os = "macos")]
+fn set_spike_last(window: &Window, origin: f64, view_offset: usize) {
+    let key = ns_window_key(window);
+    SPIKE_LAST.with(|m| m.borrow_mut().insert(key, (origin, view_offset)));
+}
+
+/// SPIKE: event-loop proxy for waking winit from the AppKit bounds-change
+/// observer. Set once at startup.
+#[cfg(target_os = "macos")]
+static SPIKE_PROXY: std::sync::OnceLock<
+    winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+pub(crate) fn set_spike_proxy(
+    proxy: winit::event_loop::EventLoopProxy<app_window::CustomEvent>,
+) {
+    let _ = SPIKE_PROXY.set(proxy);
+}
+
+/// Selector callback for `NSViewBoundsDidChangeNotification`: a scroll view's
+/// clip view moved (user scroll, momentum, or elastic bounce). Wake the loop so
+/// `about_to_wait` mirrors the offset — no busy-poll.
+#[cfg(target_os = "macos")]
+extern "C" fn yutani_scroll_did_change(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _note: *mut objc2::runtime::AnyObject,
+) {
+    if let Some(p) = SPIKE_PROXY.get() {
+        let _ = p.send_event(app_window::CustomEvent::ScrollSync);
+    }
+}
+
+/// Lazily build and return the shared scroll observer object (an `NSObject`
+/// subclass with one `scrollDidChange:` method that wakes the loop).
+#[cfg(target_os = "macos")]
+fn spike_scroll_observer() -> *mut objc2::runtime::AnyObject {
+    use objc2::runtime::{AnyClass, AnyObject, Sel};
+    use objc2::{class, msg_send, sel};
+    use std::sync::OnceLock;
+    static OBSERVER: OnceLock<usize> = OnceLock::new();
+    let ptr = *OBSERVER.get_or_init(|| unsafe {
+        type ImpAbi = extern "C" fn(*mut AnyObject, Sel, *mut AnyObject);
+        // Register a fresh NSObject subclass with our notification method.
+        let superclass = class!(NSObject);
+        let name = c"YutaniScrollObserver";
+        let cls = objc2::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0)
+            as *mut AnyClass;
+        objc2::ffi::class_addMethod(
+            cls,
+            sel!(scrollDidChange:),
+            std::mem::transmute::<ImpAbi, unsafe extern "C-unwind" fn()>(
+                yutani_scroll_did_change,
+            ),
+            c"v@:@".as_ptr(),
+        );
+        objc2::ffi::objc_registerClassPair(cls);
+        let obj: *mut AnyObject = msg_send![cls as *const AnyClass, new];
+        obj as usize
+    });
+    ptr as *mut AnyObject
+}
+
+/// The `NSWindow` pointer backing `window`, as a map key. 0 if unavailable.
+#[cfg(target_os = "macos")]
+fn ns_window_key(window: &Window) -> usize {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return 0;
+    };
+    unsafe {
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![ns_view, window];
+        ns_window as usize
+    }
+}
+
+/// Wrap winit's Metal view in an NSScrollView with a tall dummy document view,
+/// so AppKit draws the native overlay scroller and provides elastic overscroll.
+/// The Metal view is added as a *floating* subview so it stays pinned to the
+/// viewport while the (empty) document scrolls underneath. Returns whether the
+/// wrap was installed.
+#[cfg(target_os = "macos")]
+fn install_scrollview_spike(window: &Window) -> bool {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSPoint, NSRect};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return false;
+    };
+    unsafe {
+        let mtl_view = handle.ns_view as *mut AnyObject;
+        let ns_window: *mut AnyObject = msg_send![mtl_view, window];
+        if ns_window.is_null() {
+            return false;
+        }
+        let content: *mut AnyObject = msg_send![ns_window, contentView];
+        if content.is_null() {
+            return false;
+        }
+        let bounds: NSRect = msg_send![content, bounds];
+
+        // Scroll view filling the content area.
+        let sv: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+        let sv: *mut AnyObject = msg_send![sv, initWithFrame: bounds];
+        let _: () = msg_send![sv, setDrawsBackground: false];
+        // The window uses a full-size content view under a transparent title
+        // bar, so AppKit otherwise auto-insets the clip view by the title/tab-bar
+        // height — which reads as a few lines of phantom scroll (a gap above the
+        // prompt). Pin the resting scroll origin at 0 instead.
+        let _: () = msg_send![sv, setAutomaticallyAdjustsContentInsets: false];
+        let _: () = msg_send![sv, setHasVerticalScroller: true];
+        let _: () = msg_send![sv, setHasHorizontalScroller: false];
+        // NSScrollElasticityAllowed = 2.
+        let _: () = msg_send![sv, setVerticalScrollElasticity: 2isize];
+        let _: () = msg_send![sv, setAutohidesScrollers: true];
+        // NSScrollerStyleOverlay = 1.
+        let _: () = msg_send![sv, setScrollerStyle: 1isize];
+
+        // Dummy document view. Start it at exactly the viewport height (no
+        // scroll range) so a fresh tab opens parked at the bottom (newest); the
+        // per-frame sync grows it to the scrollback depth. A taller initial doc
+        // would start scrolled to its top and read as a big overscroll gap.
+        let doc: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let doc_frame = NSRect::new(NSPoint::new(0.0, 0.0), bounds.size);
+        let doc: *mut AnyObject = msg_send![doc, initWithFrame: doc_frame];
+        let _: () = msg_send![sv, setDocumentView: doc];
+
+        // Less invasive variant: keep winit's Metal view as the content view
+        // (so winit's contentView/responder assumptions hold) and add the scroll
+        // view as a transparent subview on top, purely for the native scroller +
+        // elastic bounds. NSViewWidthSizable(2) | NSViewHeightSizable(16) = 18.
+        let _: () = msg_send![sv, setAutoresizingMask: 18usize];
+        let _: () = msg_send![mtl_view, addSubview: sv];
+
+        // Wake the loop on scroll instead of busy-polling: have the clip view
+        // post bounds-change notifications and observe them.
+        let clip: *mut AnyObject = msg_send![sv, contentView];
+        let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
+        let observer = spike_scroll_observer();
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = objc2_foundation::NSString::from_str("NSViewBoundsDidChangeNotification");
+        let _: () = msg_send![
+            center,
+            addObserver: observer,
+            selector: objc2::sel!(scrollDidChange:),
+            name: &*name,
+            object: clip,
+        ];
+
+        let key = ns_window as usize;
+        SPIKE_SCROLLVIEWS.with(|m| m.borrow_mut().insert(key, sv));
+        true
+    }
+}
+
+/// The spike scroll view for `window`, or null.
+#[cfg(target_os = "macos")]
+fn scrollview_for(window: &Window) -> *mut objc2::runtime::AnyObject {
+    let key = ns_window_key(window);
+    SPIKE_SCROLLVIEWS.with(|m| m.borrow().get(&key).copied().unwrap_or(std::ptr::null_mut()))
+}
+
+/// `(clip_origin_y, viewport_height, doc_height)` of `window`'s spike scroll
+/// view, in AppKit points. `clip_origin_y` is the scroll position (0 = bottom of
+/// the non-flipped document); the elastic overscroll pushes it below 0 / above
+/// `doc_height - viewport_height`. None if the spike isn't installed.
+#[cfg(target_os = "macos")]
+fn poll_scrollview_metrics(window: &Window) -> Option<(f64, f64, f64)> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSRect;
+    let sv = scrollview_for(window);
+    if sv.is_null() {
+        return None;
+    }
+    unsafe {
+        let clip: *mut AnyObject = msg_send![sv, contentView];
+        let doc: *mut AnyObject = msg_send![sv, documentView];
+        if clip.is_null() || doc.is_null() {
+            return None;
+        }
+        let cb: NSRect = msg_send![clip, bounds];
+        let db: NSRect = msg_send![doc, frame];
+        Some((cb.origin.y, cb.size.height, db.size.height))
+    }
+}
+
+/// Show or hide `window`'s scroll view. Hiding lets wheel events fall through to
+/// winit's view (e.g. on the alt screen, where the running app should receive
+/// them) instead of the scroll view swallowing them.
+#[cfg(target_os = "macos")]
+fn set_scrollview_hidden(window: &Window, hidden: bool) {
+    use objc2::msg_send;
+    let sv = scrollview_for(window);
+    if sv.is_null() {
+        return;
+    }
+    unsafe {
+        let cur: bool = msg_send![sv, isHidden];
+        if cur != hidden {
+            let _: () = msg_send![sv, setHidden: hidden];
+        }
+    }
+}
+
+/// Enable/disable `window`'s vertical scroller (hides the bar when off, e.g.
+/// while a find / palette overlay is open).
+#[cfg(target_os = "macos")]
+fn set_scrollview_scroller(window: &Window, enabled: bool) {
+    use objc2::msg_send;
+    let sv = scrollview_for(window);
+    if sv.is_null() {
+        return;
+    }
+    unsafe {
+        let cur: bool = msg_send![sv, hasVerticalScroller];
+        if cur != enabled {
+            let _: () = msg_send![sv, setHasVerticalScroller: enabled];
+        }
+    }
+}
+
+/// Programmatically move `window`'s scroll view to vertical offset `y` (points),
+/// e.g. to follow the terminal when it scrolls itself (output / jump-to-bottom).
+#[cfg(target_os = "macos")]
+fn set_scrollview_origin(window: &Window, y: f64) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSPoint;
+    let sv = scrollview_for(window);
+    if sv.is_null() {
+        return;
+    }
+    unsafe {
+        let clip: *mut AnyObject = msg_send![sv, contentView];
+        if clip.is_null() {
+            return;
+        }
+        let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, y.max(0.0))];
+        let _: () = msg_send![sv, reflectScrolledClipView: clip];
+    }
+}
+
+/// Release `window`'s scroll view + observer registration and drop the map
+/// entry, on window close.
+#[cfg(target_os = "macos")]
+fn remove_scrollview_spike(window: &Window) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let key = ns_window_key(window);
+    let sv = SPIKE_SCROLLVIEWS.with(|m| m.borrow_mut().remove(&key)).unwrap_or(std::ptr::null_mut());
+    if sv.is_null() {
+        return;
+    }
+    unsafe {
+        let clip: *mut AnyObject = msg_send![sv, contentView];
+        let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let _: () = msg_send![center, removeObserver: spike_scroll_observer(), name: std::ptr::null::<AnyObject>(), object: clip];
+        let _: () = msg_send![sv, removeFromSuperview];
+    }
+}
+
+/// Resize the spike document view so the scroller thumb reflects the real
+/// scrollback depth: `height` should be the viewport plus the scrollable range.
+#[cfg(target_os = "macos")]
+fn set_scrollview_doc_height(window: &Window, height: f64) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSRect, NSSize};
+    let sv = scrollview_for(window);
+    if sv.is_null() {
+        return;
+    }
+    unsafe {
+        let doc: *mut AnyObject = msg_send![sv, documentView];
+        if doc.is_null() {
+            return;
+        }
+        let f: NSRect = msg_send![doc, frame];
+        if (f.size.height - height).abs() > 0.5 {
+            let _: () = msg_send![doc, setFrameSize: NSSize::new(f.size.width.max(1.0), height.max(1.0))];
+        }
+    }
 }
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
