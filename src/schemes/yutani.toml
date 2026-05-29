@@ -1,0 +1,20 @@
+background = 0x242018
+foreground = 0xffdd6f
+cursor = 0xffdd6f
+selection = 0xffdd6f
+selection_fg = 0x242018
+
+max_colors = "mono"
+
+# Glow + scanline overrides (need theme_overrides_glow = true in config).
+glow_match_brightness = true
+glow_threshold = 0
+glow_intensity = 0.45
+glow_softness = 1
+glow_hue_tolerance_deg = 3
+glow_fg_tolerance = 0
+glow_iterations = 8
+glow_scanlines = true
+glow_scanline_period = 8
+glow_scanlines_content_attenuation = 0
+

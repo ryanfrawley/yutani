@@ -54,6 +54,13 @@ pub(crate) fn run() {
     let t_start = std::time::Instant::now();
     let timing = std::env::var_os("YUTANI_STARTUP_TIMING").is_some();
 
+    // Drop the built-in color schemes into ~/.config/yutani/schemes/ before the
+    // PTY child forks for onboarding, so a fresh install has themes to offer in
+    // setup and the palette picker. Only writes ones not already present, so
+    // user edits are never clobbered. Best-effort; runs only in the parent
+    // (the `--onboard` child branches out of `main` before reaching here).
+    bundled_schemes::seed();
+
     let event_loop = EventLoop::<app_window::CustomEvent>::with_user_event()
         .build()
         .unwrap();

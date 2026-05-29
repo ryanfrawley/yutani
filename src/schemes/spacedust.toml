@@ -1,0 +1,32 @@
+background = 0x0a1e24
+foreground = 0xecefc1
+cursor = 0xffffff
+selection = 0x0a385c
+
+black   = [0x6e5246, 0x674c31]
+red     = [0xe35a00, 0xff8a39]
+green   = [0x5cab96, 0xadcab8]
+yellow  = [0xe3cd7b, 0xffc777]
+blue    = [0x0e548b, 0x67a0cd]
+magenta = [0xe35a00, 0xff8a39]
+cyan    = [0x06afc7, 0x83a6b3]
+white   = [0xf0f1ce, 0xfefff0]
+
+glow_match_brightness = true
+glow_match_bright_ansi = false
+glow_match_foreground = false
+glow_threshold = 0
+glow_intensity = 0.6
+glow_softness = 1
+glow_hue_tolerance_deg = 18
+glow_fg_tolerance = 0
+glow_iterations = 4
+glow_scanlines = true
+glow_scanline_strength = 1
+glow_scanline_period = 8
+glow_scanlines_content = false
+glow_scanlines_content_strength = 1
+glow_scanline_color_bright = 0xffffff
+glow_scanline_color_dark = 0x000000
+glow_scanlines_skip_primary_bg = false
+glow_scanlines_content_attenuation = 0
