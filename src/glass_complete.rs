@@ -133,8 +133,12 @@ mod imp {
                     class!(NSColor),
                     colorWithSRGBRed: 1.0f64, green: 1.0f64, blue: 1.0f64, alpha: 0.18f64,
                 ];
-                let cg: *mut AnyObject = msg_send![&*hl, CGColor];
-                let _: () = msg_send![hlayer, setBackgroundColor: cg];
+                // Typed accessor: a raw `msg_send![…, CGColor]` typed as an
+                // object aborts under objc2 0.6's return-encoding check (the
+                // method returns a `CGColorRef`). `cg` stays alive until
+                // `setBackgroundColor:` retains it.
+                let cg = hl.CGColor();
+                let _: () = msg_send![hlayer, setBackgroundColor: Retained::as_ptr(&cg) as *mut AnyObject];
                 let _: () = msg_send![hlayer, setCornerRadius: 6.0f64];
             }
             container.addSubview(&highlight);

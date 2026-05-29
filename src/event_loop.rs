@@ -258,6 +258,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         state.refresh_chrome_band();
         state.window.set_cursor(winit::window::CursorIcon::Text);
         state.sync_theme_colors();
+        // Restyle the native tabs now that the NSWindow exists.
+        state.configure_native_tabs();
         state.tabs[state.active]
             .terminal
             .set_keep_placements_in_scrollback(state.config.images_in_scrollback);
@@ -324,6 +326,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         state.manual_title.as_deref(),
                         state.active_tab().terminal.cwd(),
                     ));
+                    // The pill label mirrors the window title.
+                    state.refresh_tab_bar();
                 }
                 // The shell may have reported its history file (OSC 2124):
                 // read + parse it and merge past commands into the in-memory
@@ -445,6 +449,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     state.manual_title.as_deref(),
                     state.active_tab().terminal.cwd(),
                 ));
+                state.refresh_tab_bar();
             }
             if !consumed {
                 match event {
@@ -494,6 +499,10 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         // without this its prompt stays stranded behind
                         // the freshly-shown bar.
                         state.reflow_for_tab_bar();
+                        // A different tab becoming visible (or this one losing
+                        // focus to a freshly-spawned sibling) changes which pill
+                        // is active and which tabs exist.
+                        state.refresh_tab_bar();
                         // The native autocomplete popup is an independent
                         // floating panel; hide it on focus loss (a render may
                         // not follow to do it) so it doesn't sit over other apps.
@@ -512,6 +521,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         state.occluded = occluded;
                         if !occluded {
                             state.reflow_for_tab_bar();
+                            state.refresh_tab_bar();
                             state.invalidate();
                         }
                     }
@@ -674,7 +684,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         if let Some(state) = spike_wid.and_then(|w| self.windows.get_mut(&w)) {
             if let Some((origin_y, _vp_h, _doc_h)) = poll_scrollview_metrics(&state.window) {
                 let scale = state.window.scale_factor();
-                let lh_px = state.shared.with_font(|f| {
+                let lh_px = state.with_font(|f| {
                     let m = f.metrics();
                     ((m.ascender - m.descender) >> 6) as f64
                 });

@@ -778,21 +778,26 @@ mod imp {
     /// Build the 4 mask colors: a clear top stop when `fade_top`, a clear bottom
     /// stop when `fade_bottom`, opaque in between (and at any non-faded edge).
     unsafe fn gradient_colors(fade_top: bool, fade_bottom: bool) -> *mut AnyObject {
-        let make = |a: f64| -> *mut AnyObject {
+        // Use the typed `CGColor()` accessor: objc2 0.6 verifies the message
+        // return encoding at runtime, and a raw `msg_send![…, CGColor]` typed as
+        // an object (`@`) aborts because the method actually returns a
+        // `CGColorRef` (`^{CGColor=}`). The `Retained<CGColor>` values are held
+        // until after `addObject:` retains them.
+        let make = |a: f64| {
             let c: Retained<NSColor> = msg_send![
                 class!(NSColor),
                 colorWithSRGBRed: 1.0f64, green: 1.0f64, blue: 1.0f64, alpha: a,
             ];
-            msg_send![&*c, CGColor]
+            c.CGColor()
         };
         let opaque = make(1.0);
-        let top = if fade_top { make(0.0) } else { opaque };
-        let bottom = if fade_bottom { make(0.0) } else { opaque };
+        let top = if fade_top { make(0.0) } else { opaque.clone() };
+        let bottom = if fade_bottom { make(0.0) } else { opaque.clone() };
         let colors: *mut AnyObject = msg_send![class!(NSMutableArray), array];
-        let _: () = msg_send![colors, addObject: top];
-        let _: () = msg_send![colors, addObject: opaque];
-        let _: () = msg_send![colors, addObject: opaque];
-        let _: () = msg_send![colors, addObject: bottom];
+        let _: () = msg_send![colors, addObject: Retained::as_ptr(&top) as *mut AnyObject];
+        let _: () = msg_send![colors, addObject: Retained::as_ptr(&opaque) as *mut AnyObject];
+        let _: () = msg_send![colors, addObject: Retained::as_ptr(&opaque) as *mut AnyObject];
+        let _: () = msg_send![colors, addObject: Retained::as_ptr(&bottom) as *mut AnyObject];
         colors
     }
 
