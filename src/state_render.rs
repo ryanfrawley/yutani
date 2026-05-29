@@ -14,6 +14,12 @@ use crate::*;
 /// 0 — see `update_vertices`.)
 const STRIP_BLUR: bool = false;
 
+/// Keep the top edge fade permanently at full strength instead of animating it
+/// in/out with scroll position. Pairs with the frosted glass title-bar band
+/// (which is also always on) so the under-chrome dissolve is a constant part of
+/// the chrome rather than a transient scroll effect.
+const EDGE_FADE_ALWAYS_ON: bool = true;
+
 /// `YUTANI_DIRTY_AUDIT=1` disables per-row vertex reuse: every visible row is
 /// re-emitted fresh each frame. A debugging kill-switch — if a rendering
 /// artifact disappears with this set, a missed damage source (a stale cached
@@ -2022,11 +2028,15 @@ impl WindowState {
                 *phase = (*phase - step).max(target);
             }
         };
-        advance(
-            &mut self.top_fade_phase,
-            if dist_from_top > 0.0 { 1.0 } else { 0.0 },
-            self.config.top_fade_anim_secs,
-        );
+        if EDGE_FADE_ALWAYS_ON {
+            self.top_fade_phase = 1.0;
+        } else {
+            advance(
+                &mut self.top_fade_phase,
+                if dist_from_top > 0.0 { 1.0 } else { 0.0 },
+                self.config.top_fade_anim_secs,
+            );
+        }
         advance(
             &mut self.bottom_fade_phase,
             if dist_from_bottom > 0.0 { 1.0 } else { 0.0 },
@@ -2047,6 +2057,34 @@ impl WindowState {
         let bar_h = self.chrome_band_px as f32;
         let fade_h = top_fade_height;
         let soft_band = bar_h + fade_h;
+
+        // Frosted glass title-bar band: a persistent strip across the chrome
+        // (title bar + native tab bar) that samples the scene blur (`tint = 0`),
+        // so the terminal content bleeding up behind the chrome reads as Liquid
+        // Glass under the system tabs. Independent of the scroll-edge fade.
+        // Drawn first so the scroll fade (below) layers over it at the top edge.
+        let mut blur_strip = false;
+        // The frosted band covers the title-bar row only: from the top of the
+        // window down to the bottom of the title bar (which is the top of the
+        // native tab strip when tabs are shown). The tab strip and content
+        // below stay sharp.
+        let band_bottom = self.titlebar_only_px as f32;
+        if GLASS_TITLEBAR && band_bottom > 0.5 {
+            let bg = palette::get().background;
+            let a = GLASS_TITLEBAR_ALPHA;
+            // RGB is premultiplied (matches PREMULTIPLIED_ALPHA_BLENDING); for
+            // the blur tint (0) the RGB is unused and only alpha matters.
+            let solid = [bg[0] * a, bg[1] * a, bg[2] * a, a];
+            let clear = [0.0, 0.0, 0.0, 0.0];
+            // Full frost across the upper part, then ramp the alpha to 0 over
+            // the lower part so the band has no hard bottom edge — it dissolves
+            // into the tab strip / content rather than ending on a glass line.
+            let solid_to = band_bottom * 0.35;
+            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, solid_to, solid, solid, 0.0);
+            push_strip(&mut strip_vertices, &mut strip_indices, solid_to, band_bottom, solid, clear, 0.0);
+            blur_strip = true;
+        }
+
         // The per-fragment glyph fade (below) tracks the soft band so text
         // dissolves with the blur; the hard style occludes outright and leaves
         // glyphs crisp.
@@ -2134,6 +2172,7 @@ impl WindowState {
             );
         }
         self.num_strip_indices = strip_indices.len() as u32;
+        self.strip_blur_needed = blur_strip;
 
         // Both edges run the per-fragment glyph fade so scrollback text
         // dissolves into the blur strip instead of reaching the edge sharp.
@@ -2227,7 +2266,7 @@ impl WindowState {
         let scroll_y = self.active_tab().scroll_y as f32;
         let (dist_from_bottom, dist_from_top) =
             self.edge_fade_dists(scroll_y, view_offset, scrollback_len, line_height);
-        let top_target = if dist_from_top > 0.0 { 1.0 } else { 0.0 };
+        let top_target = if EDGE_FADE_ALWAYS_ON || dist_from_top > 0.0 { 1.0 } else { 0.0 };
         let bot_target = if dist_from_bottom > 0.0 { 1.0 } else { 0.0 };
         (self.top_fade_phase - top_target).abs() > f32::EPSILON
             || (self.bottom_fade_phase - bot_target).abs() > f32::EPSILON
@@ -2824,7 +2863,7 @@ impl WindowState {
             // Strip blur source (only consumed when STRIP_BLUR is on). Strips
             // live near the window edges where there's rarely text, so a
             // bg-only blur reads close to the legacy combined-scene blur.
-            if needs_strips && STRIP_BLUR {
+            if needs_strips && (STRIP_BLUR || self.strip_blur_needed) {
                 self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 
@@ -2944,7 +2983,7 @@ impl WindowState {
                     "scene pass",
                 );
             }
-            if STRIP_BLUR {
+            if STRIP_BLUR || self.strip_blur_needed {
                 self.blur.run(&mut encoder, &self.shared.blur_pipelines);
             }
 

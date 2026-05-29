@@ -244,5 +244,21 @@ impl WindowState {
             palette::linear_to_srgb_u8(c[2]),
         ];
         self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
+        // The native tab titles use dynamic system colors that track the window
+        // appearance, but re-style so a theme flip repaints them immediately.
+        tab_style::restyle(&self.window);
+    }
+
+    /// One-time native-tab chrome setup once the window exists (drops the
+    /// title-bar separator), then style the initial tab title.
+    pub(crate) fn configure_native_tabs(&mut self) {
+        tab_style::configure_window(&self.window);
+        tab_style::restyle(&self.window);
+    }
+
+    /// Re-style this window's native tab title (emphasized when selected, dimmed
+    /// otherwise). Called whenever the tab set, selection, or title changes.
+    pub(crate) fn refresh_tab_bar(&mut self) {
+        tab_style::restyle(&self.window);
     }
 }

@@ -326,9 +326,9 @@ impl Config {
         Self {
             font_size: DEFAULT_FONT_SIZE,
             top_fade_height: DECORATOR_HEIGHT * 3.0,
-            top_fade_anim_secs: 0.36,
+            top_fade_anim_secs: 0.072,
             bottom_fade_height: DECORATOR_HEIGHT * 2.0,
-            bottom_fade_anim_secs: 0.36,
+            bottom_fade_anim_secs: 0.072,
             scroll_edge_style: ScrollEdgeStyle::Soft,
             cursor_anim_secs: 0.06,
             scroll_on_output_secs: 0.08,

@@ -6,6 +6,7 @@ mod glass;
 mod glass_complete;
 mod glass_find;
 mod glass_palette;
+mod tab_style;
 mod search;
 mod font;
 mod font_loader;
@@ -714,6 +715,10 @@ struct WindowState {
     strip_vertex_buffer: wgpu::Buffer,
     strip_index_buffer: wgpu::Buffer,
     num_strip_indices: u32,
+    /// Set during `update_vertices` when any emitted strip samples the scene
+    /// blur (`tint = 0`) — e.g. the frosted glass title-bar band. Gates the
+    /// blur pass so a frame with only solid-fill strips skips it.
+    strip_blur_needed: bool,
     /// Textured-quad pipeline for image placements. Owns the per-frame
     /// vertex/index buffers and is invoked once per frame between the bg
     /// and fg cell passes (when there are placements to draw).
@@ -1473,18 +1478,18 @@ impl WindowState {
         });
 
         // Strip quads: the soft top edge is emitted as several gradient
-        // segments plus the bottom fade. Sized for up to 16 quads (64 vertices,
-        // 96 indices) — comfortably above the current segment count so resize
-        // never reallocs.
+        // segments, the bottom fade, plus the two frosted glass-titlebar band
+        // quads. Sized for up to 32 quads (128 vertices, 192 indices) —
+        // comfortably above the current segment count so resize never reallocs.
         let strip_vertex_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip vertex buffer"),
-            size: (64 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
+            size: (128 * std::mem::size_of::<renderer::vertex::Vertex>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let strip_index_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("strip index buffer"),
-            size: (96 * std::mem::size_of::<u16>()) as u64,
+            size: (192 * std::mem::size_of::<u16>()) as u64,
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1629,6 +1634,7 @@ impl WindowState {
             strip_vertex_buffer,
             strip_index_buffer,
             num_strip_indices: 0,
+            strip_blur_needed: false,
             image_pipeline,
             blur,
             glow,
@@ -2339,6 +2345,7 @@ fn spawn_window_in_process(
     // is sized correctly on the first frame rather than after the focus event.
     state.reflow_for_tab_bar();
     state.sync_theme_colors();
+    state.configure_native_tabs();
     let keep = state.config.images_in_scrollback;
     state.active_tab_mut().terminal.set_keep_placements_in_scrollback(keep);
     state.sync_terminal_cell_size();
@@ -3108,6 +3115,16 @@ fn set_scrollview_doc_height(window: &Window, height: f64) {
         }
     }
 }
+
+/// Draw a renderer-side frosted-glass band across the title-bar chrome, behind
+/// the system tabs. Blurs the terminal content that bleeds up under the chrome,
+/// so the title bar reads as Liquid Glass while content still flows behind it
+/// (AppKit glass can't sample our Metal layer, so we frost it ourselves). Costs
+/// a per-frame blur pass while on.
+pub(crate) const GLASS_TITLEBAR: bool = true;
+/// Overall opacity of the frosted band (1.0 = fully frosted; lower lets a bit
+/// of the sharp content read through).
+pub(crate) const GLASS_TITLEBAR_ALPHA: f32 = 1.0;
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;
