@@ -17,6 +17,10 @@ pub enum CustomEvent {
     /// carrying the tab it belonged to and its exit code. How the window
     /// reacts is governed by the `shell_exit_mode` config setting.
     PtyExit(TabId, i32),
+    /// SPIKE: a native NSScrollView's offset changed (fired from an NSView
+    /// bounds-change notification). Wakes the loop so `about_to_wait` mirrors the
+    /// new offset into the terminal — no busy-polling.
+    ScrollSync,
 }
 
 /// Per-tab PTY output buffer shared between the reader thread (producer) and

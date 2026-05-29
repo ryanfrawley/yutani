@@ -58,6 +58,10 @@ pub(crate) fn run() {
         .build()
         .unwrap();
     let proxy = event_loop.create_proxy();
+    // SPIKE: stash a proxy clone so the NSScrollView bounds-change observer can
+    // wake the loop from AppKit.
+    #[cfg(target_os = "macos")]
+    crate::set_spike_proxy(proxy.clone());
 
     let mut app = App {
         proxy,
@@ -241,6 +245,10 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             config.images_memory_cap_mb * 1024 * 1024,
         );
         lap("after create_tab (fork)");
+        // SPIKE: wrap the Metal view in an NSScrollView for native scroller +
+        // elastic overscroll before WindowState takes ownership of the window.
+        #[cfg(target_os = "macos")]
+        install_scrollview_spike(&window);
         let mut state =
             WindowState::create_window(shared.clone(), window, surface, surface_raw, config.clone(), dpi, initial_tab);
         lap("after create_window (GPU/atlas/pipelines)");
@@ -375,6 +383,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     // window this is the old `exit()`; the registry
                     // generalizes it.)
                     if let Some(state) = self.windows.remove(&wid) {
+                        #[cfg(target_os = "macos")]
+                        remove_scrollview_spike(&state.window);
                         for t in &state.tabs {
                             close_tab_pty(t);
                             self.tab_to_window.remove(&t.tab_id);
@@ -397,6 +407,9 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     state.window.request_redraw();
                 }
             }
+            // SPIKE: the wake itself is the payload — `about_to_wait` (which runs
+            // before the loop blocks again) reads the scroll view and mirrors it.
+            app_window::CustomEvent::ScrollSync => {}
         }
     }
 
@@ -635,6 +648,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             // free its TabId, then drop the window. Quit when the last
             // window is gone.
             if let Some(state) = self.windows.remove(&window_id) {
+                #[cfg(target_os = "macos")]
+                remove_scrollview_spike(&state.window);
                 for t in &state.tabs {
                     close_tab_pty(t);
                     self.tab_to_window.remove(&t.tab_id);
@@ -647,6 +662,96 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // SPIKE: mirror the native scroll view's offset into the terminal
+        // viewport. Size the document to the scrollback depth so the scroller
+        // thumb is right, then map the clip origin (points) to `view_offset`.
+        #[cfg(target_os = "macos")]
+        let spike_wid = self
+            .focused_window
+            .filter(|w| self.windows.contains_key(w))
+            .or_else(|| self.windows.keys().next().copied());
+        #[cfg(target_os = "macos")]
+        if let Some(state) = spike_wid.and_then(|w| self.windows.get_mut(&w)) {
+            if let Some((origin_y, _vp_h, _doc_h)) = poll_scrollview_metrics(&state.window) {
+                let scale = state.window.scale_factor();
+                let lh_px = state.shared.with_font(|f| {
+                    let m = f.metrics();
+                    ((m.ascender - m.descender) >> 6) as f64
+                });
+                let lh_pt = (lh_px / scale).max(1.0);
+                let scrollback = state.active_tab().terminal.scrollback_len();
+                let vp_h = state.surface.config.height as f64 / scale;
+                let on_alt = state.active_tab().terminal.on_alt_screen();
+                let overlay = state.command_palette.open || state.search.open;
+                if on_alt {
+                    // Full-screen app owns the screen: hide the scroll view so
+                    // wheel events fall through to winit, which forwards them to
+                    // the running app (alternate-scroll). Re-sync on exit.
+                    set_scrollview_hidden(&state.window, true);
+                    set_spike_last(&state.window, f64::NAN, 0);
+                } else if overlay {
+                    // Find / palette open: keep the view but no scroller and no
+                    // range, so it neither shows a bar nor moves the scrollback.
+                    set_scrollview_hidden(&state.window, false);
+                    set_scrollview_scroller(&state.window, false);
+                    set_scrollview_doc_height(&state.window, vp_h);
+                    set_spike_last(&state.window, f64::NAN, 0);
+                } else {
+                    set_scrollview_hidden(&state.window, false);
+                    set_scrollview_scroller(&state.window, true);
+                    // Document = viewport + one line per scrollback row.
+                    set_scrollview_doc_height(&state.window, vp_h + scrollback as f64 * lh_pt);
+                    let cur = state.active_tab().terminal.view_offset();
+                    let last = spike_last(&state.window);
+                    let resync = last.map_or(true, |(o, _)| o.is_nan());
+                    if resync {
+                        // Fresh / just-unsuppressed: sync the scroll view TO the
+                        // terminal's current position rather than the reverse.
+                        let desired = cur as f64 * lh_pt;
+                        state.active_tab_mut().scroll_y = 0.0;
+                        set_scrollview_origin(&state.window, desired);
+                        set_spike_last(&state.window, desired, cur);
+                        state.invalidate();
+                    } else {
+                        let (last_origin, last_voff) = last.unwrap();
+                        let user_scrolled = (origin_y - last_origin).abs() > 0.25;
+                        if user_scrolled {
+                            // Scroll view drove it: map its offset into the
+                            // terminal. Non-flipped doc: origin 0 = bottom
+                            // (newest); past the ends the elastic bounce maps
+                            // into `scroll_y` (clamped to the phantom-row budget)
+                            // so content rubber-bands too. px = points · scale.
+                            let lines_raw = origin_y / lh_pt;
+                            let max_sy = 15.0 * lh_px;
+                            let sb = scrollback as f64;
+                            let (target, new_scroll_y) = if lines_raw < 0.0 {
+                                (0usize, (lines_raw * lh_px).max(-max_sy))
+                            } else if lines_raw > sb {
+                                (scrollback, ((lines_raw - sb) * lh_px).min(max_sy))
+                            } else {
+                                (lines_raw.floor() as usize, (lines_raw - lines_raw.floor()) * lh_px)
+                            };
+                            if target > cur {
+                                state.active_tab_mut().terminal.scroll_up(target - cur);
+                            } else if target < cur {
+                                state.active_tab_mut().terminal.scroll_down(cur - target);
+                            }
+                            state.active_tab_mut().scroll_y = new_scroll_y;
+                            state.invalidate();
+                            set_spike_last(&state.window, origin_y, target);
+                        } else if cur != last_voff {
+                            // Terminal scrolled itself (output / jump-to-bottom):
+                            // push its position back so they don't fight.
+                            let desired = cur as f64 * lh_pt;
+                            state.active_tab_mut().scroll_y = 0.0;
+                            set_scrollview_origin(&state.window, desired);
+                            set_spike_last(&state.window, desired, cur);
+                            state.invalidate();
+                        }
+                    }
+                }
+            }
+        }
         // Drain a `+`-button click (no window context, so
         // it targets the key window's group — same as Cmd-T there).
         if NEW_TAB_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
