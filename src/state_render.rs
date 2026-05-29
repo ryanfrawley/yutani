@@ -2056,7 +2056,10 @@ impl WindowState {
         // band edge.
         let bar_h = self.chrome_band_px as f32;
         let fade_h = top_fade_height;
-        let soft_band = bar_h + fade_h;
+        // The soft fade ends just shy of the chrome bottom (visually tuned) so
+        // it doesn't bleed onto the first scrollback line — with the default
+        // `top_fade_height` of 72 this lands at `bar_h - 10`.
+        let soft_band = (bar_h + fade_h - 82.0).max(0.0);
 
         // Frosted glass title-bar band: a persistent strip across the chrome
         // (title bar + native tab bar) that samples the scene blur (`tint = 0`),
