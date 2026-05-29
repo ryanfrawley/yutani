@@ -18,6 +18,7 @@ mod gpu;
 mod images;
 mod input;
 mod onboard;
+mod bundled_schemes;
 mod palette;
 mod shaper;
 mod shell_integration;
