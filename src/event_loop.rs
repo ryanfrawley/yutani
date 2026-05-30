@@ -184,6 +184,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         // otherwise dark schemes render black "Yutani" text on a dark fill.
         window.set_theme(Some(theme_for_bg(palette::get().background)));
         set_native_window_bg(&window, palette::get().background);
+        suppress_layer_resize_animations(&window);
 
         let pt_size = config.font_size;
         let dpi = (window.scale_factor() * 96.0) as u32;
@@ -194,6 +195,9 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         let mut shaper = shaper::Shaper::new();
         shaper.set_variant(font::FaceVariant::Regular, &fd.primary_data, 0);
         let mut font = font::Font::new(fd.primary_data);
+        // Apply the configured hinting before the first atlas build so the
+        // initial glyphs are rasterized with the user's target.
+        font.set_hinting(config.font_hinting);
         font.tune_to(pt_size, dpi);
 
         for (variant, data, face_index) in fd.styled {
@@ -640,6 +644,37 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             // teardown the OS close button uses below.
             if std::mem::take(&mut state.pending_close) {
                 close_this = true;
+            }
+        }
+        // Fan a palette-driven theme change out to every other window. The
+        // initiating window already saved + applied in `persist_and_apply`;
+        // its siblings still hold the *old* config in memory and the *old*
+        // palette baked into their terminal cells, glow uniforms, and
+        // `NSWindow.backgroundColor`. Without this, revealing a sibling on
+        // the first tab switch after a theme flip flashes the stale bg for
+        // a frame before any later focus / palette refresh catches up.
+        let broadcast = self
+            .windows
+            .get_mut(&window_id)
+            .map(|s| std::mem::take(&mut s.pending_theme_broadcast))
+            .unwrap_or(false);
+        if broadcast {
+            for (&wid, state) in self.windows.iter_mut() {
+                if wid == window_id {
+                    // The initiator already ran the equivalent of
+                    // reload_config inline (persist_and_apply saved its
+                    // config; apply_active_scheme pushed the new palette).
+                    continue;
+                }
+                state.reload_config();
+                // Hidden siblings skip `RedrawRequested` (see the
+                // `state.hidden()` guard below) so `invalidate()` inside
+                // `reload_config` would otherwise leave the previously
+                // rendered frame sitting on the IOSurface — the old palette
+                // would flash for one frame when the user reveals the tab.
+                // Render now to land a fresh frame painted from the new
+                // palette before the reveal can composite the stale one.
+                state.render_now();
             }
         }
         if let Some((cwd, origin, cfg, tabbing_id, is_tab, titlebar_px)) = spawn_req {

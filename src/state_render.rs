@@ -2206,9 +2206,9 @@ impl WindowState {
         self.num_strip_indices = strip_indices.len() as u32;
         self.strip_blur_needed = blur_strip;
 
-        // Both edges run the per-fragment glyph fade so scrollback text
-        // dissolves into the blur strip instead of reaching the edge sharp.
-        // The top contribution is style-aware (zeroed for the hard backing).
+        // Per-fragment glyph fade so scrollback text dissolves into the blur
+        // strip instead of reaching the edge sharp. The top contribution is
+        // style-aware (zeroed for the hard backing).
         //
         // With glow OFF the strip blur source is the full scene, so the tint=0
         // strips already crossfade sharp→blur; running the per-fragment glyph
@@ -2218,11 +2218,17 @@ impl WindowState {
         let glow_on = self.glow.enabled();
         let (pf_top_alpha, pf_bottom_alpha) =
             per_fragment_fade_alphas(glow_on, fade_top_alpha, bottom_alpha);
-        let fade_data: [f32; 16] = [
+        // The trailing vec4 is FadeUniform.params: params.x = the glyph-
+        // coverage gamma exponent (1 / text_gamma; 1.0 = identity), the rest
+        // reserved. Written every frame so a live config reload of text_gamma
+        // takes effect without a restart.
+        let gamma_exp = 1.0 / self.config.text_gamma.max(0.0001);
+        let fade_data: [f32; 20] = [
             fade_top_band, pf_top_alpha, 0.0, 0.0,
             bottom_band_height, pf_bottom_alpha, 0.0, 0.0,
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
+            gamma_exp, 0.0, 0.0, 0.0,
         ];
         self.shared.gpu.queue.write_buffer(
             &self.fade_buffer,

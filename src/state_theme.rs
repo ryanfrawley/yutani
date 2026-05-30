@@ -109,9 +109,17 @@ impl WindowState {
     /// now matches it (and the system appearance). Used by the palette's theme
     /// commands after they mutate a scheme slot or the follow-system flag, so
     /// the change both persists and takes effect live.
+    ///
+    /// Flags `pending_theme_broadcast` so the event loop fans the change out
+    /// to every other window — sibling tabs in the same native group share
+    /// the title bar and would otherwise hold stale palette state (terminal
+    /// cells, glow uniforms, `NSWindow.backgroundColor`, appearance) until
+    /// they were individually re-focused, flashing the old background for a
+    /// frame the first time the user reveals them.
     pub(crate) fn persist_and_apply(&mut self) {
         self.config.save();
         self.apply_active_scheme();
+        self.pending_theme_broadcast = true;
     }
 
     /// Re-read `~/.config/yutani/config` and re-install the color scheme,
@@ -123,6 +131,16 @@ impl WindowState {
     /// objects, etc. — still need a restart.
     pub(crate) fn reload_config(&mut self) {
         self.config = Config::load();
+        // Hinting feeds the rasterizer, so a change only takes effect by
+        // rebuilding the glyph atlas (and everything downstream of it), the
+        // same way a font-size/DPI change does. `text_gamma` needs no rebuild —
+        // it's re-read into the fade uniform on every frame. The shared Font is
+        // process-wide; updating it here means the next window to rasterize
+        // (this one, via the rebuild below) uses the new target.
+        let hinting = self.config.font_hinting;
+        if self.with_font_mut(|f| f.set_hinting(hinting)) {
+            self.rebuild_font_resources();
+        }
         self.apply_active_scheme();
     }
 
@@ -186,11 +204,17 @@ impl WindowState {
         // them all so the next rebuild re-emits with the new scheme.
         self.invalidate_row_cache();
 
-        // OSC 10/11/12 reports and the title-bar appearance both need to
-        // reflect the new bg / fg.
-        self.sync_theme_colors();
+        // Flip the window's effective appearance and `NSWindow.backgroundColor`
+        // first: `setAppearance:` triggers AppKit to re-render the title bar,
+        // and we want our explicit `attributedTitle` (set in
+        // `sync_theme_colors` → `tab_style::restyle` below) to be the last
+        // write so the new foreground color always lands on the pill,
+        // regardless of how AppKit orders its own redraw of the chrome.
         self.window.set_theme(Some(theme_for_bg(p.background)));
         set_native_window_bg(&self.window, p.background);
+        // OSC 10/11/12 reports and the native tab title both need to reflect
+        // the new bg / fg.
+        self.sync_theme_colors();
         self.invalidate();
     }
 

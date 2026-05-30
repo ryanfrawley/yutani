@@ -153,6 +153,11 @@ pub struct Font {
     // entry per distinct (pt, dpi) seen so transitions between windows skip
     // the `load_char('M')` re-measurement in `refresh_grid_metrics`.
     metric_cache: HashMap<(u32, u32), CachedMetrics>,
+    // FreeType hinting target folded into the load flags every rasterization
+    // site uses. Defaults to `Normal`, which maps to `TARGET_NORMAL` (the zero
+    // load target) and so reproduces the historical plain-`RENDER` output
+    // exactly. Threaded in from `Config::font_hinting` via `set_hinting`.
+    hinting: crate::config::Hinting,
 }
 
 #[derive(Copy, Clone)]
@@ -252,14 +257,15 @@ impl Atlas {
         let cell_w = font.cell_width();
         let metrics = font.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        // Read the configured load flags before borrowing the face below, so
+        // the immutable `font.load_flags()` borrow doesn't conflict with the
+        // immutable face borrow we hold across the rasterization.
+        let load_flags = font.load_flags();
         let face = match font.variants[vi].face.as_ref() {
             Some(f) => f,
             None => return false,
         };
-        if face
-            .load_glyph(glyph_id, ft::face::LoadFlag::RENDER)
-            .is_err()
-        {
+        if face.load_glyph(glyph_id, load_flags).is_err() {
             return false;
         }
         // If the atlas is full, fall back to notdef and remember that — so
@@ -314,6 +320,9 @@ impl Atlas {
         let cell_w = font.cell_width();
         let metrics = font.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        // Read the configured load flags before borrowing a face below, to
+        // avoid a borrow conflict with the face we hold across rasterization.
+        let load_flags = font.load_flags();
 
         // Box-drawing & block-element glyphs are synthesized (pixel-aligned
         // strokes that tile cleanly across cell edges) rather than rasterized
@@ -359,10 +368,7 @@ impl Atlas {
                 return;
             }
         };
-        if face
-            .load_char(ch as usize, ft::face::LoadFlag::RENDER)
-            .is_err()
-        {
+        if face.load_char(ch as usize, load_flags).is_err() {
             if vi != 0 {
                 self.ensure_char(font, FaceVariant::Regular, ch);
             }
@@ -417,7 +423,37 @@ impl Font {
             cached_underline_thickness: 0,
             current_tune: None,
             metric_cache: HashMap::new(),
+            hinting: crate::config::Hinting::default(),
         }
+    }
+
+    /// The FreeType load flags every glyph rasterization site uses: always
+    /// `RENDER` (so the bitmap is produced) OR'd with the hinting target
+    /// selected by `self.hinting`. `TARGET_NORMAL` is FreeType's zero/default
+    /// target, so `Normal` is behaviorally identical to a plain `RENDER` and
+    /// reproduces Yutani's pre-hinting output exactly. FreeType has no distinct
+    /// "full" target, so `Full` also maps to `TARGET_NORMAL`.
+    pub fn load_flags(&self) -> ft::face::LoadFlag {
+        use crate::config::Hinting;
+        let target = match self.hinting {
+            Hinting::None => ft::face::LoadFlag::NO_HINTING,
+            Hinting::Light => ft::face::LoadFlag::TARGET_LIGHT,
+            // No distinct "full" target in FreeType — both map to NORMAL (= 0).
+            Hinting::Normal | Hinting::Full => ft::face::LoadFlag::TARGET_NORMAL,
+        };
+        ft::face::LoadFlag::RENDER | target
+    }
+
+    /// Set the hinting target used by future rasterizations. Returns whether
+    /// the value actually changed, so the reload path can skip the (expensive)
+    /// atlas rebuild when nothing moved. Cached glyphs already in an `Atlas`
+    /// keep their old hinting until that atlas is rebuilt.
+    pub fn set_hinting(&mut self, h: crate::config::Hinting) -> bool {
+        if self.hinting == h {
+            return false;
+        }
+        self.hinting = h;
+        true
     }
 
     // Install the primary face for a styled variant (Bold/Italic/BoldItalic).
@@ -608,6 +644,10 @@ impl Font {
         let cell_w = self.cell_width();
         let metrics = self.metrics();
         let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        // Capture the configured load flags up front: the `self.face()`
+        // immutable borrows below would otherwise conflict with calling
+        // `self.load_flags()` inline.
+        let load_flags = self.load_flags();
 
         // Ranges we care about rendering. Control chars are excluded — the
         // terminal model strips them before they ever reach a cell. PUA is
@@ -669,7 +709,7 @@ impl Font {
         // character the font doesn't provide — usually a hollow box. Packed
         // first so it always fits even when the atlas is tight.
         self.face()
-            .load_glyph(0, ft::face::LoadFlag::RENDER)
+            .load_glyph(0, load_flags)
             .expect("font has no .notdef glyph");
         let notdef = pack_glyph(
             self.face().glyph(),
@@ -709,7 +749,7 @@ impl Font {
                 Some(f) => f,
                 None => continue,
             };
-            if face.load_char(ch as usize, ft::face::LoadFlag::RENDER).is_err() {
+            if face.load_char(ch as usize, load_flags).is_err() {
                 continue;
             }
             if let Some(entry) = pack_glyph(
