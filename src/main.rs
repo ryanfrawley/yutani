@@ -867,6 +867,15 @@ struct WindowState {
     /// running-command confirmation has already been resolved by the time
     /// this is set, so the event loop closes unconditionally.
     pending_close: bool,
+    /// Set by `persist_and_apply` when a palette command (Set theme / Toggle
+    /// follow system / etc.) mutated and saved this window's config; drained
+    /// by the event loop, which fans the change out by calling `reload_config`
+    /// on every other window in the registry. Without this, the inactive
+    /// siblings in a native tab group keep their old palette in terminal
+    /// cells, glow uniforms, `NSWindow.backgroundColor`, and effective
+    /// appearance — revealing them on a tab switch then flashes the stale
+    /// background for a frame before any subsequent refresh catches up.
+    pending_theme_broadcast: bool,
     perf: PerfLog,
     /// Set whenever something invalidates the vertex/index buffers (PTY input,
     /// scroll, selection, blink, animation tick). Cleared by `flush_vertices`,
@@ -1689,6 +1698,7 @@ impl WindowState {
             pending_new_window: false,
             pending_new_tab: false,
             pending_close: false,
+            pending_theme_broadcast: false,
             perf: PerfLog::new(),
             vertices_dirty: true,
             scroll_only_dirty: false,
@@ -1743,6 +1753,29 @@ impl WindowState {
         if !self.render_pending {
             self.window.request_redraw();
         }
+    }
+
+    /// Render one frame immediately, bypassing the frame-pacing and hidden-
+    /// window guards in the normal `RedrawRequested` path. Used by the theme
+    /// broadcast: after `reload_config` re-pushes the new palette into every
+    /// hidden sibling's terminal cells, glow uniforms, and
+    /// `NSWindow.backgroundColor`, the sibling's wgpu surface still holds
+    /// the previously rendered frame painted from the *old* palette. Revealing
+    /// the window on a tab switch composites that stale drawable for a frame
+    /// before the next `RedrawRequested` catches up — a jarring background
+    /// flash on dark↔light flips. Re-rendering now lands the new frame on
+    /// the IOSurface so the reveal composites the right theme from frame
+    /// zero. No-op when no present target is free; the next user interaction
+    /// would replace the stale frame on its own anyway.
+    pub(crate) fn render_now(&mut self) {
+        if !self.present_target_available() {
+            return;
+        }
+        self.render_pending = false;
+        self.last_render_at = std::time::Instant::now();
+        self.update();
+        self.prepare_frame();
+        let _ = self.render(clear_color(self.theme));
     }
 
     /// Whether a present-source target is free to render into right now. Drains
