@@ -123,6 +123,16 @@ impl WindowState {
     /// objects, etc. — still need a restart.
     pub(crate) fn reload_config(&mut self) {
         self.config = Config::load();
+        // Hinting feeds the rasterizer, so a change only takes effect by
+        // rebuilding the glyph atlas (and everything downstream of it), the
+        // same way a font-size/DPI change does. `text_gamma` needs no rebuild —
+        // it's re-read into the fade uniform on every frame. The shared Font is
+        // process-wide; updating it here means the next window to rasterize
+        // (this one, via the rebuild below) uses the new target.
+        let hinting = self.config.font_hinting;
+        if self.with_font_mut(|f| f.set_hinting(hinting)) {
+            self.rebuild_font_resources();
+        }
         self.apply_active_scheme();
     }
 

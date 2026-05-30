@@ -50,11 +50,15 @@ var s_diffuse: sampler;
 // alpha), viewport.xy = (width, height), bg_uv.xy = the atlas UV for the
 // solid bg sentinel slot. Only fragments that don't sample the bg slot get
 // faded — so cell backgrounds stay solid and only the glyphs ramp away.
+// params.x = the glyph-coverage gamma exponent (1.0 / text_gamma); params.yzw
+// are reserved (0). At the default text_gamma = 1.0 this is 1.0, an identity
+// pow that reproduces the pre-gamma output exactly.
 struct FadeUniform {
     top: vec4<f32>,
     bottom: vec4<f32>,
     viewport: vec4<f32>,
     bg_uv: vec4<f32>,
+    params: vec4<f32>,
 };
 @group(2) @binding(0)
 var<uniform> fade: FadeUniform;
@@ -86,6 +90,12 @@ fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let glyph = textureSample(t_diffuse, s_diffuse, in.tex_coords).r;
+    // Apply the glyph-coverage gamma. Solid quads (bg cells, cursor,
+    // selection, fade strips) sample the fully-opaque sentinel slot, so
+    // `glyph == 1.0` there and `pow(1.0, x) == 1.0` for any exponent —
+    // gamma only reshapes real anti-aliased glyph edges, never the solid
+    // overlays. At the default exponent 1.0 this is the identity.
+    let cov = pow(glyph, fade.params.x);
     let max_r = max(max(in.radii.x, in.radii.y), max(in.radii.z, in.radii.w));
     let min_r = min(min(in.radii.x, in.radii.y), min(in.radii.z, in.radii.w));
     var mask: f32 = 1.0;
@@ -121,7 +131,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sdf = sd_rounded_box(in.local_pos, in.half_size, in.radii);
         mask = 1.0 - smoothstep(0.0, 1.0, sdf);
     }
-    let base = in.color * glyph * mask;
+    let base = in.color * cov * mask;
 
     // Y-position fade. clip_position.y is in framebuffer pixels with origin
     // at the top, so y=0 is the window top. select() guards against div-by-0

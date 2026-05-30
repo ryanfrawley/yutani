@@ -195,6 +195,9 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         let mut shaper = shaper::Shaper::new();
         shaper.set_variant(font::FaceVariant::Regular, &fd.primary_data, 0);
         let mut font = font::Font::new(fd.primary_data);
+        // Apply the configured hinting before the first atlas build so the
+        // initial glyphs are rasterized with the user's target.
+        font.set_hinting(config.font_hinting);
         font.tune_to(pt_size, dpi);
 
         for (variant, data, face_index) in fd.styled {
