@@ -145,6 +145,56 @@ impl ScrollEdgeStyle {
     }
 }
 
+/// FreeType hinting target applied while rasterizing glyphs. Configured via
+/// the `font_hinting` key. `Normal` is the default and — because FreeType's
+/// `TARGET_NORMAL` is the zero/default load target — reproduces the exact
+/// pixels Yutani produced before this knob existed (plain `RENDER`). The
+/// other variants thread a different hinting target into `Font::load_flags`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hinting {
+    /// No hinting (`FT_LOAD_NO_HINTING`). Outlines are rendered as designed,
+    /// at the cost of crispness on the pixel grid at small sizes.
+    None,
+    /// Light auto-hint target (`FT_LOAD_TARGET_LIGHT`): vertical positions are
+    /// snapped, horizontal stems left alone, for a softer, less distorted look.
+    Light,
+    /// Normal hinting target (`FT_LOAD_TARGET_NORMAL`), the FreeType default
+    /// and Yutani's historical behavior.
+    Normal,
+    /// Strongest hinting. FreeType has no distinct "full" load target, so this
+    /// maps to `FT_LOAD_TARGET_NORMAL` (same as `Normal`) — kept as a separate
+    /// config value for forward-compatibility and to mirror the common
+    /// none/light/normal/full vocabulary users expect.
+    Full,
+}
+
+impl Hinting {
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "light" => Some(Self::Light),
+            "normal" => Some(Self::Normal),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Light => "light",
+            Self::Normal => "normal",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl Default for Hinting {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) font_size: f32,
@@ -319,6 +369,14 @@ pub(crate) struct Config {
     /// Whether the filesystem/history autocomplete popup is shown as you
     /// type. Default on; set `autocomplete = false` to disable.
     pub(crate) autocomplete: bool,
+    /// Gamma curve applied to glyph coverage in the fragment shader to
+    /// thicken (>1) or soften (<1) anti-aliased edges. `alpha' =
+    /// pow(coverage, 1.0 / text_gamma)`. 1.0 is identity and reproduces the
+    /// pre-existing behavior exactly. Clamped to `[0.25, 4.0]`.
+    pub(crate) text_gamma: f32,
+    /// FreeType hinting target used when rasterizing glyphs into the atlas.
+    /// `Normal` (the default) reproduces the historical output. See [`Hinting`].
+    pub(crate) font_hinting: Hinting,
 }
 
 impl Config {
@@ -367,6 +425,8 @@ impl Config {
             shell_exit_mode: ShellExitMode::OnSuccess,
             prompt_gutter: PromptGutter::None,
             autocomplete: true,
+            text_gamma: 1.0,
+            font_hinting: Hinting::default(),
         }
     }
 
@@ -510,6 +570,16 @@ impl Config {
                 }
             },
             "autocomplete" => if let Some(x) = v.as_bool() { self.autocomplete = x; },
+            "text_gamma" => if let Some(x) = cfg_f32(v) {
+                self.text_gamma = x.clamp(0.25, 4.0);
+            },
+            "font_hinting" => if let Some(s) = v.as_str() {
+                if let Some(h) = Hinting::from_str(s) {
+                    self.font_hinting = h;
+                }
+                // Silently keep the default on an unknown value — same
+                // forgiving contract as `scroll_edge_style` / `images_filter`.
+            },
             _ => (),
         }
     }
@@ -548,7 +618,11 @@ impl Config {
              scroll_edge_style = {}\n\
              cursor_anim_secs = {}\n\
              scroll_on_output_secs = {}\n\
-             cursor_blink = {}\n",
+             cursor_blink = {}\n\
+             # text_gamma: glyph-edge gamma; 1.0 = unchanged, >1 thickens, <1 softens (clamped 0.25..4.0)\n\
+             text_gamma = {}\n\
+             # font_hinting: \"none\" | \"light\" | \"normal\" | \"full\"\n\
+             font_hinting = {}\n",
             self.font_size,
             self.top_fade_height,
             self.top_fade_anim_secs,
@@ -558,6 +632,8 @@ impl Config {
             self.cursor_anim_secs,
             self.scroll_on_output_secs,
             self.cursor_blink,
+            self.text_gamma,
+            toml_str_lit(self.font_hinting.as_str()),
         ));
         if let Some(name) = &self.color_scheme {
             s.push_str(&format!("color_scheme = {}\n", toml_str_lit(name)));
@@ -936,5 +1012,99 @@ mod tests {
         let cloned = c.clone();
         assert_eq!(cloned.autocomplete, c.autocomplete);
         assert!(!cloned.autocomplete);
+    }
+
+    // ---------- text_gamma ----------
+
+    /// A missing key leaves the identity default (1.0), which must reproduce
+    /// the pre-existing no-gamma behavior.
+    #[test]
+    fn text_gamma_default_is_identity() {
+        let c = Config::parse_str("");
+        assert_eq!(c.text_gamma, 1.0);
+    }
+
+    /// A plain in-range value parses through `cfg_f32` (float or int).
+    #[test]
+    fn text_gamma_parses_in_range() {
+        assert_eq!(Config::parse_str("text_gamma = 1.5").text_gamma, 1.5);
+        assert_eq!(Config::parse_str("text_gamma = 2").text_gamma, 2.0);
+    }
+
+    /// Below the lower bound clamps up to 0.25.
+    #[test]
+    fn text_gamma_clamps_low() {
+        assert_eq!(Config::parse_str("text_gamma = 0.0").text_gamma, 0.25);
+        assert_eq!(Config::parse_str("text_gamma = -5.0").text_gamma, 0.25);
+    }
+
+    /// Above the upper bound clamps down to 4.0.
+    #[test]
+    fn text_gamma_clamps_high() {
+        assert_eq!(Config::parse_str("text_gamma = 100.0").text_gamma, 4.0);
+    }
+
+    /// A non-default value survives the serialize -> parse round-trip.
+    #[test]
+    fn text_gamma_round_trips() {
+        let mut c = Config::defaults();
+        c.text_gamma = 1.75;
+        let parsed = Config::parse_str(&c.serialize());
+        assert_eq!(parsed.text_gamma, 1.75);
+    }
+
+    /// The default (1.0) is emitted explicitly and round-trips — guards
+    /// against the field being dropped from serialize().
+    #[test]
+    fn text_gamma_default_round_trips() {
+        let original = Config::defaults();
+        let parsed = Config::parse_str(&original.serialize());
+        assert_eq!(parsed.text_gamma, original.text_gamma);
+    }
+
+    // ---------- font_hinting ----------
+
+    /// All four variants parse from their lowercase strings.
+    #[test]
+    fn font_hinting_parses_all_variants() {
+        assert_eq!(Hinting::from_str("none"), Some(Hinting::None));
+        assert_eq!(Hinting::from_str("light"), Some(Hinting::Light));
+        assert_eq!(Hinting::from_str("normal"), Some(Hinting::Normal));
+        assert_eq!(Hinting::from_str("full"), Some(Hinting::Full));
+    }
+
+    /// Parsing is case-insensitive.
+    #[test]
+    fn font_hinting_parse_is_case_insensitive() {
+        assert_eq!(Hinting::from_str("NONE"), Some(Hinting::None));
+        assert_eq!(Hinting::from_str("Light"), Some(Hinting::Light));
+        assert_eq!(Hinting::from_str("FULL"), Some(Hinting::Full));
+    }
+
+    /// An unknown string yields None, and applying it leaves the default.
+    #[test]
+    fn font_hinting_unknown_keeps_default() {
+        assert_eq!(Hinting::from_str("bogus"), None);
+        let c = Config::parse_str("font_hinting = \"bogus\"");
+        assert_eq!(c.font_hinting, Hinting::default());
+    }
+
+    /// A missing key leaves the default (Normal = historical behavior).
+    #[test]
+    fn font_hinting_default_is_normal() {
+        let c = Config::parse_str("");
+        assert_eq!(c.font_hinting, Hinting::Normal);
+        assert_eq!(Hinting::default(), Hinting::Normal);
+    }
+
+    /// Each variant survives the serialize -> parse round-trip.
+    #[test]
+    fn font_hinting_round_trips() {
+        for h in [Hinting::None, Hinting::Light, Hinting::Normal, Hinting::Full] {
+            let mut c = Config::defaults();
+            c.font_hinting = h;
+            let parsed = Config::parse_str(&c.serialize());
+            assert_eq!(parsed.font_hinting, h, "round-trip failed for {h:?}");
+        }
     }
 }

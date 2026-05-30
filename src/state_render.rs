@@ -2180,11 +2180,17 @@ impl WindowState {
         // Both edges run the per-fragment glyph fade so scrollback text
         // dissolves into the blur strip instead of reaching the edge sharp.
         // The top contribution is style-aware (zeroed for the hard backing).
-        let fade_data: [f32; 16] = [
+        // The trailing vec4 is FadeUniform.params: params.x = the glyph-
+        // coverage gamma exponent (1 / text_gamma; 1.0 = identity), the rest
+        // reserved. Written every frame so a live config reload of text_gamma
+        // takes effect without a restart.
+        let gamma_exp = 1.0 / self.config.text_gamma.max(0.0001);
+        let fade_data: [f32; 20] = [
             fade_top_band, fade_top_alpha, 0.0, 0.0,
             bottom_band_height, bottom_alpha, 0.0, 0.0,
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
+            gamma_exp, 0.0, 0.0, 0.0,
         ];
         self.shared.gpu.queue.write_buffer(
             &self.fade_buffer,

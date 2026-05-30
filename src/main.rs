@@ -1429,10 +1429,11 @@ impl WindowState {
         });
 
         // Edge-fade uniform: layout matches FadeUniform in shader.wgsl —
-        // top.xy + bottom.xy + viewport.xy + bg_uv.xy = 4*vec4 = 64 bytes.
+        // top.xy + bottom.xy + viewport.xy + bg_uv.xy + params.xy = 5*vec4 =
+        // 80 bytes. `params.x` carries the text-gamma exponent (1/text_gamma).
         let fade_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade uniform"),
-            size: 64,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
