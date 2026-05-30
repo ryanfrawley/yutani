@@ -184,6 +184,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         // otherwise dark schemes render black "Yutani" text on a dark fill.
         window.set_theme(Some(theme_for_bg(palette::get().background)));
         set_native_window_bg(&window, palette::get().background);
+        suppress_layer_resize_animations(&window);
 
         let pt_size = config.font_size;
         let dpi = (window.scale_factor() * 96.0) as u32;
