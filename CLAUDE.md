@@ -8,15 +8,24 @@ working directory and its HEAD, so editing, branching, or committing there
 races against concurrent work — a branch can be renamed or HEAD moved out from
 under an in-flight commit, landing it on the wrong branch (this has happened).
 
-Before touching any file, create an isolated worktree on a fresh branch:
+Before touching any file, create an isolated worktree on a fresh branch
+**inside the repo**, under `.claude/worktrees/`:
 
 ```sh
-git worktree add ../yutani-<branch> -b <branch>   # branches off the current HEAD
+git worktree add .claude/worktrees/<branch> -b <branch>   # branches off the current HEAD
 ```
+
+The path MUST stay inside this repository. The tool sandbox is rooted at the
+project directory, so a worktree created one level up (e.g. `../yutani-<branch>`)
+falls outside the sandbox: `cd` into it gets reset after every command, and
+`Read`/`Edit`/`Agent` calls against its paths are denied as out-of-root — which
+silently breaks the whole session. Keeping it under `.claude/worktrees/` avoids
+this. (`.claude/worktrees/` is already git-ignored.)
 
 Do all edits, builds, commits, and pushes from that worktree. When invoked
 via the Agent tool, prefer `isolation: "worktree"`. Clean up with
-`git worktree remove` once the branch is pushed and the PR is open.
+`git worktree remove .claude/worktrees/<branch>` once the branch is pushed and
+the PR is open.
 
 ## Pushing branches and opening PRs
 
