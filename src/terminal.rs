@@ -923,7 +923,7 @@ pub struct Terminal {
     next_placement_id: PlacementId,
     // OSC 133 semantic prompt marks on the *primary* grid, in emission
     // order, anchored to live grid rows. Surviving scroll into scrollback
-    // and resize lands in a later slice (see design/osc133-plan.md). Read
+    // and resize lands in a later slice. Read
     // by `command_regions`; the prompt-navigation UI that consumes that
     // query is also a later slice, hence the allow.
     #[allow(dead_code)]

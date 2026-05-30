@@ -15,7 +15,8 @@
 #
 #   * OSC 2122 — yutani-private current-input report: the live edit buffer
 #                and cursor position, base64-encoded. Drives the filesystem
-#                autocomplete popup. See design/osc2122-input-report.md.
+#                autocomplete popup. Parsed by Terminal::handle_osc_2122
+#                in src/terminal.rs.
 #
 #   * OSC 2124 — yutani-private history-file path report ($HISTFILE, base64).
 #                Lets the terminal read past commands for history-based

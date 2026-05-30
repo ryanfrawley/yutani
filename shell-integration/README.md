@@ -81,7 +81,7 @@ The script emits three OSC channels on the PTY; the terminal consumes them:
 - **OSC 2122** — yutani-private current-input report: the live edit buffer and
   cursor, base64-encoded, emitted from the zle `line-pre-redraw` hook on every
   edit/cursor move. This drives the autocomplete popup. The wire protocol is
-  documented in [`design/osc2122-input-report.md`](../design/osc2122-input-report.md).
+  parsed by `Terminal::handle_osc_2122` in `src/terminal.rs`.
 
 The script composes with existing hooks (it uses `add-zsh-hook` and
 `add-zle-hook-widget` rather than clobbering with `zle -N`), is idempotent on
