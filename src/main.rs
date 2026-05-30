@@ -563,7 +563,7 @@ impl AppShared {
 /// One shell session and the interaction state bound to it. Everything here
 /// scrolls, selects, or completes against a single PTY + `Terminal`; none of
 /// it is coupled to the window's GPU surface, atlas, or buffers (so a tab can
-/// later move between windows — see MULTIWINDOW_PLAN.md). A window owns a
+/// later move between windows). A window owns a
 /// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
 /// per window; the tab UI is a later follow-up.
 struct TabState {
