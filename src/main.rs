@@ -1438,10 +1438,11 @@ impl WindowState {
         });
 
         // Edge-fade uniform: layout matches FadeUniform in shader.wgsl —
-        // top.xy + bottom.xy + viewport.xy + bg_uv.xy = 4*vec4 = 64 bytes.
+        // top.xy + bottom.xy + viewport.xy + bg_uv.xy + params.xy = 5*vec4 =
+        // 80 bytes. `params.x` carries the text-gamma exponent (1/text_gamma).
         let fade_buffer = shared.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fade uniform"),
-            size: 64,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2328,6 +2329,7 @@ fn spawn_window_in_process(
     // exactly as the first window does, so it doesn't flash a wrong fill.
     window.set_theme(Some(theme_for_bg(palette::get().background)));
     set_native_window_bg(&window, palette::get().background);
+    suppress_layer_resize_animations(&window);
     window.set_cursor(winit::window::CursorIcon::Text);
 
     let (surface, surface_raw) = shared.gpu.create_surface(&window);
@@ -2493,10 +2495,18 @@ fn confirm_close_running_command() -> bool {
     true
 }
 
-/// Metal layer redraws is filled with the window's `backgroundColor`. Left
-/// unset that's the default system window color, which flashes against the
-/// real terminal background. `bg` is stored linear (the surface is sRGB), so
-/// re-encode each channel to sRGB for `NSColor`, which expects sRGB components.
+/// Paint both the NSWindow and the backing `CAMetalLayer` with the theme
+/// background.
+///
+/// The window's `backgroundColor` fills any pixels Cocoa composites without a
+/// drawable contribution; the layer's own `backgroundColor` fills any pixel
+/// the layer covers but the Metal drawable doesn't yet — which happens during
+/// a backing-scale change (cross-monitor drag) where the OS animates the
+/// layer's `bounds` from old to new physical size before our reconfigured
+/// surface produces a fresh drawable. Without the layer color, that
+/// in-between frame composites against `kCGColorWhite`, flashing white on
+/// dark themes. `bg` is stored linear (the surface is sRGB), so re-encode
+/// each channel to sRGB for `NSColor` (which expects sRGB components).
 #[cfg(target_os = "macos")]
 fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     use objc2::rc::Retained;
@@ -2522,11 +2532,75 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
             alpha: bg[3] as f64,
         ];
         let _: () = msg_send![ns_window, setBackgroundColor: &*color];
+        // Mirror onto the CAMetalLayer that wgpu installed. `layer` is the
+        // view's backing layer (the view is layer-hosted because the Metal
+        // surface needs `wantsLayer: YES`). `setBackgroundColor:` on a
+        // CALayer takes a `CGColorRef`, not `NSColor`, so go through
+        // `-CGColor`. Null-check both: a non-layer-backed view or a fresh
+        // NSColor that failed to bridge would otherwise crash.
+        let layer: *mut AnyObject = msg_send![ns_view, layer];
+        if !layer.is_null() {
+            let cg: *mut AnyObject = msg_send![&*color, CGColor];
+            if !cg.is_null() {
+                let _: () = msg_send![layer, setBackgroundColor: cg];
+            }
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn set_native_window_bg(_window: &Window, _bg: [f32; 4]) {}
+
+/// Suppress the implicit CoreAnimation actions that fire when a CALayer's
+/// `bounds` / `contents` / `contentsScale` / `position` / `sublayers` change
+/// — i.e. exactly the keys CoreAnimation animates when the OS drags the
+/// window onto a monitor with a different backing scale. By default
+/// CoreAnimation interpolates the old drawable to the new bounds over
+/// ~0.25s, which reads as a visible "zoom" of the terminal contents during
+/// the cross-display drag. Setting these actions to `NSNull` swaps the
+/// implicit `CABasicAnimation` for a no-op, so the layer hops straight from
+/// old to new state in one frame — matching what the user expects when the
+/// pointer moves across the bezel.
+///
+/// Called once per window after the wgpu surface (and therefore the
+/// `CAMetalLayer`) exists. Safe to call multiple times — `setActions:` just
+/// replaces the dictionary.
+#[cfg(target_os = "macos")]
+fn suppress_layer_resize_animations(window: &Window) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
+
+    let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
+        return;
+    };
+    unsafe {
+        let ns_view = handle.ns_view as *mut AnyObject;
+        let layer: *mut AnyObject = msg_send![ns_view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let null: *mut AnyObject = msg_send![class!(NSNull), null];
+        let actions: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+        // The five keys CoreAnimation animates on a layer during a
+        // window-bounds / DPI transition. `bounds` + `position` cover the
+        // geometric resize; `contents` and `contentsScale` cover the Metal
+        // drawable swap; `sublayers` covers any child-layer reshuffle (none
+        // today, but cheap insurance against future glass panels).
+        for key in ["bounds", "position", "contents", "contentsScale", "sublayers"] {
+            let key_bytes = std::ffi::CString::new(key).unwrap();
+            let key_ns: *mut AnyObject = msg_send![
+                class!(NSString),
+                stringWithUTF8String: key_bytes.as_ptr()
+            ];
+            let _: () = msg_send![actions, setObject: null, forKey: key_ns];
+        }
+        let _: () = msg_send![layer, setActions: actions];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn suppress_layer_resize_animations(_window: &Window) {}
 
 /// Force the system arrow cursor onto `NSCursor` immediately.
 ///

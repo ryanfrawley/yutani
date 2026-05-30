@@ -1,0 +1,277 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://git.frawley.co/ryan/yutani/raw/branch/main/schema/yutani-config.schema.json",
+  "title": "Yutani configuration",
+  "description": "Schema for Yutani's TOML config file (~/.config/yutani/config.toml on Linux, ~/Library/Application Support/yutani/config.toml on macOS). Unknown keys are ignored by the app; this schema flags them as typos. Generated from src/config.rs (Config::apply / Config::defaults).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "font_size": {
+      "type": "number",
+      "description": "Font point size. Clamped to [6, 96] at load.",
+      "minimum": 6,
+      "maximum": 96,
+      "default": 10
+    },
+    "font_family": {
+      "type": "string",
+      "description": "Preferred font family (matched by Core Text on macOS / fontconfig on Linux). Empty string uses the built-in default."
+    },
+    "text_gamma": {
+      "type": "number",
+      "description": "Gamma curve applied to glyph coverage in the shader: alpha' = pow(coverage, 1.0 / text_gamma). 1.0 is identity (unchanged); >1 thickens/softens anti-aliased edges, <1 thins them. Clamped to [0.25, 4.0].",
+      "minimum": 0.25,
+      "maximum": 4.0,
+      "default": 1.0
+    },
+    "font_hinting": {
+      "type": "string",
+      "description": "FreeType hinting target used when rasterizing glyphs. 'normal' reproduces the historical output. 'light' keeps stems closer to their anti-aliased shape (often smoother at small sizes); 'none' disables hinting; 'full' maps to the same target as 'normal' (FreeType has no separate full target).",
+      "enum": ["none", "light", "normal", "full"],
+      "default": "normal"
+    },
+
+    "color_scheme": {
+      "type": "string",
+      "description": "Name of the color scheme to load (a file under the schemes/ directory, without .toml). Empty string uses the built-in defaults."
+    },
+    "auto_theme": {
+      "type": "boolean",
+      "description": "When true, pick light_scheme/dark_scheme based on the system appearance instead of always using color_scheme.",
+      "default": false
+    },
+    "light_scheme": {
+      "type": "string",
+      "description": "Scheme name used for the light system appearance when auto_theme is on. Falls back to color_scheme if unset."
+    },
+    "dark_scheme": {
+      "type": "string",
+      "description": "Scheme name used for the dark system appearance when auto_theme is on. Falls back to color_scheme if unset."
+    },
+
+    "cursor_blink": {
+      "type": "boolean",
+      "description": "Whether the text cursor blinks.",
+      "default": false
+    },
+    "cursor_anim_secs": {
+      "type": "number",
+      "description": "Ease-in-out duration (seconds) for cursor position changes. 0 snaps instantly.",
+      "minimum": 0,
+      "default": 0.06
+    },
+    "scroll_on_output_secs": {
+      "type": "number",
+      "description": "Ease-out duration (seconds) for the smooth scroll-on-output slide. 0 disables the animation.",
+      "minimum": 0,
+      "default": 0.08
+    },
+
+    "scroll_edge_style": {
+      "type": "string",
+      "description": "Style of the top scroll-edge effect where scrollback meets the title-bar chrome. 'soft' is a gradient blur fade; 'hard' is an opaque backing with a crisp edge.",
+      "enum": ["soft", "hard"],
+      "default": "soft"
+    },
+    "top_fade_height": {
+      "type": "number",
+      "description": "Height (px) of the top scroll-edge fade band.",
+      "minimum": 0,
+      "default": 72
+    },
+    "top_fade_anim_secs": {
+      "type": "number",
+      "description": "Animation duration (seconds) for the top fade band.",
+      "minimum": 0,
+      "default": 0.072
+    },
+    "bottom_fade_height": {
+      "type": "number",
+      "description": "Height (px) of the bottom scroll-edge fade band.",
+      "minimum": 0,
+      "default": 48
+    },
+    "bottom_fade_anim_secs": {
+      "type": "number",
+      "description": "Animation duration (seconds) for the bottom fade band.",
+      "minimum": 0,
+      "default": 0.072
+    },
+
+    "glow_match_brightness": {
+      "type": "boolean",
+      "description": "Apply the glow/bloom effect to cells brighter than glow_threshold.",
+      "default": false
+    },
+    "glow_match_bright_ansi": {
+      "type": "boolean",
+      "description": "Treat the bright (8-15) ANSI palette colors as glow sources.",
+      "default": false
+    },
+    "glow_match_foreground": {
+      "type": "boolean",
+      "description": "Treat the default foreground color as a glow source (catches achromatic default text).",
+      "default": false
+    },
+    "glow_fg_tolerance": {
+      "type": "number",
+      "description": "Color distance tolerance for matching the foreground color as a glow source (0 = exact). Max is sqrt(3).",
+      "minimum": 0,
+      "maximum": 1.7320508,
+      "default": 0.12
+    },
+    "glow_threshold": {
+      "type": "number",
+      "description": "Luminance above which a cell contributes to the glow when glow_match_brightness is on.",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.6
+    },
+    "glow_intensity": {
+      "type": "number",
+      "description": "Glow/bloom strength multiplier.",
+      "minimum": 0,
+      "default": 0.8
+    },
+    "glow_softness": {
+      "type": "number",
+      "description": "Softness of the glow falloff.",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.15
+    },
+    "glow_hue_tolerance_deg": {
+      "type": "number",
+      "description": "Hue tolerance (degrees) when matching glow source colors.",
+      "minimum": 0,
+      "maximum": 180,
+      "default": 18
+    },
+    "glow_iterations": {
+      "type": "integer",
+      "description": "Number of dual-Kawase blur iterations for the glow. More iterations = wider, softer bloom.",
+      "minimum": 1,
+      "maximum": 12,
+      "default": 2
+    },
+    "glow_scanlines": {
+      "type": "boolean",
+      "description": "Draw CRT-style scanlines over glowing content.",
+      "default": false
+    },
+    "glow_scanline_strength": {
+      "type": "number",
+      "description": "Opacity/strength of the scanlines.",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 1
+    },
+    "glow_scanline_period": {
+      "type": "number",
+      "description": "Scanline period in pixels (>= 1).",
+      "minimum": 1,
+      "default": 4
+    },
+    "glow_scanlines_content": {
+      "type": "boolean",
+      "description": "Also draw scanlines over non-glowing terminal content.",
+      "default": false
+    },
+    "glow_scanlines_content_strength": {
+      "type": "number",
+      "description": "Scanline strength for ordinary content when glow_scanlines_content is on.",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 1
+    },
+    "glow_scanlines_content_attenuation": {
+      "type": "number",
+      "description": "How much the content scanlines are attenuated relative to glow scanlines.",
+      "minimum": 0,
+      "maximum": 1,
+      "default": 0.5
+    },
+    "glow_scanlines_skip_primary_bg": {
+      "type": "boolean",
+      "description": "Skip scanlines over cells using the primary background color.",
+      "default": false
+    },
+    "glow_scanline_color_bright": {
+      "type": "integer",
+      "description": "Bright scanline color as a hex RGB integer, e.g. 0xffffff.",
+      "minimum": 0,
+      "maximum": 16777215,
+      "default": 16777215
+    },
+    "glow_scanline_color_dark": {
+      "type": "integer",
+      "description": "Dark scanline color as a hex RGB integer, e.g. 0x000000.",
+      "minimum": 0,
+      "maximum": 16777215,
+      "default": 0
+    },
+    "theme_overrides_glow": {
+      "type": "boolean",
+      "description": "When true, a color scheme's own glow settings win over the values in this file.",
+      "default": false
+    },
+
+    "images_enabled": {
+      "type": "boolean",
+      "description": "Enable inline image support (GPU image draw + protocol parsing).",
+      "default": true
+    },
+    "images_memory_cap_mb": {
+      "type": "integer",
+      "description": "Upper bound (MB) on total bytes the image store holds. 0 effectively disables image residency.",
+      "minimum": 0,
+      "default": 256
+    },
+    "images_max_pixels": {
+      "type": "integer",
+      "description": "Per-decode pixel-count rejection threshold (e.g. 16777216 = 4096x4096). Decodes larger than this are refused before allocation.",
+      "minimum": 1,
+      "default": 16777216
+    },
+    "images_decode_timeout_ms": {
+      "type": "integer",
+      "description": "Per-decode deadline (ms). A pending request older than this is dropped. Floored at 50ms.",
+      "minimum": 50,
+      "default": 2000
+    },
+    "images_in_scrollback": {
+      "type": "boolean",
+      "description": "Keep image placements that scroll off the top of the grid in scrollback instead of dropping them.",
+      "default": true
+    },
+    "images_filter": {
+      "type": "string",
+      "description": "Sampler for new image uploads. 'linear' smooths under scaling; 'nearest' keeps pixels crisp.",
+      "enum": ["linear", "nearest"],
+      "default": "linear"
+    },
+    "images_halfblock_for_missing": {
+      "type": "boolean",
+      "description": "Render placements as Unicode half-block (▀) glyphs when the GPU image draw is unavailable (disabled or decode failed).",
+      "default": false
+    },
+
+    "shell_exit_mode": {
+      "type": "string",
+      "description": "What the window does when the child shell exits. 'always' closes regardless; 'never' keeps it open with a status line; 'on_success' closes on a clean (0) exit and keeps it open otherwise.",
+      "enum": ["always", "never", "on_success"],
+      "default": "on_success"
+    },
+    "prompt_gutter": {
+      "type": "string",
+      "description": "OSC 133 prompt-status indicator in the left margin. 'none' is off; 'bar' draws a per-prompt vertical bar (green/red/dim).",
+      "enum": ["none", "bar"],
+      "default": "none"
+    },
+    "autocomplete": {
+      "type": "boolean",
+      "description": "Show the filesystem/history autocomplete popup as you type.",
+      "default": true
+    }
+  }
+}
