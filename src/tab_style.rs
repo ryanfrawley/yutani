@@ -9,10 +9,14 @@
 //! semibold), the others dim into the bar (secondary label color). We also drop
 //! the title-bar separator for a cleaner, more floating look.
 //!
-//! Each `NSWindow` owns exactly one native tab, so a window can only style its
-//! own `tab`. Selection changes surface as focus transitions, so every window
-//! re-styles itself there — the newly-selected window emphasizes, the one that
-//! lost focus dims. Stateless: just functions over the window.
+//! Each `NSWindow` owns exactly one native tab, but a window can reach every
+//! sibling in its group through `tabGroup.windows` and set each one's
+//! `attributedTitle`. Restyle walks the whole group: any one window's call
+//! repaints every pill in the bar. This matters when the active scheme changes
+//! — the global palette drives the title color, and a theme flip in the
+//! focused window has to refresh the *inactive* siblings' titles too (they
+//! don't get a focus event and would otherwise hold the old foreground until
+//! clicked). Stateless: just functions over the window.
 //!
 //! Off macOS these are no-ops.
 
@@ -49,32 +53,55 @@ mod imp {
         }
     }
 
-    /// Restyle this window's native tab title: emphasized when it's the selected
-    /// tab in its group, dimmed otherwise. Safe to call on every selection /
-    /// title change.
+    /// Restyle the native tab titles for every window in this window's tab
+    /// group: emphasized for the selected one, dimmed for the rest. Safe to
+    /// call on every selection / title change / theme change. When called by a
+    /// single window after a theme flip (the focused one), sibling tabs get
+    /// refreshed too — they share the process-global palette and would
+    /// otherwise hold the old foreground color until clicked.
     pub fn restyle(window: &Window) {
         let Some(ns) = parent_nswindow(window) else {
             return;
         };
         unsafe {
             let tab_group: *mut AnyObject = msg_send![ns, tabGroup];
-            let selected: *mut AnyObject = if tab_group.is_null() {
-                std::ptr::null_mut()
-            } else {
-                msg_send![tab_group, selectedWindow]
-            };
-            // A lone window (no group, or it *is* the selection) reads as active.
-            let active = selected.is_null() || selected == ns;
-
-            // Native tabs size to width and ellipsize the title themselves, so
-            // pass the full title through.
-            let title = window_title(ns);
-            let attr = attributed_title(&title, active);
-
-            let tab: *mut AnyObject = msg_send![ns, tab];
-            if !tab.is_null() {
-                let _: () = msg_send![tab, setAttributedTitle: &*attr];
+            if tab_group.is_null() {
+                // Lone window with no tab group — style its own tab as active.
+                restyle_one(ns, true);
+                return;
             }
+            let selected: *mut AnyObject = msg_send![tab_group, selectedWindow];
+            let windows: *mut AnyObject = msg_send![tab_group, windows];
+            if windows.is_null() {
+                let active = selected.is_null() || selected == ns;
+                restyle_one(ns, active);
+                return;
+            }
+            let count: usize = msg_send![windows, count];
+            for i in 0..count {
+                let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                if w.is_null() {
+                    continue;
+                }
+                // `selectedWindow` is nil only briefly during transitions; treat
+                // that as "every tab active" so nobody renders as dimmed in the
+                // gap (matches the lone-window case above).
+                let active = selected.is_null() || w == selected;
+                restyle_one(w, active);
+            }
+        }
+    }
+
+    /// Set one window's tab title to the styled attributed string. Caller
+    /// decides active vs inactive based on the tab group's selection.
+    unsafe fn restyle_one(ns: *mut AnyObject, active: bool) {
+        // Native tabs size to width and ellipsize the title themselves, so
+        // pass the full title through.
+        let title = window_title(ns);
+        let attr = attributed_title(&title, active);
+        let tab: *mut AnyObject = msg_send![ns, tab];
+        if !tab.is_null() {
+            let _: () = msg_send![tab, setAttributedTitle: &*attr];
         }
     }
 
