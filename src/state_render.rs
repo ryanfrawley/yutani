@@ -33,6 +33,23 @@ fn dirty_audit_enabled() -> bool {
     })
 }
 
+/// Per-fragment glyph-fade alphas `(top, bottom)` for the edge-fade uniform.
+///
+/// The scroll-edge fade strips sample the scene blur (`tint = 0`), so when glow
+/// is OFF that blur source is the *full* scene and the strips already crossfade
+/// sharp→blur on their own. Running the per-fragment glyph fade on top of that
+/// would double-attenuate the glyphs and read as additive glow, so it's
+/// suppressed (both alphas forced to 0). When glow is ON the strip blur is
+/// background-only, so the per-fragment fade is still required to dissolve the
+/// glyphs and the caller's `top`/`bottom` alphas pass through unchanged.
+pub(crate) fn per_fragment_fade_alphas(glow_on: bool, top: f32, bottom: f32) -> (f32, f32) {
+    if glow_on {
+        (top, bottom)
+    } else {
+        (0.0, 0.0)
+    }
+}
+
 impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
@@ -1970,23 +1987,28 @@ impl WindowState {
                           y1: f32,
                           c0: [f32; 4],
                           c1: [f32; 4],
-                          tint: f32| {
+                          tint0: f32,
+                          tint1: f32| {
             // The strip pipeline draws through the same (scrolled) camera, but
             // edge fades are pinned to the window — cancel the camera offset.
             let y0 = y0 - camera_vert;
             let y1 = y1 - camera_vert;
             let start = vertices.len() as u16;
             // radii.yzw = 0 so the shader skips the SDF mask; radii.x carries
-            // the blur-vs-solid tint. local_pos / half_size go unused.
+            // the blur-vs-solid tint and is interpolated across the strip, so
+            // the y0 vertices get `tint0` and the y1 vertices `tint1` — letting
+            // a strip ramp from blur toward the solid bg fill along its height.
+            // local_pos / half_size go unused.
             let stub = [0.0_f32, 0.0];
-            let radii = [tint, 0.0, 0.0, 0.0];
+            let radii0 = [tint0, 0.0, 0.0, 0.0];
+            let radii1 = [tint1, 0.0, 0.0, 0.0];
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y0, 0.0],
                 tex_coords: [bg_u, bg_v],
                 color: c0,
                 local_pos: stub,
                 half_size: stub,
-                radii,
+                radii: radii0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y1, 0.0],
@@ -1994,7 +2016,7 @@ impl WindowState {
                 color: c1,
                 local_pos: stub,
                 half_size: stub,
-                radii,
+                radii: radii1,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y0, 0.0],
@@ -2002,7 +2024,7 @@ impl WindowState {
                 color: c0,
                 local_pos: stub,
                 half_size: stub,
-                radii,
+                radii: radii0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y1, 0.0],
@@ -2010,7 +2032,7 @@ impl WindowState {
                 color: c1,
                 local_pos: stub,
                 half_size: stub,
-                radii,
+                radii: radii1,
             });
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };
@@ -2083,8 +2105,8 @@ impl WindowState {
             // the lower part so the band has no hard bottom edge — it dissolves
             // into the tab strip / content rather than ending on a glass line.
             let solid_to = band_bottom * 0.35;
-            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, solid_to, solid, solid, 0.0);
-            push_strip(&mut strip_vertices, &mut strip_indices, solid_to, band_bottom, solid, clear, 0.0);
+            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, solid_to, solid, solid, 0.0, 0.0);
+            push_strip(&mut strip_vertices, &mut strip_indices, solid_to, band_bottom, solid, clear, 0.0, 0.0);
             blur_strip = true;
         }
 
@@ -2098,22 +2120,24 @@ impl WindowState {
         if self.top_fade_phase > 0.0 {
             match self.config.scroll_edge_style {
                 ScrollEdgeStyle::Soft => {
-                    // EXPERIMENTAL: instead of blurring the scene behind the
-                    // chrome, dissolve it into the background color. Same
-                    // continuous smoothstep ramp from the very top edge down over
-                    // the whole band (chrome band + the fade below it) — full
-                    // strength at the edge, zero at the band bottom — but each
-                    // strip is a solid fill of the background color (tint = 1),
-                    // alpha-composited over the sharp content, rather than a blur
-                    // sample (tint = 0). Because the ramp spans past the chrome,
-                    // coverage is still substantial across the band, so no sharp
-                    // rows show through the chrome gap. Emitted as a few linear
-                    // segments.
+                    // Soft top edge: as content nears the edge it crossfades into
+                    // its scene blur and then into the background color. The
+                    // smoothstep ramp `r` runs full at the very top edge (u=0) to
+                    // zero at the band bottom (u=1) and scales the strip alpha
+                    // (coverage = how much of the sharp scene is replaced). The
+                    // blur→bg `tint` uses `r²`, so the bg fill only takes over
+                    // right at the edge while the blur dissolve stays dominant
+                    // across the band. Spanning past the chrome keeps coverage
+                    // full so no sharp rows show through the chrome gap. Emitted
+                    // as linear segments.
                     const SEGS: usize = 8;
                     let bg = palette::get().background;
-                    // smoothstep complement: full at the top edge (u=0), zero at
-                    // the band bottom (u=1).
-                    let a = |u: f32| top_alpha * (1.0 - u * u * (3.0 - 2.0 * u));
+                    // smoothstep complement: 1 at the top edge (u=0), 0 at the
+                    // band bottom (u=1).
+                    let r = |u: f32| 1.0 - u * u * (3.0 - 2.0 * u);
+                    let a = |u: f32| top_alpha * r(u);
+                    // Fade toward the bg fill, concentrated at the very edge.
+                    let tint = |u: f32| r(u) * r(u);
                     let mut prev_y = 0.0_f32;
                     for i in 1..=SEGS {
                         let u0 = (i - 1) as f32 / SEGS as f32;
@@ -2121,9 +2145,10 @@ impl WindowState {
                         let y1 = soft_band * u1;
                         let c0 = [bg[0], bg[1], bg[2], a(u0)];
                         let c1 = [bg[0], bg[1], bg[2], a(u1)];
-                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 1.0);
+                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1));
                         prev_y = y1;
                     }
+                    blur_strip = true;
                 }
                 ScrollEdgeStyle::Hard => {
                     // One opaque background-colored bar covering the chrome band,
@@ -2131,7 +2156,7 @@ impl WindowState {
                     // color.
                     let bg = palette::get().background;
                     let solid = [bg[0], bg[1], bg[2], top_alpha];
-                    push_strip(&mut strip_vertices, &mut strip_indices, 0.0, bar_h, solid, solid, 1.0);
+                    push_strip(&mut strip_vertices, &mut strip_indices, 0.0, bar_h, solid, solid, 1.0, 1.0);
                 }
             }
         }
@@ -2139,13 +2164,16 @@ impl WindowState {
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
-            // Mirror the top Soft fade: dissolve into the background color
-            // (tint = 1, solid bg fill) rather than sampling the scene blur.
-            // Same smoothstep ramp, flipped — zero at the band top, full
-            // strength at the very bottom edge — emitted as linear segments.
+            // Mirror the top Soft fade: content crossfades into its scene blur
+            // and then into the background color toward the edge. The smoothstep
+            // ramp `r` is flipped — 0 at the band top, 1 at the very bottom edge
+            // — and scales the strip alpha; the blur→bg `tint` uses `r²` so the
+            // bg fill takes over only at the edge. Emitted as linear segments.
             const SEGS: usize = 8;
             let bg = palette::get().background;
-            let a = |u: f32| bottom_alpha * (u * u * (3.0 - 2.0 * u));
+            let r = |u: f32| u * u * (3.0 - 2.0 * u);
+            let a = |u: f32| bottom_alpha * r(u);
+            let tint = |u: f32| r(u) * r(u);
             let band_top = win_h - bottom_band_height;
             let mut prev_y = band_top;
             for i in 1..=SEGS {
@@ -2154,9 +2182,10 @@ impl WindowState {
                 let y1 = band_top + bottom_band_height * u1;
                 let c0 = [bg[0], bg[1], bg[2], a(u0)];
                 let c1 = [bg[0], bg[1], bg[2], a(u1)];
-                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, 1.0);
+                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1));
                 prev_y = y1;
             }
+            blur_strip = true;
         }
 
         // Strip overlay: both edges now dissolve into the background color
@@ -2180,9 +2209,18 @@ impl WindowState {
         // Both edges run the per-fragment glyph fade so scrollback text
         // dissolves into the blur strip instead of reaching the edge sharp.
         // The top contribution is style-aware (zeroed for the hard backing).
+        //
+        // With glow OFF the strip blur source is the full scene, so the tint=0
+        // strips already crossfade sharp→blur; running the per-fragment glyph
+        // fade too would double-attenuate and read as additive glow — so it's
+        // suppressed. With glow ON the strip blur is bg-only, so the
+        // per-fragment fade is still needed to dissolve the glyphs.
+        let glow_on = self.glow.enabled();
+        let (pf_top_alpha, pf_bottom_alpha) =
+            per_fragment_fade_alphas(glow_on, fade_top_alpha, bottom_alpha);
         let fade_data: [f32; 16] = [
-            fade_top_band, fade_top_alpha, 0.0, 0.0,
-            bottom_band_height, bottom_alpha, 0.0, 0.0,
+            fade_top_band, pf_top_alpha, 0.0, 0.0,
+            bottom_band_height, pf_bottom_alpha, 0.0, 0.0,
             win_w, win_h, 0.0, 0.0,
             bg_u, bg_v, 0.0, 0.0,
         ];

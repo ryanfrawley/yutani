@@ -951,6 +951,36 @@ fn config_scroll_edge_style_default_soft_round_trips_through_serialize() {
 }
 
 #[test]
+fn per_fragment_fade_suppressed_when_glow_off() {
+    // Glow OFF: the edge strips sample a full-scene blur and crossfade
+    // sharp→blur on their own. The per-fragment glyph fade must be zeroed so it
+    // doesn't double-attenuate the glyphs (which reads as additive glow), no
+    // matter what band alphas the caller computed.
+    assert_eq!(
+        crate::state_render::per_fragment_fade_alphas(false, 1.0, 0.7),
+        (0.0, 0.0)
+    );
+    assert_eq!(
+        crate::state_render::per_fragment_fade_alphas(false, 0.0, 0.0),
+        (0.0, 0.0)
+    );
+}
+
+#[test]
+fn per_fragment_fade_passes_through_when_glow_on() {
+    // Glow ON: the strip blur is background-only, so the per-fragment fade is
+    // what dissolves the glyphs — the caller's band alphas pass through intact.
+    assert!(approx_pair(
+        crate::state_render::per_fragment_fade_alphas(true, 1.0, 0.7),
+        (1.0, 0.7)
+    ));
+    assert!(approx_pair(
+        crate::state_render::per_fragment_fade_alphas(true, 0.25, 0.5),
+        (0.25, 0.5)
+    ));
+}
+
+#[test]
 fn config_autocomplete_default_is_on() {
     assert!(Config::defaults().autocomplete);
 }
