@@ -145,6 +145,14 @@ pub struct Cell {
     /// common case. Independent of `style` so an SGR reset (`CSI 0 m`) does
     /// not clear the link — only `OSC 8 ; ; ST` does.
     pub hyperlink: Option<std::num::NonZeroU32>,
+    /// Grapheme cluster id into the terminal's `ClusterStore`, set when this
+    /// cell holds more than one codepoint (an emoji ZWJ sequence, a flag, an
+    /// emoji + skin tone / variation selector, a base + combining marks). `ch`
+    /// still holds the cluster's first codepoint — used for width and as the
+    /// fast single-char path — but the renderer rasterizes the whole cluster
+    /// string (Core Text shapes it). `None` for the overwhelmingly common
+    /// single-codepoint cell.
+    pub cluster: Option<std::num::NonZeroU32>,
 }
 
 /// Sentinel `ch` for the second cell of a wide (two-column) character. The
@@ -165,6 +173,7 @@ impl Cell {
             placeholder_image_row: 0,
             placeholder_image_col: 0,
             hyperlink: None,
+            cluster: None,
         }
     }
 

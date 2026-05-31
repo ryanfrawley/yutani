@@ -325,11 +325,23 @@ impl WindowState {
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
             let from = from.min(to);
-            // Skip wide-char spacer cells — the lead cell already carries the
-            // real character, so a copied 中 / 🚀 is one codepoint, not the
-            // character plus a phantom placeholder.
-            let row_text: String =
-                cells[from..to].iter().filter(|c| !c.is_wide_spacer()).map(|c| c.ch).collect();
+            // Build the row text. Skip wide-char spacer cells — the lead cell
+            // already carries the real character, so a copied 中 / 🚀 is one
+            // codepoint, not the character plus a phantom. Cells holding a
+            // grapheme cluster (emoji ZWJ/flag/skin-tone, base + combining
+            // marks) copy the whole cluster string, not just the lead codepoint.
+            let mut row_text = String::new();
+            for cell in &cells[from..to] {
+                if cell.is_wide_spacer() {
+                    continue;
+                }
+                match cell.cluster {
+                    Some(id) => {
+                        row_text.push_str(self.active_tab().terminal.cluster_str(id).unwrap_or(""))
+                    }
+                    None => row_text.push(cell.ch),
+                }
+            }
             // Trim trailing spaces — selecting a full line shouldn't paste
             // padding into the clipboard.
             let trimmed = row_text.trim_end_matches(' ');

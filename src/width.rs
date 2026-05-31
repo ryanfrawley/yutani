@@ -45,6 +45,63 @@ pub fn is_emoji(ch: char) -> bool {
     EMOJI.iter().any(|&(lo, hi)| cp >= lo && cp <= hi)
 }
 
+/// Zero-width joiner — glues emoji into a single ZWJ sequence (👨‍👩‍👧).
+pub const ZWJ: char = '\u{200D}';
+
+/// A regional indicator symbol (🇦–🇿). A pair forms one flag emoji.
+pub fn is_regional_indicator(ch: char) -> bool {
+    (0x1F1E6..=0x1F1FF).contains(&(ch as u32))
+}
+
+/// A variation selector — VS1–VS16 (notably VS16 U+FE0F, which forces emoji
+/// presentation) and the supplementary set used by some tag/flag sequences.
+fn is_variation_selector(cp: u32) -> bool {
+    (0xFE00..=0xFE0F).contains(&cp) || (0xE0100..=0xE01EF).contains(&cp)
+}
+
+/// An emoji skin-tone modifier (Fitzpatrick type 1-2 … 6).
+fn is_skin_tone(cp: u32) -> bool {
+    (0x1F3FB..=0x1F3FF).contains(&cp)
+}
+
+/// A tag character, used by subdivision-flag sequences (e.g. 🏴󠁧󠁢󠁳󠁣󠁴󠁿) and
+/// terminated by the cancel tag U+E007F.
+fn is_tag(cp: u32) -> bool {
+    (0xE0020..=0xE007F).contains(&cp)
+}
+
+/// A nonspacing/enclosing combining mark from the common blocks. Not a complete
+/// UAX #44 `Mn`/`Me` table — covers the diacritic ranges that actually show up
+/// in terminal text (Latin/Greek/Cyrillic diacritics, the combining symbols
+/// used by keycaps, and the variation/half-mark blocks).
+fn is_combining_mark(cp: u32) -> bool {
+    matches!(cp,
+        0x0300..=0x036F   // combining diacritical marks
+        | 0x0483..=0x0489 // Cyrillic combining
+        | 0x0591..=0x05BD | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7 // Hebrew
+        | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 // Arabic
+        | 0x1AB0..=0x1AFF // combining diacritical marks extended
+        | 0x1DC0..=0x1DFF // combining diacritical marks supplement
+        | 0x20D0..=0x20F0 // combining diacritical marks for symbols (incl. keycap 20E3)
+        | 0xFE20..=0xFE2F // combining half marks
+    )
+}
+
+/// Whether `ch` continues the grapheme cluster whose most recent codepoint was
+/// `prev_last`, *excluding* regional-indicator pairing (which needs the
+/// terminal's pending-flag state and is handled by the caller). Covers ZWJ
+/// sequences, variation selectors, skin tones, tag sequences, and combining
+/// marks — the multi-codepoint graphemes a terminal must keep in one cell.
+pub fn extends_grapheme(prev_last: char, ch: char) -> bool {
+    let cp = ch as u32;
+    ch == ZWJ                 // a ZWJ extends the current cluster …
+        || prev_last == ZWJ   // … and the codepoint after a ZWJ continues it
+        || is_variation_selector(cp)
+        || is_skin_tone(cp)
+        || is_tag(cp)
+        || is_combining_mark(cp)
+}
+
 /// East-Asian Wide / Fullwidth plus the default-emoji-presentation ranges.
 /// Ranges are sorted so the lookup can early-out; kept inclusive and explicit
 /// to stay readable against the Unicode charts they mirror.

@@ -320,6 +320,17 @@ impl WindowState {
                     self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
                         self.atlas.ensure_char(f, variant, ch)
                     });
+                    // Multi-codepoint grapheme: also pack the shaped cluster
+                    // glyph (Core Text), keyed by the cluster string.
+                    if let Some(id) = cell.cluster {
+                        if let Some(s) =
+                            self.active_tab().terminal.cluster_str(id).map(str::to_string)
+                        {
+                            self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
+                                self.atlas.ensure_cluster(f, &s)
+                            });
+                        }
+                    }
                 }
                 row_chars.push(ch);
             }
@@ -460,6 +471,11 @@ impl WindowState {
         enum GlyphSource {
             Char(char),
             Substituted(u32),
+            /// A pre-resolved grapheme-cluster glyph (emoji ZWJ/flag/skin-tone,
+            /// base + combining marks). The atlas entry is looked up in the main
+            /// loop (it lives in the string-keyed `clusters` map) and carried by
+            /// value so `emit_fg_for_cell` doesn't need the cluster string here.
+            Cluster(font::AtlasEntry),
         }
         // BG quad only — used by the bg-layer pass. Pulled out so we can
         // emit all cell backgrounds contiguously, record the boundary in
@@ -572,11 +588,15 @@ impl WindowState {
             // fills_h UV-clipping (added for box-drawing) cuts off
             // exactly that overlap, so we disable it for substituted
             // glyphs.
+            // `g` is an owned (Copy) entry, not a reference — so a pre-resolved
+            // cluster entry can be carried in `GlyphSource::Cluster` without
+            // tangling the atlas borrow.
             let (g, allow_overhang) = match fg_source {
-                GlyphSource::Char(ch) => (atlas.lookup(ch, variant), false),
+                GlyphSource::Char(ch) => (*atlas.lookup(ch, variant), false),
                 GlyphSource::Substituted(glyph_id) => {
-                    (atlas.lookup_glyph_id(glyph_id, variant), true)
+                    (*atlas.lookup_glyph_id(glyph_id, variant), true)
                 }
+                GlyphSource::Cluster(entry) => (entry, false),
             };
             // Color (emoji) glyph: sample the RGBA color atlas and place the
             // pre-scaled bitmap centered in the two-cell box the wide character
@@ -629,7 +649,7 @@ impl WindowState {
                         let cp = ch as u32;
                         (0x2500..=0x259F).contains(&cp) || (0xE000..=0xE0FF).contains(&cp)
                     }
-                    GlyphSource::Substituted(_) => false,
+                    GlyphSource::Substituted(_) | GlyphSource::Cluster(_) => false,
                 };
                 let fills_h = cell_filling && !allow_overhang
                     && g.width as f32 >= span_w * 0.85;
@@ -935,10 +955,23 @@ impl WindowState {
                 };
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
-                let fg_source = match over.and_then(|cs| cs[c]) {
+                let mut fg_source = match over.and_then(|cs| cs[c]) {
                     Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
                     None => GlyphSource::Char(cell.ch),
                 };
+                // A grapheme cluster (emoji ZWJ/flag/skin-tone, base+combining)
+                // overrides the single-char glyph with its shaped cluster glyph,
+                // when packed. Falls back to the base codepoint otherwise.
+                if let Some(id) = cell.cluster {
+                    if let Some(e) = self
+                        .active_tab()
+                        .terminal
+                        .cluster_str(id)
+                        .and_then(|s| atlas.lookup_cluster(s))
+                    {
+                        fg_source = GlyphSource::Cluster(*e);
+                    }
+                }
                 emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg);
                 // Wide-char spacer: paint its background (uniform with the lead
                 // via the shared style) but emit no glyph — the lead character

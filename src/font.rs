@@ -245,6 +245,12 @@ pub struct Atlas {
     // Without this set we'd re-attempt face_for + the surrounding work
     // every frame for any such char.
     tried_chars: [HashSet<char>; 4],
+    // Multi-codepoint grapheme clusters (emoji ZWJ sequences, flags, skin-tone
+    // / variation-selector variants, base + combining marks), keyed by the
+    // cluster string and packed into either the color or coverage layer.
+    // `tried_clusters` gates re-attempts like `tried_chars`.
+    pub clusters: HashMap<String, AtlasEntry>,
+    tried_clusters: HashSet<String>,
 }
 
 impl Atlas {
@@ -475,24 +481,20 @@ impl Atlas {
         self.dirty = true;
     }
 
-    /// Rasterize `ch` via the platform color rasterizer (Core Text on macOS)
-    /// and pack it into the color layer. Used for emoji that FreeType can't
-    /// render — chiefly Apple Color Emoji, whose strikes are PNG-encoded sbix
-    /// the bundled FreeType has no libpng to decode. A no-op (leaving the slot
-    /// at notdef) on platforms without a rasterizer or when rasterization fails.
-    fn pack_emoji_platform(&mut self, ch: char, vi: usize, cell_w: usize, cell_h: usize) {
+    /// Rasterize `text` (one char or a whole grapheme cluster) via the platform
+    /// color rasterizer (Core Text on macOS) and pack it into the color layer,
+    /// returning its entry. Used for emoji FreeType can't render — chiefly Apple
+    /// Color Emoji's PNG-sbix strikes. `None` off macOS or when nothing drew.
+    fn rasterize_pack_color(&mut self, text: &str, cell_w: usize, cell_h: usize) -> Option<AtlasEntry> {
         // Render near the cell height so the downscale into the two-cell box is
         // minimal; emoji are square so this also fills the width well.
-        let Some((bgra, src_w, src_h)) = crate::emoji::rasterize(ch, cell_h as u32) else {
-            return;
-        };
-        let box_w = 2 * cell_w;
-        if let Some(entry) = pack_color_glyph(
+        let (bgra, src_w, src_h) = crate::emoji::rasterize(text, cell_h as u32)?;
+        let entry = pack_color_glyph(
             &bgra,
             src_w,
             src_h,
             src_w * 4,
-            box_w,
+            2 * cell_w, // wide characters span two cells
             cell_h,
             &mut self.color_buffer,
             self.color_width,
@@ -500,22 +502,18 @@ impl Atlas {
             &mut self.color_pack_x,
             &mut self.color_pack_y,
             &mut self.color_pack_row_height,
-        ) {
-            self.variants[vi].insert(ch, entry);
-            self.color_dirty = true;
-        }
+        )?;
+        self.color_dirty = true;
+        Some(entry)
     }
 
-    /// Rasterize `ch` as monochrome coverage via the platform text stack (Core
-    /// Text on macOS) and pack it into the coverage atlas. Used for glyphs no
-    /// installed FreeType face carries — chiefly macOS CJK, whose system fonts
-    /// won't load in the bundled FreeType. No-op (leaving notdef) off macOS or
-    /// when nothing was drawn.
-    fn pack_mono_platform(&mut self, ch: char, vi: usize, cell_h: usize) {
-        let Some(g) = crate::emoji::rasterize_mono(ch, cell_h as u32) else {
-            return;
-        };
-        if let Some(entry) = pack_coverage(
+    /// Rasterize `text` as monochrome coverage via the platform text stack and
+    /// pack it into the coverage atlas, returning its entry. Used for glyphs no
+    /// installed FreeType face carries — chiefly macOS CJK. `None` off macOS or
+    /// when nothing drew.
+    fn rasterize_pack_mono(&mut self, text: &str, cell_h: usize) -> Option<AtlasEntry> {
+        let g = crate::emoji::rasterize_mono(text, cell_h as u32)?;
+        let entry = pack_coverage(
             &g.coverage,
             g.width,
             g.height,
@@ -527,10 +525,63 @@ impl Atlas {
             &mut self.pack_x,
             &mut self.pack_y,
             &mut self.pack_row_height,
-        ) {
+        )?;
+        self.dirty = true;
+        Some(entry)
+    }
+
+    /// Single-char color (emoji) platform pack, keyed into the per-char map.
+    fn pack_emoji_platform(&mut self, ch: char, vi: usize, cell_w: usize, cell_h: usize) {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if let Some(entry) = self.rasterize_pack_color(s, cell_w, cell_h) {
             self.variants[vi].insert(ch, entry);
-            self.dirty = true;
         }
+    }
+
+    /// Single-char monochrome platform pack (CJK et al.), keyed into the
+    /// per-char map.
+    fn pack_mono_platform(&mut self, ch: char, vi: usize, cell_h: usize) {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        if let Some(entry) = self.rasterize_pack_mono(s, cell_h) {
+            self.variants[vi].insert(ch, entry);
+        }
+    }
+
+    /// Rasterize and cache a whole grapheme-cluster string (an emoji ZWJ
+    /// sequence, flag, skin-tone/VS variant, or base + combining marks). Core
+    /// Text shapes the cluster into one glyph; an emoji base goes to the color
+    /// layer, anything else to the coverage layer. Keyed by the cluster string
+    /// in `clusters`; `tried_clusters` gates re-attempts like `tried_chars`.
+    pub fn ensure_cluster(&mut self, font: &mut Font, s: &str) {
+        if self.clusters.contains_key(s) || !self.tried_clusters.insert(s.to_string()) {
+            return;
+        }
+        let cell_w = font.cell_width();
+        let metrics = font.metrics();
+        let cell_h = ((metrics.ascender - metrics.descender) >> 6) as usize;
+        // Color when the cluster is emoji: any emoji codepoint, or an explicit
+        // emoji variation selector (U+FE0F) forcing emoji presentation on an
+        // otherwise text-default symbol (e.g. ❤️). Everything else (a base plus
+        // combining marks) is monochrome coverage.
+        let color = s
+            .chars()
+            .any(|c| crate::width::is_emoji(c) || c == '\u{FE0F}');
+        let entry = if color {
+            self.rasterize_pack_color(s, cell_w, cell_h)
+        } else {
+            self.rasterize_pack_mono(s, cell_h)
+        };
+        if let Some(entry) = entry {
+            self.clusters.insert(s.to_string(), entry);
+        }
+    }
+
+    /// Look up a cached cluster glyph by its string. `None` until
+    /// `ensure_cluster` has packed it (caller falls back to the per-char path).
+    pub fn lookup_cluster(&self, s: &str) -> Option<&AtlasEntry> {
+        self.clusters.get(s)
     }
 }
 
@@ -975,6 +1026,8 @@ impl Font {
                 HashSet::new(),
                 HashSet::new(),
             ],
+            clusters: HashMap::new(),
+            tried_clusters: HashSet::new(),
         }
     }
 }
@@ -1394,6 +1447,8 @@ mod tests {
                 HashSet::new(),
                 HashSet::new(),
             ],
+            clusters: HashMap::new(),
+            tried_clusters: HashSet::new(),
         }
     }
 
@@ -1822,6 +1877,8 @@ mod tests {
                 HashSet::new(),
                 HashSet::new(),
             ],
+            clusters: HashMap::new(),
+            tried_clusters: HashSet::new(),
         }
     }
 
@@ -1943,7 +2000,7 @@ mod tests {
     #[test]
     fn cjk_packs_into_coverage_atlas_via_platform_rasterizer() {
         let Some(mut font) = load_test_font() else { return };
-        if crate::emoji::rasterize_mono('中', 28).is_none() {
+        if crate::emoji::rasterize_mono("中", 28).is_none() {
             eprintln!("skipping: Core Text returned no CJK bitmap");
             return;
         }
@@ -1969,7 +2026,7 @@ mod tests {
             return;
         };
         // Sanity: the platform rasterizer actually produces pixels here.
-        if crate::emoji::rasterize('\u{2705}', 28).is_none() {
+        if crate::emoji::rasterize("\u{2705}", 28).is_none() {
             eprintln!("skipping: Core Text returned no emoji bitmap");
             return;
         }

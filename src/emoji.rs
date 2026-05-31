@@ -13,7 +13,7 @@
 /// both sources identically. `None` if the platform has no rasterizer or the
 /// glyph couldn't be drawn.
 #[cfg(target_os = "macos")]
-pub fn rasterize(ch: char, px: u32) -> Option<(Vec<u8>, usize, usize)> {
+pub fn rasterize(text: &str, px: u32) -> Option<(Vec<u8>, usize, usize)> {
     use core_foundation::attributed_string::CFMutableAttributedString;
     use core_foundation::base::{CFRange, TCFType};
     use core_foundation::string::CFString;
@@ -34,7 +34,7 @@ pub fn rasterize(ch: char, px: u32) -> Option<(Vec<u8>, usize, usize)> {
     // Attributed string carrying just this character in the emoji font. Using a
     // CTLine (rather than raw glyph lookup) shapes surrogate pairs and ZWJ
     // sequences correctly — important since most emoji are astral codepoints.
-    let text = CFString::new(&ch.to_string());
+    let text = CFString::new(text);
     let mut astr = CFMutableAttributedString::new();
     astr.replace_str(&text, CFRange::init(0, 0));
     let len = astr.char_len();
@@ -66,7 +66,7 @@ pub fn rasterize(ch: char, px: u32) -> Option<(Vec<u8>, usize, usize)> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn rasterize(_ch: char, _px: u32) -> Option<(Vec<u8>, usize, usize)> {
+pub fn rasterize(_text: &str, _px: u32) -> Option<(Vec<u8>, usize, usize)> {
     None
 }
 
@@ -89,7 +89,7 @@ pub struct MonoGlyph {
 /// font substitution finds the right face; we draw it black-on-clear and keep
 /// the alpha channel as coverage. `None` if nothing was drawn / off macOS.
 #[cfg(target_os = "macos")]
-pub fn rasterize_mono(ch: char, px: u32) -> Option<MonoGlyph> {
+pub fn rasterize_mono(text: &str, px: u32) -> Option<MonoGlyph> {
     use core_foundation::attributed_string::CFMutableAttributedString;
     use core_foundation::base::{CFRange, TCFType};
     use core_foundation::string::CFString;
@@ -106,7 +106,7 @@ pub fn rasterize_mono(ch: char, px: u32) -> Option<MonoGlyph> {
     // (e.g. PingFang for CJK) for any character this one lacks.
     let font = new_from_name("Helvetica", px).ok()?;
 
-    let text = CFString::new(&ch.to_string());
+    let text = CFString::new(text);
     let mut astr = CFMutableAttributedString::new();
     astr.replace_str(&text, CFRange::init(0, 0));
     let len = astr.char_len();
@@ -146,6 +146,6 @@ pub fn rasterize_mono(ch: char, px: u32) -> Option<MonoGlyph> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn rasterize_mono(_ch: char, _px: u32) -> Option<MonoGlyph> {
+pub fn rasterize_mono(_text: &str, _px: u32) -> Option<MonoGlyph> {
     None
 }
