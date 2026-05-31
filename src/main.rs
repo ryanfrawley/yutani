@@ -2855,12 +2855,16 @@ extern "C" fn yutani_new_window_for_tab(
 /// mouse-down to hand AppKit, and the drag hesitates for up to ~500ms.
 ///
 /// Here we're still *inside* event delivery with the real event in hand, so a
-/// left mouse-down on the empty title-bar strip goes straight to
+/// single left mouse-down on the empty title-bar strip goes straight to
 /// `performWindowDragWithEvent:` and the window follows the cursor instantly.
-/// AppKit also applies the system title-bar double-click action (zoom/minimize)
-/// itself, so we don't need to detect that. Everything else — clicks on the
-/// traffic lights, the tab bar, or the terminal body — falls through to the
-/// normal `NSWindow` path (and on to winit).
+/// A *double*-click on that same strip we handle ourselves
+/// (`perform_titlebar_double_click_action`): `performWindowDragWithEvent:` only
+/// applies the system zoom/minimize action when the press lands on a real
+/// title-bar view, which our full-size content view isn't — so without this the
+/// gesture only worked over the title *text* (a sibling view that misses our
+/// hit-test and falls through to the default path below). Everything else —
+/// clicks on the traffic lights, the tab bar, or the terminal body — falls
+/// through to the normal `NSWindow` path (and on to winit).
 #[cfg(target_os = "macos")]
 extern "C" fn yutani_send_event(
     this: *mut objc2::runtime::AnyObject,
@@ -2895,7 +2899,26 @@ extern "C" fn yutani_send_event(
                 } else {
                     msg_send![frame_view, hitTest: loc]
                 };
-                if hit == content_view {
+                // The bare strip is anything that hit-tests into winit's content
+                // view *or one of its descendants* — `hitTest:` returns the
+                // deepest subview (winit's layer-backed render view), never the
+                // content view itself, so a strict `hit == content_view` never
+                // matches. The traffic lights, the native tab bar, and the title
+                // text are AppKit siblings outside that subtree, so they still
+                // fall through to the default path below (and keep their native
+                // behavior, including AppKit's own title-text double-click zoom).
+                let mut within_content = false;
+                {
+                    let mut v = hit;
+                    while !v.is_null() {
+                        if v == content_view {
+                            within_content = true;
+                            break;
+                        }
+                        v = msg_send![v, superview];
+                    }
+                }
+                if within_content {
                     // contentLayoutRect excludes the title bar (and the tab bar
                     // when shown); it sits at the bottom of the window's flipped
                     // coords, so anything above its top edge is the draggable
@@ -2904,7 +2927,11 @@ extern "C" fn yutani_send_event(
                     let content: NSRect = msg_send![this, contentLayoutRect];
                     let titlebar = frame.size.height - content.size.height;
                     if titlebar > 0.0 && loc.y > content.size.height {
-                        let _: () = msg_send![this, performWindowDragWithEvent: event];
+                        if ns_event.clickCount() >= 2 {
+                            perform_titlebar_double_click_action(this);
+                        } else {
+                            let _: () = msg_send![this, performWindowDragWithEvent: event];
+                        }
                         return;
                     }
                 }
@@ -2914,6 +2941,48 @@ extern "C" fn yutani_send_event(
         let this_ref: &AnyObject = &*this;
         let _: () = msg_send![super(this_ref, class!(NSWindow)), sendEvent: event];
     }
+}
+
+/// Apply the system "Double-click a window's title bar to" action (System
+/// Settings › Desktop & Dock) to `window`. We invoke this for double-clicks on
+/// the bare title-bar strip — see `yutani_send_event` for why AppKit doesn't do
+/// it for us there.
+///
+/// The setting lives in `NSGlobalDomain` under `AppleActionOnDoubleClick`:
+/// `Minimize` miniaturizes, `None` does nothing, and anything else (including
+/// the default of an absent key) zooms. We route through the `performZoom:` /
+/// `performMiniaturize:` action methods rather than `zoom:` / `miniaturize:` so
+/// the window gets to validate/animate exactly as the green button and the
+/// Window menu do.
+#[cfg(target_os = "macos")]
+unsafe fn perform_titlebar_double_click_action(window: *mut objc2::runtime::AnyObject) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    let nil = std::ptr::null_mut::<AnyObject>();
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let action: *mut AnyObject = if defaults.is_null() {
+        std::ptr::null_mut()
+    } else {
+        let key = NSString::from_str("AppleActionOnDoubleClick");
+        msg_send![defaults, stringForKey: &*key]
+    };
+    if !action.is_null() {
+        let minimize = NSString::from_str("Minimize");
+        let none = NSString::from_str("None");
+        let is_minimize: bool = msg_send![action, isEqualToString: &*minimize];
+        let is_none: bool = msg_send![action, isEqualToString: &*none];
+        if is_minimize {
+            let _: () = msg_send![window, performMiniaturize: nil];
+            return;
+        }
+        if is_none {
+            return;
+        }
+    }
+    // Default / "Maximize": toggle the standard (zoomed) frame.
+    let _: () = msg_send![window, performZoom: nil];
 }
 
 /// Install `newWindowForTab:` on the window's class so AppKit draws the native
