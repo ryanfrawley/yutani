@@ -2943,17 +2943,36 @@ extern "C" fn yutani_send_event(
     }
 }
 
-/// Apply the system "Double-click a window's title bar to" action (System
-/// Settings › Desktop & Dock) to `window`. We invoke this for double-clicks on
-/// the bare title-bar strip — see `yutani_send_event` for why AppKit doesn't do
-/// it for us there.
+/// The macOS "Double-click a window's title bar to" behavior.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum TitlebarDoubleClickAction {
+    Zoom,
+    Minimize,
+    None,
+}
+
+/// Map the `NSGlobalDomain` `AppleActionOnDoubleClick` setting (System Settings ›
+/// Desktop & Dock) to the action a title-bar double-click should take. `setting`
+/// is the raw default string, or `None` when the key is absent. `"Minimize"`
+/// miniaturizes, `"None"` does nothing, and anything else — including the absent
+/// default — zooms (the modern macOS default). Free function so the mapping is
+/// unit-testable without `NSUserDefaults`; `perform_titlebar_double_click_action`
+/// reads the live default and delegates here.
+fn titlebar_double_click_action(setting: Option<&str>) -> TitlebarDoubleClickAction {
+    match setting {
+        Some("Minimize") => TitlebarDoubleClickAction::Minimize,
+        Some("None") => TitlebarDoubleClickAction::None,
+        _ => TitlebarDoubleClickAction::Zoom,
+    }
+}
+
+/// Apply the system "Double-click a window's title bar to" action to `window`.
+/// We invoke this for double-clicks on the bare title-bar strip — see
+/// `yutani_send_event` for why AppKit doesn't do it for us there.
 ///
-/// The setting lives in `NSGlobalDomain` under `AppleActionOnDoubleClick`:
-/// `Minimize` miniaturizes, `None` does nothing, and anything else (including
-/// the default of an absent key) zooms. We route through the `performZoom:` /
-/// `performMiniaturize:` action methods rather than `zoom:` / `miniaturize:` so
-/// the window gets to validate/animate exactly as the green button and the
-/// Window menu do.
+/// We route through the `performZoom:` / `performMiniaturize:` action methods
+/// rather than `zoom:` / `miniaturize:` so the window gets to validate/animate
+/// exactly as the green button and the Window menu do.
 #[cfg(target_os = "macos")]
 unsafe fn perform_titlebar_double_click_action(window: *mut objc2::runtime::AnyObject) {
     use objc2::runtime::AnyObject;
@@ -2962,27 +2981,22 @@ unsafe fn perform_titlebar_double_click_action(window: *mut objc2::runtime::AnyO
 
     let nil = std::ptr::null_mut::<AnyObject>();
     let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
-    let action: *mut AnyObject = if defaults.is_null() {
-        std::ptr::null_mut()
+    let setting: Option<objc2::rc::Retained<NSString>> = if defaults.is_null() {
+        None
     } else {
         let key = NSString::from_str("AppleActionOnDoubleClick");
         msg_send![defaults, stringForKey: &*key]
     };
-    if !action.is_null() {
-        let minimize = NSString::from_str("Minimize");
-        let none = NSString::from_str("None");
-        let is_minimize: bool = msg_send![action, isEqualToString: &*minimize];
-        let is_none: bool = msg_send![action, isEqualToString: &*none];
-        if is_minimize {
+    let setting = setting.map(|s| s.to_string());
+    match titlebar_double_click_action(setting.as_deref()) {
+        TitlebarDoubleClickAction::Minimize => {
             let _: () = msg_send![window, performMiniaturize: nil];
-            return;
         }
-        if is_none {
-            return;
+        TitlebarDoubleClickAction::None => {}
+        TitlebarDoubleClickAction::Zoom => {
+            let _: () = msg_send![window, performZoom: nil];
         }
     }
-    // Default / "Maximize": toggle the standard (zoomed) frame.
-    let _: () = msg_send![window, performZoom: nil];
 }
 
 /// Install `newWindowForTab:` on the window's class so AppKit draws the native
