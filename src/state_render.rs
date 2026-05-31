@@ -50,6 +50,38 @@ pub(crate) fn per_fragment_fade_alphas(glow_on: bool, top: f32, bottom: f32) -> 
     }
 }
 
+/// The longest per-frame animation step (in seconds) the edge fades will honor.
+/// When nothing is animating the event loop idles and stops updating
+/// `last_anim_tick`, so the first frame of a freshly-triggered fade can see the
+/// whole idle gap as its delta — capping it keeps a fade spanning multiple
+/// frames instead of snapping to its target in one.
+pub(crate) const MAX_FADE_DT: f32 = 1.0 / 30.0;
+
+/// Clamp the raw wall-clock delta between two animation ticks to at most one
+/// slow frame (`MAX_FADE_DT`). A stale `last_anim_tick` after an idle period
+/// would otherwise hand the ramp a `dt` large enough to complete in one frame.
+pub(crate) fn clamp_fade_dt(raw_dt: f32) -> f32 {
+    raw_dt.min(MAX_FADE_DT)
+}
+
+/// Advance a fade `phase` one frame toward `target` at a constant rate, where
+/// the ramp covers the full 0↔1 range in `secs` seconds. Returns the new phase.
+///
+/// `step = dt / secs` is the fraction of the range crossed this frame; the
+/// `min`/`max` clamps stop it exactly on `target` without overshoot, so a fade
+/// converges rather than oscillating. `secs <= 0` means "no animation": the
+/// phase jumps straight to `target`.
+pub(crate) fn advance_fade_phase(phase: f32, target: f32, dt: f32, secs: f32) -> f32 {
+    let step = if secs > 0.0 { dt / secs } else { 1.0 };
+    if phase < target {
+        (phase + step).min(target)
+    } else if phase > target {
+        (phase - step).max(target)
+    } else {
+        phase
+    }
+}
+
 impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
@@ -127,6 +159,10 @@ impl WindowState {
         let default_bg_solid = pal.background;
         let atlas_w = self.atlas.width as f32;
         let atlas_h = self.atlas.height as f32;
+        // Color (emoji) layer dimensions — a separate texture, so color-glyph
+        // UVs are normalized against these rather than the mono atlas size.
+        let color_atlas_w = self.atlas.color_width as f32;
+        let color_atlas_h = self.atlas.color_height as f32;
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
         let scroll_y = self.active_tab().scroll_y as f32;
@@ -160,6 +196,7 @@ impl WindowState {
                     local_pos: [-hx, -hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x, y + h, 0.0],
@@ -168,6 +205,7 @@ impl WindowState {
                     local_pos: [-hx, hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x + w, y, 0.0],
@@ -176,6 +214,7 @@ impl WindowState {
                     local_pos: [hx, -hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x + w, y + h, 0.0],
@@ -184,7 +223,39 @@ impl WindowState {
                     local_pos: [hx, hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
+                idxs.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
+            };
+
+        // Color-glyph quad (emoji). Same geometry as `push_quad` but tags the
+        // vertices `kind = 1.0` so the shader samples the RGBA color atlas and
+        // uses the texel directly. Vertex `color` is unused by that path, so it
+        // carries an opaque white placeholder; `radii`/`local_pos` are zero
+        // (no SDF). UVs index the color atlas.
+        let push_color_quad =
+            |verts: &mut Vec<renderer::vertex::Vertex>,
+             idxs: &mut Vec<u32>,
+             x: f32,
+             y: f32,
+             w: f32,
+             h: f32,
+             uv0: [f32; 2],
+             uv1: [f32; 2]| {
+                let start = verts.len() as u32;
+                let mk = |px: f32, py: f32, u: f32, v: f32| renderer::vertex::Vertex {
+                    position: [px, py, 0.0],
+                    tex_coords: [u, v],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    local_pos: [0.0, 0.0],
+                    half_size: [w * 0.5, h * 0.5],
+                    radii: [0.0; 4],
+                    kind: 1.0,
+                };
+                verts.push(mk(x, y, uv0[0], uv0[1]));
+                verts.push(mk(x, y + h, uv0[0], uv1[1]));
+                verts.push(mk(x + w, y, uv1[0], uv0[1]));
+                verts.push(mk(x + w, y + h, uv1[0], uv1[1]));
                 idxs.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
             };
 
@@ -209,7 +280,11 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        // DPI-scaled so the grid inset holds a constant apparent size; the
+        // grid-sizing math (`get_viewport_size`) and the hit-test inverse
+        // (`pixel_to_visual_cell`) apply the identical `dpi_px` scaling.
+        let window_padding = dpi_px(WINDOW_PADDING, self.dpi);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
         // In the global case the decorator easing is a whole-grid translation,
         // so (like `scroll_y`) it rides the camera and isn't baked into the
         // geometry — that's what lets a scroll-only frame skip the rebuild.
@@ -223,7 +298,7 @@ impl WindowState {
         // the same constant in screen space.
         let tab_top = self.chrome_extra_top();
         let row_y =
-            |r: isize| WINDOW_PADDING + baked_vert + tab_top + (r as f32 + 1.0) * line_height;
+            |r: isize| window_padding + baked_vert + tab_top + (r as f32 + 1.0) * line_height;
         // The vertical offset `refresh_scroll_uniforms` will fold into the
         // camera (must stay in lockstep with it). Screen-fixed geometry in this
         // same buffer — the command palette / find overlays — subtracts it so
@@ -232,7 +307,7 @@ impl WindowState {
         // the camera.) The skip fast path is disabled while either overlay is
         // open, so this compensation is always rebuilt with the live offset.
         let camera_vert = if anim_active { 0.0 } else { scroll_y + decorator_offset };
-        let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
+        let col_x = |c: usize| window_padding + c as f32 * cell_w;
 
         // Half-open band `[r_lo, r_hi)` of grid rows to render — the visible
         // grid plus phantom rows above and below so smooth sub-line scrolling
@@ -270,8 +345,10 @@ impl WindowState {
                 // Pre-pack any char outside build_atlas's fixed ranges
                 // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
                 // the render-time lookup below hits the variant chain
-                // — including fallback fonts — instead of notdef.
-                if let Some(cell) = cell {
+                // — including fallback fonts — instead of notdef. Wide-char
+                // spacer cells carry no glyph of their own (the lead spans
+                // into them), so skip them.
+                if let Some(cell) = cell.filter(|cell| !cell.is_wide_spacer()) {
                     let variant = font::FaceVariant::from_flags(
                         cell.style.bold,
                         cell.style.italic,
@@ -279,6 +356,17 @@ impl WindowState {
                     self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
                         self.atlas.ensure_char(f, variant, ch)
                     });
+                    // Multi-codepoint grapheme: also pack the shaped cluster
+                    // glyph (Core Text), keyed by the cluster string.
+                    if let Some(id) = cell.cluster {
+                        if let Some(s) =
+                            self.active_tab().terminal.cluster_str(id).map(str::to_string)
+                        {
+                            self.shared.with_font_mut_at(self.pt_size, self.dpi, |f| {
+                                self.atlas.ensure_cluster(f, &s)
+                            });
+                        }
+                    }
                 }
                 row_chars.push(ch);
             }
@@ -384,6 +472,29 @@ impl WindowState {
             );
             self.atlas.dirty = false;
         }
+        // Same incremental re-upload for the color (emoji) layer.
+        if self.atlas.color_dirty {
+            self.shared.gpu.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.emoji_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.atlas.color_buffer,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.atlas.color_width as u32 * 4),
+                    rows_per_image: Some(self.atlas.color_height as u32),
+                },
+                wgpu::Extent3d {
+                    width: self.atlas.color_width as u32,
+                    height: self.atlas.color_height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas.color_dirty = false;
+        }
         let _perf_t_shape1 = std::time::Instant::now();
 
         let atlas = &self.atlas;
@@ -396,6 +507,11 @@ impl WindowState {
         enum GlyphSource {
             Char(char),
             Substituted(u32),
+            /// A pre-resolved grapheme-cluster glyph (emoji ZWJ/flag/skin-tone,
+            /// base + combining marks). The atlas entry is looked up in the main
+            /// loop (it lives in the string-keyed `clusters` map) and carried by
+            /// value so `emit_fg_for_cell` doesn't need the cluster string here.
+            Cluster(font::AtlasEntry),
         }
         // BG quad only — used by the bg-layer pass. Pulled out so we can
         // emit all cell backgrounds contiguously, record the boundary in
@@ -508,12 +624,41 @@ impl WindowState {
             // fills_h UV-clipping (added for box-drawing) cuts off
             // exactly that overlap, so we disable it for substituted
             // glyphs.
+            // `g` is an owned (Copy) entry, not a reference — so a pre-resolved
+            // cluster entry can be carried in `GlyphSource::Cluster` without
+            // tangling the atlas borrow.
             let (g, allow_overhang) = match fg_source {
-                GlyphSource::Char(ch) => (atlas.lookup(ch, variant), false),
+                GlyphSource::Char(ch) => (*atlas.lookup(ch, variant), false),
                 GlyphSource::Substituted(glyph_id) => {
-                    (atlas.lookup_glyph_id(glyph_id, variant), true)
+                    (*atlas.lookup_glyph_id(glyph_id, variant), true)
                 }
+                GlyphSource::Cluster(entry) => (entry, false),
             };
+            // Color (emoji) glyph: sample the RGBA color atlas and place the
+            // pre-scaled bitmap centered in the two-cell box the wide character
+            // occupies. No bearings / coverage gamma / cell-fill stretching —
+            // the texel is used directly via `push_color_quad` (kind = 1.0).
+            if g.is_color {
+                if g.width == 0 || g.height == 0 {
+                    return;
+                }
+                let box_w = 2.0 * cell_w; // wide characters span two cells
+                let gw = g.width as f32;
+                let gh0 = g.height as f32;
+                let gx = x + (box_w - gw) * 0.5;
+                let gy = bg_y + (line_height - gh0) * 0.5;
+                let u0 = g.x as f32 / color_atlas_w;
+                let v0 = g.y as f32 / color_atlas_h;
+                let u1 = (g.x + g.width) as f32 / color_atlas_w;
+                let v1 = (g.y + g.height) as f32 / color_atlas_h;
+                // Clip at the region's bottom edge like the mono path, so a
+                // scrolling emoji slides under the status line, not over it.
+                let Some((gh, v1)) = clip_row_quad(r, gy, gh0, v0, v1) else {
+                    return;
+                };
+                push_color_quad(verts, idxs, gx, gy, gw, gh, [u0, v0], [u1, v1]);
+                return;
+            }
             let span_w = cell_w;
             if g.width > 0 && g.height > 0 {
                 // Cell-filling glyphs (Powerline caps, box-drawing,
@@ -540,7 +685,7 @@ impl WindowState {
                         let cp = ch as u32;
                         (0x2500..=0x259F).contains(&cp) || (0xE000..=0xE0FF).contains(&cp)
                     }
-                    GlyphSource::Substituted(_) => false,
+                    GlyphSource::Substituted(_) | GlyphSource::Cluster(_) => false,
                 };
                 let fills_h = cell_filling && !allow_overhang
                     && g.width as f32 >= span_w * 0.85;
@@ -846,12 +991,30 @@ impl WindowState {
                 };
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
-                let fg_source = match over.and_then(|cs| cs[c]) {
+                let mut fg_source = match over.and_then(|cs| cs[c]) {
                     Some((glyph_id, _v)) => GlyphSource::Substituted(glyph_id),
                     None => GlyphSource::Char(cell.ch),
                 };
+                // A grapheme cluster (emoji ZWJ/flag/skin-tone, base+combining)
+                // overrides the single-char glyph with its shaped cluster glyph,
+                // when packed. Falls back to the base codepoint otherwise.
+                if let Some(id) = cell.cluster {
+                    if let Some(e) = self
+                        .active_tab()
+                        .terminal
+                        .cluster_str(id)
+                        .and_then(|s| atlas.lookup_cluster(s))
+                    {
+                        fg_source = GlyphSource::Cluster(*e);
+                    }
+                }
                 emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg);
-                emit_fg_for_cell(&mut row_fg, &mut tmp_idx, fg_source, variant, r, c, fg);
+                // Wide-char spacer: paint its background (uniform with the lead
+                // via the shared style) but emit no glyph — the lead character
+                // already spans into this column.
+                if !cell.is_wide_spacer() {
+                    emit_fg_for_cell(&mut row_fg, &mut tmp_idx, fg_source, variant, r, c, fg);
+                }
             }
             bg_verts.extend_from_slice(&row_bg);
             fg_verts.extend_from_slice(&row_fg);
@@ -1176,8 +1339,10 @@ impl WindowState {
         };
         if !status_markers.is_empty() {
             let pal = palette::get();
-            let bar_w = (cell_w * 0.16).clamp(2.0, 4.0);
-            let bar_x = (WINDOW_PADDING - bar_w) * 0.5; // centered in the padding
+            // The clamp bounds are fixed px, so DPI-scale them (cell_w already
+            // scales) to keep the gutter bar a constant apparent width.
+            let bar_w = (cell_w * 0.16).clamp(dpi_px(2.0, self.dpi), dpi_px(4.0, self.dpi));
+            let bar_x = (window_padding - bar_w) * 0.5; // centered in the padding
             let strip_pad = (line_height - bg_h) * 0.5;
             let bar_radius = bar_w * 0.5;
             for r in r_lo..r_hi {
@@ -1375,11 +1540,11 @@ impl WindowState {
             if visible {
                 let (eased_col, eased_buf_row) = anim.current(anim_secs);
                 let eased_vis_row = eased_buf_row + live_grid_offset;
-                let block_x = WINDOW_PADDING + eased_col * cell_w;
+                let block_x = window_padding + eased_col * cell_w;
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
                 let cur_baseline =
-                    WINDOW_PADDING + baked_vert + tab_top + (eased_vis_row + 1.0) * line_height;
+                    window_padding + baked_vert + tab_top + (eased_vis_row + 1.0) * line_height;
                 let block_y = cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5
                     + row_scroll(eased_vis_row.round() as isize);
                 // Anchor the completion popup to this cell's strip: left edge at
@@ -1466,7 +1631,7 @@ impl WindowState {
                 box_w,
                 screen_w,
                 screen_h,
-                WINDOW_PADDING,
+                window_padding,
             );
 
             // Colors derived from the active palette so themes are respected.
@@ -1487,7 +1652,9 @@ impl WindowState {
             ];
             let hl_color = premul(hl_rgb, 0.85);
             let text_color = pal.foreground;
-            let radius = 5.0_f32;
+            // Corner radius is a fixed px metric → DPI-scale for constant
+            // apparent rounding across displays.
+            let radius = dpi_px(5.0, self.dpi);
 
             // Box background (rounded corners, all four equal).
             push_quad(
@@ -1580,7 +1747,7 @@ impl WindowState {
             // Box geometry: a fixed-ish width centered horizontally, parked near
             // the top of the window. `-camera_vert` cancels the scroll camera so
             // the box stays pinned (everything below derives from `box_y`).
-            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - WINDOW_PADDING * 2.0);
+            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - window_padding * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
             let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
@@ -1763,7 +1930,7 @@ impl WindowState {
 
             let box_w = (screen_w * 0.6)
                 .clamp(cell_w * 24.0, cell_w * 72.0)
-                .min(screen_w - WINDOW_PADDING * 2.0);
+                .min(screen_w - window_padding * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
             let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
@@ -1941,7 +2108,7 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
 
         let win_w = self.surface.config.width as f32;
         let win_h = self.surface.config.height as f32;
@@ -2009,6 +2176,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii0,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y1, 0.0],
@@ -2017,6 +2185,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii1,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y0, 0.0],
@@ -2025,6 +2194,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii0,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y1, 0.0],
@@ -2033,22 +2203,27 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii1,
+                kind: 0.0,
             });
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };
 
         // Edge fade animations: each phase ramps 0→1 the moment its boundary
         // distance leaves zero (and 1→0 when it returns) at a constant rate.
+        //
+        // Clamp `dt` to a single slow frame. When nothing is animating the
+        // event loop idles and stops updating `last_anim_tick`; the first frame
+        // of a freshly-triggered fade would otherwise see the whole idle gap as
+        // `dt`, making `step = dt/secs` ≥ 1 and snapping the phase to its target
+        // in one frame (the intermittent "no fade, just a pop" — it only
+        // happened when the loop had gone idle before the fade triggered).
+        // Capping keeps the ramp spanning multiple frames;
+        // `is_top_fade_animating()` keeps the loop ticking until it lands.
         let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last_anim_tick).as_secs_f32();
+        let dt = clamp_fade_dt(now.duration_since(self.last_anim_tick).as_secs_f32());
         self.last_anim_tick = now;
         let advance = |phase: &mut f32, target: f32, secs: f32| {
-            let step = if secs > 0.0 { dt / secs } else { 1.0 };
-            if *phase < target {
-                *phase = (*phase + step).min(target);
-            } else if *phase > target {
-                *phase = (*phase - step).max(target);
-            }
+            *phase = advance_fade_phase(*phase, target, dt, secs);
         };
         if EDGE_FADE_ALWAYS_ON {
             self.top_fade_phase = 1.0;
@@ -2089,11 +2264,14 @@ impl WindowState {
         // Glass under the system tabs. Independent of the scroll-edge fade.
         // Drawn first so the scroll fade (below) layers over it at the top edge.
         let mut blur_strip = false;
-        // The frosted band covers the title-bar row only: from the top of the
-        // window down to the bottom of the title bar (which is the top of the
-        // native tab strip when tabs are shown). The tab strip and content
-        // below stay sharp.
-        let band_bottom = self.titlebar_only_px as f32;
+        // The frosted band covers the title-bar row: from the top of the window
+        // down to the bottom of the title bar (which is the top of the native
+        // tab strip when tabs are shown). When tabs are shown, extend it a bit
+        // into the tab strip so the dissolve finishes *below* the tab tops —
+        // otherwise content sliding through the title↔tab gap reads sharp right
+        // where the frost reaches clear. The tab strip and content stay sharp.
+        let band_bottom =
+            self.titlebar_only_px as f32 + self.chrome_extra_top() * GLASS_TITLEBAR_TAB_DISSOLVE;
         if GLASS_TITLEBAR && band_bottom > 0.5 {
             let bg = palette::get().background;
             let a = GLASS_TITLEBAR_ALPHA;
@@ -2161,6 +2339,11 @@ impl WindowState {
             }
         }
 
+        // The bottom edge animates in/out on its phase: the band height grows
+        // from the edge (`bottom_band_height`) *and* the strip alpha
+        // (`bottom_alpha`) ramps, so both the blur/dissolve region and the
+        // colour fade animate together rather than the blur popping in at full
+        // extent while only the colour fades.
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
@@ -2619,11 +2802,14 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
         let scroll_y = self.active_tab().scroll_y as f32;
         // Fixed tab-bar top inset, baked into image geometry exactly as it is
         // for cells in `update_vertices` (the camera carries scroll/decorator).
         let tab_top = self.chrome_extra_top();
+        // DPI-scaled to match `update_vertices` and the grid-sizing reserve, so
+        // image quads align with the cell grid on every backing scale.
+        let window_padding = dpi_px(WINDOW_PADDING, self.dpi);
         // Match `update_vertices`: in the global case the camera carries the
         // whole-grid vertical offset, so image quads are placed at rest and
         // ride the same camera. Only the alt-screen slide bakes the offset into
@@ -2685,10 +2871,10 @@ impl WindowState {
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
-                let x_px = WINDOW_PADDING
+                let x_px = window_padding
                     + (p.left_col as f32) * cell_w
                     + p.pixel_offset.0 as f32;
-                let y_px = WINDOW_PADDING
+                let y_px = window_padding
                     + img_vert
                     + tab_top
                     + (viewport_row as f32) * line_height
@@ -2748,8 +2934,8 @@ impl WindowState {
                 // straight into the cell row→pixel math. No
                 // `view_offset` shift needed.
                 let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
-                let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
-                let y_px = WINDOW_PADDING
+                let x_px = window_padding + (run.screen_col_start as f32) * cell_w;
+                let y_px = window_padding
                     + img_vert
                     + tab_top
                     + (run.screen_row as f32) * line_height;

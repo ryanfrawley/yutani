@@ -1000,4 +1000,168 @@ mod tests {
         // would have to filter.
         assert_eq!(collect("\x1b_\x1b\\"), vec![]);
     }
+
+    // ---- CSI cursor-movement finals (only CursorUp `A` was tested) ----
+
+    #[test]
+    fn cursor_down_explicit_and_default() {
+        // CSI B (CUD) — explicit count and omitted-param default of 1.
+        assert_eq!(collect("\x1b[4B"), vec![Event::CursorDown(4)]);
+        assert_eq!(collect("\x1b[B"), vec![Event::CursorDown(1)]);
+    }
+
+    #[test]
+    fn cursor_down_alias_e() {
+        // CSI e (VPR) is an alias for CursorDown in this parser.
+        assert_eq!(collect("\x1b[7e"), vec![Event::CursorDown(7)]);
+        assert_eq!(collect("\x1b[e"), vec![Event::CursorDown(1)]);
+    }
+
+    #[test]
+    fn cursor_forward_explicit_and_default() {
+        // CSI C (CUF) — explicit count and omitted-param default of 1.
+        assert_eq!(collect("\x1b[3C"), vec![Event::CursorForward(3)]);
+        assert_eq!(collect("\x1b[C"), vec![Event::CursorForward(1)]);
+    }
+
+    #[test]
+    fn cursor_forward_alias_a() {
+        // CSI a (HPR) is an alias for CursorForward in this parser.
+        assert_eq!(collect("\x1b[9a"), vec![Event::CursorForward(9)]);
+        assert_eq!(collect("\x1b[a"), vec![Event::CursorForward(1)]);
+    }
+
+    #[test]
+    fn cursor_back_explicit_and_default() {
+        // CSI D (CUB) — note this is distinct from ESC D (IND/Index).
+        assert_eq!(collect("\x1b[6D"), vec![Event::CursorBack(6)]);
+        assert_eq!(collect("\x1b[D"), vec![Event::CursorBack(1)]);
+    }
+
+    #[test]
+    fn cursor_horizontal_abs_g_and_backtick() {
+        // CSI G (CHA) and its `` ` `` alias (HPA) — both → CursorHorizontalAbs.
+        assert_eq!(collect("\x1b[12G"), vec![Event::CursorHorizontalAbs(12)]);
+        assert_eq!(collect("\x1b[G"), vec![Event::CursorHorizontalAbs(1)]);
+        assert_eq!(collect("\x1b[12`"), vec![Event::CursorHorizontalAbs(12)]);
+        assert_eq!(collect("\x1b[`"), vec![Event::CursorHorizontalAbs(1)]);
+    }
+
+    #[test]
+    fn cursor_vertical_abs_d_lowercase() {
+        // CSI d (VPA) — absolute row. Lowercase `d`, distinct from `D` (CUB).
+        assert_eq!(collect("\x1b[8d"), vec![Event::CursorVerticalAbs(8)]);
+        assert_eq!(collect("\x1b[d"), vec![Event::CursorVerticalAbs(1)]);
+    }
+
+    // ---- Scroll (CSI S / CSI T) ----
+
+    #[test]
+    fn scroll_up_and_down_explicit_and_default() {
+        // CSI S (SU) and CSI T (SD) — explicit count and default of 1.
+        assert_eq!(collect("\x1b[3S"), vec![Event::ScrollUp(3)]);
+        assert_eq!(collect("\x1b[S"), vec![Event::ScrollUp(1)]);
+        assert_eq!(collect("\x1b[2T"), vec![Event::ScrollDown(2)]);
+        assert_eq!(collect("\x1b[T"), vec![Event::ScrollDown(1)]);
+    }
+
+    // ---- DECSLRM / SetLeftRightMargin (CSI s) ----
+
+    #[test]
+    fn decslrm_with_params_sets_margins() {
+        // CSI Pl ; Pr s — explicit left/right margins.
+        assert_eq!(
+            collect("\x1b[5;40s"),
+            vec![Event::SetLeftRightMargin(Some(5), Some(40))],
+        );
+    }
+
+    #[test]
+    fn decslrm_bare_s_is_ambiguous_none_none() {
+        // Bare CSI s (no params) emits SetLeftRightMargin(None, None) — the
+        // ambiguous SCOSC-vs-reset-margins form the terminal disambiguates.
+        assert_eq!(
+            collect("\x1b[s"),
+            vec![Event::SetLeftRightMargin(None, None)],
+        );
+    }
+
+    #[test]
+    fn decslrm_zero_params_normalize_to_none() {
+        // Explicit zeros are filtered to None (default), matching the
+        // `p.filter(|&v| v != 0)` logic in the `s` handler.
+        assert_eq!(
+            collect("\x1b[0;0s"),
+            vec![Event::SetLeftRightMargin(None, None)],
+        );
+        // Left given, right omitted → Some left, None right.
+        assert_eq!(
+            collect("\x1b[5;s"),
+            vec![Event::SetLeftRightMargin(Some(5), None)],
+        );
+    }
+
+    // ---- Payloads split across multiple feed() calls ----
+
+    fn collect_chunks(chunks: &[&str]) -> Vec<Event> {
+        // Drive a single parser across several feed() boundaries, mimicking
+        // a byte stream that arrives in arbitrary chunks.
+        let mut p = Parser::new();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            for ch in chunk.chars() {
+                p.feed(ch, |e| out.push(e));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn osc_split_across_feeds_reassembles() {
+        // OSC title split mid-string across two feed() chunks must reassemble
+        // into one Osc event — the streaming-parser guarantee.
+        assert_eq!(
+            collect_chunks(&["\x1b]0;my ti", "tle\x07"]),
+            vec![Event::Osc("0;my title".into())],
+        );
+    }
+
+    #[test]
+    fn osc_split_with_st_terminator_across_feeds() {
+        // Even the two-byte ST terminator (ESC \) may straddle a chunk
+        // boundary; the OscEsc state carries across the gap.
+        assert_eq!(
+            collect_chunks(&["\x1b]11;rgb:ffff/", "0000/0000\x1b", "\\"]),
+            vec![Event::Osc("11;rgb:ffff/0000/0000".into())],
+        );
+    }
+
+    #[test]
+    fn dcs_split_across_feeds_reassembles() {
+        // DCS XTGETTCAP payload delivered in three chunks reassembles into
+        // one Dcs event.
+        assert_eq!(
+            collect_chunks(&["\x1bP+q43", "6f;6b", "75\x1b\\"]),
+            vec![Event::Dcs("+q436f;6b75".into())],
+        );
+    }
+
+    #[test]
+    fn apc_kitty_split_mid_payload_reassembles() {
+        // Kitty graphics APC split mid base64 payload across chunks must
+        // reassemble into one Apc event. Highest-value streaming case.
+        assert_eq!(
+            collect_chunks(&["\x1b_Gf=100,a=T;iVBOR", "w0KGgoAAAANSUhEUg", "AA\x1b\\"]),
+            vec![Event::Apc("Gf=100,a=T;iVBORw0KGgoAAAANSUhEUgAA".into())],
+        );
+    }
+
+    #[test]
+    fn apc_split_with_bel_terminator_in_later_chunk() {
+        // APC payload in one chunk, BEL terminator in the next — reassembles.
+        assert_eq!(
+            collect_chunks(&["\x1b_Gpay", "load", "\x07"]),
+            vec![Event::Apc("Gpayload".into())],
+        );
+    }
 }

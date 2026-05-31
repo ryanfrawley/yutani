@@ -84,7 +84,21 @@ pub(crate) fn load_font_data(config: &Config) -> FontData {
             "Noto Sans Symbols 2",
             "Noto Sans Symbols",
         ]),
-        ("emoji", &["Noto Emoji"]),
+        // Emoji. Color fonts (Apple Color Emoji, Segoe UI Emoji, Noto Color
+        // Emoji) are preferred and rendered in full color via the atlas's RGBA
+        // layer; the monochrome fonts are last-resort fallbacks for systems
+        // without a color emoji font installed. The previous list held only
+        // "Noto Emoji", which ships on no stock macOS — so emoji fell through to
+        // tofu. `Font::add_fallback` detects color faces and sizes them by
+        // strike selection automatically.
+        ("emoji", &[
+            "Apple Color Emoji",  // macOS (sbix bitmap strikes)
+            "Segoe UI Emoji",     // Windows (COLR/CPAL)
+            "Noto Color Emoji",   // Linux (CBDT/CBLC)
+            "Twemoji Mozilla",
+            "OpenMoji",
+            "Noto Emoji",         // monochrome, last resort
+        ]),
     ];
     let variants_to_fill = [
         (font::FaceVariant::Regular, false, false),
@@ -95,6 +109,13 @@ pub(crate) fn load_font_data(config: &Config) -> FontData {
     let mut fallback_jobs: Vec<(&'static str, String, font::FaceVariant, bool, bool)> = Vec::new();
     for (label, candidates) in fallback_categories {
         if let Some(family) = pick_family(&installed, candidates) {
+            // Apple Color Emoji is a 188 MB PNG-sbix font FreeType can't decode
+            // (no libpng) — and on macOS its emoji are rendered via Core Text
+            // anyway (see `crate::emoji`). Skip loading it into FreeType so we
+            // don't pay that read+resident cost for a face we'd never draw from.
+            if family == "Apple Color Emoji" {
+                continue;
+            }
             for (variant, bold, italic) in variants_to_fill {
                 fallback_jobs.push((label, family.clone(), variant, bold, italic));
             }

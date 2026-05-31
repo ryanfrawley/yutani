@@ -385,8 +385,8 @@ impl Config {
             font_size: DEFAULT_FONT_SIZE,
             top_fade_height: DECORATOR_HEIGHT * 3.0,
             top_fade_anim_secs: 0.072,
-            bottom_fade_height: DECORATOR_HEIGHT * 2.0,
-            bottom_fade_anim_secs: 0.072,
+            bottom_fade_height: DECORATOR_HEIGHT * 3.0,
+            bottom_fade_anim_secs: 0.2,
             scroll_edge_style: ScrollEdgeStyle::Soft,
             cursor_anim_secs: 0.06,
             scroll_on_output_secs: 0.08,
@@ -552,34 +552,14 @@ impl Config {
             "images_halfblock_for_missing" => if let Some(x) = v.as_bool() {
                 self.images_halfblock_for_missing = x;
             },
-            "shell_exit_mode" => if let Some(x) = v.as_str() {
-                if let Some(m) = ShellExitMode::from_str(x) {
-                    self.shell_exit_mode = m;
-                }
-                // Silently keep the default on an unknown value — same
-                // forgiving contract as `images_filter`.
-            },
-            "scroll_edge_style" => if let Some(x) = v.as_str() {
-                if let Some(s) = ScrollEdgeStyle::from_str(x) {
-                    self.scroll_edge_style = s;
-                }
-            },
-            "prompt_gutter" => if let Some(x) = v.as_str() {
-                if let Some(g) = PromptGutter::from_str(x) {
-                    self.prompt_gutter = g;
-                }
-            },
+            "shell_exit_mode" => set_enum_from_str(v, &mut self.shell_exit_mode, ShellExitMode::from_str),
+            "scroll_edge_style" => set_enum_from_str(v, &mut self.scroll_edge_style, ScrollEdgeStyle::from_str),
+            "prompt_gutter" => set_enum_from_str(v, &mut self.prompt_gutter, PromptGutter::from_str),
             "autocomplete" => if let Some(x) = v.as_bool() { self.autocomplete = x; },
             "text_gamma" => if let Some(x) = cfg_f32(v) {
                 self.text_gamma = x.clamp(0.25, 4.0);
             },
-            "font_hinting" => if let Some(s) = v.as_str() {
-                if let Some(h) = Hinting::from_str(s) {
-                    self.font_hinting = h;
-                }
-                // Silently keep the default on an unknown value — same
-                // forgiving contract as `scroll_edge_style` / `images_filter`.
-            },
+            "font_hinting" => set_enum_from_str(v, &mut self.font_hinting, Hinting::from_str),
             _ => (),
         }
     }
@@ -821,6 +801,20 @@ impl Config {
 /// Read a numeric config slot, accepting either a TOML float or a bare
 /// integer (`font_size = 10` and `font_size = 10.0` both work). `None` if
 /// the value isn't a number, so the caller keeps the default.
+/// Assign `slot` from a string-typed TOML value parsed through `parse`,
+/// leaving the existing value untouched if `v` isn't a string or `parse`
+/// rejects it. This is the forgiving "keep the default on an unknown value"
+/// contract shared by every enum-valued config slot (shell_exit_mode,
+/// scroll_edge_style, prompt_gutter, font_hinting), factored out of the
+/// otherwise-identical nested `if let` blocks in `apply`.
+fn set_enum_from_str<T>(v: &toml::Value, slot: &mut T, parse: impl Fn(&str) -> Option<T>) {
+    if let Some(s) = v.as_str() {
+        if let Some(parsed) = parse(s) {
+            *slot = parsed;
+        }
+    }
+}
+
 pub(crate) fn cfg_f32(v: &toml::Value) -> Option<f32> {
     v.as_float()
         .map(|f| f as f32)

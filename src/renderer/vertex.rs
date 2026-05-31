@@ -14,6 +14,11 @@ pub struct Vertex {
     /// Per-corner radii in pixels: (top-right, bottom-right, top-left,
     /// bottom-left). All zero → ordinary axis-aligned quad with no AA.
     pub radii: [f32; 4],
+    /// Quad sampling mode: `0.0` samples the monochrome coverage atlas and
+    /// tints by `color` (text, solids, box-drawing); `1.0` samples the RGBA
+    /// color atlas and uses the texel directly (emoji). One value per quad,
+    /// duplicated across its four vertices.
+    pub kind: f32,
 }
 
 impl Vertex {
@@ -51,6 +56,11 @@ impl Vertex {
                     offset: std::mem::size_of::<[f32; 13]>() as wgpu::BufferAddress,
                     shader_location: 5,
                     format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 17]>() as wgpu::BufferAddress,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32,
                 },
             ],
         }

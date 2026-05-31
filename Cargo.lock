@@ -2996,6 +2996,7 @@ dependencies = [
  "bytemuck",
  "cgmath",
  "core-foundation",
+ "core-graphics 0.22.3",
  "core-text",
  "env_logger",
  "flate2",

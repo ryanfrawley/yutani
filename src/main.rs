@@ -1,8 +1,40 @@
+//! Yutani — a GPU-accelerated terminal emulator (macOS-first, wgpu).
+//!
+//! Module map (where to look for what):
+//!
+//! - **Terminal model** — [`terminal`] holds the grid/cell ring buffer,
+//!   scrollback, cursor, scroll regions/margins, the VT/CSI/SGR parser
+//!   ([`ansi`]) dispatch, and shell-integration OSC handlers. The inline-image
+//!   protocols (iTerm2 `OSC 1337`, Kitty graphics) live in its
+//!   `terminal/image_protocol.rs` submodule.
+//! - **Window state** — the per-window [`WindowState`] god-struct is defined
+//!   here in `main.rs`; its methods are organized by topic across the
+//!   `state_*` extension files (all `impl WindowState`): `state_render`
+//!   (vertex/quad emission + frame composition), `state_input` (key/IME
+//!   routing), `state_pointer` (mouse/selection/hover), `state_completion`
+//!   (autocomplete popup), `state_image` (inline-image upload/placement),
+//!   `state_theme` (scheme/appearance sync), `state_anim` (smooth-scroll and
+//!   fade animation). Process-shared GPU resources live in `AppShared`.
+//! - **GPU/rendering** — [`renderer`] wraps wgpu: `renderer::blur`,
+//!   `renderer::glow`, `renderer::images`, plus shared helpers in
+//!   `renderer/mod.rs` (e.g. [`renderer::uniform_buffer`]); [`gpu`] /
+//!   [`present`] own surface + frame presentation.
+//! - **Overlays/UI chrome** — [`command_palette`], [`completion`], [`search`],
+//!   [`onboard`] are the cross-platform popup models; the `glass_*` files
+//!   (`glass`, `glass_palette`, `glass_find`, `glass_complete`) are the
+//!   macOS-native Liquid Glass panels (deliberately kept as separate AppKit
+//!   controllers). [`palette`] is color/scheme math, not a UI element.
+//! - **Fonts/text** — [`font`], [`shaper`], [`font_loader`] (per-platform),
+//!   [`box_drawing`]. **Config/theming** — [`config`], [`bundled_schemes`],
+//!   [`style`]. **Platform glue** — [`app_window`], [`event_loop`],
+//!   [`pty`], [`touchid`], [`paths`].
+
 mod app_window;
 mod box_drawing;
 mod command_palette;
 mod completion;
 mod glass;
+mod glass_about;
 mod glass_complete;
 mod glass_find;
 mod glass_palette;
@@ -22,8 +54,10 @@ mod bundled_schemes;
 mod palette;
 mod shaper;
 mod shell_integration;
+mod emoji;
 mod style;
 mod terminal;
+mod width;
 
 mod pty;
 mod config;
@@ -63,6 +97,25 @@ use url::*;
 use font_data::*;
 use paths::*;
 use event_loop::run;
+
+/// Backing scale the fixed-pixel UI metrics in this codebase are authored
+/// against. Constants like [`WINDOW_PADDING`], [`DECORATOR_HEIGHT`], the glow
+/// scanline period, popup corner radii, and the drag threshold were all tuned
+/// on a 2× Retina display. A constant *physical* pixel count looks twice as
+/// large on a 1× monitor as on 2× — so wherever apparent (logical) size should
+/// stay constant across DPIs, we rescale via [`dpi_px`]. Anchoring to 2× means
+/// the Retina look is preserved exactly and only lower-DPI displays change.
+pub(crate) const UI_REFERENCE_SCALE: f32 = 2.0;
+
+/// Scale a reference-2× physical-pixel metric to the physical pixels that hold
+/// its apparent size constant at `dpi` (= backing_scale × 96; see
+/// [`WindowState::set_dpi_from_scale`]). At `dpi == 192` (2×) this is the
+/// identity; at `dpi == 96` (1×) it halves the value, so e.g. 16 px of padding
+/// authored on Retina draws as 8 px on a 1× screen — the same apparent width.
+#[inline]
+pub(crate) fn dpi_px(value: f32, dpi: u32) -> f32 {
+    value * (dpi as f32 / 96.0) / UI_REFERENCE_SCALE
+}
 
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
@@ -178,6 +231,7 @@ fn emit_text_run(
                     local_pos: [-hx, -hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx, gy + gh, 0.0],
@@ -186,6 +240,7 @@ fn emit_text_run(
                     local_pos: [-hx, hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx + gw, gy, 0.0],
@@ -194,6 +249,7 @@ fn emit_text_run(
                     local_pos: [hx, -hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx + gw, gy + gh, 0.0],
@@ -202,6 +258,7 @@ fn emit_text_run(
                     local_pos: [hx, hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 indices.extend_from_slice(&[
                     start,
@@ -380,6 +437,17 @@ impl AppShared {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // RGBA color-glyph (emoji) atlas.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
                         count: None,
                     },
                 ],
@@ -762,6 +830,9 @@ struct WindowState {
     /// ligature glyphs can be uploaded incrementally via queue.write_texture
     /// without recreating the texture or bind group.
     font_texture: renderer::texture::Texture,
+    /// RGBA color-glyph (emoji) atlas texture, bound at slot 2 of the font bind
+    /// group. Uploaded incrementally like `font_texture` when emoji are packed.
+    emoji_texture: renderer::texture::Texture,
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
@@ -1403,6 +1474,19 @@ impl WindowState {
             Some("font texture"),
         );
 
+        // RGBA color-glyph (emoji) atlas. sRGB so the BGRA samples decode to
+        // linear before the premultiplied-alpha blend, matching how the
+        // monochrome text path feeds linear color into the sRGB scene target.
+        let emoji_texture = renderer::texture::Texture::from_memory(
+            &shared.gpu.device,
+            &shared.gpu.queue,
+            &atlas.color_buffer,
+            atlas.color_width as u32,
+            atlas.color_height as u32,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Some("emoji texture"),
+        );
+
         let font_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &shared.font_bind_group_layout,
             entries: &[
@@ -1413,6 +1497,10 @@ impl WindowState {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&font_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&emoji_texture.view),
                 },
             ],
             label: Some("font bind group"),
@@ -1564,6 +1652,11 @@ impl WindowState {
                 // Masked composite needs the window bg colour to detect
                 // colored cells in the mask texture.
                 g.set_background(p.background);
+                // Scale the CRT scanline period and bloom radius to this
+                // window's backing scale so they look the same size regardless
+                // of monitor DPI. `write_uniforms` (below) reads it for the
+                // bloom kernel; `write_glow_params` reads it for the period.
+                g.set_dpi_scale(dpi_px(1.0, dpi));
             }
         }
         for g in [&glow, &glow_fg] {
@@ -1657,6 +1750,7 @@ impl WindowState {
             scanline_overlay_mask,
             font_bind_group,
             font_texture,
+            emoji_texture,
             pt_size,
             dpi,
             config,
@@ -1867,9 +1961,16 @@ impl WindowState {
         // Extra top reserve for the native tab bar when shown
         // (0 otherwise), so the bottom row never lands under the window edge.
         extra_top: f32,
+        // Backing-scale DPI (= scale_factor × 96). The window padding and
+        // decorator reserve are DPI-scaled so the grid's inset holds a constant
+        // apparent size; the rendering and hit-test paths apply the identical
+        // `dpi_px` scaling, so cells land exactly where the grid math reserved.
+        dpi: u32,
     ) -> ViewportSize {
+        let window_padding = dpi_px(WINDOW_PADDING, dpi);
+        let decorator_height = dpi_px(DECORATOR_HEIGHT, dpi);
         ViewportSize {
-            char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
+            char_width: usize::max(1, (width - window_padding * 2.0) as usize / advance_x),
             // Content extends full-height (behind the translucent title bar
             // on macOS's fullsize_content_view), gaining ~1–2 rows of
             // scrollable area at the top. Reserve DECORATOR_HEIGHT in the
@@ -1891,7 +1992,7 @@ impl WindowState {
             // an even shorter window costs nothing real.
             char_height: usize::max(
                 MIN_GRID_ROWS,
-                (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT - extra_top).max(0.0) as usize
+                (height - window_padding * 2.0 - decorator_height - extra_top).max(0.0) as usize
                     / line_height,
             ),
         }
@@ -1924,6 +2025,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             line_height,
             self.chrome_extra_top(),
+            self.dpi,
         );
         // Mirror `phantom_row_band`'s top widening so the buffer reserves the
         // extra rows the tab bar's chrome inset pushes into the band.
@@ -2050,6 +2152,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
+            self.dpi,
         );
         // Only touch the PTY winsize when the character grid actually
         // changes. macOS raises SIGWINCH on any TIOCSWINSZ whose winsize
@@ -2347,6 +2450,7 @@ fn spawn_window_in_process(
             // Brand-new window; tab-bar reserve (if it joins a group) lands via
             // the follow-up resize/focus once it's grouped.
             0.0,
+            dpi,
         );
         (vp.char_width, vp.char_height)
     };
@@ -2396,9 +2500,7 @@ fn spawn_window_in_process(
 /// scanline-colour config round-trips cleanly. Reuses palette's sRGB
 /// conversion so the byte we emit matches the byte the user typed.
 fn format_hex_rgb(c: [f32; 4]) -> String {
-    let r = palette::linear_to_srgb_u8(c[0]);
-    let g = palette::linear_to_srgb_u8(c[1]);
-    let b = palette::linear_to_srgb_u8(c[2]);
+    let [r, g, b] = palette::color_to_srgb_u8(c);
     format!("0x{:02x}{:02x}{:02x}", r, g, b)
 }
 
@@ -2517,7 +2619,7 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return;
     };
-    let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
+    let chan = palette::linear_to_srgb_f64;
     unsafe {
         let ns_view = handle.ns_view as *mut AnyObject;
         let ns_window: *mut AnyObject = msg_send![ns_view, window];
@@ -2647,9 +2749,10 @@ const CHROME_BAND_MARGIN_PX: f64 = 4.0;
 /// Height of the native `NSWindow` title bar in *physical* pixels, or `None` if
 /// the handle isn't AppKit. This is the region macOS owns: it drives window
 /// drag / zoom / traffic lights and swallows our pointer-moved events. Unlike
-/// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve (physical,
-/// DPI-independent), the title bar is a fixed number of *points*, so on a
-/// Retina display it's physically taller than that reserve — which is why a
+/// the chrome band's fallback floor — the raw, unscaled `WINDOW_PADDING +
+/// DECORATOR_HEIGHT` sum, a fixed physical-px lower bound — the title bar is a
+/// fixed number of *points*, so on a Retina display it's physically taller
+/// than that reserve — which is why a
 /// band sized to the reserve never reached the bar and left the grid's I-beam
 /// frozen over it. `contentLayoutRect` excludes the title bar even under
 /// `fullsize_content_view`, so `frame.height - contentLayoutRect.height` is the
@@ -2867,6 +2970,31 @@ fn install_new_tab_action(window: &Window) {
 #[cfg(not(target_os = "macos"))]
 fn install_new_tab_action(_window: &Window) {}
 
+/// Force the process name to the proper-noun "Yutani" before winit builds its
+/// default menu. winit titles every app-menu item ("About …", "Hide …",
+/// "Quit …") from `NSProcessInfo.processName`, which otherwise defaults to the
+/// lowercase executable name (`yutani`) when running unbundled — so the menu
+/// reads "About yutani". Must run before `run_app` (the menu is built during
+/// `applicationDidFinishLaunching`). No-op in the .app bundle, where the name is
+/// already "Yutani", but harmless to set either way.
+#[cfg(target_os = "macos")]
+fn set_app_process_name() {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+    unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if info.is_null() {
+            return;
+        }
+        let name = NSString::from_str("Yutani");
+        let _: () = msg_send![info, setProcessName: &*name];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_app_process_name() {}
+
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray
     // (sRGB 0.5). Below that, dark chrome reads better.
@@ -2891,12 +3019,12 @@ fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
 /// Choose the chrome band height from the live native title-bar height (if
 /// queryable) and the renderer's fixed `reserve`. Extracted from
 /// `WindowState::refresh_chrome_band` so the selection arithmetic is unit-testable
-/// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
-/// but never go below the reserve (and fall back to the reserve when the query
-/// failed). See `refresh_chrome_band` for the rationale.
-fn chrome_band_from(native: Option<f64>, reserve: f64) -> f64 {
+/// without a real `Window`: add `margin` (the DPI-scaled `CHROME_BAND_MARGIN_PX`)
+/// to the native height, but never go below the reserve (and fall back to the
+/// reserve when the query failed). See `refresh_chrome_band` for the rationale.
+fn chrome_band_from(native: Option<f64>, reserve: f64, margin: f64) -> f64 {
     native
-        .map(|h| h + CHROME_BAND_MARGIN_PX)
+        .map(|h| h + margin)
         .filter(|band| *band >= reserve)
         .unwrap_or(reserve)
 }
@@ -3233,6 +3361,11 @@ pub(crate) const GLASS_TITLEBAR: bool = true;
 /// Overall opacity of the frosted band (1.0 = fully frosted; lower lets a bit
 /// of the sharp content read through).
 pub(crate) const GLASS_TITLEBAR_ALPHA: f32 = 1.0;
+/// When the native tab bar is shown, extend the frosted band's dissolve this
+/// fraction of the tab-bar height past the title-bar bottom (= the tab tops),
+/// so content passing through the gap between the title bar and the tabs reads
+/// a little blurred there rather than snapping sharp right at the tab tops.
+pub(crate) const GLASS_TITLEBAR_TAB_DISSOLVE: f32 = 0.5;
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;

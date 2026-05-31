@@ -46,6 +46,18 @@ impl WindowState {
         }
         self.dpi = new_dpi;
         self.rebuild_font_resources();
+        // The glow caches its uniforms (unlike the per-frame layout constants,
+        // which re-read `self.dpi` each draw), so the scanline period and bloom
+        // radius won't pick up the new backing scale until we re-push them.
+        // Without this, the CRT stripes and halo would keep the old monitor's
+        // size after a cross-display drag.
+        let dpi_scale = dpi_px(1.0, self.dpi);
+        let (w, h) = (self.surface.config.width, self.surface.config.height);
+        for g in [&mut self.glow, &mut self.glow_fg] {
+            g.set_dpi_scale(dpi_scale);
+            g.write_glow_params(&self.shared.gpu.queue);
+            g.write_uniforms(&self.shared.gpu.queue, w, h);
+        }
         true
     }
 
@@ -70,6 +82,17 @@ impl WindowState {
             wgpu::TextureFormat::R8Unorm,
             Some("font texture"),
         );
+        // The new atlas carries a fresh (possibly re-dimensioned) color layer,
+        // so rebuild the emoji texture alongside the mono one.
+        self.emoji_texture = renderer::texture::Texture::from_memory(
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
+            &self.atlas.color_buffer,
+            self.atlas.color_width as u32,
+            self.atlas.color_height as u32,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Some("emoji texture"),
+        );
         self.font_bind_group = self.shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.shared.font_bind_group_layout,
             entries: &[
@@ -80,6 +103,10 @@ impl WindowState {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.font_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.emoji_texture.view),
                 },
             ],
             label: Some("font bind group"),
@@ -93,6 +120,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
+            self.dpi,
         );
         self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
@@ -187,6 +215,12 @@ impl WindowState {
             g.set_bright_palette(&self.shared.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
+            // Keep the scanline period (and bloom radius) scaled to this
+            // window's DPI — a config reload or theme swap re-pushes the
+            // params, so re-apply the scale. The bloom uniforms don't change
+            // here (DPI is unchanged; they were set at create/resize), so only
+            // the period needs re-uploading.
+            g.set_dpi_scale(dpi_px(1.0, self.dpi));
             g.write_glow_params(&self.shared.gpu.queue);
         }
 
@@ -262,11 +296,7 @@ impl WindowState {
         // Palette values are stored linear (sRGB-decoded) so the GPU's
         // gamma-encoding lands on the user's intended hex. Re-encode here
         // for OSC 10/11/12 so reports match the scheme's hex literals.
-        let to_u8 = |c: [f32; 4]| [
-            palette::linear_to_srgb_u8(c[0]),
-            palette::linear_to_srgb_u8(c[1]),
-            palette::linear_to_srgb_u8(c[2]),
-        ];
+        let to_u8 = palette::color_to_srgb_u8;
         self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
         // The native tab titles use dynamic system colors that track the window
         // appearance, but re-style so a theme flip repaints them immediately.

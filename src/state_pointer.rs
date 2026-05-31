@@ -27,9 +27,12 @@ impl WindowState {
 
     /// Recompute `chrome_band_px` from the live native title-bar height.
     ///
-    /// The renderer's `WINDOW_PADDING + DECORATOR_HEIGHT` reserve is fixed in
-    /// physical px, but the native title bar is a fixed number of *points*, so
-    /// on a Retina display it's physically taller than the reserve. Sizing the
+    /// The fallback floor here — the raw, *unscaled* `WINDOW_PADDING +
+    /// DECORATOR_HEIGHT` sum — is fixed in physical px (it is only a
+    /// conservative lower bound; the grid's own reserve is DPI-scaled via
+    /// `dpi_px`). The native title bar, by contrast, is a fixed number of
+    /// *points*, so on a Retina display it's physically taller than the
+    /// reserve. Sizing the
     /// band to the reserve left it shorter than the bar, and since macOS
     /// swallows pointer-moved events over the bar, the band's logic never ran
     /// up there — the grid's I-beam stayed frozen over the title bar. Track the
@@ -40,8 +43,11 @@ impl WindowState {
     /// where the reserve already comfortably covers the bar).
     pub(crate) fn refresh_chrome_band(&mut self) {
         let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
+        // The native bar height is already DPI-correct (points → px); scale the
+        // safety margin too so the band's slop is a constant apparent size.
+        let margin = dpi_px(CHROME_BAND_MARGIN_PX as f32, self.dpi) as f64;
         self.chrome_band_px =
-            chrome_band_from(native_titlebar_height_physical(&self.window), reserve);
+            chrome_band_from(native_titlebar_height_physical(&self.window), reserve, margin);
         // When the tab bar is hidden, the chrome band is the title
         // bar alone — record it so we can derive the tab bar's height (the
         // difference) while it's shown. `contentLayoutRect` already excludes the
@@ -84,6 +90,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
+            self.dpi,
         );
         let grid_changed = size.char_width != self.active_tab().terminal.cols
             || size.char_height != self.active_tab().terminal.rows;
@@ -151,19 +158,22 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let chrome_offset = DECORATOR_HEIGHT as f64 * (1.0 - near);
+        let chrome_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) as f64 * (1.0 - near);
         // Strip top = renderer's `baseline - ascender - (lh - bg_h)/2`
         // for row 0, where baseline_0 = WP + chrome + line_height.
         let strip_pad = (line_height - bg_h) * 0.5;
         // Mirror the renderer's tab-bar push-down so the hit-test
-        // tracks the offset grid.
-        let row_strip_top = WINDOW_PADDING as f64
+        // tracks the offset grid. `WINDOW_PADDING` is DPI-scaled here exactly
+        // as the renderer scales it, so the hit-test strip stays aligned with
+        // the drawn cells on every backing scale.
+        let window_padding = dpi_px(WINDOW_PADDING, self.dpi) as f64;
+        let row_strip_top = window_padding
             + chrome_offset
             + self.chrome_extra_top() as f64
             + line_height
             - ascender
             - strip_pad;
-        let col = ((px - WINDOW_PADDING as f64) / cell_w).floor() as i64;
+        let col = ((px - window_padding) / cell_w).floor() as i64;
         let row = ((py - row_strip_top - self.active_tab().scroll_y) / line_height).floor() as i64;
         let col = col.clamp(0, self.active_tab().terminal.cols as i64 - 1) as usize;
         let row = row.clamp(0, self.active_tab().terminal.rows as i64 - 1) as isize;
@@ -246,7 +256,10 @@ impl WindowState {
             let Some((px, py)) = self.active_tab().press_pixel else { return };
             let dx = self.mouse_x - px;
             let dy = self.mouse_y - py;
-            if dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX {
+            // `dx`/`dy` are physical pixels; DPI-scale the threshold so the
+            // click-vs-drag slop is a constant apparent distance across displays.
+            let threshold = dpi_px(DRAG_THRESHOLD_PX as f32, self.dpi) as f64;
+            if dx * dx + dy * dy < threshold * threshold {
                 return;
             }
         }
@@ -325,7 +338,23 @@ impl WindowState {
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
             let from = from.min(to);
-            let row_text: String = cells[from..to].iter().map(|c| c.ch).collect();
+            // Build the row text. Skip wide-char spacer cells — the lead cell
+            // already carries the real character, so a copied 中 / 🚀 is one
+            // codepoint, not the character plus a phantom. Cells holding a
+            // grapheme cluster (emoji ZWJ/flag/skin-tone, base + combining
+            // marks) copy the whole cluster string, not just the lead codepoint.
+            let mut row_text = String::new();
+            for cell in &cells[from..to] {
+                if cell.is_wide_spacer() {
+                    continue;
+                }
+                match cell.cluster {
+                    Some(id) => {
+                        row_text.push_str(self.active_tab().terminal.cluster_str(id).unwrap_or(""))
+                    }
+                    None => row_text.push(cell.ch),
+                }
+            }
             // Trim trailing spaces — selecting a full line shouldn't paste
             // padding into the clipboard.
             let trimmed = row_text.trim_end_matches(' ');

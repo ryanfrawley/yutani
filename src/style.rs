@@ -145,7 +145,24 @@ pub struct Cell {
     /// common case. Independent of `style` so an SGR reset (`CSI 0 m`) does
     /// not clear the link — only `OSC 8 ; ; ST` does.
     pub hyperlink: Option<std::num::NonZeroU32>,
+    /// Grapheme cluster id into the terminal's `ClusterStore`, set when this
+    /// cell holds more than one codepoint (an emoji ZWJ sequence, a flag, an
+    /// emoji + skin tone / variation selector, a base + combining marks). `ch`
+    /// still holds the cluster's first codepoint — used for width and as the
+    /// fast single-char path — but the renderer rasterizes the whole cluster
+    /// string (Core Text shapes it). `None` for the overwhelmingly common
+    /// single-codepoint cell.
+    pub cluster: Option<std::num::NonZeroU32>,
 }
+
+/// Sentinel `ch` for the second cell of a wide (two-column) character. The
+/// lead cell holds the real glyph; this trailing cell is a placeholder so the
+/// grid's column accounting matches the application's. The renderer skips
+/// drawing it (the lead glyph spans both columns) and text extraction skips it
+/// (so a copied 中 is one char, not a char plus a phantom). `'\0'` never reaches
+/// a cell through normal printing — control chars are filtered upstream — and
+/// the blank cell is a space, so the sentinel is unambiguous.
+pub const WIDE_SPACER: char = '\0';
 
 impl Cell {
     pub fn new(ch: char, style: Style) -> Self {
@@ -156,7 +173,20 @@ impl Cell {
             placeholder_image_row: 0,
             placeholder_image_col: 0,
             hyperlink: None,
+            cluster: None,
         }
+    }
+
+    /// The trailing placeholder cell of a wide character. Carries the lead
+    /// cell's `style` so the two-column background stays uniform.
+    pub fn wide_spacer(style: Style) -> Self {
+        Self::new(WIDE_SPACER, style)
+    }
+
+    /// Whether this cell is the trailing placeholder of a wide character.
+    #[inline]
+    pub fn is_wide_spacer(&self) -> bool {
+        self.ch == WIDE_SPACER
     }
 }
 

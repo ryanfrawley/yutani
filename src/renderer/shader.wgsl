@@ -15,6 +15,7 @@ struct VertexInput {
     @location(3) local_pos: vec2<f32>,
     @location(4) half_size: vec2<f32>,
     @location(5) radii: vec4<f32>,
+    @location(6) kind: f32,
 };
 
 struct VertexOutput {
@@ -24,6 +25,7 @@ struct VertexOutput {
     @location(2) local_pos: vec2<f32>,
     @location(3) half_size: vec2<f32>,
     @location(4) radii: vec4<f32>,
+    @location(5) kind: f32,
 };
 
 @vertex
@@ -35,6 +37,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     out.local_pos = model.local_pos;
     out.half_size = model.half_size;
     out.radii = model.radii;
+    out.kind = model.kind;
     return out;
 }
 
@@ -45,6 +48,11 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 var t_diffuse: texture_2d<f32>;
 @group(0) @binding(1)
 var s_diffuse: sampler;
+// RGBA color-glyph atlas (emoji). Sampled only by quads tagged `kind > 0.5`.
+// Stored BGRA (FreeType's pixel order) in an sRGB texture, so the sample comes
+// back already sRGB-decoded; the fragment swizzles B/R into place.
+@group(0) @binding(2)
+var t_color: texture_2d<f32>;
 
 // Edge-fade params: top.xy = (band_height, alpha), bottom.xy = (band_height,
 // alpha), viewport.xy = (width, height), bg_uv.xy = the atlas UV for the
@@ -89,6 +97,19 @@ fn fs_wire(in: VertexOutput) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Color (emoji) glyph: sample the RGBA color atlas and use the texel
+    // directly (premultiplied alpha). BGRA storage → swizzle to RGB. The mono
+    // coverage/SDF/gamma machinery below is bypassed; only the y-position fade
+    // is shared so emoji ramp away at the scrollback edges like text.
+    if (in.kind > 0.5) {
+        let texel = textureSample(t_color, s_diffuse, in.tex_coords);
+        let emoji = vec4<f32>(texel.b, texel.g, texel.r, texel.a);
+        let yy = in.clip_position.y;
+        let tf = select(0.0, fade.top.y * (1.0 - smoothstep(0.0, fade.top.x, yy)), fade.top.x > 0.0);
+        let bf = select(0.0, fade.bottom.y * (1.0 - smoothstep(0.0, fade.bottom.x, fade.viewport.y - yy)), fade.bottom.x > 0.0);
+        let fs = clamp(max(tf, bf), 0.0, 1.0);
+        return emoji * (1.0 - fs);
+    }
     let glyph = textureSample(t_diffuse, s_diffuse, in.tex_coords).r;
     // Apply the glyph-coverage gamma. Solid quads (bg cells, cursor,
     // selection, fade strips) sample the fully-opaque sentinel slot, so

@@ -482,13 +482,16 @@ impl CommandPalette {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected = (self.selected + 1).min(self.filtered.len() - 1);
+        // Reuse the popup's selection/scroll math so the palette and the
+        // autocomplete list can't drift apart (select_next clamps at the last
+        // row, panic-free on an empty list).
+        self.selected = crate::completion::select_next(self.selected, self.filtered.len());
         self.scroll =
             crate::completion::visible_window_start(self.selected, self.scroll, PALETTE_MAX_VISIBLE);
     }
 
     pub fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        self.selected = crate::completion::select_prev(self.selected);
         self.scroll =
             crate::completion::visible_window_start(self.selected, self.scroll, PALETTE_MAX_VISIBLE);
     }

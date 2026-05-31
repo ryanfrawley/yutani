@@ -23,8 +23,6 @@
 //! that handle. The bright-ANSI hue table is loaded from a palette via
 //! [`Glow::set_bright_palette`].
 
-use wgpu::util::DeviceExt;
-
 const DEFAULT_ITERATIONS: usize = 2;
 pub const MAX_ITERATIONS: usize = 12;
 
@@ -228,7 +226,22 @@ pub struct Glow {
     /// the halo: alternating rows are alpha'd toward zero.
     pub match_scanlines: bool,
     pub scanline_strength: f32,
+    /// Scanline cycle, in *reference-2× framebuffer pixels*. The shader walks
+    /// `fract(clip_position.y / period)` against physical framebuffer rows, so
+    /// a fixed period draws a pattern twice as coarse on a 1× monitor as on a
+    /// 2× Retina display. [`Self::dpi_scale`] rescales it to the actual backing
+    /// scale at upload so the apparent (logical) period is identical on every
+    /// display.
     pub scanline_period: f32,
+    /// Backing-scale multiplier the host sets from the window's DPI
+    /// (`dpi_px(1.0, dpi)` = backing_scale / 2). Holds two DPI-sensitive glow
+    /// metrics — the scanline period and the bloom blur kernel's tap spacing —
+    /// at a constant *apparent* size across displays: both effects were tuned
+    /// on a 2× screen, where this is `1.0` (a no-op). On a 1× monitor it is
+    /// `0.5`, halving the physical scanline pitch and blur radius so they look
+    /// the same as on Retina. Defaults to `1.0` until the host plumbs the real
+    /// scale in via [`Self::set_dpi_scale`].
+    pub dpi_scale: f32,
     /// When true, the dedicated `scanline_overlay_pipeline` (multiply
     /// blend) darkens alternating rows of whatever is already in the
     /// framebuffer — affecting bg colors and glyphs alike. Independent
@@ -584,9 +597,10 @@ impl Glow {
         height: u32,
         scene_view: &wgpu::TextureView,
     ) -> Self {
-        let glow_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glow params uniform"),
-            contents: bytemuck::cast_slice(&[GlowParams {
+        let glow_uniform = super::uniform_buffer(
+            device,
+            "glow params uniform",
+            GlowParams {
                 threshold: DEFAULT_THRESHOLD,
                 intensity: DEFAULT_INTENSITY,
                 softness: DEFAULT_SOFTNESS,
@@ -605,23 +619,16 @@ impl Glow {
                 scanline_color_dark: DEFAULT_SCANLINE_COLOR_DARK,
                 content_scanline_attenuation: DEFAULT_CONTENT_SCANLINE_ATTENUATION,
                 _pad: [0.0; 3],
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let bright_hues_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glow bright hues uniform"),
-            contents: bytemuck::cast_slice(&[BrightHues::empty()]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+            },
+        );
+        let bright_hues_uniform =
+            super::uniform_buffer(device, "glow bright hues uniform", BrightHues::empty());
         let make_blur_uniform = |label: &str| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&[BlurParams {
-                    texel_size: [0.0, 0.0],
-                    _pad: [0.0; 2],
-                }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            })
+            super::uniform_buffer(
+                device,
+                label,
+                BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+            )
         };
         let bright_blur_uniform = make_blur_uniform("glow bright blur uniform");
         let down_uniform = make_blur_uniform("glow down blur uniform");
@@ -668,6 +675,10 @@ impl Glow {
             match_scanlines: false,
             scanline_strength: DEFAULT_SCANLINE_STRENGTH,
             scanline_period: DEFAULT_SCANLINE_PERIOD,
+            // Identity until the host calls `set_dpi_scale`; 1.0 keeps the
+            // scanline period and bloom radius at their authored 2× values
+            // (a no-op on Retina).
+            dpi_scale: 1.0,
             match_content_scanlines: false,
             content_scanline_strength: DEFAULT_SCANLINE_STRENGTH,
             scanline_color_bright: DEFAULT_SCANLINE_COLOR_BRIGHT,
@@ -721,9 +732,20 @@ impl Glow {
     }
 
     /// Upload the per-pass `1/texel_size` uniforms.
+    ///
+    /// The down/up Kawase passes use `texel_size` as their tap offset, so the
+    /// blur radius is proportional to it. The blur targets are a fixed fraction
+    /// of the framebuffer, making one target texel a constant number of
+    /// *physical* pixels regardless of DPI — which means the bloom's apparent
+    /// (logical) radius would otherwise be twice as wide on a 1× monitor as on
+    /// 2×. Scaling the down/up offsets by [`Self::dpi_scale`] (= backing_scale
+    /// / 2) holds the apparent radius constant: identity at 2×, half at 1×. The
+    /// bright/composite passes sample at `uv` with no offset, so the bright
+    /// uniform stays a true `1/texel`.
     pub fn write_uniforms(&self, queue: &wgpu::Queue, scene_w: u32, scene_h: u32) {
         let scene_w = scene_w.max(1) as f32;
         let scene_h = scene_h.max(1) as f32;
+        let k = self.dpi_scale.max(0.0);
         queue.write_buffer(
             &self.bright_blur_uniform,
             0,
@@ -736,7 +758,7 @@ impl Glow {
             &self.down_uniform,
             0,
             bytemuck::cast_slice(&[BlurParams {
-                texel_size: [1.0 / self.bright.width as f32, 1.0 / self.bright.height as f32],
+                texel_size: [k / self.bright.width as f32, k / self.bright.height as f32],
                 _pad: [0.0; 2],
             }]),
         );
@@ -744,7 +766,7 @@ impl Glow {
             &self.up_uniform,
             0,
             bytemuck::cast_slice(&[BlurParams {
-                texel_size: [1.0 / self.scratch.width as f32, 1.0 / self.scratch.height as f32],
+                texel_size: [k / self.scratch.width as f32, k / self.scratch.height as f32],
                 _pad: [0.0; 2],
             }]),
         );
@@ -777,8 +799,10 @@ impl Glow {
                 } else {
                     0.0
                 },
-                // Period < 1 would alias to single-row noise; clamp up.
-                scanline_period: self.scanline_period.max(1.0),
+                // Scale the authored (2×) period to this window's backing
+                // scale so the scanlines look the same size on every display,
+                // then clamp: a sub-1px period aliases to single-row noise.
+                scanline_period: scaled_scanline_period(self.scanline_period, self.dpi_scale),
                 content_scanline_strength: if self.match_content_scanlines {
                     self.content_scanline_strength.clamp(0.0, 1.0)
                 } else {
@@ -802,6 +826,16 @@ impl Glow {
     /// detect colored cells. Alpha is preserved in the uniform but unused.
     pub fn set_background(&mut self, bg: [f32; 4]) {
         self.bg_color = bg;
+    }
+
+    /// Set the backing-scale multiplier ([`Self::dpi_scale`]) applied to the
+    /// scanline period and bloom kernel. The host passes `dpi_px(1.0, dpi)`
+    /// (= backing_scale / 2), so both effects — authored against a 2× display —
+    /// keep a constant apparent size on every monitor. Caller must follow with
+    /// [`Self::write_glow_params`] (scanline period) and, when the scale
+    /// changed, [`Self::write_uniforms`] (bloom kernel) for it to reach the GPU.
+    pub fn set_dpi_scale(&mut self, scale: f32) {
+        self.dpi_scale = scale;
     }
 
     /// Install the 8 bright ANSI variants (linear RGB, alpha ignored).
@@ -970,6 +1004,16 @@ fn build_resources(
     (bright, scratch, bright_bg, down_bg, up_bg, composite_bg)
 }
 
+/// Rescale the authored (2×) scanline period to the window's backing scale
+/// and clamp it so the shader never sees a sub-1px period (which aliases to
+/// single-row noise). `period` is floored at 1 before scaling — a logical
+/// period below a pixel is meaningless — and `dpi_scale` is floored at 0 so a
+/// stray negative can't flip the sign. At `dpi_scale == 1.0` (the 2× reference
+/// monitor) the period passes through unchanged.
+fn scaled_scanline_period(period: f32, dpi_scale: f32) -> f32 {
+    (period.max(1.0) * dpi_scale.max(0.0)).max(1.0)
+}
+
 /// CPU mirror of the shader's `hsv_saturation`. Kept in lockstep with
 /// `glow.wgsl` so the bright-pass behaviour is testable without a GPU.
 fn hsv_saturation(rgb: [f32; 3]) -> f32 {
@@ -979,39 +1023,6 @@ fn hsv_saturation(rgb: [f32; 3]) -> f32 {
         return 0.0;
     }
     (mx - mn) / mx
-}
-
-/// CPU mirror of the shader's `hsv_value` — max channel, used as the
-/// brightness signal by the BRIGHTNESS match mode.
-#[cfg(test)]
-fn hsv_value(rgb: [f32; 3]) -> f32 {
-    rgb[0].max(rgb[1]).max(rgb[2])
-}
-
-/// CPU mirror of the shader's bright-pass saturation `smoothstep` weight.
-/// The `0.0001` floor on `softness` matches the shader and keeps the result
-/// finite when the caller asks for a hard cutoff.
-#[cfg(test)]
-fn bright_weight(sat: f32, threshold: f32, softness: f32) -> f32 {
-    let lo = threshold;
-    let hi = (lo + softness.max(0.0001)).min(1.0);
-    let t = ((sat - lo) / (hi - lo)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// CPU mirror of the shader's `foreground_weight`. Returns a 0..=1 weight
-/// from RGB Euclidean distance, ramped down across a `softness`-wide band
-/// past `tolerance`.
-#[cfg(test)]
-fn foreground_weight(rgb: [f32; 3], fg: [f32; 3], tolerance: f32, softness: f32) -> f32 {
-    let dx = rgb[0] - fg[0];
-    let dy = rgb[1] - fg[1];
-    let dz = rgb[2] - fg[2];
-    let d = (dx * dx + dy * dy + dz * dz).sqrt();
-    let lo = tolerance.max(0.0);
-    let hi = lo + softness.max(0.0001);
-    let t = ((d - lo) / (hi - lo)).clamp(0.0, 1.0);
-    1.0 - t * t * (3.0 - 2.0 * t)
 }
 
 /// CPU mirror of the shader's `hsv_hue`. Returns `Some(degrees)` in
@@ -1073,53 +1084,6 @@ mod tests {
     }
 
     #[test]
-    fn hsv_value_is_max_channel() {
-        approx(hsv_value([0.0, 0.0, 0.0]), 0.0);
-        approx(hsv_value([0.2, 0.7, 0.3]), 0.7);
-        approx(hsv_value([1.0, 1.0, 1.0]), 1.0);
-        // Pure red, pure blue, etc. all hit 1.0 — that's the point of
-        // BRIGHTNESS mode treating saturated colours and white alike.
-        approx(hsv_value([1.0, 0.0, 0.0]), 1.0);
-        approx(hsv_value([0.0, 0.0, 1.0]), 1.0);
-    }
-
-    #[test]
-    fn brightness_drives_glow_through_bright_weight() {
-        // Sanity: BRIGHTNESS mode feeds hsv_value into bright_weight.
-        // Pixel at 0.4 (below threshold) ⇒ no glow.
-        let dim = hsv_value([0.4, 0.4, 0.4]);
-        approx(bright_weight(dim, 0.6, 0.15), 0.0);
-        // Pixel at 0.9 (well above threshold + softness) ⇒ full glow.
-        let bright = hsv_value([0.9, 0.2, 0.1]);
-        approx(bright_weight(bright, 0.6, 0.15), 1.0);
-    }
-
-    #[test]
-    fn bright_weight_below_threshold_is_zero() {
-        approx(bright_weight(0.1, 0.5, 0.2), 0.0);
-    }
-
-    #[test]
-    fn bright_weight_above_band_is_one() {
-        approx(bright_weight(0.9, 0.5, 0.2), 1.0);
-    }
-
-    #[test]
-    fn bright_weight_at_threshold_is_zero() {
-        approx(bright_weight(0.5, 0.5, 0.2), 0.0);
-    }
-
-    #[test]
-    fn bright_weight_zero_softness_is_finite() {
-        let w = bright_weight(0.6, 0.5, 0.0);
-        assert!(w.is_finite());
-        approx(w, 1.0);
-        let w_below = bright_weight(0.4, 0.5, 0.0);
-        assert!(w_below.is_finite());
-        approx(w_below, 0.0);
-    }
-
-    #[test]
     fn defaults_are_finite_and_in_range() {
         assert!(DEFAULT_THRESHOLD.is_finite());
         assert!((0.0..=1.0).contains(&DEFAULT_THRESHOLD));
@@ -1130,98 +1094,6 @@ mod tests {
         assert!((0.0..=1.0).contains(&DEFAULT_MIN_PALETTE_SAT));
         assert!(DEFAULT_FG_TOLERANCE.is_finite() && DEFAULT_FG_TOLERANCE >= 0.0);
         assert!(MAX_ITERATIONS >= 1);
-    }
-
-    #[test]
-    fn foreground_weight_exact_match_is_one() {
-        let fg = [0.18, 0.15, 0.10];
-        approx(foreground_weight(fg, fg, 0.12, 0.15), 1.0);
-    }
-
-    #[test]
-    fn foreground_weight_far_pixel_is_zero() {
-        // Pure white vs near-black foreground — way past tolerance + softness.
-        let fg = [0.0, 0.0, 0.0];
-        approx(foreground_weight([1.0, 1.0, 1.0], fg, 0.12, 0.15), 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_inside_tolerance_is_one() {
-        let fg = [0.5, 0.5, 0.5];
-        // Distance √(0.05² × 3) ≈ 0.0866, well under tolerance = 0.12.
-        let near = [0.55, 0.45, 0.55];
-        approx(foreground_weight(near, fg, 0.12, 0.15), 1.0);
-    }
-
-    #[test]
-    fn foreground_weight_outside_band_is_zero() {
-        let fg = [0.0, 0.0, 0.0];
-        // Distance √(0.3² × 3) ≈ 0.52, past tolerance 0.12 + softness 0.15.
-        let far = [0.3, 0.3, 0.3];
-        approx(foreground_weight(far, fg, 0.12, 0.15), 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_monotonic_across_band() {
-        // Walking outward from the foreground colour, the weight must
-        // never increase — once we leave the tolerance band, it should
-        // drop monotonically to zero.
-        let fg = [0.18, 0.15, 0.10];
-        let mut prev = 1.0;
-        for step in 0..30 {
-            let t = step as f32 * 0.04;
-            let probe = [fg[0] + t, fg[1] + t, fg[2] + t];
-            let w = foreground_weight(probe, fg, 0.12, 0.15);
-            assert!(
-                w <= prev + 1e-5,
-                "weight rose at step {step}: {prev} → {w}"
-            );
-            prev = w;
-        }
-        approx(prev, 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_zero_softness_is_finite() {
-        // Hard cutoff: tolerance 0.1, softness 0. The shader uses a 0.0001
-        // floor so the result stays finite either side of the boundary.
-        let fg = [0.5, 0.5, 0.5];
-        let just_inside = [0.55, 0.5, 0.5]; // dist 0.05 < 0.1
-        let just_outside = [0.7, 0.5, 0.5]; // dist 0.2 > 0.1
-        let w_in = foreground_weight(just_inside, fg, 0.1, 0.0);
-        let w_out = foreground_weight(just_outside, fg, 0.1, 0.0);
-        assert!(w_in.is_finite() && w_out.is_finite());
-        approx(w_in, 1.0);
-        approx(w_out, 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_catches_aa_toward_background() {
-        // The whole point of this mode: an achromatic foreground glyph
-        // antialiased toward the background still registers near the
-        // glyph centre — catching cases the saturation and bright-ANSI
-        // modes can't (both fail when fg is grey/white/black).
-        //
-        // Math sanity check: with fg = [0,0,0], bg = white, the RGB
-        // distance from blended back to fg is (1 - alpha) * √3. At
-        // alpha = 0.85 that's ≈ 0.26, which still lands in the
-        // tolerance + softness band (0.12 + 0.15 = 0.27). The deeper
-        // AA fringe (alpha < ~0.85) falls past the band, which is fine
-        // — those pixels are visually closer to background than to fg.
-        let fg = [0.0, 0.0, 0.0];
-        let bg = 1.0;
-        for alpha in [1.0_f32, 0.97, 0.95, 0.9, 0.86] {
-            let blended = [
-                fg[0] * alpha + bg * (1.0 - alpha),
-                fg[1] * alpha + bg * (1.0 - alpha),
-                fg[2] * alpha + bg * (1.0 - alpha),
-            ];
-            let w = foreground_weight(blended, fg, 0.12, 0.15);
-            assert!(
-                w > 0.0,
-                "AA fringe at coverage {alpha} should still register, got {w}"
-            );
-        }
     }
 
     #[test]
@@ -1263,5 +1135,43 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected hue at alpha {alpha}, got grey"));
             approx_loose(h, base_hue, 0.5);
         }
+    }
+
+    #[test]
+    fn scaled_scanline_period_is_identity_at_reference_scale() {
+        // dpi_scale == 1.0 is the 2× reference monitor the period was authored
+        // on, so it must pass through untouched for any sane period.
+        for period in [1.0_f32, 2.0, 3.5, 6.0, 100.0] {
+            approx(scaled_scanline_period(period, 1.0), period);
+        }
+    }
+
+    #[test]
+    fn scaled_scanline_period_scales_linearly_with_dpi() {
+        // The period tracks backing scale: half it at 1× (dpi_scale 0.5),
+        // one-and-a-half at 3× (dpi_scale 1.5). Picked periods large enough
+        // that the >= 1 clamp never engages.
+        approx(scaled_scanline_period(6.0, 0.5), 3.0);
+        approx(scaled_scanline_period(6.0, 1.5), 9.0);
+        approx(scaled_scanline_period(4.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn scaled_scanline_period_clamps_below_one_pixel() {
+        // A logical period of 1 at a 1× monitor (dpi_scale 0.5) would scale to
+        // 0.5px and alias to single-row noise — the floor keeps it at 1px.
+        approx(scaled_scanline_period(1.0, 0.5), 1.0);
+        // Even an absurdly small scale can't drive the period below a pixel.
+        approx(scaled_scanline_period(2.0, 0.1), 1.0);
+        // A sub-1 logical period is floored before scaling, so at the reference
+        // scale it still lands at exactly 1.
+        approx(scaled_scanline_period(0.25, 1.0), 1.0);
+    }
+
+    #[test]
+    fn scaled_scanline_period_floors_negative_scale_to_one() {
+        // A stray negative dpi_scale must not flip the period's sign — the
+        // `.max(0.0)` zeroes it, then the >= 1 floor takes over.
+        approx(scaled_scanline_period(6.0, -2.0), 1.0);
     }
 }
