@@ -57,12 +57,17 @@ mod imp {
     }
 
     // Geometry (points). The card centres on screen; the window around it has a
-    // transparent gutter (`SHADOW_MARGIN`) for the drop shadow.
+    // transparent gutter (`SHADOW_MARGIN`) for the drop shadow. The shadow can't
+    // paint outside the window, so the gutter has to clear the shadow's full
+    // reach: the shared shadow's 20pt blur spreads past its nominal radius, and
+    // its -10pt vertical offset pushes that spread further *down* — so the
+    // downward reach (offset + blur spread) is the binding side. 50pt left the
+    // bottom of the shadow clipped; 64 clears it.
     const CARD_WIDTH: f64 = 300.0;
     const CARD_HEIGHT: f64 = 240.0;
     const ICON: f64 = 96.0;
     const TOP_PAD: f64 = 30.0;
-    const SHADOW_MARGIN: f64 = 50.0;
+    const SHADOW_MARGIN: f64 = 64.0;
     const CORNER_RADIUS: f64 = 20.0;
     /// The project URL, shown as a clickable link in place of a plain tagline.
     const PROJECT_URL: &str = "https://yutani.sh";
