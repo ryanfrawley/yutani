@@ -980,6 +980,144 @@ fn per_fragment_fade_passes_through_when_glow_on() {
     ));
 }
 
+//
+// Edge-fade ramp math (`clamp_fade_dt` + `advance_fade_phase`). These are the
+// pure halves of the inline animation step inside `refresh_scroll_uniforms`,
+// which itself can't run without a GPU/window. The production method calls
+// these same functions, so the tests cover the real path.
+//
+
+#[test]
+fn clamp_fade_dt_caps_a_stale_idle_gap_at_one_slow_frame() {
+    // The bug: after the event loop idles, `last_anim_tick` goes stale, so the
+    // first frame of a freshly-triggered fade sees the whole idle gap as `dt`.
+    // A multi-second gap must clamp down to the single-slow-frame cap so a
+    // fade ramps over many frames instead of snapping in one.
+    assert!(approx_eq(
+        crate::state_render::clamp_fade_dt(5.0),
+        crate::state_render::MAX_FADE_DT
+    ));
+    assert!(approx_eq(
+        crate::state_render::clamp_fade_dt(f32::INFINITY),
+        crate::state_render::MAX_FADE_DT
+    ));
+    // The cap itself is one 30fps frame.
+    assert!(approx_eq(crate::state_render::MAX_FADE_DT, 1.0 / 30.0));
+}
+
+#[test]
+fn clamp_fade_dt_passes_through_a_normal_frame() {
+    // A normal ~60fps delta is well under the cap and must be untouched —
+    // clamping only kicks in for stale idle gaps, not steady-state frames.
+    let dt = 1.0 / 60.0;
+    assert!(approx_eq(crate::state_render::clamp_fade_dt(dt), dt));
+    // A zero delta (two ticks in the same instant) is likewise passed through.
+    assert!(approx_eq(crate::state_render::clamp_fade_dt(0.0), 0.0));
+}
+
+#[test]
+fn advance_fade_phase_ramps_up_in_multiple_steps_under_a_clamped_dt() {
+    // The heart of the fix: with `dt` clamped to one slow frame and a
+    // multi-frame `secs`, a 0→1 ramp must take several steps rather than
+    // snapping. `step = dt/secs = (1/30)/0.2 ≈ 0.1667`, so it takes 6 frames.
+    let dt = crate::state_render::MAX_FADE_DT;
+    let secs = 0.2; // the new default bottom_fade_anim_secs
+    let mut phase = 0.0_f32;
+    let mut frames = 0;
+    while phase < 1.0 {
+        phase = crate::state_render::advance_fade_phase(phase, 1.0, dt, secs);
+        frames += 1;
+        assert!(frames < 100, "ramp never converged");
+    }
+    // Spans multiple frames (the "no snap" property), and lands exactly on 1.0.
+    assert!(frames > 1, "expected a multi-frame ramp, took {frames}");
+    assert!(approx_eq(phase, 1.0));
+}
+
+#[test]
+fn advance_fade_phase_converges_to_target_without_overshoot() {
+    // Each up-step clamps with `.min(target)`, so the phase approaches 1.0
+    // monotonically and never exceeds it — even on the final partial step.
+    let dt = crate::state_render::MAX_FADE_DT;
+    let secs = 0.2;
+    let mut phase = 0.0_f32;
+    for _ in 0..50 {
+        let next = crate::state_render::advance_fade_phase(phase, 1.0, dt, secs);
+        assert!(next >= phase, "phase must not move backward toward 1.0");
+        assert!(next <= 1.0 + TOL, "phase overshot target: {next}");
+        phase = next;
+    }
+    assert!(approx_eq(phase, 1.0));
+}
+
+#[test]
+fn advance_fade_phase_ramps_down_symmetrically() {
+    // 1→0 is the mirror image: each step subtracts and clamps with `.max(0.0)`,
+    // so it descends monotonically and stops exactly on 0.0 without undershoot.
+    let dt = crate::state_render::MAX_FADE_DT;
+    let secs = 0.2;
+    let mut phase = 1.0_f32;
+    let mut frames = 0;
+    while phase > 0.0 {
+        let next = crate::state_render::advance_fade_phase(phase, 0.0, dt, secs);
+        assert!(next <= phase, "phase must not move backward toward 0.0");
+        assert!(next >= -TOL, "phase undershot target: {next}");
+        phase = next;
+        frames += 1;
+        assert!(frames < 100, "ramp never converged");
+    }
+    assert!(frames > 1, "expected a multi-frame ramp, took {frames}");
+    assert!(approx_eq(phase, 0.0));
+}
+
+#[test]
+fn advance_fade_phase_jumps_immediately_when_secs_non_positive() {
+    // `secs <= 0` means "no animation": `step` is forced to 1.0, which (after
+    // the clamp) lands the phase straight on its target in a single call, in
+    // either direction and regardless of `dt`.
+    assert!(approx_eq(
+        crate::state_render::advance_fade_phase(0.0, 1.0, 999.0, 0.0),
+        1.0
+    ));
+    assert!(approx_eq(
+        crate::state_render::advance_fade_phase(1.0, 0.0, 0.001, -1.0),
+        0.0
+    ));
+}
+
+#[test]
+fn advance_fade_phase_is_a_noop_when_already_at_target() {
+    // Phase already equal to target: neither branch fires, the value is
+    // returned untouched (no spurious jitter that would keep the loop ticking).
+    assert!(approx_eq(
+        crate::state_render::advance_fade_phase(0.4, 0.4, crate::state_render::MAX_FADE_DT, 0.2),
+        0.4
+    ));
+}
+
+#[test]
+fn config_defaults_bottom_fade_matches_design() {
+    // The bottom edge-fade dissolve: a deeper band (3× the decorator height,
+    // matching the top) and a slower ramp (0.2s) so the blur/dissolve region
+    // and the colour fade animate together instead of the band popping in.
+    let c = Config::defaults();
+    assert!(approx_eq(c.bottom_fade_height, DECORATOR_HEIGHT * 3.0));
+    assert!(approx_eq(c.bottom_fade_anim_secs, 0.2));
+    // Pin the literal pixel value too (DECORATOR_HEIGHT * 3 = 72) so a change
+    // to the decorator height surfaces against the design intent here.
+    assert!(approx_eq(c.bottom_fade_height, 72.0));
+}
+
+#[test]
+fn config_round_trip_preserves_bottom_fade_fields() {
+    // The new defaults must survive serialize -> parse_str so a reload reads
+    // them back rather than silently relying on the parse-path default.
+    let c = Config::defaults();
+    let parsed = Config::parse_str(&c.serialize());
+    assert!(approx_eq(parsed.bottom_fade_height, DECORATOR_HEIGHT * 3.0));
+    assert!(approx_eq(parsed.bottom_fade_anim_secs, 0.2));
+}
+
 #[test]
 fn config_autocomplete_default_is_on() {
     assert!(Config::defaults().autocomplete);
