@@ -30,9 +30,13 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use std::cell::Cell;
+
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
-    use objc2::{class, define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
+    use objc2::{
+        class, define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly,
+    };
     use objc2_app_kit::{NSColor, NSFont, NSPanel, NSTextField, NSView, NSWindowDelegate};
     use objc2_foundation::{NSNotification, NSObject, NSPoint, NSRect, NSSize, NSString};
 
@@ -60,6 +64,8 @@ mod imp {
     const TOP_PAD: f64 = 30.0;
     const SHADOW_MARGIN: f64 = 50.0;
     const CORNER_RADIUS: f64 = 20.0;
+    /// The project URL, shown as a clickable link in place of a plain tagline.
+    const PROJECT_URL: &str = "https://yutani.sh";
 
     fn window_size() -> NSSize {
         NSSize::new(CARD_WIDTH + SHADOW_MARGIN * 2.0, CARD_HEIGHT + SHADOW_MARGIN * 2.0)
@@ -133,12 +139,21 @@ mod imp {
         }
     }
 
-    // Holds the action method the About menu item targets, and closes the panel
-    // when it loses key focus. Both the menu target and the window delegate are
-    // weak references AppKit-side, so this is leaked / held for the process life.
+    struct AboutControllerIvars {
+        /// Set just before opening the project URL so the resign-key that the
+        /// browser's activation triggers doesn't also dismiss the panel. Consumed
+        /// (cleared) by the next `windowDidResignKey:`.
+        suppress_resign: Cell<bool>,
+    }
+
+    // Holds the action methods the About menu item and the URL link target, and
+    // closes the panel when it loses key focus. Both the menu target and the
+    // window delegate are weak references AppKit-side, so this is leaked / held
+    // for the process life.
     define_class! {
         #[unsafe(super(NSObject))]
         #[thread_kind = MainThreadOnly]
+        #[ivars = AboutControllerIvars]
         #[name = "YutaniAboutController"]
         struct AboutController;
 
@@ -150,13 +165,40 @@ mod imp {
             fn yutani_show_about(&self, _sender: *mut AnyObject) {
                 request_about();
             }
+
+            // Target/action for the project-URL link. Opens the URL in the
+            // default browser. The click is consumed by the button (NSControl
+            // swallows its mouse-down during tracking), so unlike a click
+            // anywhere else on the card it does *not* trigger the panel's
+            // dismiss-on-click; and we suppress the one resign-key that the
+            // browser's activation provokes, so the About window stays put.
+            #[unsafe(method(yutaniOpenURL:))]
+            fn yutani_open_url(&self, _sender: *mut AnyObject) {
+                self.ivars().suppress_resign.set(true);
+                unsafe {
+                    let s = NSString::from_str(PROJECT_URL);
+                    let url: *mut AnyObject = msg_send![class!(NSURL), URLWithString: &*s];
+                    if !url.is_null() {
+                        let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+                        let _: bool = msg_send![ws, openURL: url];
+                    }
+                }
+            }
         }
 
         unsafe impl NSWindowDelegate for AboutController {
             #[unsafe(method(windowDidResignKey:))]
             fn window_did_resign_key(&self, notif: &NSNotification) {
-                // Fade out the panel that just lost key (the notification's
-                // object), the same self-close the palette/find bars do.
+                // A resign-key that immediately follows opening the link is the
+                // browser stealing focus — keep the panel open and consume the
+                // one-shot flag.
+                if self.ivars().suppress_resign.get() {
+                    self.ivars().suppress_resign.set(false);
+                    return;
+                }
+                // Otherwise fade out the panel that just lost key (the
+                // notification's object), the same self-close the palette/find
+                // bars do.
                 unsafe {
                     let panel: *mut AnyObject = msg_send![notif, object];
                     if !panel.is_null() {
@@ -170,9 +212,46 @@ mod imp {
     impl AboutController {
         fn new(mtm: MainThreadMarker) -> Retained<Self> {
             let this = mtm.alloc::<AboutController>();
-            let this = this.set_ivars(());
+            let this = this.set_ivars(AboutControllerIvars {
+                suppress_resign: Cell::new(false),
+            });
             unsafe { msg_send![super(this), init] }
         }
+    }
+
+    /// Build the clickable project-URL link: a borderless `NSButton` whose
+    /// attributed title is the URL in link blue + underline, centred, firing
+    /// `controller`'s `yutaniOpenURL:` on click.
+    unsafe fn link_button(
+        frame: NSRect,
+        font: &NSFont,
+        controller: &AboutController,
+    ) -> Retained<NSView> {
+        let para: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), new];
+        let _: () = msg_send![para, setAlignment: 1isize]; // NSTextAlignmentCenter
+        let link_color: Retained<NSColor> = msg_send![class!(NSColor), linkColor];
+        // NSUnderlineStyleSingle == 1.
+        let underline: *mut AnyObject = msg_send![class!(NSNumber), numberWithInteger: 1isize];
+        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+        // Legacy attribute-name string values (stable): foreground colour, font,
+        // underline style, paragraph style.
+        let _: () = msg_send![attrs, setObject: &*link_color, forKey: &*NSString::from_str("NSColor")];
+        let _: () = msg_send![attrs, setObject: font, forKey: &*NSString::from_str("NSFont")];
+        let _: () = msg_send![attrs, setObject: underline, forKey: &*NSString::from_str("NSUnderline")];
+        let _: () = msg_send![attrs, setObject: para, forKey: &*NSString::from_str("NSParagraphStyle")];
+        let title: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+        let title: *mut AnyObject =
+            msg_send![title, initWithString: &*NSString::from_str(PROJECT_URL), attributes: attrs];
+
+        let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
+        let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+        let _: () = msg_send![button, setBordered: false];
+        let _: () = msg_send![button, setButtonType: 5isize]; // MomentaryChange — no bezel push
+        let _: () = msg_send![button, setFocusRingType: 1isize]; // none
+        let _: () = msg_send![button, setAttributedTitle: title];
+        let _: () = msg_send![button, setTarget: controller];
+        let _: () = msg_send![button, setAction: sel!(yutaniOpenURL:)];
+        Retained::from_raw(button.cast::<NSView>()).expect("link button")
     }
 
     /// Build a centred, non-editable label.
@@ -247,7 +326,7 @@ mod imp {
             );
             container.addSubview(&name);
 
-            // Version + tagline, secondary colour.
+            // Version (secondary colour), then the clickable project URL.
             let small_font: Retained<NSFont> = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
             let secondary: Retained<NSColor> = msg_send![class!(NSColor), secondaryLabelColor];
             let version_text = format!("Version {}", env!("CARGO_PKG_VERSION"));
@@ -260,16 +339,14 @@ mod imp {
             );
             container.addSubview(&version);
 
-            let tagline = label(
-                mtm,
-                from_top(0.0, CARD_WIDTH, TOP_PAD + ICON + 16.0 + 30.0 + 22.0, 16.0),
-                "Yutani terminal",
-                &small_font,
-                &secondary,
-            );
-            container.addSubview(&tagline);
-
             let controller = AboutController::new(mtm);
+
+            let link = link_button(
+                from_top(0.0, CARD_WIDTH, TOP_PAD + ICON + 16.0 + 30.0 + 22.0, 16.0),
+                &small_font,
+                &controller,
+            );
+            container.addSubview(&link);
 
             let glass = glass::make_glass(card_rect(), &container, CORNER_RADIUS);
             glass::apply_drop_shadow(&glass);
