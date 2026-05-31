@@ -981,39 +981,6 @@ fn hsv_saturation(rgb: [f32; 3]) -> f32 {
     (mx - mn) / mx
 }
 
-/// CPU mirror of the shader's `hsv_value` — max channel, used as the
-/// brightness signal by the BRIGHTNESS match mode.
-#[cfg(test)]
-fn hsv_value(rgb: [f32; 3]) -> f32 {
-    rgb[0].max(rgb[1]).max(rgb[2])
-}
-
-/// CPU mirror of the shader's bright-pass saturation `smoothstep` weight.
-/// The `0.0001` floor on `softness` matches the shader and keeps the result
-/// finite when the caller asks for a hard cutoff.
-#[cfg(test)]
-fn bright_weight(sat: f32, threshold: f32, softness: f32) -> f32 {
-    let lo = threshold;
-    let hi = (lo + softness.max(0.0001)).min(1.0);
-    let t = ((sat - lo) / (hi - lo)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// CPU mirror of the shader's `foreground_weight`. Returns a 0..=1 weight
-/// from RGB Euclidean distance, ramped down across a `softness`-wide band
-/// past `tolerance`.
-#[cfg(test)]
-fn foreground_weight(rgb: [f32; 3], fg: [f32; 3], tolerance: f32, softness: f32) -> f32 {
-    let dx = rgb[0] - fg[0];
-    let dy = rgb[1] - fg[1];
-    let dz = rgb[2] - fg[2];
-    let d = (dx * dx + dy * dy + dz * dz).sqrt();
-    let lo = tolerance.max(0.0);
-    let hi = lo + softness.max(0.0001);
-    let t = ((d - lo) / (hi - lo)).clamp(0.0, 1.0);
-    1.0 - t * t * (3.0 - 2.0 * t)
-}
-
 /// CPU mirror of the shader's `hsv_hue`. Returns `Some(degrees)` in
 /// `[0, 360)` for chromatic colours and `None` when max == min (grey).
 fn hsv_hue(rgb: [f32; 3]) -> Option<f32> {
@@ -1073,53 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn hsv_value_is_max_channel() {
-        approx(hsv_value([0.0, 0.0, 0.0]), 0.0);
-        approx(hsv_value([0.2, 0.7, 0.3]), 0.7);
-        approx(hsv_value([1.0, 1.0, 1.0]), 1.0);
-        // Pure red, pure blue, etc. all hit 1.0 — that's the point of
-        // BRIGHTNESS mode treating saturated colours and white alike.
-        approx(hsv_value([1.0, 0.0, 0.0]), 1.0);
-        approx(hsv_value([0.0, 0.0, 1.0]), 1.0);
-    }
-
-    #[test]
-    fn brightness_drives_glow_through_bright_weight() {
-        // Sanity: BRIGHTNESS mode feeds hsv_value into bright_weight.
-        // Pixel at 0.4 (below threshold) ⇒ no glow.
-        let dim = hsv_value([0.4, 0.4, 0.4]);
-        approx(bright_weight(dim, 0.6, 0.15), 0.0);
-        // Pixel at 0.9 (well above threshold + softness) ⇒ full glow.
-        let bright = hsv_value([0.9, 0.2, 0.1]);
-        approx(bright_weight(bright, 0.6, 0.15), 1.0);
-    }
-
-    #[test]
-    fn bright_weight_below_threshold_is_zero() {
-        approx(bright_weight(0.1, 0.5, 0.2), 0.0);
-    }
-
-    #[test]
-    fn bright_weight_above_band_is_one() {
-        approx(bright_weight(0.9, 0.5, 0.2), 1.0);
-    }
-
-    #[test]
-    fn bright_weight_at_threshold_is_zero() {
-        approx(bright_weight(0.5, 0.5, 0.2), 0.0);
-    }
-
-    #[test]
-    fn bright_weight_zero_softness_is_finite() {
-        let w = bright_weight(0.6, 0.5, 0.0);
-        assert!(w.is_finite());
-        approx(w, 1.0);
-        let w_below = bright_weight(0.4, 0.5, 0.0);
-        assert!(w_below.is_finite());
-        approx(w_below, 0.0);
-    }
-
-    #[test]
     fn defaults_are_finite_and_in_range() {
         assert!(DEFAULT_THRESHOLD.is_finite());
         assert!((0.0..=1.0).contains(&DEFAULT_THRESHOLD));
@@ -1130,98 +1050,6 @@ mod tests {
         assert!((0.0..=1.0).contains(&DEFAULT_MIN_PALETTE_SAT));
         assert!(DEFAULT_FG_TOLERANCE.is_finite() && DEFAULT_FG_TOLERANCE >= 0.0);
         assert!(MAX_ITERATIONS >= 1);
-    }
-
-    #[test]
-    fn foreground_weight_exact_match_is_one() {
-        let fg = [0.18, 0.15, 0.10];
-        approx(foreground_weight(fg, fg, 0.12, 0.15), 1.0);
-    }
-
-    #[test]
-    fn foreground_weight_far_pixel_is_zero() {
-        // Pure white vs near-black foreground — way past tolerance + softness.
-        let fg = [0.0, 0.0, 0.0];
-        approx(foreground_weight([1.0, 1.0, 1.0], fg, 0.12, 0.15), 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_inside_tolerance_is_one() {
-        let fg = [0.5, 0.5, 0.5];
-        // Distance √(0.05² × 3) ≈ 0.0866, well under tolerance = 0.12.
-        let near = [0.55, 0.45, 0.55];
-        approx(foreground_weight(near, fg, 0.12, 0.15), 1.0);
-    }
-
-    #[test]
-    fn foreground_weight_outside_band_is_zero() {
-        let fg = [0.0, 0.0, 0.0];
-        // Distance √(0.3² × 3) ≈ 0.52, past tolerance 0.12 + softness 0.15.
-        let far = [0.3, 0.3, 0.3];
-        approx(foreground_weight(far, fg, 0.12, 0.15), 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_monotonic_across_band() {
-        // Walking outward from the foreground colour, the weight must
-        // never increase — once we leave the tolerance band, it should
-        // drop monotonically to zero.
-        let fg = [0.18, 0.15, 0.10];
-        let mut prev = 1.0;
-        for step in 0..30 {
-            let t = step as f32 * 0.04;
-            let probe = [fg[0] + t, fg[1] + t, fg[2] + t];
-            let w = foreground_weight(probe, fg, 0.12, 0.15);
-            assert!(
-                w <= prev + 1e-5,
-                "weight rose at step {step}: {prev} → {w}"
-            );
-            prev = w;
-        }
-        approx(prev, 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_zero_softness_is_finite() {
-        // Hard cutoff: tolerance 0.1, softness 0. The shader uses a 0.0001
-        // floor so the result stays finite either side of the boundary.
-        let fg = [0.5, 0.5, 0.5];
-        let just_inside = [0.55, 0.5, 0.5]; // dist 0.05 < 0.1
-        let just_outside = [0.7, 0.5, 0.5]; // dist 0.2 > 0.1
-        let w_in = foreground_weight(just_inside, fg, 0.1, 0.0);
-        let w_out = foreground_weight(just_outside, fg, 0.1, 0.0);
-        assert!(w_in.is_finite() && w_out.is_finite());
-        approx(w_in, 1.0);
-        approx(w_out, 0.0);
-    }
-
-    #[test]
-    fn foreground_weight_catches_aa_toward_background() {
-        // The whole point of this mode: an achromatic foreground glyph
-        // antialiased toward the background still registers near the
-        // glyph centre — catching cases the saturation and bright-ANSI
-        // modes can't (both fail when fg is grey/white/black).
-        //
-        // Math sanity check: with fg = [0,0,0], bg = white, the RGB
-        // distance from blended back to fg is (1 - alpha) * √3. At
-        // alpha = 0.85 that's ≈ 0.26, which still lands in the
-        // tolerance + softness band (0.12 + 0.15 = 0.27). The deeper
-        // AA fringe (alpha < ~0.85) falls past the band, which is fine
-        // — those pixels are visually closer to background than to fg.
-        let fg = [0.0, 0.0, 0.0];
-        let bg = 1.0;
-        for alpha in [1.0_f32, 0.97, 0.95, 0.9, 0.86] {
-            let blended = [
-                fg[0] * alpha + bg * (1.0 - alpha),
-                fg[1] * alpha + bg * (1.0 - alpha),
-                fg[2] * alpha + bg * (1.0 - alpha),
-            ];
-            let w = foreground_weight(blended, fg, 0.12, 0.15);
-            assert!(
-                w > 0.0,
-                "AA fringe at coverage {alpha} should still register, got {w}"
-            );
-        }
     }
 
     #[test]

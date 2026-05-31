@@ -849,6 +849,36 @@ mod tests {
         b.data[y * b.width + x]
     }
 
+    const SIZES: &[(usize, usize)] = &[(8, 16), (10, 18), (14, 30), (12, 24), (9, 21)];
+
+    fn synth_at(ch: char, w: usize, h: usize) -> Bitmap {
+        synth(ch, w, h, h as isize).unwrap()
+    }
+
+    // Number of "on" pixels in row `y` across all columns.
+    fn row_on_count(b: &Bitmap, y: usize) -> usize {
+        (0..b.width).filter(|&x| col_alpha(b, x, y) > 0).count()
+    }
+
+    // Number of "on" pixels in column `x` across all rows.
+    fn col_on_count(b: &Bitmap, x: usize) -> usize {
+        (0..b.height).filter(|&y| col_alpha(b, x, y) > 0).count()
+    }
+
+    // Set of columns that are "on" in the center row — i.e. the horizontal
+    // span of a vertical stroke at mid-height (the stroke's width in columns).
+    fn stroke_cols_at_center(b: &Bitmap) -> Vec<usize> {
+        let y = b.height / 2;
+        (0..b.width).filter(|&x| col_alpha(b, x, y) > 0).collect()
+    }
+
+    // Set of rows that are "on" in the center column — the vertical span of a
+    // horizontal stroke at mid-width (the stroke's height in rows).
+    fn stroke_rows_at_center(b: &Bitmap) -> Vec<usize> {
+        let x = b.width / 2;
+        (0..b.height).filter(|&y| col_alpha(b, x, y) > 0).collect()
+    }
+
     // The whole point: ╭ on row N must put its vertical leg at the same
     // column(s) as ╰ on row N+1 and as │, so the strokes join across cells.
     #[test]
@@ -900,6 +930,317 @@ mod tests {
     fn synth_returns_none_outside_range() {
         assert!(synth('A', 10, 20, 20).is_none());
         assert!(synth('字', 10, 20, 20).is_none());
+    }
+
+    // ── Heavy vs light stroke weight ───────────────────────────────────────
+
+    // Invariant: ┃ (heavy vertical) occupies strictly more stroke columns than
+    // │ (light vertical) at mid-height; both share the canonical center column.
+    #[test]
+    fn heavy_vertical_thicker_than_light() {
+        for &(w, h) in SIZES {
+            let light = synth_at('│', w, h);
+            let heavy = synth_at('┃', w, h);
+            let lc = stroke_cols_at_center(&light);
+            let hc = stroke_cols_at_center(&heavy);
+            assert!(!lc.is_empty() && !hc.is_empty(), "empty stroke w={} h={}", w, h);
+            assert!(
+                hc.len() > lc.len(),
+                "┃ not thicker than │: heavy={} light={} w={} h={}",
+                hc.len(), lc.len(), w, h
+            );
+            // Both centered on the same canonical axis: the heavy stroke's
+            // column set must contain the light stroke's center column.
+            let light_center = lc[lc.len() / 2];
+            assert!(
+                hc.contains(&light_center),
+                "┃ not centered on │ axis w={} h={}", w, h
+            );
+        }
+    }
+
+    // Invariant: ━ (heavy horizontal) occupies strictly more stroke rows than
+    // ─ (light horizontal) at mid-width; both share the canonical center row.
+    #[test]
+    fn heavy_horizontal_taller_than_light() {
+        for &(w, h) in SIZES {
+            let light = synth_at('─', w, h);
+            let heavy = synth_at('━', w, h);
+            let lr = stroke_rows_at_center(&light);
+            let hr = stroke_rows_at_center(&heavy);
+            assert!(!lr.is_empty() && !hr.is_empty(), "empty stroke w={} h={}", w, h);
+            assert!(
+                hr.len() > lr.len(),
+                "━ not taller than ─: heavy={} light={} w={} h={}",
+                hr.len(), lr.len(), w, h
+            );
+            let light_center = lr[lr.len() / 2];
+            assert!(
+                hr.contains(&light_center),
+                "━ not centered on ─ axis w={} h={}", w, h
+            );
+        }
+    }
+
+    // ── Tee / cross junction alignment ─────────────────────────────────────
+
+    // Invariant: the through-vertical of ├ and ┤ occupies exactly the same
+    // columns as │, and its horizontal arm occupies the same rows as ─, so
+    // junctions join seamlessly with straight neighbours across cells.
+    #[test]
+    fn vertical_tees_align_with_straights() {
+        for &(w, h) in SIZES {
+            let v = synth_at('│', w, h);
+            let hbar = synth_at('─', w, h);
+            for &tee in &['├', '┤'] {
+                let t = synth_at(tee, w, h);
+                // Vertical leg: identical column profile to │ at top and bottom rows.
+                for &row in &[0usize, h - 1] {
+                    for x in 0..w {
+                        assert_eq!(
+                            col_alpha(&v, x, row) > 0,
+                            col_alpha(&t, x, row) > 0,
+                            "{} vertical-leg mismatch vs │ w={} h={} x={} row={}",
+                            tee, w, h, x, row
+                        );
+                    }
+                }
+                // Horizontal arm: matches ─'s row span at the cell edge it reaches.
+                let edge = if tee == '├' { w - 1 } else { 0 };
+                for y in 0..h {
+                    assert_eq!(
+                        col_alpha(&hbar, edge, y) > 0,
+                        col_alpha(&t, edge, y) > 0,
+                        "{} horizontal-arm mismatch vs ─ w={} h={} y={}",
+                        tee, w, h, y
+                    );
+                }
+            }
+        }
+    }
+
+    // Invariant: the through-horizontal of ┬ and ┴ matches ─ across the full
+    // width, and its vertical leg matches │'s columns at the edge it reaches.
+    #[test]
+    fn horizontal_tees_align_with_straights() {
+        for &(w, h) in SIZES {
+            let v = synth_at('│', w, h);
+            let hbar = synth_at('─', w, h);
+            for &tee in &['┬', '┴'] {
+                let t = synth_at(tee, w, h);
+                // Horizontal bar: identical row profile to ─ at left and right edges.
+                for &col in &[0usize, w - 1] {
+                    for y in 0..h {
+                        assert_eq!(
+                            col_alpha(&hbar, col, y) > 0,
+                            col_alpha(&t, col, y) > 0,
+                            "{} horizontal-bar mismatch vs ─ w={} h={} y={} col={}",
+                            tee, w, h, y, col
+                        );
+                    }
+                }
+                // Vertical leg: matches │'s column span at the edge it reaches.
+                let edge = if tee == '┬' { h - 1 } else { 0 };
+                for x in 0..w {
+                    assert_eq!(
+                        col_alpha(&v, x, edge) > 0,
+                        col_alpha(&t, x, edge) > 0,
+                        "{} vertical-leg mismatch vs │ w={} h={} x={}",
+                        tee, w, h, x
+                    );
+                }
+            }
+        }
+    }
+
+    // Invariant: the cross ┼ reaches all four edges, with its vertical legs
+    // matching │ and its horizontal arms matching ─ at every edge.
+    #[test]
+    fn cross_aligns_with_straights_on_all_edges() {
+        for &(w, h) in SIZES {
+            let v = synth_at('│', w, h);
+            let hbar = synth_at('─', w, h);
+            let cross = synth_at('┼', w, h);
+            // Vertical legs at top and bottom rows match │.
+            for &row in &[0usize, h - 1] {
+                for x in 0..w {
+                    assert_eq!(
+                        col_alpha(&v, x, row) > 0,
+                        col_alpha(&cross, x, row) > 0,
+                        "┼ vertical mismatch vs │ w={} h={} x={} row={}",
+                        w, h, x, row
+                    );
+                }
+            }
+            // Horizontal arms at left and right columns match ─.
+            for &col in &[0usize, w - 1] {
+                for y in 0..h {
+                    assert_eq!(
+                        col_alpha(&hbar, col, y) > 0,
+                        col_alpha(&cross, col, y) > 0,
+                        "┼ horizontal mismatch vs ─ w={} h={} y={} col={}",
+                        w, h, y, col
+                    );
+                }
+            }
+        }
+    }
+
+    // ── Light corners ──────────────────────────────────────────────────────
+
+    // Invariant: each light corner reaches exactly its two expected edges
+    // (matching the corresponding straight stroke) and leaves the other two
+    // edges blank, mirroring the arc-corner connectivity already tested.
+    #[test]
+    fn light_corners_reach_correct_two_edges() {
+        // (char, reaches_left, reaches_right, reaches_up, reaches_down)
+        let cases = [
+            ('┌', false, true, false, true),  // h_right + v_bot
+            ('┐', true, false, false, true),  // h_left  + v_bot
+            ('└', false, true, true, false),  // h_right + v_top
+            ('┘', true, false, true, false),  // h_left  + v_top
+        ];
+        for &(w, h) in SIZES {
+            let cy = h / 2;
+            let cx = w / 2;
+            for &(ch, left, right, up, down) in &cases {
+                let b = synth_at(ch, w, h);
+                // A leg "reaches" an edge iff that edge has an on-pixel on the
+                // canonical center axis.
+                let has_left = col_alpha(&b, 0, cy) > 0;
+                let has_right = col_alpha(&b, w - 1, cy) > 0;
+                let has_up = col_alpha(&b, cx, 0) > 0;
+                let has_down = col_alpha(&b, cx, h - 1) > 0;
+                assert_eq!(has_left, left, "{} left-edge w={} h={}", ch, w, h);
+                assert_eq!(has_right, right, "{} right-edge w={} h={}", ch, w, h);
+                assert_eq!(has_up, up, "{} top-edge w={} h={}", ch, w, h);
+                assert_eq!(has_down, down, "{} bottom-edge w={} h={}", ch, w, h);
+                // Exactly two legs present.
+                let legs = [left, right, up, down].iter().filter(|&&b| b).count();
+                assert_eq!(legs, 2, "{} should have exactly 2 legs", ch);
+            }
+        }
+    }
+
+    // Invariant: a corner's horizontal arm shares ─'s rows and its vertical
+    // leg shares │'s columns, so corners join straights seamlessly.
+    #[test]
+    fn light_corner_legs_match_straight_profiles() {
+        for &(w, h) in SIZES {
+            let v = synth_at('│', w, h);
+            let hbar = synth_at('─', w, h);
+            // ┌: right arm matches ─ at right edge; down leg matches │ at bottom.
+            let tl = synth_at('┌', w, h);
+            for y in 0..h {
+                assert_eq!(
+                    col_alpha(&hbar, w - 1, y) > 0,
+                    col_alpha(&tl, w - 1, y) > 0,
+                    "┌ right-arm row mismatch vs ─ w={} h={} y={}", w, h, y
+                );
+            }
+            for x in 0..w {
+                assert_eq!(
+                    col_alpha(&v, x, h - 1) > 0,
+                    col_alpha(&tl, x, h - 1) > 0,
+                    "┌ down-leg col mismatch vs │ w={} h={} x={}", w, h, x
+                );
+            }
+            // ┘: left arm matches ─ at left edge; up leg matches │ at top.
+            let br = synth_at('┘', w, h);
+            for y in 0..h {
+                assert_eq!(
+                    col_alpha(&hbar, 0, y) > 0,
+                    col_alpha(&br, 0, y) > 0,
+                    "┘ left-arm row mismatch vs ─ w={} h={} y={}", w, h, y
+                );
+            }
+            for x in 0..w {
+                assert_eq!(
+                    col_alpha(&v, x, 0) > 0,
+                    col_alpha(&br, x, 0) > 0,
+                    "┘ up-leg col mismatch vs │ w={} h={} x={}", w, h, x
+                );
+            }
+        }
+    }
+
+    // ── Heavy junctions ────────────────────────────────────────────────────
+
+    // Invariant: the heavy cross ╋ has both a thicker vertical leg than ┼ and
+    // a thicker horizontal arm, confirming heavy weight propagates to junctions.
+    #[test]
+    fn heavy_cross_thicker_than_light_cross() {
+        for &(w, h) in SIZES {
+            let light = synth_at('┼', w, h);
+            let heavy = synth_at('╋', w, h);
+            // Vertical-leg thickness sampled at the top edge row (away from the
+            // center, where the horizontal arm would mask the leg width).
+            assert!(
+                row_on_count(&heavy, 0) > row_on_count(&light, 0),
+                "╋ top-leg not thicker than ┼ w={} h={}", w, h
+            );
+            // Horizontal-arm thickness sampled at the left edge column.
+            assert!(
+                col_on_count(&heavy, 0) > col_on_count(&light, 0),
+                "╋ left-arm not thicker than ┼ w={} h={}", w, h
+            );
+        }
+    }
+
+    // ── Double lines ───────────────────────────────────────────────────────
+
+    // Invariant: ═ (double horizontal) renders as exactly two separated
+    // horizontal bands at the center column — two on-runs split by a gap —
+    // unlike the single band of ─.
+    #[test]
+    fn double_horizontal_has_two_bands() {
+        for &(w, h) in SIZES {
+            let d = synth_at('═', w, h);
+            let rows = stroke_rows_at_center(&d);
+            assert!(rows.len() >= 2, "═ too few on-rows w={} h={}", w, h);
+            // Count contiguous runs of on-rows; double line ⇒ exactly 2.
+            let mut runs = 1;
+            for win in rows.windows(2) {
+                if win[1] != win[0] + 1 {
+                    runs += 1;
+                }
+            }
+            assert_eq!(runs, 2, "═ should have 2 bands, got {} w={} h={}", runs, w, h);
+        }
+    }
+
+    // Invariant: ║ (double vertical) renders as exactly two separated vertical
+    // bands at the center row.
+    #[test]
+    fn double_vertical_has_two_bands() {
+        for &(w, h) in SIZES {
+            let d = synth_at('║', w, h);
+            let cols = stroke_cols_at_center(&d);
+            assert!(cols.len() >= 2, "║ too few on-cols w={} h={}", w, h);
+            let mut runs = 1;
+            for win in cols.windows(2) {
+                if win[1] != win[0] + 1 {
+                    runs += 1;
+                }
+            }
+            assert_eq!(runs, 2, "║ should have 2 bands, got {} w={} h={}", runs, w, h);
+        }
+    }
+
+    // ── Dashed lines (documented approximation) ────────────────────────────
+
+    // Per the module header, dashed straights are drawn SOLID, identical to
+    // their non-dashed light counterpart. Assert that approximation holds so a
+    // future change to real dashing is caught.
+    #[test]
+    fn dashed_horizontal_drawn_solid_like_light() {
+        for &(w, h) in SIZES {
+            let solid = synth_at('─', w, h);
+            for &dashed in &['┄', '┈', '╌'] {
+                let d = synth_at(dashed, w, h);
+                assert_eq!(d.data, solid.data, "{} not solid like ─ w={} h={}", dashed, w, h);
+            }
+        }
     }
 }
 
