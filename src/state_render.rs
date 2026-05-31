@@ -2089,11 +2089,14 @@ impl WindowState {
         // Glass under the system tabs. Independent of the scroll-edge fade.
         // Drawn first so the scroll fade (below) layers over it at the top edge.
         let mut blur_strip = false;
-        // The frosted band covers the title-bar row only: from the top of the
-        // window down to the bottom of the title bar (which is the top of the
-        // native tab strip when tabs are shown). The tab strip and content
-        // below stay sharp.
-        let band_bottom = self.titlebar_only_px as f32;
+        // The frosted band covers the title-bar row: from the top of the window
+        // down to the bottom of the title bar (which is the top of the native
+        // tab strip when tabs are shown). When tabs are shown, extend it a bit
+        // into the tab strip so the dissolve finishes *below* the tab tops —
+        // otherwise content sliding through the title↔tab gap reads sharp right
+        // where the frost reaches clear. The tab strip and content stay sharp.
+        let band_bottom =
+            self.titlebar_only_px as f32 + self.chrome_extra_top() * GLASS_TITLEBAR_TAB_DISSOLVE;
         if GLASS_TITLEBAR && band_bottom > 0.5 {
             let bg = palette::get().background;
             let a = GLASS_TITLEBAR_ALPHA;
