@@ -402,8 +402,16 @@ impl Atlas {
                     // Emoji, PNG sbix) isn't in the FreeType chain. Rasterize it
                     // with the platform color rasterizer (Core Text).
                     self.pack_emoji_platform(ch, vi, cell_w, cell_h);
+                } else if !is_private_use(ch as u32) {
+                    // Some other assigned glyph no FreeType face carries —
+                    // chiefly macOS CJK, whose system fonts won't load in the
+                    // bundled FreeType. Rasterize it monochrome via the platform
+                    // stack before giving up to notdef. Private-use codepoints
+                    // (Nerd Font icons et al.) are excluded: when their font
+                    // isn't installed they should stay notdef, not pick up a
+                    // Core Text "last resort" hex box.
+                    self.pack_mono_platform(ch, vi, cell_h);
                 }
-                // Otherwise leave the slot empty; `Atlas::lookup` returns notdef.
                 return;
             }
         };
@@ -495,6 +503,33 @@ impl Atlas {
         ) {
             self.variants[vi].insert(ch, entry);
             self.color_dirty = true;
+        }
+    }
+
+    /// Rasterize `ch` as monochrome coverage via the platform text stack (Core
+    /// Text on macOS) and pack it into the coverage atlas. Used for glyphs no
+    /// installed FreeType face carries — chiefly macOS CJK, whose system fonts
+    /// won't load in the bundled FreeType. No-op (leaving notdef) off macOS or
+    /// when nothing was drawn.
+    fn pack_mono_platform(&mut self, ch: char, vi: usize, cell_h: usize) {
+        let Some(g) = crate::emoji::rasterize_mono(ch, cell_h as u32) else {
+            return;
+        };
+        if let Some(entry) = pack_coverage(
+            &g.coverage,
+            g.width,
+            g.height,
+            g.left,
+            g.top,
+            &mut self.buffer,
+            self.width,
+            self.height,
+            &mut self.pack_x,
+            &mut self.pack_y,
+            &mut self.pack_row_height,
+        ) {
+            self.variants[vi].insert(ch, entry);
+            self.dirty = true;
         }
     }
 }
@@ -1093,6 +1128,67 @@ fn pack_glyph(
     // `+ 1` (already baked into `stride` above) keeps a one-pixel gutter so
     // the renderer's linear sampler can't bleed across glyphs at sub-pixel
     // UVs. Row wrapping is handled by the next call's leading bounds check.
+    *x += stride;
+    Some(entry)
+}
+
+/// Private Use Area codepoints (BMP PUA + planes 15–16). These carry no
+/// universal meaning — Nerd Font icons, Powerline glyphs — so when no installed
+/// face provides them they stay notdef rather than getting a platform
+/// last-resort box.
+fn is_private_use(cp: u32) -> bool {
+    (0xE000..=0xF8FF).contains(&cp)
+        || (0xF0000..=0xFFFFD).contains(&cp)
+        || (0x100000..=0x10FFFD).contains(&cp)
+}
+
+/// Pack a raw 8-bit coverage bitmap (from the platform mono rasterizer) into
+/// the monochrome atlas, with explicit bearings. Mirrors `pack_glyph`'s cursor
+/// bookkeeping but takes a ready buffer instead of a FreeType slot. `None` if
+/// the atlas is full.
+#[allow(clippy::too_many_arguments)]
+fn pack_coverage(
+    cov: &[u8],
+    w: usize,
+    h: usize,
+    left: i32,
+    top: i32,
+    texture: &mut [u8],
+    atlas_w: usize,
+    atlas_h: usize,
+    x: &mut usize,
+    y: &mut usize,
+    row_height: &mut usize,
+) -> Option<AtlasEntry> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let stride = w + 1;
+    if *x + stride > atlas_w {
+        *x = 0;
+        *y += *row_height + 1;
+        *row_height = 0;
+    }
+    if *y + h > atlas_h {
+        return None;
+    }
+    if h > *row_height {
+        *row_height = h;
+    }
+    for p in 0..h {
+        for q in 0..w {
+            texture[(p + *y) * atlas_w + (q + *x)] = cov[p * w + q];
+        }
+    }
+    let entry = AtlasEntry {
+        x: *x,
+        y: *y,
+        width: w,
+        height: h,
+        bearing_x: left as isize,
+        bearing_y: top as isize,
+        is_color: false,
+    };
     *x += stride;
     Some(entry)
 }
@@ -1840,6 +1936,31 @@ mod tests {
     // The previous behavior was tofu, because the only emoji candidate font
     // ("Noto Emoji") ships on no stock macOS. No-op off macOS / if Core Text
     // can't produce a bitmap.
+    // macOS CJK: the system fonts (PingFang/Hiragino) don't load in the bundled
+    // FreeType, so 中 has no FreeType glyph and is rasterized monochrome via
+    // Core Text into the coverage atlas (tinted by the cell fg, not color).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cjk_packs_into_coverage_atlas_via_platform_rasterizer() {
+        let Some(mut font) = load_test_font() else { return };
+        if crate::emoji::rasterize_mono('中', 28).is_none() {
+            eprintln!("skipping: Core Text returned no CJK bitmap");
+            return;
+        }
+        let mut atlas = font.build_atlas();
+        let notdef_x = atlas.notdef.x;
+        atlas.ensure_char(&mut font, FaceVariant::Regular, '中');
+        let e = atlas.lookup('中', FaceVariant::Regular);
+        assert!(!e.is_color, "中 is monochrome coverage, not a color glyph");
+        assert_ne!(e.x, notdef_x, "中 must render, not fall to notdef");
+        assert!(e.width > 0 && e.height > 0);
+        assert!(atlas.dirty, "packing into the coverage atlas marks it dirty");
+        // Some coverage texel in the glyph's box is non-zero.
+        let any_ink = (e.y..e.y + e.height)
+            .any(|p| (e.x..e.x + e.width).any(|q| atlas.buffer[p * atlas.width + q] > 0));
+        assert!(any_ink, "rasterized CJK glyph must have visible coverage");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn emoji_packs_into_color_layer_via_platform_rasterizer() {
