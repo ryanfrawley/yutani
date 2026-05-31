@@ -4315,4 +4315,143 @@ mod tests {
             PlayMode::Stopped,
         );
     }
+
+    // ---- Pure decode / dimension-peek coverage --------------------------
+    //
+    // The iTerm OSC 1337, Kitty graphics, and (per the module docs) Sixel
+    // parsers all live in `terminal.rs`; the only image-side helpers they
+    // reach into are `peek_dimensions` (to size a placement before the full
+    // decode lands) and `decode_to_rgba` (the worker-thread decode itself).
+    // Those two are the pure, GPU-free decoding contract every protocol path
+    // funnels through, so the tests below exercise them directly across the
+    // formats the `image` crate is compiled with (png/jpeg/gif/webp).
+
+    /// Encode a `w*h` solid GIF the same way a producer would, so the
+    /// decode/peek paths see a real container header (GIF is one of the
+    /// formats whose two dimension sources the re-check in `decode_to_rgba`
+    /// guards against).
+    fn make_gif(w: u32, h: u32) -> Vec<u8> {
+        let buf = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 200, 0, 255]));
+        let mut bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Gif)
+            .expect("encode gif");
+        bytes
+    }
+
+    /// Encode a `w*h` solid JPEG. JPEG is lossy, so callers must only assert
+    /// on dimensions / channel count, never exact pixel values.
+    fn make_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let buf = image::RgbImage::from_pixel(w, h, image::Rgb([120, 120, 120]));
+        let mut bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageOutputFormat::Jpeg(90))
+            .expect("encode jpeg");
+        bytes
+    }
+
+    // peek_dimensions reads PNG dimensions from the header without decoding pixels.
+    #[test]
+    fn peek_dimensions_reads_png_header() {
+        let png = make_png(7, 3);
+        assert_eq!(peek_dimensions(&png), Some((7, 3)));
+    }
+
+    // peek_dimensions works for the GIF container the same as for PNG.
+    #[test]
+    fn peek_dimensions_reads_gif_header() {
+        let gif = make_gif(5, 9);
+        assert_eq!(peek_dimensions(&gif), Some((5, 9)));
+    }
+
+    // peek_dimensions works for JPEG (the third inline-image format we ship).
+    #[test]
+    fn peek_dimensions_reads_jpeg_header() {
+        let jpg = make_jpeg(11, 4);
+        assert_eq!(peek_dimensions(&jpg), Some((11, 4)));
+    }
+
+    // peek_dimensions returns None on garbage rather than panicking — the
+    // OSC/Kitty parsers treat that as "use a fallback size".
+    #[test]
+    fn peek_dimensions_returns_none_for_garbage() {
+        assert_eq!(peek_dimensions(b"definitely not an image"), None);
+    }
+
+    // peek_dimensions returns None for an empty payload (zero-length base64).
+    #[test]
+    fn peek_dimensions_returns_none_for_empty_input() {
+        assert_eq!(peek_dimensions(&[]), None);
+    }
+
+    // peek_dimensions reports header dims without enforcing any pixel budget —
+    // it's a cheap size probe, distinct from decode_to_rgba's allocation guard.
+    #[test]
+    fn peek_dimensions_ignores_pixel_budget() {
+        let png = make_png(64, 64);
+        assert_eq!(peek_dimensions(&png), Some((64, 64)));
+    }
+
+    // decode_to_rgba expands a GIF to straight-alpha RGBA8 at full size.
+    #[test]
+    fn decode_gif_returns_rgba() {
+        let gif = make_gif(3, 2);
+        let (rgba, w, h) = decode_to_rgba(&gif, 1_000_000).expect("decode gif");
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(rgba.len(), (3 * 2 * 4) as usize);
+        // Solid fill: every pixel is fully opaque.
+        assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    // decode_to_rgba expands a JPEG to RGBA8 (4 bytes/pixel) at full size;
+    // exact colors aren't asserted because JPEG is lossy.
+    #[test]
+    fn decode_jpeg_returns_rgba_with_opaque_alpha() {
+        let jpg = make_jpeg(4, 3);
+        let (rgba, w, h) = decode_to_rgba(&jpg, 1_000_000).expect("decode jpeg");
+        assert_eq!((w, h), (4, 3));
+        assert_eq!(rgba.len(), (4 * 3 * 4) as usize);
+        // JPEG has no alpha channel; the RGBA expansion fills it opaque.
+        assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
+    }
+
+    // decode_to_rgba rejects an oversized GIF on the header read, before the
+    // full decode allocates — same budget contract as the PNG path.
+    #[test]
+    fn decode_rejects_oversized_gif() {
+        let gif = make_gif(4, 4); // 16 px
+        let err = decode_to_rgba(&gif, 4).expect_err("expected size rejection");
+        match err {
+            DecodeError::TooLarge { pixels, max } => {
+                assert_eq!(pixels, 16);
+                assert_eq!(max, 4);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    // decode_to_rgba admits an image whose pixel count exactly equals the
+    // budget — the guard is `>`, not `>=`.
+    #[test]
+    fn decode_admits_image_at_exact_budget() {
+        let png = make_png(2, 2); // 4 px
+        let (_, w, h) = decode_to_rgba(&png, 4).expect("decode at exact budget");
+        assert_eq!((w, h), (2, 2));
+    }
+
+    // decode_to_rgba surfaces a Decode error (not TooLarge) for empty input.
+    #[test]
+    fn decode_empty_input_is_decode_error() {
+        let err = decode_to_rgba(&[], 1_000_000).expect_err("expected decode err");
+        assert!(matches!(err, DecodeError::Decode(_)));
+    }
+
+    // A zero pixel budget rejects even a 1x1 image — the smallest real image
+    // still has 1 > 0 pixels.
+    #[test]
+    fn decode_zero_budget_rejects_smallest_image() {
+        let png = make_png(1, 1);
+        let err = decode_to_rgba(&png, 0).expect_err("expected size rejection");
+        assert!(matches!(err, DecodeError::TooLarge { pixels: 1, max: 0 }));
+    }
 }

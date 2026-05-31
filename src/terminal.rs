@@ -14535,4 +14535,198 @@ mod tests {
         t.feed("\x1b[HA"); // and again
         assert!(no_rows_dirty(&t), "repeated identical writes stay clean");
     }
+
+    // ===================================================================
+    // Character sets / DEC line drawing.
+    //
+    // CONFIRMED GAP: charset switching is entirely unimplemented. SCS
+    // designators (`ESC ( 0`, `ESC ) 0`, ...) are consumed by the ANSI
+    // parser but emit no event, and SI (0x0F) / SO (0x0E) are not handled.
+    // These tests pin that the sequences are inert: the surrounding text
+    // prints normally and the "graphics" letters print as their literal
+    // ASCII, NOT as box-drawing glyphs.
+    // ===================================================================
+
+    #[test]
+    fn dec_special_graphics_designation_is_inert() {
+        // Invariant: `ESC ( 0` then 'q' prints a literal 'q', not '─'.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b(0qxl");
+        assert_eq!(t.row(0)[0].ch, 'q', "DEC graphics not mapped to ─");
+        assert_eq!(t.row(0)[1].ch, 'x');
+        assert_eq!(t.row(0)[2].ch, 'l');
+        assert_eq!(t.cursor().col, 3);
+    }
+
+    #[test]
+    fn shift_in_shift_out_are_inert() {
+        // Invariant: SO (0x0E) / SI (0x0F) do not switch charsets nor consume
+        // the surrounding glyphs incorrectly; 'q' prints literally throughout.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x0eq\x0fq");
+        assert_eq!(t.row(0)[0].ch, 'q');
+        assert_eq!(t.row(0)[1].ch, 'q');
+    }
+
+    #[test]
+    fn scs_terminator_does_not_leak_final_byte() {
+        // Invariant: `ESC ( B` (reset G0 to ASCII, used by prompts) is fully
+        // consumed — no stray 'B' leaks into the grid. Regression guard for
+        // starship/tmux-style styled prompts.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("a\x1b(Bb");
+        assert_eq!(render(&t), "ab");
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    // ===================================================================
+    // Tab stops.
+    //
+    // CONFIRMED GAP: tab stops are a hardcoded fixed 8-column grid. There
+    // is no HTS (`ESC H`) / TBC (`CSI g`) custom-stop machinery, and CBT
+    // (`CSI Z`, back-tab) is consumed by the parser with no event, so it
+    // is a no-op. These tests pin the real fixed-8 behavior and the
+    // inertness of the unsupported sequences.
+    // ===================================================================
+
+    #[test]
+    fn tab_clamps_at_right_edge() {
+        // Invariant: a tab past the last 8-multiple clamps to the final
+        // column (cols-1) instead of running off the grid.
+        let mut t = Terminal::new(6, 1, 100);
+        t.feed("\t"); // from col 0, next multiple of 8 is 8 -> clamp to 5
+        assert_eq!(t.cursor().col, 5);
+        t.feed("\t"); // already at right edge, stays clamped
+        assert_eq!(t.cursor().col, 5);
+    }
+
+    #[test]
+    fn tab_from_a_stop_advances_a_full_eight() {
+        // Invariant: tabbing while already on a stop jumps to the next stop,
+        // not staying put — exercised on a wide grid so no clamping hides it.
+        let mut t = Terminal::new(40, 1, 100);
+        t.feed("\x1b[9G"); // col 8 (a stop)
+        assert_eq!(t.cursor().col, 8);
+        t.feed("\t");
+        assert_eq!(t.cursor().col, 16);
+    }
+
+    #[test]
+    fn tab_clears_wrap_pending() {
+        // Invariant: a tab cancels a pending wrap (cursor was parked at the
+        // last column) and moves within the same row.
+        let mut t = Terminal::new(20, 2, 100);
+        t.feed("\x1b[20G"); // last col (col 19)
+        t.feed("X"); // sets wrap_pending
+        assert_eq!(t.cursor().col, 19);
+        t.feed("\t"); // clamps to right edge, clears wrap_pending
+        assert_eq!(t.cursor().col, 19);
+        t.feed("Y"); // would have wrapped if wrap_pending survived
+        assert_eq!(t.cursor().row, 0, "tab cleared wrap, no line feed");
+    }
+
+    #[test]
+    fn back_tab_cbt_is_a_noop() {
+        // Invariant: CSI Z (CBT, back-tab) is unimplemented — the parser
+        // consumes it without moving the cursor.
+        let mut t = Terminal::new(40, 1, 100);
+        t.feed("\x1b[17G"); // col 16
+        assert_eq!(t.cursor().col, 16);
+        t.feed("\x1b[Z"); // CBT — would move to col 8 if implemented
+        assert_eq!(t.cursor().col, 16, "CBT is a no-op");
+    }
+
+    #[test]
+    fn hts_and_tbc_are_inert() {
+        // Invariant: HTS (ESC H) and TBC (CSI g / CSI 3 g) do not alter the
+        // fixed 8-column tab grid (no custom-stop support). After issuing
+        // them, tabs still land on multiples of 8.
+        let mut t = Terminal::new(40, 1, 100);
+        t.feed("\x1b[4G"); // col 3
+        t.feed("\x1bH"); // HTS — try to set a stop at col 3 (ignored)
+        t.feed("\x1b[g"); // TBC 0 (ignored)
+        t.feed("\x1b[3g"); // TBC 3 — clear all (ignored)
+        t.feed("\x1b[1G\t"); // back to col 0, then tab
+        assert_eq!(t.cursor().col, 8, "tab still lands on multiple of 8");
+    }
+
+    // ===================================================================
+    // Cursor-movement edge cases (CUU/CUD/CUF/CUB clamping, CHA/VPA,
+    // CNL/CPL). These ARE implemented (except CNL/CPL — see report).
+    // ===================================================================
+
+    #[test]
+    fn cursor_up_clamps_at_top_row() {
+        // Invariant: CUU past the top row clamps to row 0.
+        let mut t = Terminal::new(5, 4, 100);
+        t.feed("\x1b[2;1H"); // row 1
+        t.feed("\x1b[10A"); // up 10 -> clamp to row 0
+        assert_eq!(t.cursor().row, 0);
+    }
+
+    #[test]
+    fn cursor_down_and_back_clamp_at_edges() {
+        // Invariant: CUD clamps at the last row, CUB clamps at col 0.
+        let mut t = Terminal::new(5, 4, 100);
+        t.feed("\x1b[1;3H"); // row 0, col 2
+        t.feed("\x1b[10B"); // down 10 -> last row (3)
+        assert_eq!(t.cursor().row, 3);
+        t.feed("\x1b[10D"); // back 10 -> col 0
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn cursor_forward_clamps_at_right_edge() {
+        // Invariant: CUF past the last column clamps to cols-1.
+        let mut t = Terminal::new(6, 2, 100);
+        t.feed("\x1b[99C");
+        assert_eq!(t.cursor().col, 5);
+    }
+
+    #[test]
+    fn cha_absolute_column_clamps_and_is_one_based() {
+        // Invariant: CHA (CSI G) sets the column 1-based, clamped to cols-1,
+        // and a zero/empty param means column 1 (col 0).
+        let mut t = Terminal::new(6, 3, 100);
+        t.feed("\x1b[3G"); // col 2
+        assert_eq!(t.cursor().col, 2);
+        t.feed("\x1b[99G"); // clamp to last col
+        assert_eq!(t.cursor().col, 5);
+        t.feed("\x1b[G"); // default -> col 0
+        assert_eq!(t.cursor().col, 0);
+    }
+
+    #[test]
+    fn hpa_backtick_alias_matches_cha() {
+        // Invariant: HPA (CSI `) is parsed as CursorHorizontalAbs, same as CHA.
+        let mut t = Terminal::new(10, 2, 100);
+        t.feed("\x1b[5`");
+        assert_eq!(t.cursor().col, 4);
+    }
+
+    #[test]
+    fn vpa_absolute_row_clamps_and_is_one_based() {
+        // Invariant: VPA (CSI d) sets the row 1-based, clamped to rows-1,
+        // and leaves the column untouched.
+        let mut t = Terminal::new(6, 4, 100);
+        t.feed("\x1b[1;4H"); // row 0, col 3
+        t.feed("\x1b[3d"); // row 2, col unchanged
+        assert_eq!(t.cursor().row, 2);
+        assert_eq!(t.cursor().col, 3);
+        t.feed("\x1b[99d"); // clamp to last row
+        assert_eq!(t.cursor().row, 3);
+    }
+
+    #[test]
+    fn cnl_and_cpl_are_unimplemented_noops() {
+        // CONFIRMED GAP: CSI E (CNL) and CSI F (CPL) are not emitted by the
+        // ANSI parser (they fall through to a silent drop), so they neither
+        // move to column 0 nor change rows. Pin that real no-op behavior.
+        let mut t = Terminal::new(6, 4, 100);
+        t.feed("\x1b[2;3H"); // row 1, col 2
+        t.feed("\x1b[E"); // CNL — would go row 2 col 0 if implemented
+        assert_eq!((t.cursor().row, t.cursor().col), (1, 2), "CNL is a no-op");
+        t.feed("\x1b[F"); // CPL — would go row 0 col 0 if implemented
+        assert_eq!((t.cursor().row, t.cursor().col), (1, 2), "CPL is a no-op");
+    }
 }
