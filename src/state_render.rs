@@ -98,10 +98,6 @@ impl WindowState {
         let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
         let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
 
-        // Cached theme (synced from `WindowEvent::ThemeChanged`, the same
-        // source `clear_color` reads) — avoids an NSWindow OS roundtrip on the
-        // hot path.
-        let theme = self.theme;
         // All face-derived metrics are pulled in one borrow so the shared
         // font's `Ref` is dropped before the `ensure_*` fill calls below
         // (which take `&mut Font`) — see the `AppShared::font` borrow rule.
@@ -577,7 +573,8 @@ impl WindowState {
                                 idxs: &mut Vec<u32>,
                                 r: isize,
                                 c: usize,
-                                bg: [f32; 4]| {
+                                bg: [f32; 4],
+                                radii: [f32; 4]| {
             let x = col_x(c);
             let baseline_y = row_y(r);
             // Background quad spans one line-height strip, centered on the
@@ -590,6 +587,9 @@ impl WindowState {
             let Some((bg_height, _)) = clip_row_quad(r, bg_y, line_height, bg_v, bg_v) else {
                 return;
             };
+            // `radii` is normally all-zero (a square cell); the mono selection
+            // path passes convex corner radii so its per-cell inverted fills
+            // round the selection's outer boundary like the non-mono pill.
             push_quad(
                 verts,
                 idxs,
@@ -600,7 +600,7 @@ impl WindowState {
                 [bg_u, bg_v],
                 [bg_u, bg_v],
                 bg,
-                [0.0; 4],
+                radii,
             );
         };
 
@@ -754,20 +754,14 @@ impl WindowState {
             }
         };
 
-        // Selection highlight: translucent macOS text-selection blue, drawn
-        // as an overlay on top of cells. Uses premultiplied alpha so RGB is
-        // pre-scaled by alpha.
-        let selection_alpha: f32 = match theme {
-            winit::window::Theme::Light => 0.30,
-            winit::window::Theme::Dark => 0.35,
-        };
-        let sel = palette::get().selection;
-        let selection_bg = [
-            sel[0] * selection_alpha,
-            sel[1] * selection_alpha,
-            sel[2] * selection_alpha,
-            selection_alpha,
-        ];
+        // Selection highlight: a solid fill drawn behind the selected glyphs
+        // (emitted into the bg layer at assembly time below). The fill color
+        // comes from the scheme's `selection_background`, falling back to the
+        // theme foreground; the selected glyphs are recolored to
+        // `selection_foreground`, falling back to the theme background (see
+        // `selection_fg` below). So the default selection simply inverts the
+        // theme's own fg/bg unless a scheme overrides either color.
+        let selection_bg = pal.selection_background.unwrap_or(pal.foreground);
         let selection = self.active_tab().selection;
 
         // 0b. Half-block fallback overrides for image placements that
@@ -787,11 +781,72 @@ impl WindowState {
         // boundary index, then emit all fg glyphs. The renderer issues two
         // draw_indexed calls against the resulting buffer (bg layer +
         // fg-and-overlays layer) so glow can bloom each layer independently.
-        // Optional per-scheme override for glyph color inside the selection.
-        // Resolved once: `None` short-circuits the per-cell membership test
-        // so the common (unselected / no-override) path stays branch-cheap.
-        let selection_fg = pal.selection_fg;
+        // Glyph color inside the selection. The fill is opaque, so selected
+        // text is always recolored to stay legible: the scheme's
+        // `selection_foreground` if set, otherwise the theme background.
+        let selection_fg = pal.selection_foreground.unwrap_or(pal.background);
         let selection_range = selection.as_ref().map(|s| s.range());
+
+        // A mono scheme has only two ink levels, so the uniform fill above can
+        // collide with the cell it covers: selecting over a reverse-video block
+        // (already painted in the `foreground` ink tone) with a `foreground`
+        // fill leaves nothing visible. Instead, mono selections invert each
+        // cell's two-tone appearance per-cell — a cell showing the foreground
+        // tone flips to the background tone and vice versa (transparent bg
+        // counts as the background tone, since the window shows through). The
+        // uniform pill is suppressed for mono (see section 1a).
+        let is_mono = pal.max_colors == palette::ColorCap::Mono;
+        let mono_invert = |c: [f32; 4]| -> [f32; 4] {
+            const EPS: f32 = 1.0 / 512.0;
+            let shows_fg = c[3] != 0.0
+                && (c[0] - pal.foreground[0]).abs() < EPS
+                && (c[1] - pal.foreground[1]).abs() < EPS
+                && (c[2] - pal.foreground[2]).abs() < EPS;
+            if shows_fg { pal.background } else { pal.foreground }
+        };
+        // Selection columns (inclusive) on the row at `abs_line`, or `None` if
+        // that line is outside the selection. Shared by the per-row strip below
+        // and, for mono, by the neighbor-row lookups that classify corners.
+        let strip_for = |abs_line: isize| -> Option<(usize, usize)> {
+            let (start, end) = selection_range?;
+            if abs_line < start.0 || abs_line > end.0 {
+                return None;
+            }
+            let from = if abs_line == start.0 { start.1 } else { 0 };
+            let to = if abs_line == end.0 { end.1 } else { cols - 1 };
+            if from > to || from >= cols { None } else { Some((from, to.min(cols - 1))) }
+        };
+        // Mono rounds the selection's outer boundary by giving the end cells'
+        // inverted fills the same convex radius the non-mono pill uses. Only
+        // convex (outer) corners round; concave inner L-steps stay square.
+        // `radii` layout matches `push_quad`: [top-right, bottom-right,
+        // top-left, bottom-left].
+        let convex_radius = (line_height * 0.35).min(cell_w * 0.7);
+        let mono_corner_radii = |c: usize,
+                                 strip: Option<(usize, usize)>,
+                                 prev: Option<(usize, usize)>,
+                                 next: Option<(usize, usize)>|
+         -> [f32; 4] {
+            let Some((from, to)) = strip else { return [0.0; 4] };
+            let mut radii = [0.0f32; 4];
+            if c == from {
+                if classify_corner_with_neighbor(from, prev, HorizSide::Left) == CornerType::Convex {
+                    radii[2] = convex_radius; // top-left
+                }
+                if classify_corner_with_neighbor(from, next, HorizSide::Left) == CornerType::Convex {
+                    radii[3] = convex_radius; // bottom-left
+                }
+            }
+            if c == to {
+                if classify_corner_with_neighbor(to, prev, HorizSide::Right) == CornerType::Convex {
+                    radii[0] = convex_radius; // top-right
+                }
+                if classify_corner_with_neighbor(to, next, HorizSide::Right) == CornerType::Convex {
+                    radii[1] = convex_radius; // bottom-right
+                }
+            }
+            radii
+        };
 
         // ---- Dirty-row vertex cache ------------------------------------
         // Re-emit only the rows whose rendered content changed since the last
@@ -828,12 +883,11 @@ impl WindowState {
         // under heavy output. Selection coords below are in the unfolded abs
         // space, so they add `evicted` to reach the same key.
         let evicted = self.active_tab().terminal.scrollback_evicted() as isize;
-        // A `selection_fg` scheme recolors glyphs inside the selection, so a
-        // range change makes the cached lines it entered/left stale. (The
-        // translucent selection background is a separate dynamic overlay below
-        // and needs no invalidation.) With no `selection_fg`, selection never
-        // touches cell colors — skip entirely.
-        if selection_fg.is_some() && self.active_tab().prev_selection_range != selection_range {
+        // The selection recolors glyphs inside it to `selection_foreground`,
+        // so a range change makes the cached lines it entered/left stale. (The
+        // selection fill itself is a dynamic bg-layer quad emitted fresh each
+        // frame and needs no invalidation.)
+        if self.active_tab().prev_selection_range != selection_range {
             for rng in [self.active_tab().prev_selection_range, selection_range] {
                 if let Some((s, e)) = rng {
                     for abs_line in s.0..=e.0 {
@@ -912,15 +966,16 @@ impl WindowState {
             // Selection strip on this row (inclusive cols), or None if the
             // row falls outside the selection. Mirrors `strip_at` further
             // down where the overlay quads are emitted.
-            let sel_strip = selection_range.and_then(|(start, end)| {
-                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
-                if abs_line < start.0 || abs_line > end.0 {
-                    return None;
-                }
-                let from = if abs_line == start.0 { start.1 } else { 0 };
-                let to = if abs_line == end.0 { end.1 } else { cols - 1 };
-                if from > to || from >= cols { None } else { Some((from, to.min(cols - 1))) }
-            });
+            let sel_abs = self.active_tab().terminal.visual_to_abs_line(r);
+            let sel_strip = strip_for(sel_abs);
+            // For mono, classify this row's strip-end corners against the
+            // neighbor rows so the per-cell inverted fills round the selection's
+            // outer boundary like the pill. Only computed when it matters.
+            let (sel_prev, sel_next) = if is_mono && sel_strip.is_some() {
+                (strip_for(sel_abs - 1), strip_for(sel_abs + 1))
+            } else {
+                (None, None)
+            };
             for c in 0..cols {
                 // Half-block fallback: substitute the underlying cell
                 // (typically a blank reserved by the placement) with a
@@ -929,12 +984,12 @@ impl WindowState {
                 // the image placement *owns* these cells — there's no
                 // real text the user expects to see here.
                 if let Some(hb) = halfblock_overrides.get(&(r, c)) {
-                    emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, hb.bg);
-                    // Image-replacement glyphs honour selection_fg too so a
+                    emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, hb.bg, [0.0; 4]);
+                    // Image-replacement glyphs honour the selection fg too so a
                     // selection that runs through an image preview keeps a
                     // consistent text color.
-                    let fg = match (selection_fg, sel_strip) {
-                        (Some(sfg), Some((from, to))) if c >= from && c <= to => sfg,
+                    let fg = match sel_strip {
+                        Some((from, to)) if c >= from && c <= to => selection_fg,
                         _ => hb.fg,
                     };
                     emit_fg_for_cell(
@@ -981,13 +1036,29 @@ impl WindowState {
                 // background is flipped to fg-ink-on-bg-text so it stays
                 // distinct from an empty cell (see palette::Palette).
                 let (fg, bg) = pal.project_cell(fg, bg);
-                // Scheme-provided selection_fg wins over the cell's own fg
-                // (including the post-reverse swap). Applied after projection
-                // so it stays at scheme-author fidelity, matching how
-                // cursor/selection chrome behave.
-                let fg = match (selection_fg, sel_strip) {
-                    (Some(sfg), Some((from, to))) if c >= from && c <= to => sfg,
-                    _ => fg,
+                // Apply the selection to this cell's colors. For mono, invert
+                // both tones per-cell so the selection reads against whatever
+                // is underneath (the uniform pill is suppressed for mono). For
+                // every other cap, the opaque pill drawn in the BG layer sits
+                // behind the glyph, so only the glyph is recolored to the
+                // selection fg to stay legible. Applied after projection so it
+                // stays at scheme-author fidelity, like the other chrome.
+                let in_sel = matches!(sel_strip, Some((from, to)) if c >= from && c <= to);
+                let (fg, bg) = if in_sel {
+                    if is_mono {
+                        (mono_invert(fg), mono_invert(bg))
+                    } else {
+                        (selection_fg, bg)
+                    }
+                } else {
+                    (fg, bg)
+                };
+                // Round the mono selection's outer-corner cells so the per-cell
+                // inverted fills trace the same pill boundary as non-mono.
+                let bg_radii = if in_sel && is_mono {
+                    mono_corner_radii(c, sel_strip, sel_prev, sel_next)
+                } else {
+                    [0.0; 4]
                 };
                 let variant = font::FaceVariant::from_flags(cell.style.bold, cell.style.italic);
                 // Ligature pass may have substituted this cell's glyph.
@@ -1008,7 +1079,7 @@ impl WindowState {
                         fg_source = GlyphSource::Cluster(*e);
                     }
                 }
-                emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg);
+                emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg, bg_radii);
                 // Wide-char spacer: paint its background (uniform with the lead
                 // via the shared style) but emit no glyph — the lead character
                 // already spans into this column.
@@ -1054,88 +1125,31 @@ impl WindowState {
             }
         };
         append_quads(&mut vertices, &mut indices, &bg_verts);
-        // Everything in the BG layer ends here. Glow runs separately on bg vs
-        // fg, so the renderer needs this split to know where one layer's draw
-        // call ends and the next begins.
-        let num_bg_indices = indices.len() as u32;
-        append_quads(&mut vertices, &mut indices, &fg_verts);
 
-        // 1a. Cmd-hover URL underline. Drawn on top of the glyph row so the
-        // line is visible regardless of cell bg, and below the selection
-        // overlay (1b) so a selected URL still reads as selected. Walks the
-        // phantom-row range like the cell loop so the underline follows the
-        // text through smooth scroll.
-        if let Some(hu) = &self.active_tab().hover_url {
-            for r in r_lo..r_hi {
-                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
-                // Underline every segment that lands on this line. Most links
-                // have one per line; an OSC 8 link with an `id=` shared across
-                // non-contiguous spans can have several, so don't stop early.
-                for seg in hu.segments.iter().filter(|seg| seg.abs_line == abs_line) {
-                    let from = seg.start_col;
-                    if from >= cols {
-                        continue;
-                    }
-                    let last = seg.end_col.min(cols - 1);
-                    if last < from {
-                        continue;
-                    }
-                    let ux = col_x(from);
-                    let uw = (last - from + 1) as f32 * cell_w;
-                    // Honor the font's own underline_position / underline_thickness
-                    // so the line lands where the type designer intended and scales
-                    // with point size. `underline_pos_px` is the (signed) offset of
-                    // the stem center from the baseline — negative means below, so
-                    // adding `-pos` walks downward in screen coords. Subtracting
-                    // half the thickness then gives the top edge of the stripe.
-                    let uh = underline_thickness_px;
-                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + row_scroll(r);
-                    // Drop a moving row's underline once it crosses the region's
-                    // bottom edge so it can't streak across the static status line.
-                    if row_moving(r) && uy >= clip_bottom_px {
-                        continue;
-                    }
-                    // Match the cell's foreground color so the underline tracks
-                    // theme overrides; fall back to the default fg.
-                    let fg = self.active_tab()
-                        .terminal
-                        .extended_cell(r, from)
-                        .map(|cell| {
-                            if cell.style.reverse {
-                                cell.style.bg.resolve(default_bg_solid)
-                            } else {
-                                cell.style.fg.resolve(default_fg)
-                            }
-                        })
-                        .unwrap_or(default_fg);
-                    push_quad(
-                        &mut vertices,
-                        &mut indices,
-                        ux,
-                        uy,
-                        uw,
-                        uh,
-                        [bg_u, bg_v],
-                        [bg_u, bg_v],
-                        fg,
-                        [0.0; 4],
-                    );
-                }
-            }
-        }
-
-        // 1b. Selection overlay. Each row's selected range is rendered as a
-        // translucent strip; corner radii adapt to the neighbor rows so the
-        // multi-row shape reads as one continuous form. Outer corners round
-        // outward (convex), inner L-step corners round inward via a fillet
-        // quad, and corners on a continuous vertical edge stay flat.
+        // 1a. Selection fill. Emitted into the BG layer — after the cell
+        // backgrounds, before the layer split below — so the opaque fill sits
+        // behind the selected glyphs, which the cell loop above recolored to
+        // `selection_fg`. Each row's selected range is one rounded strip;
+        // corner radii adapt to the neighbor rows so the multi-row shape reads
+        // as one continuous form. Outer corners round outward (convex), inner
+        // L-step corners round inward via a fillet quad, and corners on a
+        // continuous vertical edge stay flat. For mono the uniform main strip
+        // is skipped (the cell loop above already painted per-cell inverted
+        // fills with rounded convex corners); only the concave inner-corner
+        // fillets are emitted here, in the ink tone, so the L-step notches
+        // round inward to match. The fillet sits on top of the per-cell fills
+        // (both in the BG layer) and shares their y/height, so it joins
+        // seamlessly.
         if let Some(sel) = selection.as_ref() {
             let (start, end) = sel.range();
             // Outer convex corners get a generous radius for a soft pill
             // shape; inner concave fillets stay tighter so the L-step
-            // joins read as a subtle curve rather than a deep bite.
+            // joins read as a subtle curve rather than a deep bite. The fillet
+            // tone is the ink `foreground` for mono (matching the inverted
+            // fills) and the uniform fill color otherwise.
             let convex_radius = (line_height * 0.35).min(cell_w * 0.7);
             let concave_radius = (line_height * 0.18).min(cell_w * 0.45);
+            let fill_color = if is_mono { pal.foreground } else { selection_bg };
             let strip_pad = (line_height - bg_h) * 0.5;
 
             // Range of selected columns on the row at `abs_line`, or `None`
@@ -1176,18 +1190,22 @@ impl WindowState {
                 let sx = col_x(from);
                 let sw = (to - from + 1) as f32 * cell_w;
                 let sy = row_y(r) - bg_h - descender - strip_pad + row_scroll(r);
-                push_quad(
-                    &mut vertices,
-                    &mut indices,
-                    sx,
-                    sy,
-                    sw,
-                    line_height,
-                    [bg_u, bg_v],
-                    [bg_u, bg_v],
-                    selection_bg,
-                    [r_tr, r_br, r_tl, r_bl],
-                );
+                // Mono draws its fill per-cell in the loop above; only the
+                // concave fillets below are emitted here for it.
+                if !is_mono {
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        sx,
+                        sy,
+                        sw,
+                        line_height,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        selection_bg,
+                        [r_tr, r_br, r_tl, r_bl],
+                    );
+                }
 
                 // Concave fillets: each is an r×r quad in the unselected
                 // quadrant adjacent to the strip's concave corner. The
@@ -1209,7 +1227,7 @@ impl WindowState {
                         cr,
                         [bg_u, bg_v],
                         [bg_u, bg_v],
-                        selection_bg,
+                        fill_color,
                         bite,
                     );
                 };
@@ -1261,7 +1279,86 @@ impl WindowState {
             }
         }
 
-        // 1b. Find-in-scrollback match highlights. Translucent rounded quads
+        // Everything in the BG layer ends here. Glow runs separately on bg vs
+        // fg, so the renderer needs this split to know where one layer's draw
+        // call ends and the next begins.
+        let num_bg_indices = indices.len() as u32;
+        append_quads(&mut vertices, &mut indices, &fg_verts);
+
+        // 1b. Cmd-hover URL underline. Drawn on top of the glyph row so the
+        // line is visible regardless of cell bg. The selection fill (1a) is in
+        // the BG layer below, so a selected link's underline is recolored to
+        // the selection fg (see below) to still read as selected. Walks the
+        // phantom-row range like the cell loop so the underline follows the
+        // text through smooth scroll.
+        if let Some(hu) = &self.active_tab().hover_url {
+            for r in r_lo..r_hi {
+                let abs_line = self.active_tab().terminal.visual_to_abs_line(r);
+                // Underline every segment that lands on this line. Most links
+                // have one per line; an OSC 8 link with an `id=` shared across
+                // non-contiguous spans can have several, so don't stop early.
+                for seg in hu.segments.iter().filter(|seg| seg.abs_line == abs_line) {
+                    let from = seg.start_col;
+                    if from >= cols {
+                        continue;
+                    }
+                    let last = seg.end_col.min(cols - 1);
+                    if last < from {
+                        continue;
+                    }
+                    let ux = col_x(from);
+                    let uw = (last - from + 1) as f32 * cell_w;
+                    // Honor the font's own underline_position / underline_thickness
+                    // so the line lands where the type designer intended and scales
+                    // with point size. `underline_pos_px` is the (signed) offset of
+                    // the stem center from the baseline — negative means below, so
+                    // adding `-pos` walks downward in screen coords. Subtracting
+                    // half the thickness then gives the top edge of the stripe.
+                    let uh = underline_thickness_px;
+                    let uy = row_y(r) - underline_pos_px - uh * 0.5 + row_scroll(r);
+                    // Drop a moving row's underline once it crosses the region's
+                    // bottom edge so it can't streak across the static status line.
+                    if row_moving(r) && uy >= clip_bottom_px {
+                        continue;
+                    }
+                    // Match the cell's foreground color so the underline tracks
+                    // theme overrides; fall back to the default fg.
+                    let cell_fg = self.active_tab()
+                        .terminal
+                        .extended_cell(r, from)
+                        .map(|cell| {
+                            if cell.style.reverse {
+                                cell.style.bg.resolve(default_bg_solid)
+                            } else {
+                                cell.style.fg.resolve(default_fg)
+                            }
+                        })
+                        .unwrap_or(default_fg);
+                    // Over the opaque selection fill the glyph was recolored to
+                    // `selection_fg`; match it so a selected link's underline
+                    // reads as selected rather than clashing with the fill.
+                    let selected = matches!(selection_range, Some((s, e))
+                        if abs_line >= s.0 && abs_line <= e.0
+                            && from >= (if abs_line == s.0 { s.1 } else { 0 })
+                            && from <= (if abs_line == e.0 { e.1 } else { cols - 1 }));
+                    let fg = if selected { selection_fg } else { cell_fg };
+                    push_quad(
+                        &mut vertices,
+                        &mut indices,
+                        ux,
+                        uy,
+                        uw,
+                        uh,
+                        [bg_u, bg_v],
+                        [bg_u, bg_v],
+                        fg,
+                        [0.0; 4],
+                    );
+                }
+            }
+        }
+
+        // 1c. Find-in-scrollback match highlights. Translucent rounded quads
         //     over each matched run; the current (stepped-to) match gets a
         //     stronger fill drawn last so it reads as emphasised. Mapped from a
         //     match's absolute line to a visible row the same way the selection
@@ -1326,7 +1423,7 @@ impl WindowState {
             }
         }
 
-        // 1c. OSC 133 prompt-status gutter. A short rounded vertical bar in
+        // 1d. OSC 133 prompt-status gutter. A short rounded vertical bar in
         //     the left window padding at each prompt's row, colored by the
         //     command's exit status — green for success, red for failure, and
         //     a dim foreground tint while a command is still running (or the
