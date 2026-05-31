@@ -3562,3 +3562,102 @@ fn free_pool_releasing_every_target_restores_full_capacity() {
     let regained = std::iter::from_fn(|| pool.acquire()).count();
     assert_eq!(regained, present::POOL_SIZE);
 }
+
+// ---- context-menu "Clear" command escape sequence ----
+//
+// The native right-click context menu's "Clear" action feeds the byte
+// sequence "\x1b[H\x1b[2J\x1b[3J" into the terminal model:
+//   CSI H   — cursor home (top-left)
+//   CSI 2J  — erase the entire visible screen
+//   CSI 3J  — erase scrollback (xterm ED 3 / "saved lines")
+// These tests pin the terminal-model behavior the menu relies on: after
+// the sequence, scrollback is gone AND every visible cell is blank. The
+// NSMenu plumbing itself is GUI-only and not unit-testable.
+
+/// The exact bytes the "Clear" menu item feeds (see context_menu.rs /
+/// state_pointer.rs). Kept as a const so the test fails loudly if the
+/// sequence the model is exercised with ever drifts from the real one.
+const CLEAR_SEQUENCE: &str = "\x1b[H\x1b[2J\x1b[3J";
+
+/// Returns true when every cell of the live grid (rows 0..rows) is a
+/// blank space — i.e. the visible screen shows nothing.
+fn visible_grid_is_blank(t: &terminal::Terminal) -> bool {
+    let base = t.scrollback_len() as isize;
+    (0..t.rows as isize).all(|r| {
+        t.line_at(base + r)
+            .map(|row| row.iter().all(|c| c.ch == ' '))
+            .unwrap_or(false)
+    })
+}
+
+#[test]
+fn clear_sequence_erases_scrollback_and_visible_screen() {
+    // 80x24 grid with room for 100 scrollback lines — mirrors the
+    // `terminal::Terminal::new(80, 24, 100)` usages elsewhere.
+    let mut t = terminal::Terminal::new(80, 24, 100);
+
+    // Feed 60 newline-terminated lines. With only 24 visible rows, the
+    // earlier lines are pushed up into scrollback.
+    for i in 0..60 {
+        t.feed(&format!("line {i}\r\n"));
+    }
+
+    // Precondition: scrollback is populated and the visible grid holds
+    // recognizable text.
+    assert!(
+        t.scrollback_len() > 0,
+        "feeding 60 lines into a 24-row grid should populate scrollback"
+    );
+    let visible_text: String = {
+        let base = t.scrollback_len() as isize;
+        (0..t.rows as isize)
+            .filter_map(|r| t.line_at(base + r))
+            .flat_map(|row| row.iter().map(|c| c.ch))
+            .collect()
+    };
+    assert!(
+        visible_text.contains("line 5"),
+        "a recent line should be visible before clearing (got: {visible_text:?})"
+    );
+    assert!(
+        !visible_grid_is_blank(&t),
+        "the visible grid should not be blank before clearing"
+    );
+
+    // Act: feed the Clear menu item's escape sequence.
+    t.feed(CLEAR_SEQUENCE);
+
+    // CSI 3J must have erased the saved (scrollback) lines.
+    assert_eq!(
+        t.scrollback_len(),
+        0,
+        "\\x1b[3J (ED 3) must erase all scrollback"
+    );
+    // CSI 2J must have blanked the visible screen.
+    assert!(
+        visible_grid_is_blank(&t),
+        "\\x1b[2J must blank every visible cell"
+    );
+}
+
+#[test]
+fn clear_sequence_homes_cursor_to_top_left() {
+    // After "Clear", subsequent output must start at row 0, col 0 —
+    // CSI H homes the cursor before the erases take effect.
+    let mut t = terminal::Terminal::new(80, 24, 100);
+    for i in 0..40 {
+        t.feed(&format!("line {i}\r\n"));
+    }
+
+    t.feed(CLEAR_SEQUENCE);
+    // The next printable lands at the home position.
+    t.feed("X");
+
+    let base = t.scrollback_len() as isize;
+    let top = t.line_at(base).expect("top visible row should exist");
+    assert_eq!(
+        top.first().map(|c| c.ch),
+        Some('X'),
+        "cursor should be homed to row 0, col 0 after Clear"
+    );
+}

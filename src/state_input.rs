@@ -608,6 +608,21 @@ impl WindowState {
                         self.invalidate();
                         return true;
                     }
+                    // Right-down (when not feeding the app's mouse protocol)
+                    // opens the native context menu. Resolve any hyperlink
+                    // under the click first — independent of the Cmd-hover
+                    // model, which only tracks links while Cmd is held — so the
+                    // menu can offer Open/Copy Link. The existing selection is
+                    // left untouched: right-clicking acts on it, never clears
+                    // it.
+                    if code == input::MOUSE_RIGHT && press {
+                        let (col, vrow) =
+                            self.pixel_to_visual_cell(self.mouse_x, self.mouse_y);
+                        let abs_line = self.active_tab().terminal.visual_to_abs_line(vrow);
+                        let link = find_url_at(&self.active_tab().terminal, abs_line, col);
+                        self.show_context_menu(link);
+                        return true;
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {

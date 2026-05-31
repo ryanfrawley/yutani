@@ -394,4 +394,66 @@ impl WindowState {
         self.invalidate();
         true
     }
+
+    /// Select the whole buffer — every scrollback row plus the live grid (just
+    /// the visible grid on the alt screen, which keeps no scrollback). Uses the
+    /// same absolute-line coordinates as drag selection (`0..scrollback_len` is
+    /// scrollback, then the grid rows), so `selection_text` materializes it
+    /// unchanged. Drives the context menu's Select All.
+    pub(crate) fn select_all(&mut self) {
+        let term = &self.active_tab().terminal;
+        let last_col = term.cols.saturating_sub(1);
+        let last_line = if term.on_alt_screen() {
+            term.rows as isize - 1
+        } else {
+            term.scrollback_len() as isize + term.rows as isize - 1
+        };
+        self.active_tab_mut().selection = Some(Selection {
+            anchor: (0, 0),
+            head: (last_line.max(0), last_col),
+        });
+        self.active_tab_mut().selection_mode = SelectionMode::Cell;
+        self.invalidate();
+    }
+
+    /// Show the native right-click context menu and apply the chosen command.
+    /// `link` is the hyperlink under the click, if any — it gates the Open/Copy
+    /// Link items and is the target those act on. Runs a modal menu loop
+    /// (no-op off macOS), then dispatches the pick against the active tab.
+    pub(crate) fn show_context_menu(&mut self, link: Option<HoverUrl>) {
+        let cmd = context_menu::show(ContextMenuItems {
+            has_selection: self.active_tab().selection.is_some(),
+            has_link: link.is_some(),
+        });
+        let Some(cmd) = cmd else { return };
+        match cmd {
+            ContextMenuCommand::Copy => self.copy_selection(),
+            ContextMenuCommand::Paste => self.paste_from_clipboard(),
+            ContextMenuCommand::SelectAll => self.select_all(),
+            ContextMenuCommand::OpenLink => {
+                if let Some(hu) = &link {
+                    if is_safe_url(&hu.url) {
+                        open_url(&hu.url);
+                    }
+                }
+            }
+            ContextMenuCommand::CopyLink => {
+                if let Some(hu) = &link {
+                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(hu.url.clone())) {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("clipboard write failed: {e}"),
+                    }
+                }
+            }
+            // Clear screen + scrollback, homing the cursor — fed through the
+            // parser exactly as shell output would arrive, so the model stays
+            // consistent without writing to the shell's stdin. Mirrors the
+            // Cmd-K behavior other macOS terminals ship.
+            ContextMenuCommand::Clear => {
+                self.active_tab_mut().terminal.feed("\x1b[H\x1b[2J\x1b[3J");
+                self.clear_selection();
+                self.invalidate();
+            }
+        }
+    }
 }

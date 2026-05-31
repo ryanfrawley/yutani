@@ -61,6 +61,7 @@ mod width;
 
 mod pty;
 mod config;
+mod context_menu;
 mod url;
 mod font_data;
 mod paths;
@@ -93,6 +94,7 @@ use std::rc::Rc;
 
 use wgpu::util::DeviceExt;
 use config::*;
+use context_menu::*;
 use url::*;
 use font_data::*;
 use paths::*;
