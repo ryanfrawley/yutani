@@ -132,6 +132,19 @@ pub fn fork_pty(
                 let term_val = CString::new("xterm-256color").unwrap();
                 setenv(term.as_ptr(), term_val.as_ptr(), 1);
 
+                // Advertise OSC 8 hyperlink support. Tools that auto-detect
+                // (anything using the `supports-hyperlinks` crate — bat, delta,
+                // eza's auto path, …) gate emission on an exact-match terminal
+                // allowlist; a bare `xterm-256color` matches nothing, so they
+                // print plain text and our OSC 8 handling never gets fed. The
+                // one signal that crate keys off *numerically* (no name list)
+                // is `VTE_VERSION` >= 5000 — honest here, since we implement the
+                // VTE-style `OSC 8 ; params ; URI ST` protocol. Without this,
+                // only tools with an explicit `--hyperlink` flag emit links.
+                let vte = CString::new("VTE_VERSION").unwrap();
+                let vte_val = CString::new("7400").unwrap();
+                setenv(vte.as_ptr(), vte_val.as_ptr(), 1);
+
                 match program {
                     // Start the shell as a *login* shell so /etc/zprofile and
                     // ~/.zprofile run. When launched from Finder we inherit only
