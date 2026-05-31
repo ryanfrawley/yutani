@@ -118,11 +118,21 @@ mod imp {
     /// Title font size: a couple points below the system default so the tab
     /// titles read a touch lighter than standard chrome.
     const FONT_SIZE_DELTA: f64 = -2.0;
-    /// Text alpha — the only "transparency" lever AppKit exposes for a native
-    /// tab (the pill glass itself is system-drawn). The active title stays more
-    /// solid; the inactive one recedes further.
-    const ACTIVE_ALPHA: f64 = 0.80;
-    const INACTIVE_ALPHA: f64 = 0.55;
+    /// Text alpha. Both titles are fully opaque: AppKit *itself* composites the
+    /// non-selected tab button at reduced opacity (a system behavior we can't
+    /// override), so the inactive title already reads dimmer than the active one
+    /// no matter what color we set. Fading it further here only hurt legibility,
+    /// so we leave both at full strength and lean on font *weight* — which
+    /// survives the system dimming — to distinguish the two.
+    const ACTIVE_ALPHA: f64 = 1.0;
+    const INACTIVE_ALPHA: f64 = 1.0;
+
+    /// Font weights (`NSFontWeight`: regular 0.0, medium 0.23, semibold 0.3,
+    /// bold 0.4). The inactive tab is semibold rather than regular so its
+    /// system-dimmed glyphs stay legible; the active tab goes bold to keep a
+    /// clear emphasis step above it.
+    const ACTIVE_WEIGHT: f64 = 0.4;
+    const INACTIVE_WEIGHT: f64 = 0.3;
 
     /// Build the styled tab title: emphasized (label color, semibold) when
     /// active, dimmed (secondary label color, regular) otherwise. Both use a
@@ -145,12 +155,8 @@ mod imp {
             blue: chan(fg[2]),
             alpha: alpha,
         ];
-        let font: Retained<NSFont> = if active {
-            // Semibold (weight 0.3) reads as emphasis without looking heavy.
-            msg_send![class!(NSFont), systemFontOfSize: size, weight: 0.3f64]
-        } else {
-            msg_send![class!(NSFont), systemFontOfSize: size]
-        };
+        let weight = if active { ACTIVE_WEIGHT } else { INACTIVE_WEIGHT };
+        let font: Retained<NSFont> = msg_send![class!(NSFont), systemFontOfSize: size, weight: weight];
 
         let astr: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
         let astr: *mut AnyObject = msg_send![astr, initWithString: &*s];
