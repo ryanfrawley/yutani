@@ -502,6 +502,22 @@ pub fn linear_to_srgb_u8(c: f32) -> u8 {
     (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// Re-encode a stored linear-space RGBA color back to its sRGB `[r, g, b]`
+/// bytes (alpha dropped). Single source of truth for the per-channel
+/// `linear_to_srgb_u8` triple that otherwise gets copy-pasted wherever a
+/// palette color round-trips to its user-visible hex form (OSC 10/11/12
+/// reports, hex config serialization, the Kitty placeholder image id).
+pub fn color_to_srgb_u8(c: [f32; 4]) -> [u8; 3] {
+    [linear_to_srgb_u8(c[0]), linear_to_srgb_u8(c[1]), linear_to_srgb_u8(c[2])]
+}
+
+/// One linear-space channel as an sRGB value normalized to `0.0..=1.0`, as the
+/// macOS `NSColor` constructors want it. Shares `linear_to_srgb_u8`'s gamma
+/// curve so native chrome matches the GPU-rendered grid.
+pub fn linear_to_srgb_f64(c: f32) -> f64 {
+    linear_to_srgb_u8(c) as f64 / 255.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +527,7 @@ mod tests {
     /// internal linear representation, which would couple the assertions to
     /// the exact gamma curve.
     fn to_bytes(c: [f32; 4]) -> [u8; 3] {
-        [linear_to_srgb_u8(c[0]), linear_to_srgb_u8(c[1]), linear_to_srgb_u8(c[2])]
+        color_to_srgb_u8(c)
     }
 
     #[test]

@@ -277,11 +277,7 @@ impl WindowState {
         // Palette values are stored linear (sRGB-decoded) so the GPU's
         // gamma-encoding lands on the user's intended hex. Re-encode here
         // for OSC 10/11/12 so reports match the scheme's hex literals.
-        let to_u8 = |c: [f32; 4]| [
-            palette::linear_to_srgb_u8(c[0]),
-            palette::linear_to_srgb_u8(c[1]),
-            palette::linear_to_srgb_u8(c[2]),
-        ];
+        let to_u8 = palette::color_to_srgb_u8;
         self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
         // The native tab titles use dynamic system colors that track the window
         // appearance, but re-style so a theme flip repaints them immediately.

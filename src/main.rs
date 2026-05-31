@@ -2435,9 +2435,7 @@ fn spawn_window_in_process(
 /// scanline-colour config round-trips cleanly. Reuses palette's sRGB
 /// conversion so the byte we emit matches the byte the user typed.
 fn format_hex_rgb(c: [f32; 4]) -> String {
-    let r = palette::linear_to_srgb_u8(c[0]);
-    let g = palette::linear_to_srgb_u8(c[1]);
-    let b = palette::linear_to_srgb_u8(c[2]);
+    let [r, g, b] = palette::color_to_srgb_u8(c);
     format!("0x{:02x}{:02x}{:02x}", r, g, b)
 }
 
@@ -2556,7 +2554,7 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return;
     };
-    let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
+    let chan = palette::linear_to_srgb_f64;
     unsafe {
         let ns_view = handle.ns_view as *mut AnyObject;
         let ns_window: *mut AnyObject = msg_send![ns_view, window];

@@ -1190,6 +1190,22 @@ impl ClusterStore {
     }
 }
 
+/// Clamp a 1-based VT cursor coordinate (column or row) to a 0-based index
+/// within `len`. VT params are 1-based with 0 meaning "default to 1", which the
+/// `.max(1)` handles; the saturating clamp keeps a zero-sized axis from
+/// underflowing. Single source for the `((v as usize).max(1) - 1).min(dim - 1)`
+/// math that CUP/HPA/VPA all repeat.
+fn clamp_cursor_1based(v: u16, len: usize) -> usize {
+    ((v as usize).max(1) - 1).min(len.saturating_sub(1))
+}
+
+/// Convert an optional 1-based VT margin parameter to a 0-based index,
+/// substituting `default` (itself 1-based) when the parameter is omitted.
+/// Shared by DECSTBM (top/bottom) and DECSLRM (left/right).
+fn margin_param_0based(param: Option<u16>, default: usize) -> usize {
+    param.map(|v| v as usize).unwrap_or(default).saturating_sub(1)
+}
+
 impl Terminal {
     pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         assert!(cols > 0 && rows > 0, "terminal must be non-empty");
@@ -2071,7 +2087,8 @@ impl Terminal {
             // Match scroll_region_up_by: keep the user's view of historical
             // content stable while new lines stream into scrollback.
             if self.view_offset > 0 {
-                self.view_offset = (self.view_offset + spill).min(self.scrollback.len());
+                self.view_offset += spill;
+                self.clamp_view_offset();
             }
         }
 
@@ -2132,7 +2149,7 @@ impl Terminal {
             }
             // We just removed `refill` rows from the tail of scrollback. Any
             // view_offset pointing into that tail is now stale; clamp it.
-            self.view_offset = self.view_offset.min(self.scrollback.len());
+            self.clamp_view_offset();
 
             // Migrate placements through the refill: live placements shift
             // down to make room for the refilled rows; scrollback placements
@@ -2200,7 +2217,7 @@ impl Terminal {
         self.scroll_left = 0;
         self.scroll_right = cols - 1;
         self.lrmm_enabled = false;
-        self.view_offset = self.view_offset.min(self.scrollback.len());
+        self.clamp_view_offset();
     }
 
     fn active_grid(&self) -> &Grid {
@@ -2255,11 +2272,11 @@ impl Terminal {
             Event::CursorBack(n) => self.move_cursor(0, -(n as isize)),
             Event::CursorPosition(row, col) => self.set_cursor_1_based(row, col),
             Event::CursorHorizontalAbs(col) => {
-                self.cursor.col = ((col as usize).max(1) - 1).min(self.cols - 1);
+                self.cursor.col = clamp_cursor_1based(col, self.cols);
                 self.cursor.wrap_pending = false;
             }
             Event::CursorVerticalAbs(row) => {
-                self.cursor.row = ((row as usize).max(1) - 1).min(self.rows - 1);
+                self.cursor.row = clamp_cursor_1based(row, self.rows);
                 self.cursor.wrap_pending = false;
             }
             Event::EraseInDisplay(mode) => self.erase_in_display(mode),
@@ -2570,9 +2587,16 @@ impl Terminal {
     }
 
     fn set_cursor_1_based(&mut self, row: u16, col: u16) {
-        self.cursor.row = ((row as usize).max(1) - 1).min(self.rows - 1);
-        self.cursor.col = ((col as usize).max(1) - 1).min(self.cols - 1);
+        self.cursor.row = clamp_cursor_1based(row, self.rows);
+        self.cursor.col = clamp_cursor_1based(col, self.cols);
         self.cursor.wrap_pending = false;
+    }
+
+    /// Clamp the scrollback view offset to the available history depth so a
+    /// shrinking `scrollback` (eviction) or an over-eager bump can't scroll
+    /// past the oldest retained line.
+    fn clamp_view_offset(&mut self) {
+        self.view_offset = self.view_offset.min(self.scrollback.len());
     }
 
     fn erase_in_display(&mut self, mode: u16) {
@@ -2661,7 +2685,8 @@ impl Terminal {
                 // the end of scrollback, so without this bump every appended
                 // line would shift the viewport down by one row.
                 if self.view_offset > 0 {
-                    self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+                    self.view_offset += 1;
+                    self.clamp_view_offset();
                 }
             }
         }
@@ -2987,11 +3012,8 @@ impl Terminal {
             }
             return;
         }
-        let l = left.map(|v| v as usize).unwrap_or(1).saturating_sub(1);
-        let r = right
-            .map(|v| v as usize)
-            .unwrap_or(self.cols)
-            .saturating_sub(1);
+        let l = margin_param_0based(left, 1);
+        let r = margin_param_0based(right, self.cols);
         if l < r && r < self.cols {
             self.scroll_left = l;
             self.scroll_right = r;
@@ -3007,8 +3029,8 @@ impl Terminal {
     }
 
     fn set_scroll_region(&mut self, top: Option<u16>, bottom: Option<u16>) {
-        let t = top.map(|v| v as usize).unwrap_or(1).saturating_sub(1);
-        let b = bottom.map(|v| v as usize).unwrap_or(self.rows).saturating_sub(1);
+        let t = margin_param_0based(top, 1);
+        let b = margin_param_0based(bottom, self.rows);
         if t < b && b < self.rows {
             self.scroll_top = t;
             self.scroll_bottom = b;
@@ -5400,10 +5422,8 @@ fn decode_kitty_placeholder_image_id(style: &crate::style::Style) -> Option<u32>
         crate::style::CellColor::Default => return None,
         c => c.resolve([0.0, 0.0, 0.0, 1.0]),
     };
-    let r = crate::palette::linear_to_srgb_u8(fg[0]) as u32;
-    let g = crate::palette::linear_to_srgb_u8(fg[1]) as u32;
-    let b = crate::palette::linear_to_srgb_u8(fg[2]) as u32;
-    let id = (r << 16) | (g << 8) | b;
+    let [r, g, b] = crate::palette::color_to_srgb_u8(fg);
+    let id = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
     // id == 0 is the "no id" sentinel — the placeholder has no
     // meaningful image to reference. Treat as absent.
     if id == 0 {
