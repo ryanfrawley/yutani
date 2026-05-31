@@ -771,6 +771,33 @@ blue = [0x0000ab, 0x5555ff]
     }
 
     #[test]
+    fn color_to_srgb_u8_drops_alpha_and_matches_per_channel() {
+        // The helper is the single source of truth for the per-channel
+        // `linear_to_srgb_u8` triple. It must encode each RGB channel exactly
+        // as `linear_to_srgb_u8` does and discard alpha — a stored color with
+        // alpha == 0.5 must still round-trip to the same bytes as one with
+        // alpha 1.0, since OSC reports and hex serialization carry only RGB.
+        let c = [srgb_to_linear(0x12), srgb_to_linear(0x34), srgb_to_linear(0x56), 0.5];
+        assert_eq!(
+            color_to_srgb_u8(c),
+            [linear_to_srgb_u8(c[0]), linear_to_srgb_u8(c[1]), linear_to_srgb_u8(c[2])],
+        );
+        // Alpha is ignored: the byte triple matches the source hex regardless.
+        assert_eq!(color_to_srgb_u8(c), [0x12, 0x34, 0x56]);
+    }
+
+    #[test]
+    fn linear_to_srgb_f64_matches_u8_normalized() {
+        // The f64 form (for NSColor) must share the byte form's gamma curve,
+        // differing only by the /255 normalization — otherwise native chrome
+        // would drift from the GPU-rendered grid. Check the endpoints and a
+        // mid channel.
+        for c in [0.0_f32, 1.0, srgb_to_linear(128)] {
+            assert_eq!(linear_to_srgb_f64(c), linear_to_srgb_u8(c) as f64 / 255.0);
+        }
+    }
+
+    #[test]
     fn default_cap_is_truecolor() {
         // Existing schemes don't carry a cap → must behave as truecolor so
         // upgrading the binary doesn't suddenly quantise everyone's terminal.

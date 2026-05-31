@@ -1,3 +1,34 @@
+//! Yutani — a GPU-accelerated terminal emulator (macOS-first, wgpu).
+//!
+//! Module map (where to look for what):
+//!
+//! - **Terminal model** — [`terminal`] holds the grid/cell ring buffer,
+//!   scrollback, cursor, scroll regions/margins, the VT/CSI/SGR parser
+//!   ([`ansi`]) dispatch, and shell-integration OSC handlers. The inline-image
+//!   protocols (iTerm2 `OSC 1337`, Kitty graphics) live in its
+//!   `terminal/image_protocol.rs` submodule.
+//! - **Window state** — the per-window [`WindowState`] god-struct is defined
+//!   here in `main.rs`; its methods are organized by topic across the
+//!   `state_*` extension files (all `impl WindowState`): `state_render`
+//!   (vertex/quad emission + frame composition), `state_input` (key/IME
+//!   routing), `state_pointer` (mouse/selection/hover), `state_completion`
+//!   (autocomplete popup), `state_image` (inline-image upload/placement),
+//!   `state_theme` (scheme/appearance sync), `state_anim` (smooth-scroll and
+//!   fade animation). Process-shared GPU resources live in `AppShared`.
+//! - **GPU/rendering** — [`renderer`] wraps wgpu: `renderer::blur`,
+//!   `renderer::glow`, `renderer::images`, plus shared helpers in
+//!   `renderer/mod.rs` (e.g. [`renderer::uniform_buffer`]); [`gpu`] /
+//!   [`present`] own surface + frame presentation.
+//! - **Overlays/UI chrome** — [`command_palette`], [`completion`], [`search`],
+//!   [`onboard`] are the cross-platform popup models; the `glass_*` files
+//!   (`glass`, `glass_palette`, `glass_find`, `glass_complete`) are the
+//!   macOS-native Liquid Glass panels (deliberately kept as separate AppKit
+//!   controllers). [`palette`] is color/scheme math, not a UI element.
+//! - **Fonts/text** — [`font`], [`shaper`], [`font_loader`] (per-platform),
+//!   [`box_drawing`]. **Config/theming** — [`config`], [`bundled_schemes`],
+//!   [`style`]. **Platform glue** — [`app_window`], [`event_loop`],
+//!   [`pty`], [`touchid`], [`paths`].
+
 mod app_window;
 mod box_drawing;
 mod command_palette;

@@ -1,3 +1,15 @@
+//! The terminal model: the grid/cell ring buffer ([`Grid`]), scrollback, the
+//! [`Cursor`], scroll regions/margins, and the execution of parsed VT events
+//! (the [`crate::ansi`] parser feeds the dispatch loop). Shell-integration OSC
+//! handlers (cwd/title, OSC 133 prompt marks, the yutani-private OSC
+//! extensions) also live here.
+//!
+//! The inline-image protocols — iTerm2 `OSC 1337 File=` and the full Kitty
+//! graphics protocol — are split into the [`image_protocol`] submodule; the
+//! shared Kitty types and pure decode/parse free functions stay in this file
+//! (the [`Terminal`] struct holds Kitty state fields) and the submodule reaches
+//! them via `use super::*`.
+
 use crate::ansi::{self, Event};
 use crate::images::ImageId;
 use crate::style::{Cell, Style};
@@ -4970,6 +4982,32 @@ mod tests {
             .iter()
             .map(|p| (p.image.0, p.top_row, p.left_col, p.rows, p.cols))
             .collect()
+    }
+
+    #[test]
+    fn clamp_cursor_1based_maps_and_clamps() {
+        // VT params are 1-based with 0 meaning "default to 1", so both 0 and 1
+        // land on index 0.
+        assert_eq!(clamp_cursor_1based(0, 10), 0);
+        assert_eq!(clamp_cursor_1based(1, 10), 0);
+        // A normal in-range param is just v-1.
+        assert_eq!(clamp_cursor_1based(5, 10), 4);
+        // Past the axis it clamps to the last index.
+        assert_eq!(clamp_cursor_1based(99, 10), 9);
+        // A zero-sized axis must not underflow; it saturates to 0.
+        assert_eq!(clamp_cursor_1based(1, 0), 0);
+        assert_eq!(clamp_cursor_1based(7, 0), 0);
+    }
+
+    #[test]
+    fn margin_param_0based_handles_default_and_saturation() {
+        // Omitted param falls back to the (1-based) default, minus one.
+        assert_eq!(margin_param_0based(None, 1), 0);
+        assert_eq!(margin_param_0based(None, 24), 23);
+        // A provided param is converted 1-based -> 0-based.
+        assert_eq!(margin_param_0based(Some(5), 1), 4);
+        // A bogus 0 param saturates to 0 rather than underflowing.
+        assert_eq!(margin_param_0based(Some(0), 24), 0);
     }
 
     #[test]
