@@ -2614,6 +2614,7 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
+    use objc2_app_kit::NSColor;
     use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
@@ -2626,7 +2627,7 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
         if ns_window.is_null() {
             return;
         }
-        let color: Retained<AnyObject> = msg_send![
+        let color: Retained<NSColor> = msg_send![
             class!(NSColor),
             colorWithSRGBRed: chan(bg[0]),
             green: chan(bg[1]),
@@ -2637,15 +2638,16 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
         // Mirror onto the CAMetalLayer that wgpu installed. `layer` is the
         // view's backing layer (the view is layer-hosted because the Metal
         // surface needs `wantsLayer: YES`). `setBackgroundColor:` on a
-        // CALayer takes a `CGColorRef`, not `NSColor`, so go through
-        // `-CGColor`. Null-check both: a non-layer-backed view or a fresh
-        // NSColor that failed to bridge would otherwise crash.
+        // CALayer takes a `CGColorRef`, not `NSColor`, so go through `CGColor`.
+        // Use the typed `CGColor()` accessor, not a raw `msg_send![…, CGColor]`
+        // typed as an object (`@`): objc2 0.6 verifies the message return
+        // encoding at runtime and aborts on the mismatch, because the method
+        // actually returns a `CGColorRef` (`^{CGColor=}`). The `Retained<CGColor>`
+        // is held until after `setBackgroundColor:` retains it.
         let layer: *mut AnyObject = msg_send![ns_view, layer];
         if !layer.is_null() {
-            let cg: *mut AnyObject = msg_send![&*color, CGColor];
-            if !cg.is_null() {
-                let _: () = msg_send![layer, setBackgroundColor: cg];
-            }
+            let cg = color.CGColor();
+            let _: () = msg_send![layer, setBackgroundColor: &*cg];
         }
     }
 }
