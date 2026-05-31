@@ -29,14 +29,33 @@ the PR is open.
 
 ## Pushing branches and opening PRs
 
-Push your worktree branch and open a pull request with the `gh` CLI:
+This repo lives on a self-hosted **Gitea** instance (`git.frawley.co`), not
+GitHub — so `gh` does not apply (and isn't installed). Push your worktree
+branch over SSH, which is the only transport that works unattended here:
 
 ```sh
 git push -u origin <branch>
-gh pr create --base main --title "<title>" --body "<markdown body>"
 ```
 
-Surface the resulting PR URL to the user.
+**Opening the PR is not scriptable from this environment.** The Gitea server
+requires a **mutual-TLS client certificate** that lives in the macOS keychain,
+and only `git`'s Secure-Transport libcurl can present it — standalone `curl`
+(LibreSSL) and `tea` cannot complete the API handshake, and there is no API
+token on disk. So the Gitea REST API / `tea pr create` are unavailable.
+
+To open the PR, use one of:
+
+- **Browser automation** (the browser already trusts the client cert): drive
+  Chrome via the `claude-in-chrome` tools to the compare page
+  `https://git.frawley.co/ryan/yutani/compare/main...<branch>`, fill in the
+  title/body, and submit.
+- **Hand off to the user**: surface that compare URL and ask them to click
+  *Create Pull Request*.
+
+Either way, surface the resulting PR URL to the user. If a `tea` login is ever
+configured (`tea login list` non-empty) and the mTLS issue is resolved,
+`tea pr create --repo ryan/yutani --base main --head <branch> ...` becomes an
+option too.
 
 ## Testing requirement
 
