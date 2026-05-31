@@ -98,6 +98,25 @@ use font_data::*;
 use paths::*;
 use event_loop::run;
 
+/// Backing scale the fixed-pixel UI metrics in this codebase are authored
+/// against. Constants like [`WINDOW_PADDING`], [`DECORATOR_HEIGHT`], the glow
+/// scanline period, popup corner radii, and the drag threshold were all tuned
+/// on a 2× Retina display. A constant *physical* pixel count looks twice as
+/// large on a 1× monitor as on 2× — so wherever apparent (logical) size should
+/// stay constant across DPIs, we rescale via [`dpi_px`]. Anchoring to 2× means
+/// the Retina look is preserved exactly and only lower-DPI displays change.
+pub(crate) const UI_REFERENCE_SCALE: f32 = 2.0;
+
+/// Scale a reference-2× physical-pixel metric to the physical pixels that hold
+/// its apparent size constant at `dpi` (= backing_scale × 96; see
+/// [`WindowState::set_dpi_from_scale`]). At `dpi == 192` (2×) this is the
+/// identity; at `dpi == 96` (1×) it halves the value, so e.g. 16 px of padding
+/// authored on Retina draws as 8 px on a 1× screen — the same apparent width.
+#[inline]
+pub(crate) fn dpi_px(value: f32, dpi: u32) -> f32 {
+    value * (dpi as f32 / 96.0) / UI_REFERENCE_SCALE
+}
+
 const WINDOW_PADDING: f32 = 16.0;
 const DECORATOR_HEIGHT: f32 = 24.0;
 /// Maximum rows the completion popup shows at once; longer lists scroll. Shared
@@ -1633,6 +1652,11 @@ impl WindowState {
                 // Masked composite needs the window bg colour to detect
                 // colored cells in the mask texture.
                 g.set_background(p.background);
+                // Scale the CRT scanline period and bloom radius to this
+                // window's backing scale so they look the same size regardless
+                // of monitor DPI. `write_uniforms` (below) reads it for the
+                // bloom kernel; `write_glow_params` reads it for the period.
+                g.set_dpi_scale(dpi_px(1.0, dpi));
             }
         }
         for g in [&glow, &glow_fg] {
@@ -1937,9 +1961,16 @@ impl WindowState {
         // Extra top reserve for the native tab bar when shown
         // (0 otherwise), so the bottom row never lands under the window edge.
         extra_top: f32,
+        // Backing-scale DPI (= scale_factor × 96). The window padding and
+        // decorator reserve are DPI-scaled so the grid's inset holds a constant
+        // apparent size; the rendering and hit-test paths apply the identical
+        // `dpi_px` scaling, so cells land exactly where the grid math reserved.
+        dpi: u32,
     ) -> ViewportSize {
+        let window_padding = dpi_px(WINDOW_PADDING, dpi);
+        let decorator_height = dpi_px(DECORATOR_HEIGHT, dpi);
         ViewportSize {
-            char_width: usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x),
+            char_width: usize::max(1, (width - window_padding * 2.0) as usize / advance_x),
             // Content extends full-height (behind the translucent title bar
             // on macOS's fullsize_content_view), gaining ~1–2 rows of
             // scrollable area at the top. Reserve DECORATOR_HEIGHT in the
@@ -1961,7 +1992,7 @@ impl WindowState {
             // an even shorter window costs nothing real.
             char_height: usize::max(
                 MIN_GRID_ROWS,
-                (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT - extra_top).max(0.0) as usize
+                (height - window_padding * 2.0 - decorator_height - extra_top).max(0.0) as usize
                     / line_height,
             ),
         }
@@ -1994,6 +2025,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             line_height,
             self.chrome_extra_top(),
+            self.dpi,
         );
         // Mirror `phantom_row_band`'s top widening so the buffer reserves the
         // extra rows the tab bar's chrome inset pushes into the band.
@@ -2120,6 +2152,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
+            self.dpi,
         );
         // Only touch the PTY winsize when the character grid actually
         // changes. macOS raises SIGWINCH on any TIOCSWINSZ whose winsize
@@ -2417,6 +2450,7 @@ fn spawn_window_in_process(
             // Brand-new window; tab-bar reserve (if it joins a group) lands via
             // the follow-up resize/focus once it's grouped.
             0.0,
+            dpi,
         );
         (vp.char_width, vp.char_height)
     };
@@ -2715,9 +2749,10 @@ const CHROME_BAND_MARGIN_PX: f64 = 4.0;
 /// Height of the native `NSWindow` title bar in *physical* pixels, or `None` if
 /// the handle isn't AppKit. This is the region macOS owns: it drives window
 /// drag / zoom / traffic lights and swallows our pointer-moved events. Unlike
-/// the renderer's fixed `WINDOW_PADDING + DECORATOR_HEIGHT` reserve (physical,
-/// DPI-independent), the title bar is a fixed number of *points*, so on a
-/// Retina display it's physically taller than that reserve — which is why a
+/// the chrome band's fallback floor — the raw, unscaled `WINDOW_PADDING +
+/// DECORATOR_HEIGHT` sum, a fixed physical-px lower bound — the title bar is a
+/// fixed number of *points*, so on a Retina display it's physically taller
+/// than that reserve — which is why a
 /// band sized to the reserve never reached the bar and left the grid's I-beam
 /// frozen over it. `contentLayoutRect` excludes the title bar even under
 /// `fullsize_content_view`, so `frame.height - contentLayoutRect.height` is the
@@ -2984,12 +3019,12 @@ fn py_in_top_toolbar(py: f64, band_px: f64) -> bool {
 /// Choose the chrome band height from the live native title-bar height (if
 /// queryable) and the renderer's fixed `reserve`. Extracted from
 /// `WindowState::refresh_chrome_band` so the selection arithmetic is unit-testable
-/// without a real `Window`: add `CHROME_BAND_MARGIN_PX` to the native height,
-/// but never go below the reserve (and fall back to the reserve when the query
-/// failed). See `refresh_chrome_band` for the rationale.
-fn chrome_band_from(native: Option<f64>, reserve: f64) -> f64 {
+/// without a real `Window`: add `margin` (the DPI-scaled `CHROME_BAND_MARGIN_PX`)
+/// to the native height, but never go below the reserve (and fall back to the
+/// reserve when the query failed). See `refresh_chrome_band` for the rationale.
+fn chrome_band_from(native: Option<f64>, reserve: f64, margin: f64) -> f64 {
     native
-        .map(|h| h + CHROME_BAND_MARGIN_PX)
+        .map(|h| h + margin)
         .filter(|band| *band >= reserve)
         .unwrap_or(reserve)
 }

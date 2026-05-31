@@ -280,7 +280,11 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        // DPI-scaled so the grid inset holds a constant apparent size; the
+        // grid-sizing math (`get_viewport_size`) and the hit-test inverse
+        // (`pixel_to_visual_cell`) apply the identical `dpi_px` scaling.
+        let window_padding = dpi_px(WINDOW_PADDING, self.dpi);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
         // In the global case the decorator easing is a whole-grid translation,
         // so (like `scroll_y`) it rides the camera and isn't baked into the
         // geometry — that's what lets a scroll-only frame skip the rebuild.
@@ -294,7 +298,7 @@ impl WindowState {
         // the same constant in screen space.
         let tab_top = self.chrome_extra_top();
         let row_y =
-            |r: isize| WINDOW_PADDING + baked_vert + tab_top + (r as f32 + 1.0) * line_height;
+            |r: isize| window_padding + baked_vert + tab_top + (r as f32 + 1.0) * line_height;
         // The vertical offset `refresh_scroll_uniforms` will fold into the
         // camera (must stay in lockstep with it). Screen-fixed geometry in this
         // same buffer — the command palette / find overlays — subtracts it so
@@ -303,7 +307,7 @@ impl WindowState {
         // the camera.) The skip fast path is disabled while either overlay is
         // open, so this compensation is always rebuilt with the live offset.
         let camera_vert = if anim_active { 0.0 } else { scroll_y + decorator_offset };
-        let col_x = |c: usize| WINDOW_PADDING + c as f32 * cell_w;
+        let col_x = |c: usize| window_padding + c as f32 * cell_w;
 
         // Half-open band `[r_lo, r_hi)` of grid rows to render — the visible
         // grid plus phantom rows above and below so smooth sub-line scrolling
@@ -1335,8 +1339,10 @@ impl WindowState {
         };
         if !status_markers.is_empty() {
             let pal = palette::get();
-            let bar_w = (cell_w * 0.16).clamp(2.0, 4.0);
-            let bar_x = (WINDOW_PADDING - bar_w) * 0.5; // centered in the padding
+            // The clamp bounds are fixed px, so DPI-scale them (cell_w already
+            // scales) to keep the gutter bar a constant apparent width.
+            let bar_w = (cell_w * 0.16).clamp(dpi_px(2.0, self.dpi), dpi_px(4.0, self.dpi));
+            let bar_x = (window_padding - bar_w) * 0.5; // centered in the padding
             let strip_pad = (line_height - bg_h) * 0.5;
             let bar_radius = bar_w * 0.5;
             for r in r_lo..r_hi {
@@ -1534,11 +1540,11 @@ impl WindowState {
             if visible {
                 let (eased_col, eased_buf_row) = anim.current(anim_secs);
                 let eased_vis_row = eased_buf_row + live_grid_offset;
-                let block_x = WINDOW_PADDING + eased_col * cell_w;
+                let block_x = window_padding + eased_col * cell_w;
                 // Cursor lives in the same per-row strip as the bg quad so
                 // it aligns with selection / colored backgrounds.
                 let cur_baseline =
-                    WINDOW_PADDING + baked_vert + tab_top + (eased_vis_row + 1.0) * line_height;
+                    window_padding + baked_vert + tab_top + (eased_vis_row + 1.0) * line_height;
                 let block_y = cur_baseline - bg_h - descender - (line_height - bg_h) * 0.5
                     + row_scroll(eased_vis_row.round() as isize);
                 // Anchor the completion popup to this cell's strip: left edge at
@@ -1625,7 +1631,7 @@ impl WindowState {
                 box_w,
                 screen_w,
                 screen_h,
-                WINDOW_PADDING,
+                window_padding,
             );
 
             // Colors derived from the active palette so themes are respected.
@@ -1646,7 +1652,9 @@ impl WindowState {
             ];
             let hl_color = premul(hl_rgb, 0.85);
             let text_color = pal.foreground;
-            let radius = 5.0_f32;
+            // Corner radius is a fixed px metric → DPI-scale for constant
+            // apparent rounding across displays.
+            let radius = dpi_px(5.0, self.dpi);
 
             // Box background (rounded corners, all four equal).
             push_quad(
@@ -1739,7 +1747,7 @@ impl WindowState {
             // Box geometry: a fixed-ish width centered horizontally, parked near
             // the top of the window. `-camera_vert` cancels the scroll camera so
             // the box stays pinned (everything below derives from `box_y`).
-            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - WINDOW_PADDING * 2.0);
+            let box_w = (screen_w * 0.6).clamp(cell_w * 24.0, cell_w * 72.0).min(screen_w - window_padding * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
             let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
@@ -1922,7 +1930,7 @@ impl WindowState {
 
             let box_w = (screen_w * 0.6)
                 .clamp(cell_w * 24.0, cell_w * 72.0)
-                .min(screen_w - WINDOW_PADDING * 2.0);
+                .min(screen_w - window_padding * 2.0);
             let box_x = ((screen_w - box_w) * 0.5).round();
             let box_y = (screen_h * 0.12).round() - camera_vert;
             let pad_v = (line_height * 0.45).round();
@@ -2100,7 +2108,7 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
 
         let win_w = self.surface.config.width as f32;
         let win_h = self.surface.config.height as f32;
@@ -2794,11 +2802,14 @@ impl WindowState {
         let near = (dist_from_bottom / line_height)
             .min(dist_from_top / line_height)
             .clamp(0.0, 1.0);
-        let decorator_offset = DECORATOR_HEIGHT * (1.0 - near);
+        let decorator_offset = dpi_px(DECORATOR_HEIGHT, self.dpi) * (1.0 - near);
         let scroll_y = self.active_tab().scroll_y as f32;
         // Fixed tab-bar top inset, baked into image geometry exactly as it is
         // for cells in `update_vertices` (the camera carries scroll/decorator).
         let tab_top = self.chrome_extra_top();
+        // DPI-scaled to match `update_vertices` and the grid-sizing reserve, so
+        // image quads align with the cell grid on every backing scale.
+        let window_padding = dpi_px(WINDOW_PADDING, self.dpi);
         // Match `update_vertices`: in the global case the camera carries the
         // whole-grid vertical offset, so image quads are placed at rest and
         // ride the same camera. Only the alt-screen slide bakes the offset into
@@ -2860,10 +2871,10 @@ impl WindowState {
                 // pixel_offset shifts the draw inside the anchor cell — phase 2
                 // Kitty `X=`/`Y=` plumb through here. Whole-cell math stays
                 // identical so eviction / scroll-region shifting is unaffected.
-                let x_px = WINDOW_PADDING
+                let x_px = window_padding
                     + (p.left_col as f32) * cell_w
                     + p.pixel_offset.0 as f32;
-                let y_px = WINDOW_PADDING
+                let y_px = window_padding
                     + img_vert
                     + tab_top
                     + (viewport_row as f32) * line_height
@@ -2923,8 +2934,8 @@ impl WindowState {
                 // straight into the cell row→pixel math. No
                 // `view_offset` shift needed.
                 let cells_wide = (run.screen_col_end - run.screen_col_start) as f32;
-                let x_px = WINDOW_PADDING + (run.screen_col_start as f32) * cell_w;
-                let y_px = WINDOW_PADDING
+                let x_px = window_padding + (run.screen_col_start as f32) * cell_w;
+                let y_px = window_padding
                     + img_vert
                     + tab_top
                     + (run.screen_row as f32) * line_height;

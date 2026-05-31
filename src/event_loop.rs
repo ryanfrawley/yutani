@@ -259,6 +259,7 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 cell_w,
                 line_h,
                 0.0, // first window opens standalone — no tab bar
+                dpi,
             );
             (vp.char_width, vp.char_height)
         };

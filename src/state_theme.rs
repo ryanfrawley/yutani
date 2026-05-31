@@ -46,6 +46,18 @@ impl WindowState {
         }
         self.dpi = new_dpi;
         self.rebuild_font_resources();
+        // The glow caches its uniforms (unlike the per-frame layout constants,
+        // which re-read `self.dpi` each draw), so the scanline period and bloom
+        // radius won't pick up the new backing scale until we re-push them.
+        // Without this, the CRT stripes and halo would keep the old monitor's
+        // size after a cross-display drag.
+        let dpi_scale = dpi_px(1.0, self.dpi);
+        let (w, h) = (self.surface.config.width, self.surface.config.height);
+        for g in [&mut self.glow, &mut self.glow_fg] {
+            g.set_dpi_scale(dpi_scale);
+            g.write_glow_params(&self.shared.gpu.queue);
+            g.write_uniforms(&self.shared.gpu.queue, w, h);
+        }
         true
     }
 
@@ -108,6 +120,7 @@ impl WindowState {
             self.with_font(|f| f.cell_width()),
             ((metrics.ascender - metrics.descender) >> 6) as usize,
             self.chrome_extra_top(),
+            self.dpi,
         );
         self.active_tab_mut().terminal.resize(viewport.char_width, viewport.char_height);
         self.notify_pty_size(viewport.char_width, viewport.char_height);
@@ -202,6 +215,12 @@ impl WindowState {
             g.set_bright_palette(&self.shared.gpu.queue, &bright);
             g.set_foreground(p.foreground);
             g.set_background(p.background);
+            // Keep the scanline period (and bloom radius) scaled to this
+            // window's DPI — a config reload or theme swap re-pushes the
+            // params, so re-apply the scale. The bloom uniforms don't change
+            // here (DPI is unchanged; they were set at create/resize), so only
+            // the period needs re-uploading.
+            g.set_dpi_scale(dpi_px(1.0, self.dpi));
             g.write_glow_params(&self.shared.gpu.queue);
         }
 

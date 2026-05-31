@@ -226,7 +226,22 @@ pub struct Glow {
     /// the halo: alternating rows are alpha'd toward zero.
     pub match_scanlines: bool,
     pub scanline_strength: f32,
+    /// Scanline cycle, in *reference-2× framebuffer pixels*. The shader walks
+    /// `fract(clip_position.y / period)` against physical framebuffer rows, so
+    /// a fixed period draws a pattern twice as coarse on a 1× monitor as on a
+    /// 2× Retina display. [`Self::dpi_scale`] rescales it to the actual backing
+    /// scale at upload so the apparent (logical) period is identical on every
+    /// display.
     pub scanline_period: f32,
+    /// Backing-scale multiplier the host sets from the window's DPI
+    /// (`dpi_px(1.0, dpi)` = backing_scale / 2). Holds two DPI-sensitive glow
+    /// metrics — the scanline period and the bloom blur kernel's tap spacing —
+    /// at a constant *apparent* size across displays: both effects were tuned
+    /// on a 2× screen, where this is `1.0` (a no-op). On a 1× monitor it is
+    /// `0.5`, halving the physical scanline pitch and blur radius so they look
+    /// the same as on Retina. Defaults to `1.0` until the host plumbs the real
+    /// scale in via [`Self::set_dpi_scale`].
+    pub dpi_scale: f32,
     /// When true, the dedicated `scanline_overlay_pipeline` (multiply
     /// blend) darkens alternating rows of whatever is already in the
     /// framebuffer — affecting bg colors and glyphs alike. Independent
@@ -660,6 +675,10 @@ impl Glow {
             match_scanlines: false,
             scanline_strength: DEFAULT_SCANLINE_STRENGTH,
             scanline_period: DEFAULT_SCANLINE_PERIOD,
+            // Identity until the host calls `set_dpi_scale`; 1.0 keeps the
+            // scanline period and bloom radius at their authored 2× values
+            // (a no-op on Retina).
+            dpi_scale: 1.0,
             match_content_scanlines: false,
             content_scanline_strength: DEFAULT_SCANLINE_STRENGTH,
             scanline_color_bright: DEFAULT_SCANLINE_COLOR_BRIGHT,
@@ -713,9 +732,20 @@ impl Glow {
     }
 
     /// Upload the per-pass `1/texel_size` uniforms.
+    ///
+    /// The down/up Kawase passes use `texel_size` as their tap offset, so the
+    /// blur radius is proportional to it. The blur targets are a fixed fraction
+    /// of the framebuffer, making one target texel a constant number of
+    /// *physical* pixels regardless of DPI — which means the bloom's apparent
+    /// (logical) radius would otherwise be twice as wide on a 1× monitor as on
+    /// 2×. Scaling the down/up offsets by [`Self::dpi_scale`] (= backing_scale
+    /// / 2) holds the apparent radius constant: identity at 2×, half at 1×. The
+    /// bright/composite passes sample at `uv` with no offset, so the bright
+    /// uniform stays a true `1/texel`.
     pub fn write_uniforms(&self, queue: &wgpu::Queue, scene_w: u32, scene_h: u32) {
         let scene_w = scene_w.max(1) as f32;
         let scene_h = scene_h.max(1) as f32;
+        let k = self.dpi_scale.max(0.0);
         queue.write_buffer(
             &self.bright_blur_uniform,
             0,
@@ -728,7 +758,7 @@ impl Glow {
             &self.down_uniform,
             0,
             bytemuck::cast_slice(&[BlurParams {
-                texel_size: [1.0 / self.bright.width as f32, 1.0 / self.bright.height as f32],
+                texel_size: [k / self.bright.width as f32, k / self.bright.height as f32],
                 _pad: [0.0; 2],
             }]),
         );
@@ -736,7 +766,7 @@ impl Glow {
             &self.up_uniform,
             0,
             bytemuck::cast_slice(&[BlurParams {
-                texel_size: [1.0 / self.scratch.width as f32, 1.0 / self.scratch.height as f32],
+                texel_size: [k / self.scratch.width as f32, k / self.scratch.height as f32],
                 _pad: [0.0; 2],
             }]),
         );
@@ -769,8 +799,10 @@ impl Glow {
                 } else {
                     0.0
                 },
-                // Period < 1 would alias to single-row noise; clamp up.
-                scanline_period: self.scanline_period.max(1.0),
+                // Scale the authored (2×) period to this window's backing
+                // scale so the scanlines look the same size on every display,
+                // then clamp: a sub-1px period aliases to single-row noise.
+                scanline_period: scaled_scanline_period(self.scanline_period, self.dpi_scale),
                 content_scanline_strength: if self.match_content_scanlines {
                     self.content_scanline_strength.clamp(0.0, 1.0)
                 } else {
@@ -794,6 +826,16 @@ impl Glow {
     /// detect colored cells. Alpha is preserved in the uniform but unused.
     pub fn set_background(&mut self, bg: [f32; 4]) {
         self.bg_color = bg;
+    }
+
+    /// Set the backing-scale multiplier ([`Self::dpi_scale`]) applied to the
+    /// scanline period and bloom kernel. The host passes `dpi_px(1.0, dpi)`
+    /// (= backing_scale / 2), so both effects — authored against a 2× display —
+    /// keep a constant apparent size on every monitor. Caller must follow with
+    /// [`Self::write_glow_params`] (scanline period) and, when the scale
+    /// changed, [`Self::write_uniforms`] (bloom kernel) for it to reach the GPU.
+    pub fn set_dpi_scale(&mut self, scale: f32) {
+        self.dpi_scale = scale;
     }
 
     /// Install the 8 bright ANSI variants (linear RGB, alpha ignored).
@@ -962,6 +1004,16 @@ fn build_resources(
     (bright, scratch, bright_bg, down_bg, up_bg, composite_bg)
 }
 
+/// Rescale the authored (2×) scanline period to the window's backing scale
+/// and clamp it so the shader never sees a sub-1px period (which aliases to
+/// single-row noise). `period` is floored at 1 before scaling — a logical
+/// period below a pixel is meaningless — and `dpi_scale` is floored at 0 so a
+/// stray negative can't flip the sign. At `dpi_scale == 1.0` (the 2× reference
+/// monitor) the period passes through unchanged.
+fn scaled_scanline_period(period: f32, dpi_scale: f32) -> f32 {
+    (period.max(1.0) * dpi_scale.max(0.0)).max(1.0)
+}
+
 /// CPU mirror of the shader's `hsv_saturation`. Kept in lockstep with
 /// `glow.wgsl` so the bright-pass behaviour is testable without a GPU.
 fn hsv_saturation(rgb: [f32; 3]) -> f32 {
@@ -1083,5 +1135,43 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected hue at alpha {alpha}, got grey"));
             approx_loose(h, base_hue, 0.5);
         }
+    }
+
+    #[test]
+    fn scaled_scanline_period_is_identity_at_reference_scale() {
+        // dpi_scale == 1.0 is the 2× reference monitor the period was authored
+        // on, so it must pass through untouched for any sane period.
+        for period in [1.0_f32, 2.0, 3.5, 6.0, 100.0] {
+            approx(scaled_scanline_period(period, 1.0), period);
+        }
+    }
+
+    #[test]
+    fn scaled_scanline_period_scales_linearly_with_dpi() {
+        // The period tracks backing scale: half it at 1× (dpi_scale 0.5),
+        // one-and-a-half at 3× (dpi_scale 1.5). Picked periods large enough
+        // that the >= 1 clamp never engages.
+        approx(scaled_scanline_period(6.0, 0.5), 3.0);
+        approx(scaled_scanline_period(6.0, 1.5), 9.0);
+        approx(scaled_scanline_period(4.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn scaled_scanline_period_clamps_below_one_pixel() {
+        // A logical period of 1 at a 1× monitor (dpi_scale 0.5) would scale to
+        // 0.5px and alias to single-row noise — the floor keeps it at 1px.
+        approx(scaled_scanline_period(1.0, 0.5), 1.0);
+        // Even an absurdly small scale can't drive the period below a pixel.
+        approx(scaled_scanline_period(2.0, 0.1), 1.0);
+        // A sub-1 logical period is floored before scaling, so at the reference
+        // scale it still lands at exactly 1.
+        approx(scaled_scanline_period(0.25, 1.0), 1.0);
+    }
+
+    #[test]
+    fn scaled_scanline_period_floors_negative_scale_to_one() {
+        // A stray negative dpi_scale must not flip the period's sign — the
+        // `.max(0.0)` zeroes it, then the >= 1 floor takes over.
+        approx(scaled_scanline_period(6.0, -2.0), 1.0);
     }
 }
