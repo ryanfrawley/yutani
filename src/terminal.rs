@@ -481,6 +481,74 @@ pub enum PreviewRequest {
     Reload,
 }
 
+/// Kitty graphics-protocol state, bundled off [`Terminal`] so the seven
+/// related fields move as a unit. The protocol handlers that own this state
+/// live in the [`image_protocol`] submodule and reach it via `self.kitty`.
+#[derive(Default)]
+struct KittyImageState {
+    // Kitty graphics chunked transmissions in flight. Keyed by `i=`
+    // image id; chunks with `m=1` append, chunk with `m=0` (or omitted)
+    // completes the upload. Only the FIRST chunk's sizing / cursor
+    // params are kept — that's what the Kitty spec says wins.
+    chunks: std::collections::HashMap<u32, KittyChunks>,
+    // Chunked transmission without an image_id. The Kitty spec says
+    // chunked transmissions MUST use `i=`, but `kitty +kitten icat`
+    // doesn't in practice — when sending raw RGB/JPG it omits the id
+    // and expects the terminal to thread the chunks together as a
+    // singular anonymous in-flight image. Only one can be in flight at
+    // a time; a new `m=1` without an id while one's open silently
+    // overwrites (matching the implicit "only one anonymous stream"
+    // contract).
+    chunks_anon: Option<KittyChunks>,
+    // Tracks the `i=` of the most recently opened id-keyed chunked
+    // transmission. icat puts `i=` on the first chunk and omits it
+    // on every continuation — without this thread, continuation
+    // chunks fall through to the anonymous bucket and the id-keyed
+    // entry leaks. Set when an `m=1` chunk with `i=` arrives, cleared
+    // when that transmission's final chunk (`m=0` / no `m=`) finalizes
+    // or when a fresh id-keyed transmission preempts it.
+    current_chunked_id: Option<u32>,
+    // Tracks the `i=` of the most recently *completed* transmission
+    // (single-chunk or chunked) so `a=p` / `a=d` / `a=f` / `a=a`
+    // without an explicit `i=` can fall back per the Kitty spec
+    // ("if i is missing, the most recently created image is
+    // targeted"). icat's animation-frame stream emits `a=f` with no
+    // `i=` and no `m=` between control messages; without this
+    // fallback those frames silently drop. Updated whenever
+    // `finalize_kitty_image_bytes` runs with a `kitty_image_id`.
+    last_image_id: Option<u32>,
+    // Kitty client image-id → our store ImageId. Populated when a
+    // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
+    // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
+    // populated across a=t (transmit only) → a=p (place later)
+    // round-trips, which is the whole point of the protocol's
+    // image-id mechanism — clients re-display without re-uploading.
+    //
+    // `referenced_image_ids` includes the values from this map so
+    // mark-and-sweep doesn't drop a transmitted-but-not-yet-placed
+    // image between a=t and a=p.
+    image_ids: std::collections::HashMap<u32, ImageId>,
+    // Format the base image was transmitted with, keyed by the same
+    // client id used in `kitty_image_ids`. Animation frames (`a=f`)
+    // commonly omit `f=` and expect the base's format to apply (icat
+    // sends e.g. `f=24` on the base, then a=f frames with no `f=` at
+    // all — the spec says raw frame data inherits the base format).
+    // Populated whenever a Kitty transmission with a client id
+    // finalizes; cleared on `a=d` selectors that drop the image.
+    image_formats: std::collections::HashMap<u32, KittyFormat>,
+    // Image's total cell extent `(cols, rows)` from the original
+    // `a=T` / `a=t` transmission's `c=` / `r=` parameters. Used by
+    // the renderer's per-run draw path as the UV denominator: a
+    // placeholder cell at `(image_row, image_col)` shows the sub-rect
+    // `(image_col/cols, image_row/rows)` to `((image_col+1)/cols,
+    // (image_row+1)/rows)` of the source texture. Without this,
+    // partial overwrites of a placeholder grid would distort the
+    // image (the surviving cells would stretch the whole image into
+    // a shrinking bbox). Cleared on the same `a=d` selectors as
+    // `kitty_image_ids` / `kitty_image_formats`.
+    image_cell_extents: std::collections::HashMap<u32, (u32, u32)>,
+}
+
 pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
@@ -639,67 +707,8 @@ pub struct Terminal {
     // multiple OSC 1337 sequences and we want them all visible in one
     // drain.
     pending_image_uploads: Vec<PendingImageUpload>,
-    // Kitty graphics chunked transmissions in flight. Keyed by `i=`
-    // image id; chunks with `m=1` append, chunk with `m=0` (or omitted)
-    // completes the upload. Only the FIRST chunk's sizing / cursor
-    // params are kept — that's what the Kitty spec says wins.
-    kitty_chunks: std::collections::HashMap<u32, KittyChunks>,
-    // Chunked transmission without an image_id. The Kitty spec says
-    // chunked transmissions MUST use `i=`, but `kitty +kitten icat`
-    // doesn't in practice — when sending raw RGB/JPG it omits the id
-    // and expects the terminal to thread the chunks together as a
-    // singular anonymous in-flight image. Only one can be in flight at
-    // a time; a new `m=1` without an id while one's open silently
-    // overwrites (matching the implicit "only one anonymous stream"
-    // contract).
-    kitty_chunks_anon: Option<KittyChunks>,
-    // Tracks the `i=` of the most recently opened id-keyed chunked
-    // transmission. icat puts `i=` on the first chunk and omits it
-    // on every continuation — without this thread, continuation
-    // chunks fall through to the anonymous bucket and the id-keyed
-    // entry leaks. Set when an `m=1` chunk with `i=` arrives, cleared
-    // when that transmission's final chunk (`m=0` / no `m=`) finalizes
-    // or when a fresh id-keyed transmission preempts it.
-    current_chunked_id: Option<u32>,
-    // Tracks the `i=` of the most recently *completed* transmission
-    // (single-chunk or chunked) so `a=p` / `a=d` / `a=f` / `a=a`
-    // without an explicit `i=` can fall back per the Kitty spec
-    // ("if i is missing, the most recently created image is
-    // targeted"). icat's animation-frame stream emits `a=f` with no
-    // `i=` and no `m=` between control messages; without this
-    // fallback those frames silently drop. Updated whenever
-    // `finalize_kitty_image_bytes` runs with a `kitty_image_id`.
-    last_kitty_image_id: Option<u32>,
-    // Kitty client image-id → our store ImageId. Populated when a
-    // transmission carries `i=` so subsequent `a=p,i=N` (place by id)
-    // and `a=d,d=i,i=N` (delete by id) can find the image. Stays
-    // populated across a=t (transmit only) → a=p (place later)
-    // round-trips, which is the whole point of the protocol's
-    // image-id mechanism — clients re-display without re-uploading.
-    //
-    // `referenced_image_ids` includes the values from this map so
-    // mark-and-sweep doesn't drop a transmitted-but-not-yet-placed
-    // image between a=t and a=p.
-    kitty_image_ids: std::collections::HashMap<u32, ImageId>,
-    // Format the base image was transmitted with, keyed by the same
-    // client id used in `kitty_image_ids`. Animation frames (`a=f`)
-    // commonly omit `f=` and expect the base's format to apply (icat
-    // sends e.g. `f=24` on the base, then a=f frames with no `f=` at
-    // all — the spec says raw frame data inherits the base format).
-    // Populated whenever a Kitty transmission with a client id
-    // finalizes; cleared on `a=d` selectors that drop the image.
-    kitty_image_formats: std::collections::HashMap<u32, KittyFormat>,
-    // Image's total cell extent `(cols, rows)` from the original
-    // `a=T` / `a=t` transmission's `c=` / `r=` parameters. Used by
-    // the renderer's per-run draw path as the UV denominator: a
-    // placeholder cell at `(image_row, image_col)` shows the sub-rect
-    // `(image_col/cols, image_row/rows)` to `((image_col+1)/cols,
-    // (image_row+1)/rows)` of the source texture. Without this,
-    // partial overwrites of a placeholder grid would distort the
-    // image (the surviving cells would stretch the whole image into
-    // a shrinking bbox). Cleared on the same `a=d` selectors as
-    // `kitty_image_ids` / `kitty_image_formats`.
-    kitty_image_cell_extents: std::collections::HashMap<u32, (u32, u32)>,
+    /// Kitty graphics-protocol state (chunk assembly + id/format/extent maps).
+    kitty: KittyImageState,
     // Font metrics in framebuffer pixels. The OSC 1337 handler needs
     // these to translate pixel-spec sizing to cell extent. State pushes
     // them in via `set_cell_size_px` at construction and on every font-
@@ -937,13 +946,7 @@ impl Terminal {
             next_placement_id: 1,
             keep_placements_in_scrollback: true,
             pending_image_uploads: Vec::new(),
-            kitty_chunks: std::collections::HashMap::new(),
-            kitty_chunks_anon: None,
-            current_chunked_id: None,
-            last_kitty_image_id: None,
-            kitty_image_ids: std::collections::HashMap::new(),
-            kitty_image_formats: std::collections::HashMap::new(),
-            kitty_image_cell_extents: std::collections::HashMap::new(),
+            kitty: KittyImageState::default(),
             cell_w_px: 1,
             line_h_px: 1,
             placeholder_decode: None,
@@ -1081,13 +1084,13 @@ impl Terminal {
     /// store id overwrites (a client that re-transmits with the same
     /// `i=` expects the new image to replace the old).
     pub fn register_kitty_image_id(&mut self, client_id: u32, store_id: ImageId) {
-        self.kitty_image_ids.insert(client_id, store_id);
+        self.kitty.image_ids.insert(client_id, store_id);
     }
 
     /// Look up the store ImageId for a Kitty client `i=` id, if known.
     /// Used by the `a=p` placement path.
     pub fn kitty_image_id_lookup(&self, client_id: u32) -> Option<ImageId> {
-        self.kitty_image_ids.get(&client_id).copied()
+        self.kitty.image_ids.get(&client_id).copied()
     }
 
     /// Total cell extent `(cols, rows)` from the original `a=T` / `a=t`
@@ -1097,7 +1100,7 @@ impl Terminal {
     /// must then skip the runs — without the denominator there's no
     /// honest UV).
     pub fn kitty_image_cell_extent(&self, client_id: u32) -> Option<(u32, u32)> {
-        self.kitty_image_cell_extents.get(&client_id).copied()
+        self.kitty.image_cell_extents.get(&client_id).copied()
     }
 
     /// Scan visible rows — including scrollback pulled into view via
@@ -1293,7 +1296,7 @@ impl Terminal {
         // has no placement yet — the client will send `a=p,i=N` later
         // to display it. Without this branch, mark-and-sweep would drop
         // the image between the two ops.
-        for &iid in self.kitty_image_ids.values() {
+        for &iid in self.kitty.image_ids.values() {
             out.insert(iid);
         }
         out
