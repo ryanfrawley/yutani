@@ -70,6 +70,17 @@ impl WindowState {
             wgpu::TextureFormat::R8Unorm,
             Some("font texture"),
         );
+        // The new atlas carries a fresh (possibly re-dimensioned) color layer,
+        // so rebuild the emoji texture alongside the mono one.
+        self.emoji_texture = renderer::texture::Texture::from_memory(
+            &self.shared.gpu.device,
+            &self.shared.gpu.queue,
+            &self.atlas.color_buffer,
+            self.atlas.color_width as u32,
+            self.atlas.color_height as u32,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Some("emoji texture"),
+        );
         self.font_bind_group = self.shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &self.shared.font_bind_group_layout,
             entries: &[
@@ -80,6 +91,10 @@ impl WindowState {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.font_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&self.emoji_texture.view),
                 },
             ],
             label: Some("font bind group"),

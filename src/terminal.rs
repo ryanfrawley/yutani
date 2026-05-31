@@ -1045,6 +1045,37 @@ pub struct Terminal {
     placeholder_decode: Option<PlaceholderDecode>,
     /// OSC 8 hyperlink target interner. See [`HyperlinkStore`].
     hyperlinks: HyperlinkStore,
+    /// Grapheme-cluster string interner. See [`ClusterStore`].
+    clusters: ClusterStore,
+    /// Tracks the most recent printed grapheme so `print` can absorb cluster
+    /// extenders (ZWJ continuations, variation selectors, skin tones, combining
+    /// marks, regional-indicator pairs) into the cell they belong to instead of
+    /// spawning a new cell. `(row, col, last_codepoint, ri_pending)` where
+    /// `ri_pending` marks a lone regional indicator awaiting its flag partner.
+    last_grapheme: Option<GraphemeAnchor>,
+}
+
+#[derive(Copy, Clone, Debug)]
+struct GraphemeAnchor {
+    /// Grid cell holding the grapheme's lead codepoint.
+    row: usize,
+    col: usize,
+    /// Cursor position right after the grapheme was laid down. The next print
+    /// only merges into this grapheme if the cursor is still here — any cursor
+    /// move (CR/LF/CUP/wrap) leaves the anchor stale and a stray combining mark
+    /// then prints on its own, as before.
+    post_row: usize,
+    post_col: usize,
+    /// The most recent codepoint folded into this grapheme — drives ZWJ
+    /// continuation (a base right after a ZWJ extends the sequence).
+    last: char,
+    /// This grapheme is a single regional indicator awaiting a second to form a
+    /// flag. Cleared once paired or once any other grapheme is printed.
+    ri_pending: bool,
+    /// This grapheme already occupies two columns (a wide base, a paired flag,
+    /// or a VS16-promoted symbol). Stops a second widening trigger from adding
+    /// another spacer.
+    wide: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1127,6 +1158,38 @@ impl HyperlinkStore {
     }
 }
 
+/// Interner for grapheme-cluster strings — the multi-codepoint content of a
+/// cell that holds more than its first codepoint (emoji ZWJ sequences, flags,
+/// emoji + skin tone / variation selector, base + combining marks). Identical
+/// clusters dedupe to one id so a screen full of the same emoji costs one
+/// string. Cells reference an id via `Cell::cluster`; `ch` keeps the first
+/// codepoint for the fast path and for width.
+#[derive(Default)]
+pub struct ClusterStore {
+    /// id (1-based) -> cluster string.
+    strings: Vec<String>,
+    /// cluster string -> interned id, for dedup.
+    interned: std::collections::HashMap<String, std::num::NonZeroU32>,
+}
+
+impl ClusterStore {
+    /// Intern `s`, returning its (1-based) id; identical strings share one id.
+    fn intern(&mut self, s: &str) -> std::num::NonZeroU32 {
+        if let Some(&id) = self.interned.get(s) {
+            return id;
+        }
+        self.strings.push(s.to_string());
+        let id = std::num::NonZeroU32::new(self.strings.len() as u32).expect("len >= 1");
+        self.interned.insert(s.to_string(), id);
+        id
+    }
+
+    /// Resolve an id back to its cluster string.
+    pub fn get(&self, id: std::num::NonZeroU32) -> Option<&str> {
+        self.strings.get(id.get() as usize - 1).map(String::as_str)
+    }
+}
+
 impl Terminal {
     pub fn new(cols: usize, rows: usize, scrollback_limit: usize) -> Self {
         assert!(cols > 0 && rows > 0, "terminal must be non-empty");
@@ -1196,6 +1259,8 @@ impl Terminal {
             line_h_px: 1,
             placeholder_decode: None,
             hyperlinks: HyperlinkStore::default(),
+            clusters: ClusterStore::default(),
+            last_grapheme: None,
         }
     }
 
@@ -2253,6 +2318,26 @@ impl Terminal {
         }
         self.placeholder_decode = None;
 
+        // Grapheme-cluster absorption: a ZWJ continuation, variation selector,
+        // skin-tone modifier, combining mark, tag, or the second half of a
+        // regional-indicator flag pair extends the previous grapheme rather than
+        // landing in its own cell — so 👨‍👩‍👧, 👍🏽, ❤️, and 🇯🇵 stay one glyph.
+        // Gated on the cursor still sitting right after that grapheme: any
+        // CR/LF/CUP since leaves the anchor stale, and a stray combining mark
+        // then prints on its own (the pre-existing behavior).
+        if let Some(a) = self.last_grapheme {
+            if self.cursor.row == a.post_row && self.cursor.col == a.post_col {
+                let ri_pair = crate::width::is_regional_indicator(ch) && a.ri_pending;
+                if ri_pair || crate::width::extends_grapheme(a.last, ch) {
+                    // A flag pair, or a VS16 forcing emoji presentation onto a
+                    // narrow base, promotes a one-cell grapheme to two cells.
+                    let widen = (ri_pair || ch == '\u{FE0F}') && !a.wide;
+                    self.merge_grapheme(a, ch, widen);
+                    return;
+                }
+            }
+        }
+
         // With DECLRMM enabled, autowrap pivots on the right margin instead
         // of the screen edge, and wraps back to the left margin. We detect
         // the "inside LRM" case so that cursor positions sitting *outside*
@@ -2272,6 +2357,25 @@ impl Terminal {
             self.cursor.wrap_pending = false;
             self.line_feed_no_cr();
         }
+
+        // Wide characters (CJK, fullwidth forms, emoji) occupy two columns:
+        // the lead cell holds the glyph, the next is a `WIDE_SPACER`
+        // placeholder. Keeping the grid two columns wide for these matches the
+        // shell's own line-editor accounting, so the cursor models stay in
+        // lockstep (a mismatch is what smeared pasted emoji into a stray
+        // cursor-block). The Kitty placeholder codepoint is treated as narrow
+        // regardless so its diacritic-encoded geometry is unaffected.
+        let cells = if ch == '\u{10EEEE}' { 1 } else { crate::width::char_cells(ch) };
+
+        // A wide glyph with only one column left before the wrap point can't
+        // fit; xterm drops to the next line (leaving that final column blank)
+        // before laying it down. Narrow chars still fill that last column.
+        if cells == 2 && self.autowrap && self.cursor.col >= wrap_at {
+            self.cursor.col = wrap_to;
+            self.cursor.wrap_pending = false;
+            self.line_feed_no_cr();
+        }
+
         let mut cell = Cell::new(ch, self.cursor.style);
         // Carry the active OSC 8 hyperlink (if any) onto the cell. Kept off
         // `Style` so an SGR reset mid-link doesn't sever it.
@@ -2286,7 +2390,13 @@ impl Terminal {
         let row = self.cursor.row;
         let col = self.cursor.col;
         if row < self.rows && col < self.cols {
-            self.active_grid_mut().set(row, col, cell);
+            self.put_cell(row, col, cell);
+            // Lay down the trailing spacer for a wide glyph (when there's room;
+            // the wrap above guarantees it inside the margins).
+            if cells == 2 && col + 1 < self.cols {
+                let spacer = Cell::wide_spacer(self.cursor.style);
+                self.put_cell(row, col + 1, spacer);
+            }
             if ch == '\u{10EEEE}' && cell.placeholder_image_id.is_some() {
                 self.placeholder_decode = Some(PlaceholderDecode {
                     cell_row: row,
@@ -2295,14 +2405,107 @@ impl Terminal {
                 });
             }
         }
-        if self.cursor.col >= wrap_at {
-            if self.autowrap {
-                self.cursor.wrap_pending = true;
+        // Advance one column per cell the character consumed, honoring the wrap
+        // point. The final column sets `wrap_pending` instead of stepping past
+        // the margin; intermediate columns of a wide char step normally.
+        for _ in 0..cells {
+            if self.cursor.col >= wrap_at {
+                if self.autowrap {
+                    self.cursor.wrap_pending = true;
+                }
+                // when autowrap is off, cursor sticks at the wrap column
+                break;
+            } else {
+                self.cursor.col += 1;
             }
-            // when autowrap is off, cursor sticks at the wrap column
-        } else {
-            self.cursor.col += 1;
         }
+        // Record this grapheme so a following combining mark / ZWJ / skin tone /
+        // flag partner can merge into it. `ri_pending` arms flag pairing when the
+        // base is a lone regional indicator. The Kitty placeholder codepoint is
+        // excluded: it isn't real text, and its trailing diacritics carry image
+        // geometry (consumed by `placeholder_decode`), not cluster content.
+        if row < self.rows && col < self.cols && ch != '\u{10EEEE}' {
+            self.last_grapheme = Some(GraphemeAnchor {
+                row,
+                col,
+                post_row: self.cursor.row,
+                post_col: self.cursor.col,
+                last: ch,
+                ri_pending: crate::width::is_regional_indicator(ch),
+                wide: cells == 2,
+            });
+        } else {
+            self.last_grapheme = None;
+        }
+    }
+
+    /// Fold codepoint `ch` into the grapheme anchored at `a` — appending it to
+    /// the cell's interned cluster string (creating one from the lead char if
+    /// this is the first extender). `widen` promotes a one-cell grapheme to two
+    /// (a flag's second regional indicator, or a VS16 forcing emoji presentation
+    /// onto a narrow base): a spacer is dropped and the cursor steps past it.
+    /// Zero-width extenders leave the cursor put.
+    fn merge_grapheme(&mut self, a: GraphemeAnchor, ch: char, widen: bool) {
+        if a.row < self.rows && a.col < self.cols {
+            let cell = self.active_grid().get(a.row, a.col);
+            let mut s = match cell.cluster {
+                Some(id) => self
+                    .clusters
+                    .get(id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| cell.ch.to_string()),
+                None => cell.ch.to_string(),
+            };
+            s.push(ch);
+            let id = self.clusters.intern(&s);
+            let mut merged = cell;
+            merged.cluster = Some(id);
+            self.active_grid_mut().set(a.row, a.col, merged);
+        }
+        let mut post_col = a.post_col;
+        if widen && self.cursor.col < self.cols {
+            let spacer = Cell::wide_spacer(self.cursor.style);
+            self.put_cell(self.cursor.row, self.cursor.col, spacer);
+            if self.cursor.col + 1 < self.cols {
+                self.cursor.col += 1;
+            }
+            post_col = self.cursor.col;
+        }
+        self.last_grapheme = Some(GraphemeAnchor {
+            last: ch,
+            ri_pending: false,
+            wide: a.wide || widen,
+            post_col,
+            ..a
+        });
+    }
+
+    /// Write `cell` at `(row, col)`, clearing any wide-pair partner the write
+    /// would orphan. Overwriting the lead half of a wide character blanks its
+    /// now-dangling spacer; overwriting a spacer blanks its now-dangling lead.
+    /// Without this, partially-overwritten wide glyphs would leave a spacer
+    /// that swallows a column or a lead glyph that bleeds into its neighbor.
+    fn put_cell(&mut self, row: usize, col: usize, cell: Cell) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let blank = Cell::new(' ', self.cursor.style);
+        let grid = self.active_grid();
+        // Overwriting a spacer: its lead is the cell to the left.
+        let clear_left = col > 0 && grid.get(row, col).is_wide_spacer();
+        // Overwriting a lead whose spacer follows: a spacer at `col + 1`
+        // always belongs to a lead at `col`, so replacing this cell orphans
+        // it. (When the new cell is itself a wide lead, the caller re-lays a
+        // fresh spacer at `col + 1` right after this write.)
+        let clear_right = col + 1 < self.cols && grid.get(row, col + 1).is_wide_spacer();
+        let g = self.active_grid_mut();
+        if clear_left {
+            g.set(row, col - 1, blank);
+        }
+        if clear_right {
+            g.set(row, col + 1, blank);
+        }
+        g.set(row, col, cell);
     }
 
     /// Apply one decoded Kitty placeholder diacritic to the cell that
@@ -2887,6 +3090,13 @@ impl Terminal {
     /// URI. Used by the front end to turn a hovered cell into a clickable URL.
     pub fn hyperlink_uri(&self, id: std::num::NonZeroU32) -> Option<&str> {
         self.hyperlinks.get(id)
+    }
+
+    /// Resolve a grapheme-cluster id (from [`Cell::cluster`]) to its full
+    /// multi-codepoint string. Used by the renderer to rasterize the shaped
+    /// cluster and by text extraction to copy it whole.
+    pub fn cluster_str(&self, id: std::num::NonZeroU32) -> Option<&str> {
+        self.clusters.get(id)
     }
 
     /// `OSC 8 ; params ; URI ST` — open or close an explicit hyperlink (the
@@ -5947,6 +6157,147 @@ mod tests {
         t.feed("abcd");
         assert_eq!(t.row(0)[2].ch, 'd');
         assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中x");
+        assert_eq!(t.row(0)[0].ch, '中');
+        assert!(t.row(0)[1].is_wide_spacer(), "second cell is a wide spacer");
+        assert_eq!(t.row(0)[2].ch, 'x');
+        // Cursor advanced by two for the wide char, one for 'x'.
+        assert_eq!(t.cursor().col, 3);
+    }
+
+    #[test]
+    fn emoji_checkmark_occupies_two_cells() {
+        // The reported bug: ✅ U+2705 must reserve two columns so the shell's
+        // cursor model stays in lockstep with the grid.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\u{2705}");
+        assert_eq!(t.row(0)[0].ch, '\u{2705}');
+        assert!(t.row(0)[1].is_wide_spacer());
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn wide_char_wraps_when_one_column_left() {
+        // 3 cols; after "aa" only the last column is free, which can't hold a
+        // two-cell glyph — it wraps to the next row, leaving the last col blank.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("aa中");
+        assert_eq!(t.row(0)[0].ch, 'a');
+        assert_eq!(t.row(0)[1].ch, 'a');
+        assert_eq!(t.row(0)[2].ch, ' ', "last column left blank — wide char didn't fit");
+        assert_eq!(t.row(1)[0].ch, '中');
+        assert!(t.row(1)[1].is_wide_spacer());
+    }
+
+    #[test]
+    fn overwriting_wide_lead_clears_orphaned_spacer() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中");
+        t.feed("\r"); // cursor back to col 0
+        t.feed("X"); // overwrite the lead half
+        assert_eq!(t.row(0)[0].ch, 'X');
+        assert_eq!(t.row(0)[1].ch, ' ', "orphaned spacer cleared to blank");
+    }
+
+    #[test]
+    fn overwriting_wide_spacer_clears_orphaned_lead() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中");
+        t.feed("\r\x1b[1C"); // col 0, then cursor forward one → onto the spacer
+        t.feed("Y"); // overwrite the spacer half
+        assert_eq!(t.row(0)[0].ch, ' ', "orphaned lead cleared to blank");
+        assert_eq!(t.row(0)[1].ch, 'Y');
+    }
+
+    // Resolve cell (r,c)'s grapheme: its cluster string if it has one, else the
+    // single char. Mirrors what the renderer / copy do.
+    fn grapheme_at(t: &Terminal, r: usize, c: usize) -> String {
+        let cell = t.row(r)[c];
+        match cell.cluster {
+            Some(id) => t.cluster_str(id).unwrap().to_string(),
+            None => cell.ch.to_string(),
+        }
+    }
+
+    #[test]
+    fn zwj_sequence_is_one_grapheme_two_cells() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("👨\u{200D}👩\u{200D}👧"); // family ZWJ sequence
+        assert_eq!(grapheme_at(&t, 0, 0), "👨\u{200D}👩\u{200D}👧");
+        assert!(t.row(0)[1].is_wide_spacer(), "base emoji keeps its 2-cell width");
+        assert_eq!(t.row(0)[2].ch, ' ', "nothing spilled into col 2");
+        assert_eq!(t.cursor().col, 2, "ZWJ members don't advance the cursor");
+    }
+
+    #[test]
+    fn skin_tone_modifier_merges_into_base() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("👍\u{1F3FD}"); // thumbs up + medium skin tone
+        assert_eq!(grapheme_at(&t, 0, 0), "👍\u{1F3FD}");
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn vs16_promotes_narrow_base_to_two_cell_emoji() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\u{2764}\u{FE0F}"); // ❤ + VS16 forces emoji presentation
+        assert_eq!(grapheme_at(&t, 0, 0), "\u{2764}\u{FE0F}");
+        // VS16 promotes the narrow ❤ to a two-cell color emoji.
+        assert!(t.row(0)[1].is_wide_spacer());
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn vs16_on_wide_base_does_not_double_widen() {
+        // A base that's already two cells (an astral emoji) plus VS16 stays two
+        // cells — the widening must not run twice.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\u{1F600}\u{FE0F}"); // 😀 + VS16
+        assert_eq!(grapheme_at(&t, 0, 0), "\u{1F600}\u{FE0F}");
+        assert!(t.row(0)[1].is_wide_spacer());
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn regional_indicator_pair_forms_one_two_cell_flag() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("🇯🇵"); // regional indicators J + P → Japan flag
+        assert_eq!(grapheme_at(&t, 0, 0), "🇯🇵");
+        assert!(t.row(0)[1].is_wide_spacer(), "flag pair widens to two cells");
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn third_regional_indicator_starts_a_new_flag() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("🇦🇧🇨"); // AB pairs into a flag; C begins a fresh (lone) one
+        assert_eq!(grapheme_at(&t, 0, 0), "🇦🇧");
+        assert!(t.row(0)[1].is_wide_spacer());
+        assert_eq!(t.row(0)[2].ch, '🇨', "third RI is its own grapheme");
+        assert!(t.row(0)[2].cluster.is_none());
+    }
+
+    #[test]
+    fn combining_mark_merges_into_latin_base() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("e\u{0301}"); // e + combining acute → é
+        assert_eq!(grapheme_at(&t, 0, 0), "e\u{0301}");
+        assert_eq!(t.row(0)[0].ch, 'e', "lead codepoint stays the base");
+        assert_eq!(t.cursor().col, 1);
+    }
+
+    #[test]
+    fn cursor_move_breaks_grapheme_absorption() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("a");
+        t.feed("\r"); // carriage return — cursor no longer after 'a'
+        t.feed("\u{0301}"); // combining acute should NOT merge into 'a'
+        assert!(t.row(0)[0].cluster.is_none(), "no merge after a cursor move");
     }
 
     #[test]
@@ -11465,15 +11816,14 @@ mod tests {
         let mut t = Terminal::new(80, 24, 100);
         t.feed(&placeholder_sgr_fg(0x222222));
         t.feed("\u{10EEEE}");
-        t.feed("a"); // breaks the absorption window
-        t.feed("\u{0305}"); // should now land in its own cell
-        // Placeholder at col 0, 'a' at col 1, diacritic at col 2.
+        t.feed("a"); // breaks the placeholder absorption window
+        t.feed("\u{0305}"); // attaches to 'a' (grapheme cluster), not the placeholder
         let cell0 = t.extended_cell(0, 0).unwrap();
         let cell1 = t.extended_cell(0, 1).unwrap();
-        let cell2 = t.extended_cell(0, 2).unwrap();
         assert_eq!(cell0.placeholder_image_id, Some(0x222222));
+        // The diacritic clusters onto the real glyph 'a', not the placeholder.
         assert_eq!(cell1.ch, 'a');
-        assert_eq!(cell2.ch, '\u{0305}');
+        assert_eq!(t.cluster_str(cell1.cluster.unwrap()).unwrap(), "a\u{0305}");
     }
 
     #[test]
@@ -11569,13 +11919,15 @@ mod tests {
         t.feed("\u{10EEEE}\u{0305}\u{030D}");
         let cell0 = t.extended_cell(0, 0).unwrap();
         let cell1 = t.extended_cell(0, 1).unwrap();
-        let cell2 = t.extended_cell(0, 2).unwrap();
         assert_eq!(cell0.placeholder_image_id, None);
         assert_eq!(cell0.placeholder_image_row, 0);
         assert_eq!(cell0.placeholder_image_col, 0);
-        assert_eq!(cell1.ch, '\u{0305}', "diacritic 1 falls through");
-        assert_eq!(cell2.ch, '\u{030D}', "diacritic 2 falls through");
-        assert_eq!(t.cursor().col, 3);
+        // With no placeholder to absorb them, the diacritics fall through to
+        // normal print: the first becomes a (degenerate) base in its own cell
+        // and the second clusters onto it — they don't attach to U+10EEEE.
+        assert_eq!(cell1.ch, '\u{0305}', "first diacritic starts a cell");
+        assert_eq!(t.cluster_str(cell1.cluster.unwrap()).unwrap(), "\u{0305}\u{030D}");
+        assert_eq!(t.cursor().col, 2);
     }
 
     #[test]
