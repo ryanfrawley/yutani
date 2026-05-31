@@ -22,8 +22,10 @@ mod bundled_schemes;
 mod palette;
 mod shaper;
 mod shell_integration;
+mod emoji;
 mod style;
 mod terminal;
+mod width;
 
 mod pty;
 mod config;
@@ -178,6 +180,7 @@ fn emit_text_run(
                     local_pos: [-hx, -hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx, gy + gh, 0.0],
@@ -186,6 +189,7 @@ fn emit_text_run(
                     local_pos: [-hx, hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx + gw, gy, 0.0],
@@ -194,6 +198,7 @@ fn emit_text_run(
                     local_pos: [hx, -hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 vertices.push(renderer::vertex::Vertex {
                     position: [gx + gw, gy + gh, 0.0],
@@ -202,6 +207,7 @@ fn emit_text_run(
                     local_pos: [hx, hy],
                     half_size,
                     radii: [0.0; 4],
+                    kind: 0.0,
                 });
                 indices.extend_from_slice(&[
                     start,
@@ -380,6 +386,17 @@ impl AppShared {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // RGBA color-glyph (emoji) atlas.
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
                         count: None,
                     },
                 ],
@@ -762,6 +779,9 @@ struct WindowState {
     /// ligature glyphs can be uploaded incrementally via queue.write_texture
     /// without recreating the texture or bind group.
     font_texture: renderer::texture::Texture,
+    /// RGBA color-glyph (emoji) atlas texture, bound at slot 2 of the font bind
+    /// group. Uploaded incrementally like `font_texture` when emoji are packed.
+    emoji_texture: renderer::texture::Texture,
     /// Current font size in points; mutated by Cmd-+ / Cmd--.
     pt_size: f32,
     dpi: u32,
@@ -1403,6 +1423,19 @@ impl WindowState {
             Some("font texture"),
         );
 
+        // RGBA color-glyph (emoji) atlas. sRGB so the BGRA samples decode to
+        // linear before the premultiplied-alpha blend, matching how the
+        // monochrome text path feeds linear color into the sRGB scene target.
+        let emoji_texture = renderer::texture::Texture::from_memory(
+            &shared.gpu.device,
+            &shared.gpu.queue,
+            &atlas.color_buffer,
+            atlas.color_width as u32,
+            atlas.color_height as u32,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Some("emoji texture"),
+        );
+
         let font_bind_group = shared.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &shared.font_bind_group_layout,
             entries: &[
@@ -1413,6 +1446,10 @@ impl WindowState {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&font_texture.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&emoji_texture.view),
                 },
             ],
             label: Some("font bind group"),
@@ -1657,6 +1694,7 @@ impl WindowState {
             scanline_overlay_mask,
             font_bind_group,
             font_texture,
+            emoji_texture,
             pt_size,
             dpi,
             config,

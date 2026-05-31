@@ -127,6 +127,10 @@ impl WindowState {
         let default_bg_solid = pal.background;
         let atlas_w = self.atlas.width as f32;
         let atlas_h = self.atlas.height as f32;
+        // Color (emoji) layer dimensions — a separate texture, so color-glyph
+        // UVs are normalized against these rather than the mono atlas size.
+        let color_atlas_w = self.atlas.color_width as f32;
+        let color_atlas_h = self.atlas.color_height as f32;
         let bg_u = 1.0 / atlas_w;
         let bg_v = 1.0 / atlas_h;
         let scroll_y = self.active_tab().scroll_y as f32;
@@ -160,6 +164,7 @@ impl WindowState {
                     local_pos: [-hx, -hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x, y + h, 0.0],
@@ -168,6 +173,7 @@ impl WindowState {
                     local_pos: [-hx, hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x + w, y, 0.0],
@@ -176,6 +182,7 @@ impl WindowState {
                     local_pos: [hx, -hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
                 verts.push(renderer::vertex::Vertex {
                     position: [x + w, y + h, 0.0],
@@ -184,7 +191,39 @@ impl WindowState {
                     local_pos: [hx, hy],
                     half_size,
                     radii,
+                    kind: 0.0,
                 });
+                idxs.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
+            };
+
+        // Color-glyph quad (emoji). Same geometry as `push_quad` but tags the
+        // vertices `kind = 1.0` so the shader samples the RGBA color atlas and
+        // uses the texel directly. Vertex `color` is unused by that path, so it
+        // carries an opaque white placeholder; `radii`/`local_pos` are zero
+        // (no SDF). UVs index the color atlas.
+        let push_color_quad =
+            |verts: &mut Vec<renderer::vertex::Vertex>,
+             idxs: &mut Vec<u32>,
+             x: f32,
+             y: f32,
+             w: f32,
+             h: f32,
+             uv0: [f32; 2],
+             uv1: [f32; 2]| {
+                let start = verts.len() as u32;
+                let mk = |px: f32, py: f32, u: f32, v: f32| renderer::vertex::Vertex {
+                    position: [px, py, 0.0],
+                    tex_coords: [u, v],
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    local_pos: [0.0, 0.0],
+                    half_size: [w * 0.5, h * 0.5],
+                    radii: [0.0; 4],
+                    kind: 1.0,
+                };
+                verts.push(mk(x, y, uv0[0], uv0[1]));
+                verts.push(mk(x, y + h, uv0[0], uv1[1]));
+                verts.push(mk(x + w, y, uv1[0], uv0[1]));
+                verts.push(mk(x + w, y + h, uv1[0], uv1[1]));
                 idxs.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
             };
 
@@ -270,8 +309,10 @@ impl WindowState {
                 // Pre-pack any char outside build_atlas's fixed ranges
                 // (Nerd Font icons in SPUA, CJK, arbitrary symbols) so
                 // the render-time lookup below hits the variant chain
-                // — including fallback fonts — instead of notdef.
-                if let Some(cell) = cell {
+                // — including fallback fonts — instead of notdef. Wide-char
+                // spacer cells carry no glyph of their own (the lead spans
+                // into them), so skip them.
+                if let Some(cell) = cell.filter(|cell| !cell.is_wide_spacer()) {
                     let variant = font::FaceVariant::from_flags(
                         cell.style.bold,
                         cell.style.italic,
@@ -383,6 +424,29 @@ impl WindowState {
                 },
             );
             self.atlas.dirty = false;
+        }
+        // Same incremental re-upload for the color (emoji) layer.
+        if self.atlas.color_dirty {
+            self.shared.gpu.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.emoji_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &self.atlas.color_buffer,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.atlas.color_width as u32 * 4),
+                    rows_per_image: Some(self.atlas.color_height as u32),
+                },
+                wgpu::Extent3d {
+                    width: self.atlas.color_width as u32,
+                    height: self.atlas.color_height as u32,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.atlas.color_dirty = false;
         }
         let _perf_t_shape1 = std::time::Instant::now();
 
@@ -514,6 +578,31 @@ impl WindowState {
                     (atlas.lookup_glyph_id(glyph_id, variant), true)
                 }
             };
+            // Color (emoji) glyph: sample the RGBA color atlas and place the
+            // pre-scaled bitmap centered in the two-cell box the wide character
+            // occupies. No bearings / coverage gamma / cell-fill stretching —
+            // the texel is used directly via `push_color_quad` (kind = 1.0).
+            if g.is_color {
+                if g.width == 0 || g.height == 0 {
+                    return;
+                }
+                let box_w = 2.0 * cell_w; // wide characters span two cells
+                let gw = g.width as f32;
+                let gh0 = g.height as f32;
+                let gx = x + (box_w - gw) * 0.5;
+                let gy = bg_y + (line_height - gh0) * 0.5;
+                let u0 = g.x as f32 / color_atlas_w;
+                let v0 = g.y as f32 / color_atlas_h;
+                let u1 = (g.x + g.width) as f32 / color_atlas_w;
+                let v1 = (g.y + g.height) as f32 / color_atlas_h;
+                // Clip at the region's bottom edge like the mono path, so a
+                // scrolling emoji slides under the status line, not over it.
+                let Some((gh, v1)) = clip_row_quad(r, gy, gh0, v0, v1) else {
+                    return;
+                };
+                push_color_quad(verts, idxs, gx, gy, gw, gh, [u0, v0], [u1, v1]);
+                return;
+            }
             let span_w = cell_w;
             if g.width > 0 && g.height > 0 {
                 // Cell-filling glyphs (Powerline caps, box-drawing,
@@ -851,7 +940,12 @@ impl WindowState {
                     None => GlyphSource::Char(cell.ch),
                 };
                 emit_bg_for_cell(&mut row_bg, &mut tmp_idx, r, c, bg);
-                emit_fg_for_cell(&mut row_fg, &mut tmp_idx, fg_source, variant, r, c, fg);
+                // Wide-char spacer: paint its background (uniform with the lead
+                // via the shared style) but emit no glyph — the lead character
+                // already spans into this column.
+                if !cell.is_wide_spacer() {
+                    emit_fg_for_cell(&mut row_fg, &mut tmp_idx, fg_source, variant, r, c, fg);
+                }
             }
             bg_verts.extend_from_slice(&row_bg);
             fg_verts.extend_from_slice(&row_fg);
@@ -2009,6 +2103,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii0,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y1, 0.0],
@@ -2017,6 +2112,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii1,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y0, 0.0],
@@ -2025,6 +2121,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii0,
+                kind: 0.0,
             });
             vertices.push(renderer::vertex::Vertex {
                 position: [win_w, y1, 0.0],
@@ -2033,6 +2130,7 @@ impl WindowState {
                 local_pos: stub,
                 half_size: stub,
                 radii: radii1,
+                kind: 0.0,
             });
             indices.extend_from_slice(&[start, start + 1, start + 2, start + 1, start + 2, start + 3]);
         };

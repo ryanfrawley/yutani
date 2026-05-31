@@ -147,6 +147,15 @@ pub struct Cell {
     pub hyperlink: Option<std::num::NonZeroU32>,
 }
 
+/// Sentinel `ch` for the second cell of a wide (two-column) character. The
+/// lead cell holds the real glyph; this trailing cell is a placeholder so the
+/// grid's column accounting matches the application's. The renderer skips
+/// drawing it (the lead glyph spans both columns) and text extraction skips it
+/// (so a copied 中 is one char, not a char plus a phantom). `'\0'` never reaches
+/// a cell through normal printing — control chars are filtered upstream — and
+/// the blank cell is a space, so the sentinel is unambiguous.
+pub const WIDE_SPACER: char = '\0';
+
 impl Cell {
     pub fn new(ch: char, style: Style) -> Self {
         Self {
@@ -157,6 +166,18 @@ impl Cell {
             placeholder_image_col: 0,
             hyperlink: None,
         }
+    }
+
+    /// The trailing placeholder cell of a wide character. Carries the lead
+    /// cell's `style` so the two-column background stays uniform.
+    pub fn wide_spacer(style: Style) -> Self {
+        Self::new(WIDE_SPACER, style)
+    }
+
+    /// Whether this cell is the trailing placeholder of a wide character.
+    #[inline]
+    pub fn is_wide_spacer(&self) -> bool {
+        self.ch == WIDE_SPACER
     }
 }
 

@@ -325,7 +325,11 @@ impl WindowState {
             let to_inclusive = if line == end.0 { end.1 } else { cells.len().saturating_sub(1) };
             let to = (to_inclusive + 1).min(cells.len());
             let from = from.min(to);
-            let row_text: String = cells[from..to].iter().map(|c| c.ch).collect();
+            // Skip wide-char spacer cells — the lead cell already carries the
+            // real character, so a copied 中 / 🚀 is one codepoint, not the
+            // character plus a phantom placeholder.
+            let row_text: String =
+                cells[from..to].iter().filter(|c| !c.is_wide_spacer()).map(|c| c.ch).collect();
             // Trim trailing spaces — selecting a full line shouldn't paste
             // padding into the clipboard.
             let trimmed = row_text.trim_end_matches(' ');

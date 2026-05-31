@@ -102,11 +102,20 @@ pub fn find_face_index(data: &[u8], variant: FaceVariant) -> isize {
     0
 }
 
+// A fallback face plus whether it's a color (bitmap-strike) font like Apple
+// Color Emoji. Color faces are sized and rasterized differently — `set_char_size`
+// fails on them, so they're tuned via `set_pixel_sizes` to the nearest strike
+// and loaded with `FT_LOAD_COLOR` into the atlas's separate RGBA layer.
+pub struct FallbackFace {
+    pub face: ft::Face,
+    pub color: bool,
+}
+
 // One installed style. Regular's `face` is required; the others are optional —
 // when the styled face isn't installed, atlas lookups fall back to Regular.
 pub struct Variant {
     pub face: Option<ft::Face>,
-    pub fallbacks: Vec<ft::Face>,
+    pub fallbacks: Vec<FallbackFace>,
 }
 
 impl Variant {
@@ -114,12 +123,19 @@ impl Variant {
         Self { face: None, fallbacks: Vec::new() }
     }
 
-    fn faces(&self) -> impl Iterator<Item = &ft::Face> {
-        self.face.iter().chain(self.fallbacks.iter())
-    }
-
-    fn face_for(&self, ch: char) -> Option<&ft::Face> {
-        self.faces().find(|f| f.get_char_index(ch as usize).is_ok())
+    /// First face in the chain (primary, then fallbacks in order) that carries
+    /// `ch`, with a flag marking whether it's a color face. The primary cut is
+    /// always monochrome outlines, so it reports `false`.
+    fn face_for(&self, ch: char) -> Option<(&ft::Face, bool)> {
+        if let Some(f) = &self.face {
+            if f.get_char_index(ch as usize).is_ok() {
+                return Some((f, false));
+            }
+        }
+        self.fallbacks
+            .iter()
+            .find(|fb| fb.face.get_char_index(ch as usize).is_ok())
+            .map(|fb| (&fb.face, fb.color))
     }
 }
 
@@ -186,6 +202,23 @@ pub struct Atlas {
     pub width: usize,
     pub height: usize,
     pub buffer: Vec<u8>,
+    // Separate RGBA layer for color glyphs (emoji). Kept apart from the
+    // monochrome `buffer` so the (potentially large, CJK-driven) coverage atlas
+    // never pays 4 bytes/texel, and so its own packing cursor packs the handful
+    // of color glyphs a session actually uses. UVs for `is_color` entries index
+    // `color_width`/`color_height`, uploaded to a second GPU texture. `BGRA`
+    // byte order, premultiplied alpha — exactly what FreeType hands back for
+    // `FT_PIXEL_MODE_BGRA`, and what the swapchain expects.
+    pub color_buffer: Vec<u8>,
+    pub color_width: usize,
+    pub color_height: usize,
+    color_pack_x: usize,
+    color_pack_y: usize,
+    color_pack_row_height: usize,
+    // Set when a color glyph was packed since the last upload, so the renderer
+    // re-uploads the color texture. Tracked apart from `dirty` (the mono layer)
+    // to keep the two uploads independent.
+    pub color_dirty: bool,
     // One glyph map per variant. Bold/italic/bold-italic maps are sparse — a
     // miss falls back to the Regular variant (and finally to `notdef`).
     pub variants: [HashMap<char, AtlasEntry>; 4],
@@ -354,20 +387,61 @@ impl Atlas {
             return;
         }
 
-        let face = match font.variants[vi].face_for(ch) {
+        let (face, is_color) = match font.variants[vi].face_for(ch) {
             Some(f) => f,
             None => {
                 // No face in this variant's chain has the glyph. For a
                 // styled variant, ensure Regular is also tried so its
                 // fallback chain (which can differ — Apple Symbols ships
-                // no bold cut, for example) gets a chance. For Regular,
-                // leave the slot empty; `Atlas::lookup` returns `notdef`.
+                // no bold cut, for example) gets a chance.
                 if vi != 0 {
                     self.ensure_char(font, FaceVariant::Regular, ch);
+                } else if crate::width::is_emoji(ch) {
+                    // An emoji no installed monochrome/COLR face carries — the
+                    // common macOS case, where the color font (Apple Color
+                    // Emoji, PNG sbix) isn't in the FreeType chain. Rasterize it
+                    // with the platform color rasterizer (Core Text).
+                    self.pack_emoji_platform(ch, vi, cell_w, cell_h);
                 }
+                // Otherwise leave the slot empty; `Atlas::lookup` returns notdef.
                 return;
             }
         };
+        // Color (emoji) glyph: load the BGRA bitmap and pack it into the RGBA
+        // color layer, scaled into the two-cell box a wide character occupies.
+        if is_color {
+            let color_flags = load_flags | ft::face::LoadFlag::COLOR;
+            if face.load_char(ch as usize, color_flags).is_err() {
+                // FreeType can't render this color glyph — e.g. a PNG-encoded
+                // sbix/CBDT strike when the build lacks libpng. Fall back to a
+                // platform rasterizer (Core Text on macOS) before giving up.
+                self.pack_emoji_platform(ch, vi, cell_w, cell_h);
+                return;
+            }
+            let bitmap = face.glyph().bitmap();
+            let src_w = bitmap.width() as usize;
+            let src_h = bitmap.rows() as usize;
+            let pitch = bitmap.pitch().unsigned_abs() as usize;
+            let box_w = 2 * cell_w; // wide characters span two cells
+            if let Some(entry) = pack_color_glyph(
+                bitmap.buffer(),
+                src_w,
+                src_h,
+                pitch,
+                box_w,
+                cell_h,
+                &mut self.color_buffer,
+                self.color_width,
+                self.color_height,
+                &mut self.color_pack_x,
+                &mut self.color_pack_y,
+                &mut self.color_pack_row_height,
+            ) {
+                self.variants[vi].insert(ch, entry);
+                self.color_dirty = true;
+            }
+            return;
+        }
         if face.load_char(ch as usize, load_flags).is_err() {
             if vi != 0 {
                 self.ensure_char(font, FaceVariant::Regular, ch);
@@ -392,6 +466,37 @@ impl Atlas {
         self.variants[vi].insert(ch, entry);
         self.dirty = true;
     }
+
+    /// Rasterize `ch` via the platform color rasterizer (Core Text on macOS)
+    /// and pack it into the color layer. Used for emoji that FreeType can't
+    /// render — chiefly Apple Color Emoji, whose strikes are PNG-encoded sbix
+    /// the bundled FreeType has no libpng to decode. A no-op (leaving the slot
+    /// at notdef) on platforms without a rasterizer or when rasterization fails.
+    fn pack_emoji_platform(&mut self, ch: char, vi: usize, cell_w: usize, cell_h: usize) {
+        // Render near the cell height so the downscale into the two-cell box is
+        // minimal; emoji are square so this also fills the width well.
+        let Some((bgra, src_w, src_h)) = crate::emoji::rasterize(ch, cell_h as u32) else {
+            return;
+        };
+        let box_w = 2 * cell_w;
+        if let Some(entry) = pack_color_glyph(
+            &bgra,
+            src_w,
+            src_h,
+            src_w * 4,
+            box_w,
+            cell_h,
+            &mut self.color_buffer,
+            self.color_width,
+            self.color_height,
+            &mut self.color_pack_x,
+            &mut self.color_pack_y,
+            &mut self.color_pack_row_height,
+        ) {
+            self.variants[vi].insert(ch, entry);
+            self.color_dirty = true;
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -402,6 +507,11 @@ pub struct AtlasEntry {
     pub height: usize,
     pub bearing_y: isize,
     pub bearing_x: isize,
+    /// `true` when the glyph lives in the atlas's RGBA color layer (emoji)
+    /// rather than the monochrome coverage layer. The renderer samples the
+    /// color texture and uses the texel directly instead of tinting by the
+    /// cell's foreground color.
+    pub is_color: bool,
 }
 
 impl Font {
@@ -499,9 +609,14 @@ impl Font {
     }
 
     // Append a fallback face onto the given variant. Returns false (and drops
-    // the data) if the font can't be sized to the current tune —
-    // typically a bitmap-only face like Apple Color Emoji that we can't
-    // currently render anyway.
+    // the data) if the font can't be sized to the current tune.
+    //
+    // Color (bitmap-strike) faces like Apple Color Emoji are accepted: their
+    // `set_char_size` fails (they carry no scalable outlines), so they're sized
+    // by selecting the nearest fixed strike via `set_pixel_sizes` instead, and
+    // tagged `color` so the rasterizer loads them with `FT_LOAD_COLOR` into the
+    // atlas's RGBA layer. Monochrome faces keep the scalable `set_char_size`
+    // path.
     //
     // See [`Font::set_variant`] for the `face_index` story; same TTC-
     // collection concern applies to fallback fonts too.
@@ -521,11 +636,20 @@ impl Font {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let size = (height_points * 64.0) as isize;
-        if face.set_char_size(size, 0, dpi, dpi).is_err() {
-            return false;
+        let color = face.has_color();
+        if color {
+            // Fixed-strike font: select the nearest available strike to the
+            // cell's em pixel size. We downscale it into the cell box at render.
+            if !select_color_strike(&face, color_strike_px(height_points, dpi)) {
+                return false;
+            }
+        } else {
+            let size = (height_points * 64.0) as isize;
+            if face.set_char_size(size, 0, dpi, dpi).is_err() {
+                return false;
+            }
         }
-        self.variants[variant as usize].fallbacks.push(face);
+        self.variants[variant as usize].fallbacks.push(FallbackFace { face, color });
         // See `set_variant`: force a full re-tune on next access so a fallback
         // added after a DPI change can't stay sized to the wrong scale.
         self.current_tune = None;
@@ -612,12 +736,19 @@ impl Font {
             return;
         }
         let size = (height_points * 64.0) as isize;
+        let strike_px = color_strike_px(height_points, dpi);
         for variant in &mut self.variants {
             if let Some(face) = variant.face.as_mut() {
                 face.set_char_size(size, 0, dpi, dpi).unwrap();
             }
-            for face in &mut variant.fallbacks {
-                let _ = face.set_char_size(size, 0, dpi, dpi);
+            for fb in &mut variant.fallbacks {
+                if fb.color {
+                    // Bitmap-strike face: re-select the nearest strike for the
+                    // new tune (`set_char_size` has no effect on these).
+                    let _ = select_color_strike(&fb.face, strike_px);
+                } else {
+                    let _ = fb.face.set_char_size(size, 0, dpi, dpi);
+                }
             }
         }
         self.current_tune = Some(key);
@@ -745,7 +876,7 @@ impl Font {
                 Some(ch) => ch,
                 None => continue,
             };
-            let face = match self.variants[0].face_for(ch) {
+            let (face, _color) = match self.variants[0].face_for(ch) {
                 Some(f) => f,
                 None => continue,
             };
@@ -767,10 +898,30 @@ impl Font {
             }
         }
 
+        // Color (emoji) layer. Independently sized — emoji are few per session,
+        // and at 4 bytes/texel a CJK-grown coverage atlas would be wasteful to
+        // mirror. A 2-cell-wide box per glyph with packing slack; capped well
+        // below the coverage atlas.
+        let color_cell = (2 * cell_w + 2) * (cell_h + 2);
+        let color_needed = (256 * color_cell * 3 / 2) as f64;
+        let color_target = (color_needed.sqrt().ceil() as usize).max(2 * cell_w + 4);
+        let mut color_size = 512usize;
+        while color_size < color_target && color_size < 2048 {
+            color_size *= 2;
+        }
+        let color_buffer = vec![0u8; color_size * color_size * 4];
+
         Atlas {
             buffer: texture,
             width,
             height,
+            color_buffer,
+            color_width: color_size,
+            color_height: color_size,
+            color_pack_x: 0,
+            color_pack_y: 0,
+            color_pack_row_height: 0,
+            color_dirty: false,
             variants: variants_entries,
             ligatures: [
                 HashMap::new(),
@@ -836,6 +987,7 @@ fn pack_synth(
         height: h,
         bearing_x: bm.bearing_x,
         bearing_y: bm.bearing_y,
+        is_color: false,
     };
     *x += stride;
     Some(entry)
@@ -931,6 +1083,7 @@ fn pack_glyph(
         height: h,
         bearing_x: glyph.bitmap_left() as isize,
         bearing_y: glyph.bitmap_top() as isize,
+        is_color: false,
     };
     // Step the atlas cursor past the bitmap's full footprint, not just the
     // typographic advance. Programming-ligature substitutions (Fira Code calt
@@ -940,6 +1093,132 @@ fn pack_glyph(
     // `+ 1` (already baked into `stride` above) keeps a one-pixel gutter so
     // the renderer's linear sampler can't bleed across glyphs at sub-pixel
     // UVs. Row wrapping is handled by the next call's leading bounds check.
+    *x += stride;
+    Some(entry)
+}
+
+/// Pixel size to target for a fixed-strike color font (Apple Color Emoji) at a
+/// given point size and DPI — the em pixel size. [`select_color_strike`] then
+/// picks the nearest available strike, which we downscale into the cell box.
+/// Kept in one place so `add_fallback` and `tune_to` agree on the target.
+fn color_strike_px(height_points: f32, dpi: u32) -> u32 {
+    ((height_points * dpi as f32) / 72.0).round().max(1.0) as u32
+}
+
+/// Select the bitmap strike of a fixed-size color face nearest to `target_px`
+/// (preferring a strike at least that big, so the glyph is downscaled rather
+/// than blown up). Returns `false` if the face has no strikes or the selection
+/// fails. `FT_Select_Size` is the correct entry point for sbix/CBDT fonts —
+/// `FT_Set_Pixel_Sizes` rejects any size that isn't an exact strike match.
+fn select_color_strike(face: &ft::Face, target_px: u32) -> bool {
+    let rec = face.raw();
+    let n = rec.num_fixed_sizes;
+    if n <= 0 || rec.available_sizes.is_null() {
+        return false;
+    }
+    let sizes = unsafe { std::slice::from_raw_parts(rec.available_sizes, n as usize) };
+    let target = target_px as i64;
+    let mut best = 0usize;
+    let mut best_score = i64::MAX;
+    for (i, s) in sizes.iter().enumerate() {
+        // y_ppem is 26.6 fixed point; >> 6 gives integer pixels.
+        let ppem = (s.y_ppem >> 6) as i64;
+        // Undershoot (upscaling) is penalized so we prefer a larger strike.
+        let diff = ppem - target;
+        let score = if diff >= 0 { diff } else { 4096 - diff };
+        if score < best_score {
+            best_score = score;
+            best = i;
+        }
+    }
+    let ptr = face.raw() as *const ft::ffi::FT_FaceRec as ft::ffi::FT_Face;
+    unsafe { ft::ffi::FT_Select_Size(ptr, best as ft::ffi::FT_Int) == ft::ffi::FT_Err_Ok }
+}
+
+/// Downscale a FreeType `BGRA` color bitmap to fit a `box_w × box_h` cell box
+/// (preserving aspect, centered) and pack it into the atlas's RGBA color layer.
+/// Returns the entry (with `is_color: true`) or `None` if the color atlas is
+/// full. `box_w` is the full two-cell width a wide emoji is allotted.
+///
+/// The source is premultiplied BGRA (FreeType's `FT_PIXEL_MODE_BGRA`); we box-
+/// average source texels per destination texel, which keeps the premultiplied
+/// invariant (a linear combination of premultiplied samples is premultiplied),
+/// so the result drops straight into the premultiplied-alpha blend.
+#[allow(clippy::too_many_arguments)]
+fn pack_color_glyph(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    src_pitch: usize,
+    box_w: usize,
+    box_h: usize,
+    color_buffer: &mut [u8],
+    atlas_w: usize,
+    atlas_h: usize,
+    x: &mut usize,
+    y: &mut usize,
+    row_height: &mut usize,
+) -> Option<AtlasEntry> {
+    if src_w == 0 || src_h == 0 || box_w == 0 || box_h == 0 {
+        return None;
+    }
+    // Scale to fit the box, preserving aspect (emoji are ~square but strikes
+    // vary). Never upscale past the box.
+    let scale = (box_w as f32 / src_w as f32).min(box_h as f32 / src_h as f32);
+    let dst_w = ((src_w as f32 * scale).round() as usize).clamp(1, box_w);
+    let dst_h = ((src_h as f32 * scale).round() as usize).clamp(1, box_h);
+    let stride = dst_w + 1;
+
+    if *x + stride > atlas_w {
+        *x = 0;
+        *y += *row_height + 1;
+        *row_height = 0;
+    }
+    if *y + dst_h > atlas_h {
+        return None; // color atlas full — caller falls back to notdef
+    }
+    if dst_h > *row_height {
+        *row_height = dst_h;
+    }
+
+    // Box filter: each destination texel averages the source rectangle that
+    // maps onto it. Cheap, and good enough for emoji downscales (strike → cell).
+    for dy in 0..dst_h {
+        let sy0 = dy * src_h / dst_h;
+        let sy1 = ((dy + 1) * src_h / dst_h).max(sy0 + 1).min(src_h);
+        for dx in 0..dst_w {
+            let sx0 = dx * src_w / dst_w;
+            let sx1 = ((dx + 1) * src_w / dst_w).max(sx0 + 1).min(src_w);
+            let (mut b, mut g, mut r, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let i = sy * src_pitch + sx * 4;
+                    b += src[i] as u32;
+                    g += src[i + 1] as u32;
+                    r += src[i + 2] as u32;
+                    a += src[i + 3] as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            let di = ((*y + dy) * atlas_w + (*x + dx)) * 4;
+            color_buffer[di] = (b / n) as u8;
+            color_buffer[di + 1] = (g / n) as u8;
+            color_buffer[di + 2] = (r / n) as u8;
+            color_buffer[di + 3] = (a / n) as u8;
+        }
+    }
+
+    let entry = AtlasEntry {
+        x: *x,
+        y: *y,
+        width: dst_w,
+        height: dst_h,
+        // Bearings are computed at draw time from the box, so neutral here.
+        bearing_x: 0,
+        bearing_y: 0,
+        is_color: true,
+    };
     *x += stride;
     Some(entry)
 }
@@ -973,6 +1252,7 @@ mod tests {
             height: 1,
             bearing_x: 0,
             bearing_y: 0,
+            is_color: false,
         }
     }
 
@@ -993,6 +1273,13 @@ mod tests {
             width: 0,
             height: 0,
             buffer: Vec::new(),
+            color_buffer: Vec::new(),
+            color_width: 0,
+            color_height: 0,
+            color_pack_x: 0,
+            color_pack_y: 0,
+            color_pack_row_height: 0,
+            color_dirty: false,
             variants,
             ligatures: [
                 HashMap::new(),
@@ -1028,6 +1315,25 @@ mod tests {
             let (b, i) = v.flags();
             assert_eq!(FaceVariant::from_flags(b, i), v);
         }
+    }
+
+    #[test]
+    fn color_strike_px_scales_with_dpi_and_clamps() {
+        // em pixels = round(points * dpi / 72), never below 1.
+        // 14 * 96 / 72 = 18.666… -> 19
+        assert_eq!(color_strike_px(14.0, 96), 19);
+        // 14 * 144 / 72 = 28 exactly
+        assert_eq!(color_strike_px(14.0, 144), 28);
+        // Doubling DPI roughly doubles the pixel target (within rounding).
+        let lo = color_strike_px(14.0, 96);
+        let hi = color_strike_px(14.0, 192);
+        assert!(
+            (hi as i64 - 2 * lo as i64).abs() <= 1,
+            "doubling dpi should ~double px: lo={lo} hi={hi}"
+        );
+        // A vanishingly small size still yields a usable strike (>= 1 px).
+        assert_eq!(color_strike_px(0.1, 96), 1);
+        assert!(color_strike_px(0.001, 1) >= 1);
     }
 
     #[test]
@@ -1390,6 +1696,13 @@ mod tests {
             width,
             height,
             buffer: vec![0u8; width * height],
+            color_buffer: vec![0u8; width * height * 4],
+            color_width: width,
+            color_height: height,
+            color_pack_x: 0,
+            color_pack_y: 0,
+            color_pack_row_height: 0,
+            color_dirty: false,
             variants: [
                 HashMap::new(),
                 HashMap::new(),
@@ -1522,6 +1835,37 @@ mod tests {
     // the wrong scale, so the next `tune_to` is forced to re-size everything.
     // Append a fallback onto the Regular variant (reusing a real, sizable face)
     // and confirm the tune is dropped.
+    // On macOS, an emoji no monochrome face carries (✅ U+2705) is rasterized
+    // by the Core Text path into the RGBA color layer with `is_color: true`.
+    // The previous behavior was tofu, because the only emoji candidate font
+    // ("Noto Emoji") ships on no stock macOS. No-op off macOS / if Core Text
+    // can't produce a bitmap.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn emoji_packs_into_color_layer_via_platform_rasterizer() {
+        let Some(mut font) = load_test_font() else {
+            eprintln!("skipping: no test font installed");
+            return;
+        };
+        // Sanity: the platform rasterizer actually produces pixels here.
+        if crate::emoji::rasterize('\u{2705}', 28).is_none() {
+            eprintln!("skipping: Core Text returned no emoji bitmap");
+            return;
+        }
+        let mut atlas = font.build_atlas();
+        atlas.ensure_char(&mut font, FaceVariant::Regular, '\u{2705}');
+        let e = atlas.lookup('\u{2705}', FaceVariant::Regular);
+        assert!(e.is_color, "✅ must be packed as a color glyph");
+        assert!(e.width > 0 && e.height > 0, "color glyph must have a bitmap");
+        assert!(atlas.color_dirty, "packing a color glyph marks the color layer dirty");
+        // Some color texel in the entry's region is non-transparent.
+        let cw = atlas.color_width;
+        let any_opaque = (e.y..e.y + e.height).any(|py| {
+            (e.x..e.x + e.width).any(|px| atlas.color_buffer[(py * cw + px) * 4 + 3] > 0)
+        });
+        assert!(any_opaque, "packed emoji must have visible pixels");
+    }
+
     #[test]
     fn add_fallback_resets_current_tune_to_none() {
         let Some(mut font) = load_test_font() else {

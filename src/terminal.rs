@@ -2272,6 +2272,25 @@ impl Terminal {
             self.cursor.wrap_pending = false;
             self.line_feed_no_cr();
         }
+
+        // Wide characters (CJK, fullwidth forms, emoji) occupy two columns:
+        // the lead cell holds the glyph, the next is a `WIDE_SPACER`
+        // placeholder. Keeping the grid two columns wide for these matches the
+        // shell's own line-editor accounting, so the cursor models stay in
+        // lockstep (a mismatch is what smeared pasted emoji into a stray
+        // cursor-block). The Kitty placeholder codepoint is treated as narrow
+        // regardless so its diacritic-encoded geometry is unaffected.
+        let cells = if ch == '\u{10EEEE}' { 1 } else { crate::width::char_cells(ch) };
+
+        // A wide glyph with only one column left before the wrap point can't
+        // fit; xterm drops to the next line (leaving that final column blank)
+        // before laying it down. Narrow chars still fill that last column.
+        if cells == 2 && self.autowrap && self.cursor.col >= wrap_at {
+            self.cursor.col = wrap_to;
+            self.cursor.wrap_pending = false;
+            self.line_feed_no_cr();
+        }
+
         let mut cell = Cell::new(ch, self.cursor.style);
         // Carry the active OSC 8 hyperlink (if any) onto the cell. Kept off
         // `Style` so an SGR reset mid-link doesn't sever it.
@@ -2286,7 +2305,13 @@ impl Terminal {
         let row = self.cursor.row;
         let col = self.cursor.col;
         if row < self.rows && col < self.cols {
-            self.active_grid_mut().set(row, col, cell);
+            self.put_cell(row, col, cell);
+            // Lay down the trailing spacer for a wide glyph (when there's room;
+            // the wrap above guarantees it inside the margins).
+            if cells == 2 && col + 1 < self.cols {
+                let spacer = Cell::wide_spacer(self.cursor.style);
+                self.put_cell(row, col + 1, spacer);
+            }
             if ch == '\u{10EEEE}' && cell.placeholder_image_id.is_some() {
                 self.placeholder_decode = Some(PlaceholderDecode {
                     cell_row: row,
@@ -2295,14 +2320,48 @@ impl Terminal {
                 });
             }
         }
-        if self.cursor.col >= wrap_at {
-            if self.autowrap {
-                self.cursor.wrap_pending = true;
+        // Advance one column per cell the character consumed, honoring the wrap
+        // point. The final column sets `wrap_pending` instead of stepping past
+        // the margin; intermediate columns of a wide char step normally.
+        for _ in 0..cells {
+            if self.cursor.col >= wrap_at {
+                if self.autowrap {
+                    self.cursor.wrap_pending = true;
+                }
+                // when autowrap is off, cursor sticks at the wrap column
+                break;
+            } else {
+                self.cursor.col += 1;
             }
-            // when autowrap is off, cursor sticks at the wrap column
-        } else {
-            self.cursor.col += 1;
         }
+    }
+
+    /// Write `cell` at `(row, col)`, clearing any wide-pair partner the write
+    /// would orphan. Overwriting the lead half of a wide character blanks its
+    /// now-dangling spacer; overwriting a spacer blanks its now-dangling lead.
+    /// Without this, partially-overwritten wide glyphs would leave a spacer
+    /// that swallows a column or a lead glyph that bleeds into its neighbor.
+    fn put_cell(&mut self, row: usize, col: usize, cell: Cell) {
+        if row >= self.rows || col >= self.cols {
+            return;
+        }
+        let blank = Cell::new(' ', self.cursor.style);
+        let grid = self.active_grid();
+        // Overwriting a spacer: its lead is the cell to the left.
+        let clear_left = col > 0 && grid.get(row, col).is_wide_spacer();
+        // Overwriting a lead whose spacer follows: a spacer at `col + 1`
+        // always belongs to a lead at `col`, so replacing this cell orphans
+        // it. (When the new cell is itself a wide lead, the caller re-lays a
+        // fresh spacer at `col + 1` right after this write.)
+        let clear_right = col + 1 < self.cols && grid.get(row, col + 1).is_wide_spacer();
+        let g = self.active_grid_mut();
+        if clear_left {
+            g.set(row, col - 1, blank);
+        }
+        if clear_right {
+            g.set(row, col + 1, blank);
+        }
+        g.set(row, col, cell);
     }
 
     /// Apply one decoded Kitty placeholder diacritic to the cell that
@@ -5947,6 +6006,61 @@ mod tests {
         t.feed("abcd");
         assert_eq!(t.row(0)[2].ch, 'd');
         assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn wide_char_occupies_two_cells() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中x");
+        assert_eq!(t.row(0)[0].ch, '中');
+        assert!(t.row(0)[1].is_wide_spacer(), "second cell is a wide spacer");
+        assert_eq!(t.row(0)[2].ch, 'x');
+        // Cursor advanced by two for the wide char, one for 'x'.
+        assert_eq!(t.cursor().col, 3);
+    }
+
+    #[test]
+    fn emoji_checkmark_occupies_two_cells() {
+        // The reported bug: ✅ U+2705 must reserve two columns so the shell's
+        // cursor model stays in lockstep with the grid.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\u{2705}");
+        assert_eq!(t.row(0)[0].ch, '\u{2705}');
+        assert!(t.row(0)[1].is_wide_spacer());
+        assert_eq!(t.cursor().col, 2);
+    }
+
+    #[test]
+    fn wide_char_wraps_when_one_column_left() {
+        // 3 cols; after "aa" only the last column is free, which can't hold a
+        // two-cell glyph — it wraps to the next row, leaving the last col blank.
+        let mut t = Terminal::new(3, 2, 100);
+        t.feed("aa中");
+        assert_eq!(t.row(0)[0].ch, 'a');
+        assert_eq!(t.row(0)[1].ch, 'a');
+        assert_eq!(t.row(0)[2].ch, ' ', "last column left blank — wide char didn't fit");
+        assert_eq!(t.row(1)[0].ch, '中');
+        assert!(t.row(1)[1].is_wide_spacer());
+    }
+
+    #[test]
+    fn overwriting_wide_lead_clears_orphaned_spacer() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中");
+        t.feed("\r"); // cursor back to col 0
+        t.feed("X"); // overwrite the lead half
+        assert_eq!(t.row(0)[0].ch, 'X');
+        assert_eq!(t.row(0)[1].ch, ' ', "orphaned spacer cleared to blank");
+    }
+
+    #[test]
+    fn overwriting_wide_spacer_clears_orphaned_lead() {
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("中");
+        t.feed("\r\x1b[1C"); // col 0, then cursor forward one → onto the spacer
+        t.feed("Y"); // overwrite the spacer half
+        assert_eq!(t.row(0)[0].ch, ' ', "orphaned lead cleared to blank");
+        assert_eq!(t.row(0)[1].ch, 'Y');
     }
 
     #[test]
