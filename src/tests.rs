@@ -2468,6 +2468,75 @@ fn single_slash_https_scheme_is_not_a_url() {
 }
 
 #[test]
+fn file_scheme_is_detected() {
+    // A bare file:/// URL printed as plain text is now clickable.
+    let row = cells_from_str("file:///Users/ry/foo.txt");
+    let (s, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+    assert_eq!(s, 0);
+    assert_eq!(e, row.len() - 1);
+    assert_eq!(url, "file:///Users/ry/foo.txt");
+}
+
+#[test]
+fn ssh_scheme_is_detected() {
+    let row = cells_from_str("ssh://host.example/path");
+    let (s, e, url) = find_url_in_cells(&row, 8).expect("should find url");
+    assert_eq!(s, 0);
+    assert_eq!(e, row.len() - 1);
+    assert_eq!(url, "ssh://host.example/path");
+}
+
+#[test]
+fn ftp_scheme_is_detected() {
+    let row = cells_from_str("ftp://ftp.example.com/file");
+    let (s, e, url) = find_url_in_cells(&row, 8).expect("should find url");
+    assert_eq!(s, 0);
+    assert_eq!(e, row.len() - 1);
+    assert_eq!(url, "ftp://ftp.example.com/file");
+}
+
+#[test]
+fn mailto_scheme_is_detected() {
+    // mailto uses a single colon with no "//" authority.
+    let row = cells_from_str("mailto:user@example.com");
+    let (s, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+    assert_eq!(s, 0);
+    assert_eq!(e, row.len() - 1);
+    assert_eq!(url, "mailto:user@example.com");
+}
+
+#[test]
+fn file_scheme_only_is_not_a_url() {
+    // "file://" with nothing after the prefix is scheme-only — rejected,
+    // mirroring the http(s) scheme-only behavior.
+    let row = cells_from_str("file://");
+    for c in 0..row.len() {
+        assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+    }
+}
+
+#[test]
+fn mailto_scheme_only_is_not_a_url() {
+    // "mailto:" with no address after the colon is scheme-only — rejected.
+    let row = cells_from_str("mailto:");
+    for c in 0..row.len() {
+        assert!(find_url_in_cells(&row, c).is_none(), "col {c}");
+    }
+}
+
+#[test]
+fn https_wins_over_http_longest_prefix() {
+    // URL_SCHEMES lists "https://" before "http://", and the prefix scan
+    // breaks on the first match at a column, so the full "https://" scheme
+    // is taken — not the shorter "http" with a stray 's'.
+    let row = cells_from_str("https://example.com");
+    let (s, e, url) = find_url_in_cells(&row, 10).expect("should find url");
+    assert_eq!(s, 0);
+    assert_eq!(e, row.len() - 1);
+    assert_eq!(url, "https://example.com");
+}
+
+#[test]
 fn unicode_letter_adjacent_to_url_is_part_of_run() {
     // Non-whitespace unicode glues onto the run, but the prefix scan
     // still locates "https://" further in and produces a clean URL.

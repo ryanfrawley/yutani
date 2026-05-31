@@ -54,10 +54,18 @@ impl HoverUrl {
     }
 }
 
-/// Locate an http/https URL within a row of cells that covers `col`. The
-/// run is bounded by surrounding whitespace; trailing sentence punctuation
-/// (`.,;:!?)]}>'"`) is stripped so a URL at the end of a sentence still
-/// opens cleanly.
+/// Schemes the heuristic recognizes in bare (non-OSC-8) text, longest-prefix
+/// first so `https` wins over `http`. Kept in step with [`is_safe_url`]'s
+/// allowlist — every scheme we'd open on click is also one we'll underline as
+/// plain text. `mailto:` has no `//` authority, hence the single colon.
+const URL_SCHEMES: [&str; 6] = ["https://", "http://", "file://", "ftp://", "ssh://", "mailto:"];
+
+/// Locate a URL within a row of cells that covers `col`. Recognizes the
+/// [`URL_SCHEMES`] set (http/https plus file/ftp/ssh/mailto), so a bare
+/// `file:///path` or `ssh://host` printed as plain text is clickable, not just
+/// OSC 8 links. The run is bounded by surrounding whitespace; trailing sentence
+/// punctuation (`.,;:!?)]}>'"`) is stripped so a URL at the end of a sentence
+/// still opens cleanly.
 pub(crate) fn find_url_in_cells(cells: &[style::Cell], col: usize) -> Option<(usize, usize, String)> {
     let n = cells.len();
     if col >= n || cells[col].ch.is_whitespace() {
@@ -73,7 +81,7 @@ pub(crate) fn find_url_in_cells(cells: &[style::Cell], col: usize) -> Option<(us
     }
     let mut hit: Option<(usize, usize)> = None;
     'outer: for s in start..=end {
-        for prefix in ["https://", "http://"] {
+        for prefix in URL_SCHEMES {
             let plen = prefix.len();
             if s + plen > end + 1 {
                 continue;
@@ -245,10 +253,11 @@ pub(crate) fn find_osc8_link_at(
     })
 }
 
-/// Scheme allowlist for opening a clicked link. The heuristic only ever
-/// produces http/https, but OSC 8 lets an app declare an arbitrary target, so
-/// we refuse anything outside a small safe set (no `javascript:`, `data:`,
-/// `vbscript:`, etc.) before handing it to the OS opener.
+/// Scheme allowlist for opening a clicked link. The heuristic produces only
+/// these schemes (see [`URL_SCHEMES`]), but OSC 8 lets an app declare an
+/// arbitrary target, so we refuse anything outside this small safe set (no
+/// `javascript:`, `data:`, `vbscript:`, etc.) before handing it to the OS
+/// opener.
 pub(crate) fn is_safe_url(url: &str) -> bool {
     let lower = url.trim().to_ascii_lowercase();
     const SAFE: [&str; 6] = ["http://", "https://", "mailto:", "ftp://", "file://", "ssh://"];
