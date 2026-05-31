@@ -50,6 +50,38 @@ pub(crate) fn per_fragment_fade_alphas(glow_on: bool, top: f32, bottom: f32) -> 
     }
 }
 
+/// The longest per-frame animation step (in seconds) the edge fades will honor.
+/// When nothing is animating the event loop idles and stops updating
+/// `last_anim_tick`, so the first frame of a freshly-triggered fade can see the
+/// whole idle gap as its delta — capping it keeps a fade spanning multiple
+/// frames instead of snapping to its target in one.
+pub(crate) const MAX_FADE_DT: f32 = 1.0 / 30.0;
+
+/// Clamp the raw wall-clock delta between two animation ticks to at most one
+/// slow frame (`MAX_FADE_DT`). A stale `last_anim_tick` after an idle period
+/// would otherwise hand the ramp a `dt` large enough to complete in one frame.
+pub(crate) fn clamp_fade_dt(raw_dt: f32) -> f32 {
+    raw_dt.min(MAX_FADE_DT)
+}
+
+/// Advance a fade `phase` one frame toward `target` at a constant rate, where
+/// the ramp covers the full 0↔1 range in `secs` seconds. Returns the new phase.
+///
+/// `step = dt / secs` is the fraction of the range crossed this frame; the
+/// `min`/`max` clamps stop it exactly on `target` without overshoot, so a fade
+/// converges rather than oscillating. `secs <= 0` means "no animation": the
+/// phase jumps straight to `target`.
+pub(crate) fn advance_fade_phase(phase: f32, target: f32, dt: f32, secs: f32) -> f32 {
+    let step = if secs > 0.0 { dt / secs } else { 1.0 };
+    if phase < target {
+        (phase + step).min(target)
+    } else if phase > target {
+        (phase - step).max(target)
+    } else {
+        phase
+    }
+}
+
 impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
@@ -2039,16 +2071,20 @@ impl WindowState {
 
         // Edge fade animations: each phase ramps 0→1 the moment its boundary
         // distance leaves zero (and 1→0 when it returns) at a constant rate.
+        //
+        // Clamp `dt` to a single slow frame. When nothing is animating the
+        // event loop idles and stops updating `last_anim_tick`; the first frame
+        // of a freshly-triggered fade would otherwise see the whole idle gap as
+        // `dt`, making `step = dt/secs` ≥ 1 and snapping the phase to its target
+        // in one frame (the intermittent "no fade, just a pop" — it only
+        // happened when the loop had gone idle before the fade triggered).
+        // Capping keeps the ramp spanning multiple frames;
+        // `is_top_fade_animating()` keeps the loop ticking until it lands.
         let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last_anim_tick).as_secs_f32();
+        let dt = clamp_fade_dt(now.duration_since(self.last_anim_tick).as_secs_f32());
         self.last_anim_tick = now;
         let advance = |phase: &mut f32, target: f32, secs: f32| {
-            let step = if secs > 0.0 { dt / secs } else { 1.0 };
-            if *phase < target {
-                *phase = (*phase + step).min(target);
-            } else if *phase > target {
-                *phase = (*phase - step).max(target);
-            }
+            *phase = advance_fade_phase(*phase, target, dt, secs);
         };
         if EDGE_FADE_ALWAYS_ON {
             self.top_fade_phase = 1.0;
@@ -2161,6 +2197,11 @@ impl WindowState {
             }
         }
 
+        // The bottom edge animates in/out on its phase: the band height grows
+        // from the edge (`bottom_band_height`) *and* the strip alpha
+        // (`bottom_alpha`) ramps, so both the blur/dissolve region and the
+        // colour fade animate together rather than the blur popping in at full
+        // extent while only the colour fades.
         let bottom_alpha = self.bottom_fade_phase;
         let bottom_band_height = bottom_fade_height_max * self.bottom_fade_phase;
         if self.bottom_fade_phase > 0.0 {
