@@ -1,7 +1,7 @@
 background = 0x282828
 foreground = 0xebdbb2
 cursor = 0x928374
-selection = 0xebdbb2
+selection_background = 0xebdbb2
 
 black   = [0x665c54, 0x7c6f64]
 red     = [0xcc241d, 0xfb4934]

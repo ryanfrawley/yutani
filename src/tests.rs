@@ -3661,3 +3661,139 @@ fn clear_sequence_homes_cursor_to_top_left() {
         "cursor should be homed to row 0, col 0 after Clear"
     );
 }
+
+// `classify_corner_with_neighbor` decides, per selection-strip corner, whether
+// it rounds outward (Convex), sits on a continuous edge (Straight), or is an
+// inner step needing a fillet (Concave). Selection-pill rounding *and* the new
+// mono per-cell corner rounding both depend on it, so its column/neighbor
+// arithmetic is worth pinning down. `Left` classifies TL/BL corners (the
+// `from` column); `Right` classifies TR/BR corners (the `to` column).
+
+#[test]
+fn classify_corner_no_neighbor_is_convex_both_sides() {
+    // With no strip in the adjacent row, the corner is exposed on the outside
+    // and always rounds outward, regardless of column or side.
+    assert_eq!(
+        classify_corner_with_neighbor(0, None, HorizSide::Left),
+        CornerType::Convex
+    );
+    assert_eq!(
+        classify_corner_with_neighbor(7, None, HorizSide::Left),
+        CornerType::Convex
+    );
+    assert_eq!(
+        classify_corner_with_neighbor(0, None, HorizSide::Right),
+        CornerType::Convex
+    );
+    assert_eq!(
+        classify_corner_with_neighbor(7, None, HorizSide::Right),
+        CornerType::Convex
+    );
+}
+
+#[test]
+fn classify_corner_left_concave_when_neighbor_covers_outer_and_at() {
+    // Left corner at col 5. Neighbor [3..=8] starts before col (covers col-1,
+    // the outer/left side) and also includes col itself => inner step => fillet.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((3, 8)), HorizSide::Left),
+        CornerType::Concave
+    );
+}
+
+#[test]
+fn classify_corner_left_straight_when_neighbor_covers_at_only() {
+    // Left corner at col 5. Neighbor starts exactly at col 5, so it covers
+    // `col` but nothing further left => continuous edge => no rounding.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((5, 8)), HorizSide::Left),
+        CornerType::Straight
+    );
+}
+
+#[test]
+fn classify_corner_left_convex_when_neighbor_does_not_cover_at() {
+    // Left corner at col 5, neighbor entirely to the right (6..=8): it neither
+    // covers col nor the outer side, so the corner is exposed => rounds outward.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((6, 8)), HorizSide::Left),
+        CornerType::Convex
+    );
+    // Neighbor entirely to the left (1..=4) also leaves col 5 uncovered: the
+    // `covers_at` test fails (col > nt), so it is Convex, not Concave.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((1, 4)), HorizSide::Left),
+        CornerType::Convex
+    );
+}
+
+#[test]
+fn classify_corner_right_concave_when_neighbor_covers_outer_and_at() {
+    // Right corner at col 5. Neighbor [2..=8] extends past col to the right
+    // (covers col+1, the outer side for a right corner) and includes col itself.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((2, 8)), HorizSide::Right),
+        CornerType::Concave
+    );
+}
+
+#[test]
+fn classify_corner_right_straight_when_neighbor_ends_exactly_at_col() {
+    // Right corner at col 5. Neighbor ends exactly at col 5: it covers `col`
+    // but nothing further right => continuous edge => no rounding.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((2, 5)), HorizSide::Right),
+        CornerType::Straight
+    );
+}
+
+#[test]
+fn classify_corner_right_convex_when_neighbor_does_not_cover_at() {
+    // Right corner at col 5, neighbor entirely to the left (1..=4): col not
+    // covered, outer (right) side not covered => exposed => rounds outward.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((1, 4)), HorizSide::Right),
+        CornerType::Convex
+    );
+    // Neighbor entirely to the right (6..=8) also leaves col 5 uncovered
+    // (col < nf), so `covers_at` is false => Convex despite extending outward.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((6, 8)), HorizSide::Right),
+        CornerType::Convex
+    );
+}
+
+#[test]
+fn classify_corner_single_cell_neighbor_exactly_under_corner_is_straight() {
+    // A one-column neighbor sitting exactly under the corner covers `col` but
+    // neither outer side, so both Left and Right read it as a continuous edge.
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((5, 5)), HorizSide::Left),
+        CornerType::Straight
+    );
+    assert_eq!(
+        classify_corner_with_neighbor(5, Some((5, 5)), HorizSide::Right),
+        CornerType::Straight
+    );
+}
+
+#[test]
+fn classify_corner_column_zero_boundary() {
+    // At the left boundary (col 0), no neighbor can start "before" it, so the
+    // outer-left side can never be covered: a Left corner is never Concave
+    // there. A neighbor covering col 0 is Straight; otherwise Convex.
+    assert_eq!(
+        classify_corner_with_neighbor(0, Some((0, 4)), HorizSide::Left),
+        CornerType::Straight
+    );
+    assert_eq!(
+        classify_corner_with_neighbor(0, Some((1, 4)), HorizSide::Left),
+        CornerType::Convex
+    );
+    // The same col 0 on the Right side can still be Concave if the neighbor
+    // extends rightward past it while covering it.
+    assert_eq!(
+        classify_corner_with_neighbor(0, Some((0, 4)), HorizSide::Right),
+        CornerType::Concave
+    );
+}

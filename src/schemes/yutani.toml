@@ -1,8 +1,8 @@
 background = 0x242018
 foreground = 0xffdd6f
 cursor = 0xffdd6f
-selection = 0xffdd6f
-selection_fg = 0x242018
+selection_background = 0xffdd6f
+selection_foreground = 0x242018
 
 max_colors = "mono"
 

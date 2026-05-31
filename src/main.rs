@@ -729,9 +729,8 @@ struct TabState {
     /// mismatch on the next frame drops the whole cache.
     row_cache_key: Option<RowCacheKey>,
     /// Last frame's selection range (absolute-line coords). Used to invalidate
-    /// the rows a `selection_fg` recolor entered/left when the scheme defines a
-    /// selection foreground (otherwise selection is a pure overlay and doesn't
-    /// touch cached cell colors).
+    /// the rows the selection's glyph recolor entered/left, since the opaque
+    /// selection fill always recolors selected text to the selection fg.
     prev_selection_range: Option<((isize, usize), (isize, usize))>,
 }
 

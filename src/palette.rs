@@ -34,16 +34,17 @@ pub struct Palette {
     pub background: [f32; 4],
     pub foreground: [f32; 4],
     pub cursor: [f32; 4],
-    /// Stored un-premultiplied. The renderer applies a theme-dependent alpha
-    /// at draw time and premultiplies there.
-    pub selection: [f32; 4],
-    /// Optional override applied to a cell's glyph color while that cell is
-    /// part of the active selection. `None` (the default) leaves selected
-    /// text in its underlying fg so the translucent selection overlay just
-    /// tints it; `Some(c)` paints the glyph in `c` instead — useful when a
-    /// scheme's selection bg doesn't have enough contrast against the
-    /// default fg.
-    pub selection_fg: Option<[f32; 4]>,
+    /// Optional selection-highlight background. The renderer draws the
+    /// selection as a solid (opaque) fill behind the selected glyphs. `None`
+    /// (the default) derives the fill from the theme `foreground` at draw
+    /// time; `Some(c)` overrides it. Set via the `selection_background` key.
+    pub selection_background: Option<[f32; 4]>,
+    /// Optional selection-highlight foreground — the glyph color inside the
+    /// selection. Since the fill is opaque, selected text is always recolored
+    /// so it stays legible. `None` (the default) derives it from the theme
+    /// `background` at draw time; `Some(c)` overrides it. Set via the
+    /// `selection_foreground` key.
+    pub selection_foreground: Option<[f32; 4]>,
     /// Index 0..=7 normal, 8..=15 bright. Order matches ANSI:
     /// black, red, green, yellow, blue, magenta, cyan, white.
     pub ansi: [[f32; 4]; 16],
@@ -119,8 +120,8 @@ impl Palette {
             background: [1.0, 1.0, 1.0, 1.0],
             foreground: [0.0, 0.0, 0.0, 1.0],
             cursor: [0.1, 0.0, 0.8, 1.0],
-            selection: [0.20, 0.40, 0.85, 1.0],
-            selection_fg: None,
+            selection_background: None,
+            selection_foreground: None,
             ansi: [
                 [0.0, 0.0, 0.0, 1.0],
                 [0.67, 0.0, 0.0, 1.0],
@@ -343,8 +344,8 @@ fn apply(p: &mut Palette, key: &str, value: &toml::Value) -> Result<(), String> 
         "background" => p.background = rgb_from_value(value)?,
         "foreground" => p.foreground = rgb_from_value(value)?,
         "cursor" => p.cursor = rgb_from_value(value)?,
-        "selection" => p.selection = rgb_from_value(value)?,
-        "selection_fg" | "selection_foreground" => p.selection_fg = Some(rgb_from_value(value)?),
+        "selection_background" => p.selection_background = Some(rgb_from_value(value)?),
+        "selection_foreground" => p.selection_foreground = Some(rgb_from_value(value)?),
         "black" => set_pair(&mut p.ansi, 0, value)?,
         "red" => set_pair(&mut p.ansi, 1, value)?,
         "green" => set_pair(&mut p.ansi, 2, value)?,
@@ -543,12 +544,12 @@ mod tests {
 
     #[test]
     fn parses_singletons() {
-        let src = "background = 0xfbfaf7\nforeground = 0x2d2519\ncursor = 0x1a00cc\nselection = 0x3366d9\n";
+        let src = "background = 0xfbfaf7\nforeground = 0x2d2519\ncursor = 0x1a00cc\nselection_background = 0x3366d9\n";
         let p = parse_toml(src);
         assert_eq!(to_bytes(p.background), [0xfb, 0xfa, 0xf7]);
         assert_eq!(to_bytes(p.foreground), [0x2d, 0x25, 0x19]);
         assert_eq!(to_bytes(p.cursor), [0x1a, 0x00, 0xcc]);
-        assert_eq!(to_bytes(p.selection), [0x33, 0x66, 0xd9]);
+        assert_eq!(to_bytes(p.selection_background.expect("set")), [0x33, 0x66, 0xd9]);
     }
 
     #[test]
@@ -730,34 +731,87 @@ blue = [0x0000ab, 0x5555ff]
     }
 
     #[test]
-    fn selection_fg_defaults_to_none() {
-        // Omitting the key keeps the legacy behavior — selected text retains
-        // its underlying fg and only the translucent overlay tints it.
-        assert_eq!(Palette::defaults().selection_fg, None);
-        assert_eq!(parse_toml("background = 0x111111\n").selection_fg, None);
+    fn selection_colors_default_to_none() {
+        // Omitting the keys means the renderer derives the selection fill from
+        // the theme `foreground` and the selected-text color from the theme
+        // `background`.
+        assert_eq!(Palette::defaults().selection_background, None);
+        assert_eq!(Palette::defaults().selection_foreground, None);
+        assert_eq!(parse_toml("background = 0x111111\n").selection_background, None);
+        assert_eq!(parse_toml("background = 0x111111\n").selection_foreground, None);
     }
 
     #[test]
-    fn parses_selection_fg() {
-        let p = parse_toml("selection_fg = 0xffeeaa\n");
-        let c = p.selection_fg.expect("selection_fg should be set");
-        assert_eq!(to_bytes(c), [0xff, 0xee, 0xaa]);
-        // Alias spelling — kitty-style — must reach the same field.
-        let p = parse_toml("selection_foreground = 0x010203\n");
-        let c = p.selection_fg.expect("alias should populate selection_fg");
-        assert_eq!(to_bytes(c), [0x01, 0x02, 0x03]);
+    fn parses_selection_colors() {
+        let p = parse_toml("selection_background = 0x0a385c\nselection_foreground = 0xffeeaa\n");
+        let bg = p.selection_background.expect("selection_background should be set");
+        assert_eq!(to_bytes(bg), [0x0a, 0x38, 0x5c]);
+        let fg = p.selection_foreground.expect("selection_foreground should be set");
+        assert_eq!(to_bytes(fg), [0xff, 0xee, 0xaa]);
     }
 
     #[test]
-    fn selection_alpha_is_one() {
-        // The renderer applies its own theme-dependent alpha at draw time,
-        // so the parsed selection color must be stored un-premultiplied with
-        // alpha == 1.0 regardless of the RGB value supplied.
-        let p = parse_toml("selection = 0x000000\n");
-        assert_eq!(p.selection[3], 1.0);
-        assert_eq!(p.selection, [0.0, 0.0, 0.0, 1.0]);
-        let p = parse_toml("selection = 0x3366d9\n");
-        assert_eq!(p.selection[3], 1.0);
+    fn old_selection_keys_are_ignored() {
+        // The pre-rename spellings (`selection`, `selection_fg`) are no longer
+        // recognised keys. A scheme still using them must NOT set the new
+        // fields — both stay `None` so the renderer falls back to the theme
+        // colors, exactly as if the keys were absent. The unknown keys are
+        // skipped per-key (logged, not fatal), so any sibling color still
+        // applies.
+        let src = "selection = 0x3366d9\nselection_fg = 0xffeeaa\nbackground = 0x111111\n";
+        let p = parse_toml(src);
+        assert_eq!(p.selection_background, None, "old `selection` key must not set selection_background");
+        assert_eq!(p.selection_foreground, None, "old `selection_fg` key must not set selection_foreground");
+        // The legitimate sibling key still landed despite the unknown keys.
+        assert_eq!(to_bytes(p.background), [0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn selection_background_and_foreground_are_independent() {
+        // Setting only one selection key must leave the other at `None` —
+        // they're separate optional overrides, not a coupled pair.
+        let only_bg = parse_toml("selection_background = 0x0a385c\n");
+        assert_eq!(to_bytes(only_bg.selection_background.expect("set")), [0x0a, 0x38, 0x5c]);
+        assert_eq!(only_bg.selection_foreground, None, "fg must stay None when only bg is set");
+
+        let only_fg = parse_toml("selection_foreground = 0xffeeaa\n");
+        assert_eq!(to_bytes(only_fg.selection_foreground.expect("set")), [0xff, 0xee, 0xaa]);
+        assert_eq!(only_fg.selection_background, None, "bg must stay None when only fg is set");
+    }
+
+    #[test]
+    fn invalid_selection_color_leaves_field_none() {
+        // Same forgiving contract as the other color keys: a wrong-typed or
+        // out-of-range selection value is skipped per-key, leaving the field
+        // at its `None` default rather than poisoning the parse. Sibling keys
+        // still apply.
+        let src = "selection_background = \"nothex\"\nselection_foreground = 0x1000000\nforeground = 0x2d2519\n";
+        let p = parse_toml(src);
+        assert_eq!(p.selection_background, None, "wrong-typed selection_background stays None");
+        assert_eq!(p.selection_foreground, None, "out-of-range selection_foreground stays None");
+        assert_eq!(to_bytes(p.foreground), [0x2d, 0x25, 0x19]);
+    }
+
+    #[test]
+    fn selection_foreground_alpha_is_one() {
+        // Mirror of `selection_background_alpha_is_one`: the recolored
+        // selected-text glyph color is stored opaque too.
+        let p = parse_toml("selection_foreground = 0xffeeaa\n");
+        let fg = p.selection_foreground.expect("set");
+        assert_eq!(fg[3], 1.0);
+        assert_eq!(to_bytes(fg), [0xff, 0xee, 0xaa]);
+    }
+
+    #[test]
+    fn selection_background_alpha_is_one() {
+        // Parsed selection colors are stored opaque (alpha == 1.0) — the
+        // renderer draws the fill solid.
+        let p = parse_toml("selection_background = 0x000000\n");
+        let bg = p.selection_background.expect("set");
+        assert_eq!(bg[3], 1.0);
+        assert_eq!(bg, [0.0, 0.0, 0.0, 1.0]);
+        let p = parse_toml("selection_background = 0x3366d9\n");
+        assert_eq!(p.selection_background.expect("set")[3], 1.0);
     }
 
     #[test]
