@@ -209,7 +209,7 @@ impl Terminal {
         // id-keyed entry leaks, so `kitty_image_id_lookup` later
         // returns None and the placeholder cells render as tofu.
         if ctrl.image_id.is_none() {
-            if let Some(id) = self.current_chunked_id {
+            if let Some(id) = self.kitty.current_chunked_id {
                 if matches!(
                     ctrl.action,
                     KittyAction::Transmit
@@ -238,7 +238,7 @@ impl Terminal {
                     | KittyAction::AnimationFrame
                     | KittyAction::AnimationControl,
             ) {
-                ctrl.image_id = self.last_kitty_image_id;
+                ctrl.image_id = self.kitty.last_image_id;
             }
         }
         // Update the in-flight tracker. First chunk of an id-keyed
@@ -252,9 +252,9 @@ impl Terminal {
         ) {
             if let Some(id) = ctrl.image_id {
                 if ctrl.more_chunks {
-                    self.current_chunked_id = Some(id);
-                } else if self.current_chunked_id == Some(id) {
-                    self.current_chunked_id = None;
+                    self.kitty.current_chunked_id = Some(id);
+                } else if self.kitty.current_chunked_id == Some(id) {
+                    self.kitty.current_chunked_id = None;
                 }
             }
         }
@@ -449,7 +449,7 @@ impl Terminal {
         if matches!(ctrl.transmission, KittyTransmission::Direct) {
             if ctrl.more_chunks {
                 let entry =
-                    self.kitty_chunks.entry(client_id).or_insert_with(|| KittyChunks {
+                    self.kitty.chunks.entry(client_id).or_insert_with(|| KittyChunks {
                         b64: String::new(),
                         // Carry through the parser's view — even if
                         // Png (the "no f= seen" sentinel) — so the
@@ -474,7 +474,7 @@ impl Terminal {
             // accumulator out, append the final piece, decode the
             // assembled base64, and continue through the normal
             // finalize path with the parent's params.
-            if let Some(mut acc) = self.kitty_chunks.remove(&client_id) {
+            if let Some(mut acc) = self.kitty.chunks.remove(&client_id) {
                 use base64::Engine;
                 append_b64_filtered(&mut acc.b64, payload);
                 let Ok(mut raw) = base64::engine::general_purpose::STANDARD
@@ -609,7 +609,7 @@ impl Terminal {
             raw,
             source_w,
             source_h,
-            self.kitty_image_formats.get(&client_id).copied(),
+            self.kitty.image_formats.get(&client_id).copied(),
         )
     }
 
@@ -707,17 +707,17 @@ impl Terminal {
                     .retain(|p| p.kitty_image_id.is_none());
                 self.scrollback_placements
                     .retain(|sp| sp.placement.kitty_image_id.is_none());
-                self.kitty_image_ids.clear();
-                self.kitty_image_formats.clear();
-                self.kitty_image_cell_extents.clear();
+                self.kitty.image_ids.clear();
+                self.kitty.image_formats.clear();
+                self.kitty.image_cell_extents.clear();
             }
             KittyDeleteSelector::Image => {
                 let Some(client_id) = ctrl.image_id else { return };
                 let Some(image_id) = self.kitty_image_id_lookup(client_id) else { return };
                 self.remove_placements_with_image(image_id);
-                self.kitty_image_ids.remove(&client_id);
-                self.kitty_image_formats.remove(&client_id);
-                self.kitty_image_cell_extents.remove(&client_id);
+                self.kitty.image_ids.remove(&client_id);
+                self.kitty.image_formats.remove(&client_id);
+                self.kitty.image_cell_extents.remove(&client_id);
             }
             KittyDeleteSelector::Placement => {
                 let Some(pid) = ctrl.placement_id else { return };
@@ -800,7 +800,7 @@ impl Terminal {
             && !ctrl.virtual_placement;
         match (ctrl.image_id, ctrl.more_chunks) {
             (Some(id), true) => {
-                let entry = self.kitty_chunks.entry(id).or_insert_with(|| KittyChunks {
+                let entry = self.kitty.chunks.entry(id).or_insert_with(|| KittyChunks {
                     b64: String::new(),
                     format: ctrl.format,
                     source_w: ctrl.source_w,
@@ -816,8 +816,8 @@ impl Terminal {
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
-            (Some(id), false) if self.kitty_chunks.contains_key(&id) => {
-                let mut acc = self.kitty_chunks.remove(&id).expect("contains_key");
+            (Some(id), false) if self.kitty.chunks.contains_key(&id) => {
+                let mut acc = self.kitty.chunks.remove(&id).expect("contains_key");
                 append_b64_filtered(&mut acc.b64, payload);
                 self.finalize_kitty_image_from_chunks(&acc);
             }
@@ -826,7 +826,7 @@ impl Terminal {
                 // sizing/format; later ones just append base64. A new
                 // first-chunk while one's open overwrites — there's no
                 // way to distinguish them otherwise.
-                let entry = self.kitty_chunks_anon.get_or_insert_with(|| KittyChunks {
+                let entry = self.kitty.chunks_anon.get_or_insert_with(|| KittyChunks {
                     b64: String::new(),
                     format: ctrl.format,
                     source_w: ctrl.source_w,
@@ -842,8 +842,8 @@ impl Terminal {
                 });
                 append_b64_filtered(&mut entry.b64, payload);
             }
-            (None, false) if self.kitty_chunks_anon.is_some() => {
-                let mut acc = self.kitty_chunks_anon.take().expect("is_some");
+            (None, false) if self.kitty.chunks_anon.is_some() => {
+                let mut acc = self.kitty.chunks_anon.take().expect("is_some");
                 append_b64_filtered(&mut acc.b64, payload);
                 self.finalize_kitty_image_from_chunks(&acc);
             }
@@ -1016,20 +1016,20 @@ impl Terminal {
         // f=24 (RGB) or f=32 (RGBA) for animations sourced from
         // GIFs, since the app already decoded once.
         if let Some(id) = kitty_image_id {
-            self.kitty_image_formats.insert(id, source_format);
+            self.kitty.image_formats.insert(id, source_format);
             // Mark this image as "most recently completed" so a
             // subsequent `a=p` / `a=d` / `a=f` / `a=a` arriving
             // without `i=` can target it (per the Kitty spec
             // fallback). icat's animation-frame stream relies on
             // this — it emits `a=f` with no `i=` and no `m=` between
             // animation-control messages.
-            self.last_kitty_image_id = Some(id);
+            self.kitty.last_image_id = Some(id);
             // Cache the image's total cell extent so the per-run
             // placeholder renderer can compute UVs against it. Only
             // record when BOTH dimensions are present — partial
             // values can't define a tiling.
             if let (Some(c), Some(r)) = (cells_cols, cells_rows) {
-                self.kitty_image_cell_extents.insert(id, (c, r));
+                self.kitty.image_cell_extents.insert(id, (c, r));
             }
         }
         // Kitty's `c=`/`r=` map onto `ImageSizeSpec::Cells` when present,
