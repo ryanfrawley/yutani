@@ -1,3 +1,7 @@
 /target
 .vscode
 .DS_Store
+
+# Local, untracked Claude instructions (internal infra recipes etc.) that must
+# not ship in the public release. Loaded automatically alongside CLAUDE.md.
+CLAUDE.local.md

@@ -3,6 +3,7 @@ mod box_drawing;
 mod command_palette;
 mod completion;
 mod glass;
+mod glass_about;
 mod glass_complete;
 mod glass_find;
 mod glass_palette;
@@ -580,7 +581,7 @@ impl AppShared {
 /// One shell session and the interaction state bound to it. Everything here
 /// scrolls, selects, or completes against a single PTY + `Terminal`; none of
 /// it is coupled to the window's GPU surface, atlas, or buffers (so a tab can
-/// later move between windows — see MULTIWINDOW_PLAN.md). A window owns a
+/// later move between windows). A window owns a
 /// `Vec<TabState>` and renders only the active one. First cut: exactly one tab
 /// per window; the tab UI is a later follow-up.
 struct TabState {
@@ -2904,6 +2905,31 @@ fn install_new_tab_action(window: &Window) {
 
 #[cfg(not(target_os = "macos"))]
 fn install_new_tab_action(_window: &Window) {}
+
+/// Force the process name to the proper-noun "Yutani" before winit builds its
+/// default menu. winit titles every app-menu item ("About …", "Hide …",
+/// "Quit …") from `NSProcessInfo.processName`, which otherwise defaults to the
+/// lowercase executable name (`yutani`) when running unbundled — so the menu
+/// reads "About yutani". Must run before `run_app` (the menu is built during
+/// `applicationDidFinishLaunching`). No-op in the .app bundle, where the name is
+/// already "Yutani", but harmless to set either way.
+#[cfg(target_os = "macos")]
+fn set_app_process_name() {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+    unsafe {
+        let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+        if info.is_null() {
+            return;
+        }
+        let name = NSString::from_str("Yutani");
+        let _: () = msg_send![info, setProcessName: &*name];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_app_process_name() {}
 
 fn theme_for_bg(bg: [f32; 4]) -> winit::window::Theme {
     // Rec. 709 luma in linear-light. <0.18 is roughly perceptual midgray

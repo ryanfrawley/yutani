@@ -650,8 +650,17 @@ mod imp {
             // No grid lines / alternating fills (they'd paint over the glass).
             let _: () = msg_send![&*table, setGridStyleMask: 0usize];
             let _: () = msg_send![&*table, setUsesAlternatingRowBackgroundColors: false];
-            // NSTableViewSelectionHighlightStyleRegular == 1.
-            let _: () = msg_send![&*table, setSelectionHighlightStyle: 1isize];
+            // Regular (0) selection, NOT SourceList (1). SourceList draws the
+            // selected row as a translucent *vibrant* material that samples the
+            // backdrop; over our live NSGlassEffectView (which re-blurs the
+            // animating terminal every frame) it re-samples each frame and
+            // shimmers as a flickering blue glass tint. Regular's unemphasized
+            // fill is a solid, opaque gray that covers the backdrop and can't
+            // flicker. The PaletteRowView's `isEmphasized = false` keeps it on
+            // the gray (unemphasized) variant rather than the accent-blue one.
+            // (NSTableViewSelectionHighlightStyle: None = -1, Regular = 0,
+            // SourceList = 1.)
+            let _: () = msg_send![&*table, setSelectionHighlightStyle: 0isize];
             table.setDataSource(Some(ProtocolObject::from_ref(&*controller)));
             table.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
             // Single click on a row runs it (like Enter).
