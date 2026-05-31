@@ -45,6 +45,10 @@ struct App {
     /// Guards the one-time bring-up in `resumed` (called again on some
     /// platforms after suspend/resume; on desktop it fires once at startup).
     inited: bool,
+    /// The process-global "About Yutani" glass panel, built lazily the first
+    /// time the menu item is picked. App-level (not per-window) since it floats
+    /// centred on screen, not over any one terminal.
+    glass_about: Option<glass_about::GlassAbout>,
 }
 
 /// Build the event loop and run the app. Sync (was `async` pre-0.30): GPU
@@ -60,6 +64,11 @@ pub(crate) fn run() {
     // user edits are never clobbered. Best-effort; runs only in the parent
     // (the `--onboard` child branches out of `main` before reaching here).
     bundled_schemes::seed();
+
+    // Name the process "Yutani" before the loop builds its default menu, so the
+    // app-menu items read "About Yutani" / "Quit Yutani" rather than the
+    // lowercase executable name. See `set_app_process_name`.
+    set_app_process_name();
 
     let event_loop = EventLoop::<app_window::CustomEvent>::with_user_event()
         .build()
@@ -81,6 +90,7 @@ pub(crate) fn run() {
         t_start,
         first_frame_done: false,
         inited: false,
+        glass_about: None,
     };
     let _ = event_loop.run_app(&mut app);
 }
@@ -93,6 +103,12 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             return;
         }
         self.inited = true;
+
+        // The default menu now exists (built in applicationDidFinishLaunching).
+        // Retarget its "About Yutani" item from the stock system panel to our
+        // glass one.
+        #[cfg(target_os = "macos")]
+        glass_about::install_about_menu_action();
 
         let t_start = self.t_start;
         let timing = self.timing;
@@ -859,6 +875,23 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     glass_find::FindSignal::Prev => state.find_step(false),
                     glass_find::FindSignal::Close => state.find_close(),
                 }
+            }
+        }
+
+        // Drain a "show About" request from the menu item. The panel is
+        // app-global (built once, lazily) and floats centred on screen, so it
+        // isn't routed to a window — but match its glass appearance to the
+        // focused window's theme so its text stays legible.
+        #[cfg(target_os = "macos")]
+        if glass_about::take_about_request() {
+            if self.glass_about.is_none() {
+                self.glass_about = glass_about::new();
+            }
+            if let Some(about) = self.glass_about.as_mut() {
+                // The native overlays all read the process-global palette (see
+                // `toggle_find` / `toggle_command_palette`); match that here.
+                let dark = theme_for_bg(palette::get().background) == winit::window::Theme::Dark;
+                about.show(dark);
             }
         }
 
