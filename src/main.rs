@@ -3326,6 +3326,11 @@ pub(crate) const GLASS_TITLEBAR: bool = true;
 /// Overall opacity of the frosted band (1.0 = fully frosted; lower lets a bit
 /// of the sharp content read through).
 pub(crate) const GLASS_TITLEBAR_ALPHA: f32 = 1.0;
+/// When the native tab bar is shown, extend the frosted band's dissolve this
+/// fraction of the tab-bar height past the title-bar bottom (= the tab tops),
+/// so content passing through the gap between the title bar and the tabs reads
+/// a little blurred there rather than snapping sharp right at the tab tops.
+pub(crate) const GLASS_TITLEBAR_TAB_DISSOLVE: f32 = 0.5;
 
 fn clear_color(_theme: winit::window::Theme) -> wgpu::Color {
     let bg = palette::get().background;
