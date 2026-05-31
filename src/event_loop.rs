@@ -14,6 +14,51 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+/// Map a non-flipped `NSScrollView` clip-origin into a terminal scroll position.
+///
+/// The document runs newest-at-bottom: `origin_y` (points) is 0 at the live grid
+/// and grows toward `scrollback * lh_pt` at the oldest line. The return is the
+/// target `view_offset` line plus a `scroll_y` overscroll in physical pixels
+/// (`scale = lh_px / lh_pt`). Within range, `scroll_y` is the sub-line remainder;
+/// past either end the elastic bounce maps into `scroll_y`, clamped to the
+/// phantom-row budget, so content rubber-bands along with the scroller.
+///
+/// The dead-zone is the fix for the reversed-scroll bug: a wheel/trackpad gesture
+/// that begins from the resting edge nudges the clip origin a few points the
+/// *opposite* way before it catches. Without the dead-zone that nudge mapped to an
+/// opposite-sign `scroll_y`, so starting an upward scroll from the bottom first
+/// slid the view *down* a few pixels before reversing — glaring on low-DPI panels
+/// where each pixel is large. Swallowing the give within `OVERSCROLL_DEADZONE_PT`
+/// kills the reversal; soft-kneeing past it (subtracting the dead-zone rather than
+/// gating) keeps deliberate rubber-band sliding in smoothly with no pop.
+pub(crate) fn scrollview_origin_to_view(
+    origin_y: f64,
+    lh_pt: f64,
+    lh_px: f64,
+    scrollback: usize,
+) -> (usize, f64) {
+    /// Points of elastic "give" at the ends to treat as no movement.
+    const OVERSCROLL_DEADZONE_PT: f64 = 8.0;
+    if lh_pt <= 0.0 {
+        return (0, 0.0);
+    }
+    let scale = lh_px / lh_pt;
+    let max_sy = 15.0 * lh_px;
+    let top_pt = scrollback as f64 * lh_pt;
+    if origin_y < 0.0 {
+        // Past the bottom (newest): rubber-band down, after the dead-zone.
+        let over = (origin_y + OVERSCROLL_DEADZONE_PT).min(0.0);
+        (0, (over * scale).max(-max_sy))
+    } else if origin_y > top_pt {
+        // Past the top (oldest): rubber-band up, after the dead-zone.
+        let over = (origin_y - top_pt - OVERSCROLL_DEADZONE_PT).max(0.0);
+        (scrollback, (over * scale).min(max_sy))
+    } else {
+        let lines = origin_y / lh_pt;
+        (lines.floor() as usize, (lines - lines.floor()) * lh_px)
+    }
+}
+
 /// Long-lived state for the process. Built empty by [`run`] and populated on the
 /// first [`resumed`](App::resumed); the per-event trait methods then route
 /// against it. The window registry (`windows` + `tab_to_window`) is owned here
@@ -788,18 +833,9 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                             // Scroll view drove it: map its offset into the
                             // terminal. Non-flipped doc: origin 0 = bottom
                             // (newest); past the ends the elastic bounce maps
-                            // into `scroll_y` (clamped to the phantom-row budget)
-                            // so content rubber-bands too. px = points · scale.
-                            let lines_raw = origin_y / lh_pt;
-                            let max_sy = 15.0 * lh_px;
-                            let sb = scrollback as f64;
-                            let (target, new_scroll_y) = if lines_raw < 0.0 {
-                                (0usize, (lines_raw * lh_px).max(-max_sy))
-                            } else if lines_raw > sb {
-                                (scrollback, ((lines_raw - sb) * lh_px).min(max_sy))
-                            } else {
-                                (lines_raw.floor() as usize, (lines_raw - lines_raw.floor()) * lh_px)
-                            };
+                            // into `scroll_y` so content rubber-bands too.
+                            let (target, new_scroll_y) =
+                                scrollview_origin_to_view(origin_y, lh_pt, lh_px, scrollback);
                             if target > cur {
                                 state.active_tab_mut().terminal.scroll_up(target - cur);
                             } else if target < cur {
@@ -994,5 +1030,137 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
             Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
+    }
+}
+
+#[cfg(test)]
+mod scrollview_origin_tests {
+    use super::scrollview_origin_to_view;
+
+    /// The dead-zone constant mirrored from `scrollview_origin_to_view`.
+    const DEADZONE_PT: f64 = 8.0;
+
+    /// Assert two f64s are equal within a tight epsilon (the function does only
+    /// a couple of multiplies, so the result is exact to well under this).
+    fn approx(a: f64, b: f64) {
+        assert!((a - b).abs() < 1e-9, "expected {b}, got {a}");
+    }
+
+    // 1. In-range mapping with a non-1.0 scale (lh_pt=8, lh_px=16 → scale 2).
+
+    #[test]
+    fn in_range_maps_to_floor_line_and_subline_remainder() {
+        // Origin exactly on a line boundary: whole line, no remainder.
+        let (target, sy) = scrollview_origin_to_view(16.0, 8.0, 16.0, 100);
+        assert_eq!(target, 2); // floor(16/8)
+        approx(sy, 0.0);
+
+        // Origin half a line past line 1: remainder is half a line in px (8.0).
+        let (target, sy) = scrollview_origin_to_view(12.0, 8.0, 16.0, 100);
+        assert_eq!(target, 1); // floor(12/8)
+        approx(sy, 8.0); // (1.5 - 1.0) * 16
+
+        // Quarter line past line 3.
+        let (target, sy) = scrollview_origin_to_view(26.0, 8.0, 16.0, 100);
+        assert_eq!(target, 3); // floor(26/8)
+        approx(sy, 4.0); // (3.25 - 3.0) * 16
+    }
+
+    #[test]
+    fn in_range_bottom_edge_is_origin_and_no_overscroll() {
+        let (target, sy) = scrollview_origin_to_view(0.0, 8.0, 16.0, 100);
+        assert_eq!(target, 0);
+        approx(sy, 0.0);
+    }
+
+    #[test]
+    fn in_range_top_edge_maps_to_scrollback_with_no_remainder() {
+        // origin_y == scrollback*lh_pt == 800 is the inclusive top of the range.
+        let (target, sy) = scrollview_origin_to_view(800.0, 8.0, 16.0, 100);
+        assert_eq!(target, 100); // floor(800/8)
+        approx(sy, 0.0);
+    }
+
+    // 2. THE BUG FIX — bottom dead-zone swallows the opposite-direction nudge.
+
+    #[test]
+    fn bottom_deadzone_swallows_small_negative_nudge() {
+        // A tiny negative origin (the give at the start of an upward scroll from
+        // the bottom) must NOT push content down — target 0, scroll_y exactly 0.
+        for origin in [-1.0, -3.0, -7.9] {
+            let (target, sy) = scrollview_origin_to_view(origin, 8.0, 16.0, 100);
+            assert_eq!(target, 0, "origin {origin} should clamp to target 0");
+            approx(sy, 0.0); // crucially NOT negative
+            // Regression guard: the bug produced an opposite-sign scroll_y here.
+            assert!(sy >= 0.0, "origin {origin} produced reversed scroll_y {sy}");
+        }
+    }
+
+    // 3. Bottom rubber-band past the dead-zone (soft-knee), with clamp.
+
+    #[test]
+    fn bottom_rubberband_softknees_past_deadzone() {
+        // origin_y = -20, dead-zone 8 → over = -12pt → scroll_y = -12 * scale.
+        let (target, sy) = scrollview_origin_to_view(-20.0, 8.0, 16.0, 100);
+        assert_eq!(target, 0);
+        approx(sy, (-20.0 + DEADZONE_PT) * 2.0); // -24.0
+        assert!(sy < 0.0);
+    }
+
+    #[test]
+    fn bottom_rubberband_is_continuous_at_deadzone_edge() {
+        // Soft-knee (subtract the dead-zone) makes scroll_y continuous through
+        // the edge: at exactly -8pt it is ~0, just beyond it goes negative.
+        let (_, sy_edge) = scrollview_origin_to_view(-DEADZONE_PT, 8.0, 16.0, 100);
+        approx(sy_edge, 0.0);
+
+        let (_, sy_just_past) = scrollview_origin_to_view(-(DEADZONE_PT + 0.5), 8.0, 16.0, 100);
+        approx(sy_just_past, -0.5 * 2.0); // -1.0
+        assert!(sy_just_past < sy_edge);
+    }
+
+    #[test]
+    fn bottom_rubberband_clamps_to_phantom_budget() {
+        // A huge negative origin clamps to -(15 * lh_px).
+        let (target, sy) = scrollview_origin_to_view(-100_000.0, 8.0, 16.0, 100);
+        assert_eq!(target, 0);
+        approx(sy, -15.0 * 16.0); // -240.0
+    }
+
+    // 4. Top dead-zone & rubber-band — symmetric with the bottom.
+
+    #[test]
+    fn top_deadzone_swallows_small_positive_overshoot() {
+        // top = 100 * 8 = 800. A few points past stays put with no overscroll.
+        for delta in [1.0, 3.0, 7.9] {
+            let (target, sy) = scrollview_origin_to_view(800.0 + delta, 8.0, 16.0, 100);
+            assert_eq!(target, 100, "delta {delta} should clamp to scrollback");
+            approx(sy, 0.0); // symmetric with the bottom: no overscroll inside the give
+        }
+    }
+
+    #[test]
+    fn top_rubberband_softknees_and_clamps() {
+        // 20pt past the top, dead-zone 8 → over = 12pt → scroll_y = +12 * scale.
+        let (target, sy) = scrollview_origin_to_view(820.0, 8.0, 16.0, 100);
+        assert_eq!(target, 100);
+        approx(sy, (820.0 - 800.0 - DEADZONE_PT) * 2.0); // +24.0
+        assert!(sy > 0.0);
+
+        // Continuity at the top dead-zone edge: ~0 at exactly the edge.
+        let (_, sy_edge) = scrollview_origin_to_view(800.0 + DEADZONE_PT, 8.0, 16.0, 100);
+        approx(sy_edge, 0.0);
+
+        // Huge overshoot clamps to +(15 * lh_px).
+        let (_, sy_clamped) = scrollview_origin_to_view(1_000_000.0, 8.0, 16.0, 100);
+        approx(sy_clamped, 15.0 * 16.0); // +240.0
+    }
+
+    // 5. Degenerate: non-positive line height yields a safe zero.
+
+    #[test]
+    fn nonpositive_line_height_is_safe_zero() {
+        assert_eq!(scrollview_origin_to_view(50.0, 0.0, 16.0, 100), (0, 0.0));
+        assert_eq!(scrollview_origin_to_view(50.0, -8.0, 16.0, 100), (0, 0.0));
     }
 }
