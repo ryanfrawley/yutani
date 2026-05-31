@@ -23,8 +23,6 @@
 //! that handle. The bright-ANSI hue table is loaded from a palette via
 //! [`Glow::set_bright_palette`].
 
-use wgpu::util::DeviceExt;
-
 const DEFAULT_ITERATIONS: usize = 2;
 pub const MAX_ITERATIONS: usize = 12;
 
@@ -584,9 +582,10 @@ impl Glow {
         height: u32,
         scene_view: &wgpu::TextureView,
     ) -> Self {
-        let glow_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glow params uniform"),
-            contents: bytemuck::cast_slice(&[GlowParams {
+        let glow_uniform = super::uniform_buffer(
+            device,
+            "glow params uniform",
+            GlowParams {
                 threshold: DEFAULT_THRESHOLD,
                 intensity: DEFAULT_INTENSITY,
                 softness: DEFAULT_SOFTNESS,
@@ -605,23 +604,16 @@ impl Glow {
                 scanline_color_dark: DEFAULT_SCANLINE_COLOR_DARK,
                 content_scanline_attenuation: DEFAULT_CONTENT_SCANLINE_ATTENUATION,
                 _pad: [0.0; 3],
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-        let bright_hues_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("glow bright hues uniform"),
-            contents: bytemuck::cast_slice(&[BrightHues::empty()]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+            },
+        );
+        let bright_hues_uniform =
+            super::uniform_buffer(device, "glow bright hues uniform", BrightHues::empty());
         let make_blur_uniform = |label: &str| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(&[BlurParams {
-                    texel_size: [0.0, 0.0],
-                    _pad: [0.0; 2],
-                }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            })
+            super::uniform_buffer(
+                device,
+                label,
+                BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+            )
         };
         let bright_blur_uniform = make_blur_uniform("glow bright blur uniform");
         let down_uniform = make_blur_uniform("glow down blur uniform");

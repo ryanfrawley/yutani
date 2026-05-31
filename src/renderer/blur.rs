@@ -7,8 +7,6 @@
 //! per-level uniforms. The down/up chain uses 3 levels (1/2 → 1/4 → 1/8)
 //! which gives a generous "fat" glass blur.
 
-use wgpu::util::DeviceExt;
-
 const CHAIN_LEVELS: usize = 2;
 // Default extra inner down/up passes. Each iteration adds one down
 // (chain[0]→chain[1]) and one up (chain[1]→chain[0]), compounding the
@@ -203,11 +201,11 @@ impl BlurPipelines {
 
         // Static dummy uniform — its texel_size field is unused by the blit /
         // strip-source shaders, but the bind-group layout requires a buffer.
-        let blit_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("blur blit uniform"),
-            contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let blit_uniform = super::uniform_buffer(
+            device,
+            "blur blit uniform",
+            BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+        );
 
         Self {
             format,
@@ -285,24 +283,24 @@ impl BlurChain {
         width: u32,
         height: u32,
     ) -> Self {
-        let strip_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("blur strip uniform"),
-            contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let strip_uniform = super::uniform_buffer(
+            device,
+            "blur strip uniform",
+            BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+        );
         let mut down_uniforms = Vec::with_capacity(CHAIN_LEVELS);
         let mut up_uniforms = Vec::with_capacity(CHAIN_LEVELS);
         for _ in 0..CHAIN_LEVELS {
-            down_uniforms.push(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blur down uniform"),
-                contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            }));
-            up_uniforms.push(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("blur up uniform"),
-                contents: bytemuck::cast_slice(&[BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] }]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            }));
+            down_uniforms.push(super::uniform_buffer(
+                device,
+                "blur down uniform",
+                BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+            ));
+            up_uniforms.push(super::uniform_buffer(
+                device,
+                "blur up uniform",
+                BlurParams { texel_size: [0.0, 0.0], _pad: [0.0; 2] },
+            ));
         }
 
         let strip_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

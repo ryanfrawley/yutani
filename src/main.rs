@@ -1,3 +1,34 @@
+//! Yutani — a GPU-accelerated terminal emulator (macOS-first, wgpu).
+//!
+//! Module map (where to look for what):
+//!
+//! - **Terminal model** — [`terminal`] holds the grid/cell ring buffer,
+//!   scrollback, cursor, scroll regions/margins, the VT/CSI/SGR parser
+//!   ([`ansi`]) dispatch, and shell-integration OSC handlers. The inline-image
+//!   protocols (iTerm2 `OSC 1337`, Kitty graphics) live in its
+//!   `terminal/image_protocol.rs` submodule.
+//! - **Window state** — the per-window [`WindowState`] god-struct is defined
+//!   here in `main.rs`; its methods are organized by topic across the
+//!   `state_*` extension files (all `impl WindowState`): `state_render`
+//!   (vertex/quad emission + frame composition), `state_input` (key/IME
+//!   routing), `state_pointer` (mouse/selection/hover), `state_completion`
+//!   (autocomplete popup), `state_image` (inline-image upload/placement),
+//!   `state_theme` (scheme/appearance sync), `state_anim` (smooth-scroll and
+//!   fade animation). Process-shared GPU resources live in `AppShared`.
+//! - **GPU/rendering** — [`renderer`] wraps wgpu: `renderer::blur`,
+//!   `renderer::glow`, `renderer::images`, plus shared helpers in
+//!   `renderer/mod.rs` (e.g. [`renderer::uniform_buffer`]); [`gpu`] /
+//!   [`present`] own surface + frame presentation.
+//! - **Overlays/UI chrome** — [`command_palette`], [`completion`], [`search`],
+//!   [`onboard`] are the cross-platform popup models; the `glass_*` files
+//!   (`glass`, `glass_palette`, `glass_find`, `glass_complete`) are the
+//!   macOS-native Liquid Glass panels (deliberately kept as separate AppKit
+//!   controllers). [`palette`] is color/scheme math, not a UI element.
+//! - **Fonts/text** — [`font`], [`shaper`], [`font_loader`] (per-platform),
+//!   [`box_drawing`]. **Config/theming** — [`config`], [`bundled_schemes`],
+//!   [`style`]. **Platform glue** — [`app_window`], [`event_loop`],
+//!   [`pty`], [`touchid`], [`paths`].
+
 mod app_window;
 mod box_drawing;
 mod command_palette;
@@ -2435,9 +2466,7 @@ fn spawn_window_in_process(
 /// scanline-colour config round-trips cleanly. Reuses palette's sRGB
 /// conversion so the byte we emit matches the byte the user typed.
 fn format_hex_rgb(c: [f32; 4]) -> String {
-    let r = palette::linear_to_srgb_u8(c[0]);
-    let g = palette::linear_to_srgb_u8(c[1]);
-    let b = palette::linear_to_srgb_u8(c[2]);
+    let [r, g, b] = palette::color_to_srgb_u8(c);
     format!("0x{:02x}{:02x}{:02x}", r, g, b)
 }
 
@@ -2556,7 +2585,7 @@ fn set_native_window_bg(window: &Window, bg: [f32; 4]) {
     let RawWindowHandle::AppKit(handle) = window.raw_window_handle() else {
         return;
     };
-    let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
+    let chan = palette::linear_to_srgb_f64;
     unsafe {
         let ns_view = handle.ns_view as *mut AnyObject;
         let ns_window: *mut AnyObject = msg_send![ns_view, window];

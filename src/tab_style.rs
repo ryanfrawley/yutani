@@ -136,7 +136,7 @@ mod imp {
         // can come out dark on dark themes). The frosted band shows the scheme
         // background, so the scheme foreground always reads against it.
         let fg = palette::get().foreground;
-        let chan = |c: f32| palette::linear_to_srgb_u8(c) as f64 / 255.0;
+        let chan = palette::linear_to_srgb_f64;
         let alpha = if active { ACTIVE_ALPHA } else { INACTIVE_ALPHA };
         let color: Retained<NSColor> = msg_send![
             class!(NSColor),
