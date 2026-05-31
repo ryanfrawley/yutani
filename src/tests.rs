@@ -222,15 +222,17 @@ fn get_viewport_size_floors_rows_at_min_grid_rows() {
     // 1–2 row grid, which spills the prompt into scrollback on resize.
     // The row count must never drop below MIN_GRID_ROWS no matter how
     // short the window. cell 8px wide, 18px line height.
-    let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18, 0.0);
+    // dpi 192 = the 2× reference, where the DPI-scaled padding/decorator equal
+    // their authored values, so these geometry expectations are unchanged.
+    let tiny = WindowState::get_viewport_size(800.0, 0.0, 8, 18, 0.0, 192);
     assert_eq!(tiny.char_height, MIN_GRID_ROWS);
-    let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18, 0.0);
+    let short = WindowState::get_viewport_size(800.0, 60.0, 8, 18, 0.0, 192);
     assert_eq!(short.char_height, MIN_GRID_ROWS);
     // A normally-sized window is unaffected — the floor doesn't clamp it.
-    let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 0.0);
+    let normal = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 0.0, 192);
     assert!(normal.char_height > MIN_GRID_ROWS);
     // The native tab bar's extra top reserve removes rows from the same window.
-    let with_tab_bar = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 90.0);
+    let with_tab_bar = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 90.0, 192);
     assert!(with_tab_bar.char_height < normal.char_height);
 }
 
@@ -247,9 +249,9 @@ fn get_viewport_size_extra_top_removes_expected_rows() {
     let advance_x = 8;
     let width = 800.0;
     let height = 1000.0;
-    let no_bar = WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0);
+    let no_bar = WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 192);
     let with_bar =
-        WindowState::get_viewport_size(width, height, advance_x, line_height, 72.0);
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 72.0, 192);
     assert_eq!(
         no_bar.char_height - with_bar.char_height,
         72 / line_height,
@@ -267,7 +269,7 @@ fn get_viewport_size_rows_monotonically_nonincreasing_in_extra_top() {
     // sign flip or off-by-one in the subtraction surfaces here.
     let mut prev = usize::MAX;
     for extra_top in [0.0, 10.0, 25.0, 50.0, 90.0, 200.0, 1000.0] {
-        let rows = WindowState::get_viewport_size(800.0, 1000.0, 8, 18, extra_top).char_height;
+        let rows = WindowState::get_viewport_size(800.0, 1000.0, 8, 18, extra_top, 192).char_height;
         assert!(
             rows <= prev,
             "rows must not grow as extra_top increases: extra_top={extra_top} \
@@ -283,13 +285,13 @@ fn get_viewport_size_floor_holds_even_with_huge_tab_bar() {
     // grid: the MIN_GRID_ROWS floor applies after `extra_top` is subtracted, so
     // the row count never collapses to zero (which would divide-by-zero the
     // shell or strand the prompt entirely).
-    let rows = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 10_000.0).char_height;
+    let rows = WindowState::get_viewport_size(800.0, 600.0, 8, 18, 10_000.0, 192).char_height;
     assert_eq!(rows, MIN_GRID_ROWS);
     // And a negative usable height (reserve exceeds height) is clamped to 0
     // before the divide, not wrapped — the `.max(0.0)` on the subtraction —
     // so we still land exactly on the floor rather than panicking on an
     // `as usize` of a negative float.
-    let rows_neg = WindowState::get_viewport_size(800.0, 50.0, 8, 18, 5_000.0).char_height;
+    let rows_neg = WindowState::get_viewport_size(800.0, 50.0, 8, 18, 5_000.0, 192).char_height;
     assert_eq!(rows_neg, MIN_GRID_ROWS);
 }
 
@@ -298,7 +300,7 @@ fn get_viewport_size_zero_extra_top_matches_unmodified_path() {
     // `extra_top == 0.0` is the no-tab-bar case and must be identical to the
     // pre-reflow geometry: subtracting zero changes nothing. This guards
     // against the bar reserve accidentally leaking into single-window layout.
-    let v = WindowState::get_viewport_size(1024.0, 768.0, 9, 20, 0.0);
+    let v = WindowState::get_viewport_size(1024.0, 768.0, 9, 20, 0.0, 192);
     let expected_rows = ((768.0 - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT).max(0.0) as usize) / 20;
     assert_eq!(v.char_height, expected_rows);
 }
@@ -321,6 +323,155 @@ fn chrome_extra_top_formula_is_band_minus_baseline_floored_at_zero() {
     // Defensive floor: if the baseline somehow exceeds the band, the reserve
     // clamps to 0 rather than going negative (which would *add* rows downstream).
     assert!(approx_eq(extra_top(40.0, 56.0), 0.0));
+}
+
+//
+// DPI consistency for fixed-pixel UI metrics. `dpi_px` rescales values
+// authored on a 2× Retina display (`UI_REFERENCE_SCALE`) so they hold a
+// constant *apparent* size on every backing scale. `dpi = scale_factor × 96`,
+// so 96 = 1×, 144 = 1.5×, 192 = 2× (the reference, identity), 288 = 3×.
+//
+
+#[test]
+fn dpi_px_is_identity_at_reference_dpi() {
+    // dpi=192 is the 2× display the metrics were authored against, so every
+    // value passes through unchanged — existing geometry expectations that
+    // hardcode 192 rely on this.
+    for v in [0.0_f32, 1.0, 16.0, 24.0, 56.5, 1000.0] {
+        assert!(
+            approx_eq(dpi_px(v, 192), v),
+            "dpi_px({v}, 192) should be identity, got {}",
+            dpi_px(v, 192),
+        );
+    }
+}
+
+#[test]
+fn dpi_px_halves_at_1x() {
+    // dpi=96 is a 1× monitor: a metric authored at 2× covers half the physical
+    // pixels to keep the same apparent size.
+    for v in [0.0_f32, 8.0, 16.0, 24.0, 100.0] {
+        assert!(approx_eq(dpi_px(v, 96), v * 0.5), "dpi_px({v}, 96)");
+    }
+}
+
+#[test]
+fn dpi_px_scales_for_fractional_and_triple_dpi() {
+    // 1.5× (dpi=144): factor 144/96 / 2 = 0.75. 3× (dpi=288): 288/96 / 2 = 1.5.
+    for v in [16.0_f32, 24.0, 40.0] {
+        assert!(approx_eq(dpi_px(v, 144), v * 0.75), "dpi_px({v}, 144)");
+        assert!(approx_eq(dpi_px(v, 288), v * 1.5), "dpi_px({v}, 288)");
+    }
+}
+
+#[test]
+fn dpi_px_zero_maps_to_zero() {
+    // A zero metric stays zero at every DPI — no padding means no padding.
+    for dpi in [96, 144, 192, 288] {
+        assert!(approx_eq(dpi_px(0.0, dpi), 0.0), "dpi_px(0.0, {dpi})");
+    }
+}
+
+#[test]
+fn dpi_px_unit_factor_drives_glow_dpi_scale() {
+    // `dpi_px(1.0, dpi)` is the "unit factor" the host feeds the glow as its
+    // `dpi_scale` (= backing_scale / UI_REFERENCE_SCALE): 0.5 at 1×, 1.0 at the
+    // 2× reference, 1.5 at 3×. This is the bridge between the metric scaler and
+    // the glow's apparent-size correction, so pin the exact values.
+    assert!(approx_eq(dpi_px(1.0, 96), 0.5));
+    assert!(approx_eq(dpi_px(1.0, 192), 1.0));
+    assert!(approx_eq(dpi_px(1.0, 288), 1.5));
+    // dpi_px(v, dpi) equals v × dpi_px(1.0, dpi) for any value — the metric
+    // scaler is just the unit factor multiplied through.
+    assert!(approx_eq(dpi_px(40.0, 144), 40.0 * dpi_px(1.0, 144)));
+}
+
+#[test]
+fn dpi_px_is_monotonic_in_dpi() {
+    // Higher DPI → more physical pixels for the same apparent size. Sweep a
+    // range of backing scales and confirm the scaled value never decreases.
+    let v = 24.0_f32;
+    let mut prev = f32::NEG_INFINITY;
+    for dpi in [72, 96, 120, 144, 192, 240, 288, 384] {
+        let scaled = dpi_px(v, dpi);
+        assert!(
+            scaled > prev,
+            "dpi_px({v}, {dpi}) = {scaled} not strictly greater than previous {prev}",
+        );
+        prev = scaled;
+    }
+}
+
+#[test]
+fn dpi_px_relates_to_reference_scale_constant() {
+    // The divisor is `UI_REFERENCE_SCALE`, not a bare literal: at dpi=96 (1×)
+    // the result is `value / UI_REFERENCE_SCALE`, so a change to the anchor
+    // (e.g. re-authoring on a 1× display) surfaces here.
+    assert!(approx_eq(dpi_px(2.0, 96), 2.0 / UI_REFERENCE_SCALE));
+    assert!(approx_eq(UI_REFERENCE_SCALE, 2.0));
+}
+
+#[test]
+fn get_viewport_size_reserves_less_padding_at_low_dpi() {
+    // Apparent-size consistency: the window padding is DPI-scaled, so a 1×
+    // (dpi=96) window spends *fewer physical pixels* on padding than a 2×
+    // (dpi=192) window of the same physical size. Fewer reserved pixels ⇒ more
+    // usable width ⇒ at least as many columns at 1× as at 2×. Use a width that
+    // doesn't divide evenly so the relation isn't masked by the floor divide.
+    let width = 803.0;
+    let height = 1000.0;
+    let advance_x = 8;
+    let line_height = 18;
+    let cols_1x =
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 96).char_width;
+    let cols_2x =
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 192).char_width;
+    assert!(
+        cols_1x >= cols_2x,
+        "1× should reserve less padding and fit >= columns: 1×={cols_1x}, 2×={cols_2x}",
+    );
+    // And the saving is real, not a no-op: with a width this wide the halved
+    // padding (16px vs 32px per side, in physical px) frees genuine columns.
+    assert!(cols_1x > cols_2x, "halved padding should free at least one column");
+}
+
+#[test]
+fn get_viewport_size_at_reference_dpi_matches_raw_metric_formula() {
+    // At dpi=192 the DPI-scaled padding/decorator equal their authored values,
+    // so the row/col counts must match the pre-DPI formula spelled out from the
+    // raw WINDOW_PADDING / DECORATOR_HEIGHT constants. This pins that the 2×
+    // path is exactly the old behavior (the migration's invariant).
+    let width = 1024.0;
+    let height = 768.0;
+    let advance_x = 9;
+    let line_height = 20;
+    let v = WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 192);
+    let expected_cols = usize::max(1, (width - WINDOW_PADDING * 2.0) as usize / advance_x);
+    let expected_rows = usize::max(
+        MIN_GRID_ROWS,
+        (height - WINDOW_PADDING * 2.0 - DECORATOR_HEIGHT).max(0.0) as usize / line_height,
+    );
+    assert_eq!(v.char_width, expected_cols);
+    assert_eq!(v.char_height, expected_rows);
+}
+
+#[test]
+fn get_viewport_size_low_dpi_yields_at_least_as_many_rows() {
+    // The vertical reserve (padding ×2 + decorator) is DPI-scaled too, so a 1×
+    // window reserves fewer physical rows-worth of pixels and can never end up
+    // with *fewer* usable rows than the 2× reference for the same window.
+    let width = 800.0;
+    let height = 1003.0;
+    let advance_x = 8;
+    let line_height = 18;
+    let rows_1x =
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 96).char_height;
+    let rows_2x =
+        WindowState::get_viewport_size(width, height, advance_x, line_height, 0.0, 192).char_height;
+    assert!(
+        rows_1x >= rows_2x,
+        "1× reserves less vertical chrome and should fit >= rows: 1×={rows_1x}, 2×={rows_2x}",
+    );
 }
 
 #[test]
@@ -409,7 +560,7 @@ fn py_in_top_toolbar_band_scales_with_dpi() {
 fn chrome_band_from_falls_back_to_reserve_when_query_fails() {
     // No native height available → use the renderer's fixed reserve.
     let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
-    assert_eq!(chrome_band_from(None, reserve), reserve);
+    assert_eq!(chrome_band_from(None, reserve, CHROME_BAND_MARGIN_PX), reserve);
 }
 
 #[test]
@@ -418,10 +569,10 @@ fn chrome_band_from_clamps_short_native_up_to_reserve() {
     // margin) is clamped up, since the reserve already covers the bar.
     let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64; // 40.0
     // 30 + CHROME_BAND_MARGIN_PX (4) = 34 < 40 → reserve.
-    assert_eq!(chrome_band_from(Some(30.0), reserve), reserve);
+    assert_eq!(chrome_band_from(Some(30.0), reserve, CHROME_BAND_MARGIN_PX), reserve);
     // Boundary: native+margin exactly equal to reserve is kept (>= reserve).
     assert_eq!(
-        chrome_band_from(Some(reserve - CHROME_BAND_MARGIN_PX), reserve),
+        chrome_band_from(Some(reserve - CHROME_BAND_MARGIN_PX), reserve, CHROME_BAND_MARGIN_PX),
         reserve
     );
 }
@@ -432,7 +583,7 @@ fn chrome_band_from_uses_native_plus_margin_when_taller() {
     // with CHROME_BAND_MARGIN_PX added so the lowest grid move lands inside.
     let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64; // 40.0
     assert_eq!(
-        chrome_band_from(Some(52.0), reserve),
+        chrome_band_from(Some(52.0), reserve, CHROME_BAND_MARGIN_PX),
         52.0 + CHROME_BAND_MARGIN_PX
     );
 }
