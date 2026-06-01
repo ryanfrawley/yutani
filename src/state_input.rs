@@ -293,8 +293,15 @@ impl WindowState {
                 // for the current appearance while following the system,
                 // otherwise the single scheme.
                 A::SetTheme => scheme(self.config.active_scheme(self.system_is_dark())),
-                A::SetLightTheme => scheme(self.config.light_scheme.as_deref()),
-                A::SetDarkTheme => scheme(self.config.dark_scheme.as_deref()),
+                // The light/dark slots only take effect while following the
+                // system, so only surface their values then — otherwise the
+                // single `color_scheme` (shown on "Set theme") is what's active.
+                A::SetLightTheme if self.config.auto_theme => {
+                    scheme(self.config.light_scheme.as_deref())
+                }
+                A::SetDarkTheme if self.config.auto_theme => {
+                    scheme(self.config.dark_scheme.as_deref())
+                }
                 A::ToggleFollowSystem => on_off(self.config.auto_theme),
                 A::ToggleWireframe => on_off(self.wireframe),
                 A::ToggleAutocomplete => on_off(self.config.autocomplete),
