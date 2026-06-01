@@ -238,7 +238,17 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
         // doesn't take the terminal down. With `auto_theme` on, pick the slot for
         // the OS's current appearance up front so we open in the right scheme.
         // Touches the window, so it stays on the main thread (after the join).
-        let initial_dark = window.theme() == Some(winit::window::Theme::Dark);
+        // Read the *system* appearance (not `window.theme()`, which we pin to
+        // the scheme bg below) and start watching it so `auto_theme` follows
+        // live OS light↔dark flips — winit can't, once the window appearance is
+        // pinned (see [`crate::appearance`]). `resumed` runs on the main thread,
+        // so the marker is available.
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            appearance::install_observer(mtm);
+        }
+        let initial_dark = appearance::system_is_dark()
+            .unwrap_or_else(|| window.theme() == Some(winit::window::Theme::Dark));
         install_color_scheme(config.active_scheme(initial_dark));
         // Match the NSAppearance to the palette so the title-bar text the OS
         // draws over our transparent chrome reads against the actual bg —
@@ -911,6 +921,18 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     glass_find::FindSignal::Next => state.find_step(true),
                     glass_find::FindSignal::Prev => state.find_step(false),
                     glass_find::FindSignal::Close => state.find_close(),
+                }
+            }
+        }
+
+        // The OS light/dark appearance flipped (our own observer caught it,
+        // since winit can't once a window's appearance is pinned). Re-resolve
+        // the active scheme on every window that follows the system — the
+        // change affects all of them, not just the focused one.
+        if appearance::take_change() {
+            for state in self.windows.values_mut() {
+                if state.config.auto_theme {
+                    state.apply_active_scheme();
                 }
             }
         }
