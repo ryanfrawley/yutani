@@ -16,6 +16,9 @@ impl WindowState {
         // (commands / argument / choose) but leaves `open` false, so the GPU
         // overlay (the off-macOS fallback) stays dormant while it drives input.
         let dark = theme_for_bg(palette::get().background) == winit::window::Theme::Dark;
+        // Snapshot the per-command status details before borrowing the palette
+        // mutably (both read `self`).
+        let details = self.palette_command_details();
         match self.glass_palette.as_mut() {
             Some(gp) => {
                 if gp.visible() {
@@ -24,7 +27,7 @@ impl WindowState {
                 } else {
                     self.command_palette.mode = command_palette::Mode::Commands;
                     gp.set_appearance(dark);
-                    gp.show(&self.window);
+                    gp.show(&self.window, details);
                 }
             }
             None => self.command_palette.toggle(),
@@ -165,8 +168,11 @@ impl WindowState {
         match self.command_palette.mode {
             Mode::Argument { .. } | Mode::Choose { .. } => {
                 self.command_palette.mode = Mode::Commands;
+                // Recompute details — backing out to the command list may follow
+                // an action that changed state (e.g. picking a theme).
+                let details = self.palette_command_details();
                 if let Some(gp) = self.glass_palette.as_ref() {
-                    gp.enter_commands();
+                    gp.enter_commands(details);
                 }
             }
             Mode::Commands => self.close_glass_palette(),
@@ -266,6 +272,42 @@ impl WindowState {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The right-aligned status detail for each palette command, in
+    /// `command_palette::COMMANDS` order, shown after the title in the native
+    /// command list (e.g. the current theme next to "Set theme", "On"/"Off"
+    /// next to a toggle). Computed fresh each time the command list is shown so
+    /// it reflects live state. An empty string means "no detail" — most actions
+    /// (Zoom in, New window, …) have no standing state to surface.
+    pub(crate) fn palette_command_details(&self) -> Vec<String> {
+        use command_palette::PaletteAction as A;
+        // A theme slot's display name: the scheme, or "Default" when unset
+        // (i.e. the built-in palette is in effect).
+        let scheme = |s: Option<&str>| s.unwrap_or("Default").to_string();
+        let on_off = |b: bool| if b { "On" } else { "Off" }.to_string();
+        command_palette::COMMANDS
+            .iter()
+            .map(|c| match c.action {
+                // "Set theme" follows the same context as running it: the slot
+                // for the current appearance while following the system,
+                // otherwise the single scheme.
+                A::SetTheme => scheme(self.config.active_scheme(self.system_is_dark())),
+                A::SetLightTheme => scheme(self.config.light_scheme.as_deref()),
+                A::SetDarkTheme => scheme(self.config.dark_scheme.as_deref()),
+                A::ToggleFollowSystem => on_off(self.config.auto_theme),
+                A::ToggleWireframe => on_off(self.wireframe),
+                A::ToggleAutocomplete => on_off(self.config.autocomplete),
+                // Derived from the world-readable PAM files (no privilege
+                // needed); "—" when this Mac's sudo stack can't be set up.
+                A::ToggleTouchIdSudo => match crate::touchid::status() {
+                    crate::touchid::Status::Enabled => "On".to_string(),
+                    crate::touchid::Status::Disabled => "Off".to_string(),
+                    crate::touchid::Status::Unsupported => "—".to_string(),
+                },
+                _ => String::new(),
+            })
+            .collect()
     }
 
     /// Drive the find overlay from a key press while it's open. Always consumes
