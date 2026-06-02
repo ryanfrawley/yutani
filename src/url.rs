@@ -25,11 +25,12 @@ pub(crate) struct HoverSegment {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HoverUrl {
-    /// Every strip to underline. A heuristic match or a contiguous OSC 8 link
-    /// is one segment (or a few, when it wraps across rows); an OSC 8 link
-    /// whose `id=` is shared by non-contiguous spans contributes a segment per
-    /// visible run, so all siblings underline together. Ordered by line then
-    /// column for stable equality (so hover repaint de-dup works).
+    /// Every strip to underline. A heuristic match or an OSC 8 link is one
+    /// segment, or a few when it wraps across rows — one per row it spans.
+    /// Only the run physically connected to the hovered cell is included, so a
+    /// link that merely shares an `id=` with a far-off span doesn't drag that
+    /// span in. Ordered by line then column for stable equality (so hover
+    /// repaint de-dup works).
     pub(crate) segments: Vec<HoverSegment>,
     /// The URL text itself, ready to hand to `open(1)`.
     pub(crate) url: String,
@@ -187,66 +188,116 @@ pub(crate) fn build_wrapped_line(
     Some((start, cols, buf))
 }
 
-/// Locate the URL under `(abs_line, col)`, joining wrap-continued rows so a
-/// link that spilled past the right edge still resolves as a single span.
-/// Falls back to a same-row search when no wrap continuation is in play.
-/// Inclusive column runs of cells whose hyperlink id equals `id`, in one row.
-pub(crate) fn hyperlink_runs(
+/// The inclusive column run of cells carrying `id` that covers `col`, or
+/// `None` if the cell at `col` doesn't carry it. A single contiguous stretch:
+/// it stops at the first neighbouring cell that lacks the id.
+pub(crate) fn run_containing(
     cells: &[style::Cell],
     id: std::num::NonZeroU32,
-) -> Vec<(usize, usize)> {
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < cells.len() {
-        if cells[i].hyperlink == Some(id) {
-            let start = i;
-            while i + 1 < cells.len() && cells[i + 1].hyperlink == Some(id) {
-                i += 1;
-            }
-            runs.push((start, i));
-        }
-        i += 1;
+    col: usize,
+) -> Option<(usize, usize)> {
+    if cells.get(col)?.hyperlink != Some(id) {
+        return None;
     }
-    runs
+    let mut start = col;
+    while start > 0 && cells[start - 1].hyperlink == Some(id) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cells.len() && cells[end + 1].hyperlink == Some(id) {
+        end += 1;
+    }
+    Some((start, end))
 }
 
-/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)`. The link id is
-/// taken from the cell; every visible cell sharing that id is part of the same
-/// logical link (the OSC 8 `id=` contract), so we collect a [`HoverSegment`]
-/// for every run of it across the visible rows — including non-contiguous
-/// siblings, which then underline together. We scan only what's on screen
-/// because that's all the overlay can draw; siblings scrolled off don't need a
-/// strip. Takes precedence over the heuristic: the extent and target are
-/// exactly what the app declared.
+/// Locate an OSC 8 explicit hyperlink under `(abs_line, col)` and return only
+/// the **physically connected** run of it that the pointer is on — the
+/// contiguous cells under the cursor, plus any rows the link autowrapped onto
+/// (one row's run reaches the last column and the next resumes at column 0).
+/// We deliberately do *not* gather every other span that merely shares the
+/// `id=`: an app can reuse one id across many separate occurrences of a link,
+/// and lighting up copies several line-breaks away (as the old behaviour did)
+/// is surprising. Only the glyphs joined to the one being hovered underline.
+///
+/// Connectivity is the same grid signature [`build_wrapped_line`] uses for the
+/// heuristic — edge-to-edge across a row boundary — so a wrapped link still
+/// resolves as one span. The walk is bounded by [`URL_WRAP_MAX_ROWS`] each way.
+/// Takes precedence over the heuristic: the extent and target are exactly what
+/// the app declared. Segments come back ordered by line for stable equality.
 pub(crate) fn find_osc8_link_at(
     terminal: &terminal::Terminal,
     abs_line: isize,
     col: usize,
 ) -> Option<HoverUrl> {
     let row = terminal.line_at(abs_line)?;
-    if col >= row.len() {
+    let cols = row.len();
+    if col >= cols {
         return None;
     }
     let id = row[col].hyperlink?;
     let uri = terminal.hyperlink_uri(id)?.to_string();
+    let (start_col, end_col) = run_containing(row, id, col)?;
 
-    let mut segments = Vec::new();
-    for v in 0..terminal.rows as isize {
-        let line = terminal.visual_to_abs_line(v);
-        let Some(cells) = terminal.line_at(line) else {
-            continue;
+    let mut segments = vec![HoverSegment {
+        abs_line,
+        start_col,
+        end_col,
+    }];
+
+    // Walk up while the topmost strip starts at column 0: that's only a wrap
+    // continuation if the row above ends on this same link at its last column.
+    let mut top_line = abs_line;
+    let mut top_start = start_col;
+    let mut steps = 0;
+    while top_start == 0 && steps < URL_WRAP_MAX_ROWS {
+        let Some(prev) = terminal.line_at(top_line - 1) else {
+            break;
         };
-        for (start_col, end_col) in hyperlink_runs(cells, id) {
-            segments.push(HoverSegment {
-                abs_line: line,
-                start_col,
-                end_col,
-            });
+        if prev.len() != cols {
+            break;
         }
+        let Some((ps, pe)) = run_containing(prev, id, cols - 1) else {
+            break;
+        };
+        segments.push(HoverSegment {
+            abs_line: top_line - 1,
+            start_col: ps,
+            end_col: pe,
+        });
+        top_line -= 1;
+        top_start = ps;
+        steps += 1;
     }
-    if segments.is_empty() {
-        return None;
+
+    // Mirror downward: extend while this link reaches the last column and the
+    // row below resumes it at column 0.
+    let mut bot_line = abs_line;
+    let mut bot_end = end_col;
+    let mut steps = 0;
+    while bot_end == cols - 1 && steps < URL_WRAP_MAX_ROWS {
+        let Some(next) = terminal.line_at(bot_line + 1) else {
+            break;
+        };
+        if next.len() != cols {
+            break;
+        }
+        let Some((ns, ne)) = run_containing(next, id, 0) else {
+            break;
+        };
+        segments.push(HoverSegment {
+            abs_line: bot_line + 1,
+            start_col: ns,
+            end_col: ne,
+        });
+        bot_line += 1;
+        bot_end = ne;
+        steps += 1;
     }
+
+    // Hovering any row of the link must yield the identical set; the walk
+    // visits rows out of order, so sort to the line-then-column order the
+    // `HoverUrl` accessors and repaint de-dup rely on.
+    segments.sort_by_key(|s| (s.abs_line, s.start_col));
     Some(HoverUrl {
         segments,
         url: uri,
