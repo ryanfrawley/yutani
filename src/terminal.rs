@@ -786,17 +786,20 @@ struct ScrollbackPlacement {
 const MAX_HYPERLINK_URI_LEN: usize = 4096;
 
 /// Interns OSC 8 hyperlink targets so each `Cell` references one by a compact
-/// id instead of owning the string. The id also drives hover co-highlighting:
-/// every cell sharing an id is one logical link.
+/// id instead of owning the string. The id marks which cells belong to one
+/// logical link (so a click anywhere on it opens the same target).
 ///
 /// Grouping follows the OSC 8 `id=` parameter. A link opened with an explicit
 /// `id=` is keyed by `(id, uri)`, so the *same* `(id, uri)` reused anywhere —
 /// even in a non-contiguous region elsewhere on screen — interns to the same
-/// id and co-highlights. A link opened *without* an id is anonymous: each open
-/// gets a fresh id, so two anonymous spans never merge (only the contiguous
-/// cells of one open share an id). The table only grows; distinct links per
-/// session are few, and dropping entries would orphan ids still held by
-/// scrollback cells.
+/// id. A link opened *without* an id is anonymous: each open gets a fresh id,
+/// so two anonymous spans never merge (only the contiguous cells of one open
+/// share an id). The table only grows; distinct links per session are few, and
+/// dropping entries would orphan ids still held by scrollback cells.
+///
+/// Note this id is about link *identity*, not the hover underline: hovering
+/// underlines only the run physically connected to the pointer (see
+/// [`crate::url::find_osc8_link_at`]), never every same-id span on screen.
 #[derive(Default)]
 pub struct HyperlinkStore {
     /// id (1-based) -> target URI.
@@ -821,9 +824,8 @@ impl HyperlinkStore {
     }
 
     /// Intern a link carrying an explicit `id=`: `(id, uri)` dedupes to one id
-    /// so every span sharing them is the same logical link and co-highlights.
-    /// The id is scoped to the URI — the same `id=` with a different URI is a
-    /// different link.
+    /// so every span sharing them is the same logical link. The id is scoped to
+    /// the URI — the same `id=` with a different URI is a different link.
     fn intern_keyed(&mut self, id_param: &str, uri: &str) -> std::num::NonZeroU32 {
         let key = (id_param.to_string(), uri.to_string());
         if let Some(&id) = self.keyed.get(&key) {
@@ -2236,8 +2238,8 @@ impl Terminal {
             return;
         }
         // `params` is a colon-separated `key=value` list. Only `id=` is
-        // defined: it groups (possibly non-contiguous) spans of one logical
-        // link. With an id, intern by `(id, uri)` so siblings co-highlight;
+        // defined: it marks (possibly non-contiguous) spans as one logical
+        // link. With an id, intern by `(id, uri)` so they share identity;
         // without one the link is anonymous (a fresh id per open).
         let id_param = params
             .split(':')

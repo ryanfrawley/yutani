@@ -2235,61 +2235,67 @@ fn osc8_link_span_stops_at_unlinked_cells() {
 }
 
 #[test]
-fn osc8_id_siblings_cohighlight() {
-    // Two non-contiguous spans share `id=grp` + URI: hovering either must
-    // return segments covering BOTH runs so they underline together.
+fn osc8_id_spans_split_by_text_do_not_cohighlight() {
+    // Two spans share `id=grp` + URI but are separated by plain text on the
+    // same row. They're not physically connected, so hovering one underlines
+    // only that run — not the far copy that merely shares the id.
     let mut t = terminal::Terminal::new(80, 24, 100);
     t.feed("\x1b]8;id=grp;https://x/\x07AB\x1b]8;;\x07 mid \x1b]8;id=grp;https://x/\x07CD\x1b]8;;\x07");
     let abs = t.visual_to_abs_line(0);
     // "AB" at cols 0..1; " mid " at 2..6; "CD" at cols 7..8.
     let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
     assert_eq!(hu.url, "https://x/");
-    let mut spans: Vec<(usize, usize)> =
+    let spans: Vec<(usize, usize)> =
         hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
-    spans.sort();
-    assert_eq!(spans, vec![(0, 1), (7, 8)], "both id=grp spans co-highlight");
-    // Hovering the second span resolves to the identical set.
+    assert_eq!(spans, vec![(0, 1)], "only the hovered run underlines");
+    // Hovering the second span underlines only it.
     let hu2 = find_osc8_link_at(&t, abs, 7).expect("link under second span");
-    assert_eq!(hu, hu2);
+    let spans2: Vec<(usize, usize)> =
+        hu2.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+    assert_eq!(spans2, vec![(7, 8)], "only the hovered run underlines");
 }
 
 #[test]
-fn osc8_id_three_siblings_all_cohighlight() {
-    // Three non-contiguous spans share one id: hovering any of them must
-    // return all three segments.
+fn osc8_id_three_separate_spans_each_highlight_alone() {
+    // Three isolated spans share one id; hovering any one underlines only it.
     let mut t = terminal::Terminal::new(80, 24, 100);
     t.feed("\x1b]8;id=g;https://x/\x07A\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07B\x1b]8;;\x07 \x1b]8;id=g;https://x/\x07C\x1b]8;;\x07");
     let abs = t.visual_to_abs_line(0);
-    // "A" col 0, "B" col 2, "C" col 4.
-    let hu = find_osc8_link_at(&t, abs, 0).expect("link under first span");
-    let mut spans: Vec<(usize, usize)> =
-        hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
-    spans.sort();
-    assert_eq!(spans, vec![(0, 0), (2, 2), (4, 4)], "all three spans co-highlight");
-    // Hovering the middle and last spans yields the identical set.
-    assert_eq!(find_osc8_link_at(&t, abs, 2).unwrap(), hu);
-    assert_eq!(find_osc8_link_at(&t, abs, 4).unwrap(), hu);
+    // "A" col 0, "B" col 2, "C" col 4 — single spaces between, so none touch.
+    for col in [0usize, 2, 4] {
+        let hu = find_osc8_link_at(&t, abs, col).expect("link under span");
+        let spans: Vec<(usize, usize)> =
+            hu.segments.iter().map(|s| (s.start_col, s.end_col)).collect();
+        assert_eq!(spans, vec![(col, col)], "hovering col {col} underlines only it");
+    }
 }
 
 #[test]
-fn osc8_id_siblings_on_different_rows_cohighlight() {
-    // Two spans share one id but land on different visible rows (a newline
-    // separates them). Hovering either must return one segment per row.
+fn osc8_id_spans_on_different_rows_do_not_cohighlight() {
+    // Two spans share one id but sit on different rows with a newline between
+    // them (the first run doesn't reach the right edge, so it isn't a wrap
+    // continuation). This is the reported bug: hovering one must not light up
+    // the copy several lines away.
     let mut t = make_terminal(5, 20);
     t.feed("\x1b]8;id=g;https://x/\x07AB\x1b]8;;\x07\r\n\x1b]8;id=g;https://x/\x07CD\x1b]8;;\x07");
     let abs0 = t.visual_to_abs_line(0);
     let abs1 = t.visual_to_abs_line(1);
     let hu = find_osc8_link_at(&t, abs0, 0).expect("hover first row span");
     assert_eq!(hu.url, "https://x/");
-    let mut segs: Vec<(isize, usize, usize)> = hu
+    let segs: Vec<(isize, usize, usize)> = hu
         .segments
         .iter()
         .map(|s| (s.abs_line, s.start_col, s.end_col))
         .collect();
-    segs.sort();
-    assert_eq!(segs, vec![(abs0, 0, 1), (abs1, 0, 1)], "siblings on two rows co-highlight");
-    // Hovering the second-row span resolves to the same set.
-    assert_eq!(find_osc8_link_at(&t, abs1, 0).unwrap(), hu);
+    assert_eq!(segs, vec![(abs0, 0, 1)], "only the first-row run underlines");
+    // Hovering the second-row span underlines only it.
+    let hu1 = find_osc8_link_at(&t, abs1, 0).expect("hover second row span");
+    let segs1: Vec<(isize, usize, usize)> = hu1
+        .segments
+        .iter()
+        .map(|s| (s.abs_line, s.start_col, s.end_col))
+        .collect();
+    assert_eq!(segs1, vec![(abs1, 0, 1)], "only the second-row run underlines");
 }
 
 #[test]
@@ -2349,6 +2355,171 @@ fn find_osc8_link_at_extends_across_wrapped_rows() {
     assert_eq!(from_first.end_abs_line(), 1);
     assert_eq!(from_first.end_col(), 3, "14 glyphs over 10 cols end at col 3 of row 1");
     assert_eq!(from_first.url, "https://wrap/target");
+}
+
+#[test]
+fn osc8_id_link_wrapped_edge_to_edge_cohighlights_across_rows() {
+    // Positive connected-across-rows case *with* an explicit id=, complementing
+    // the anonymous wrap test. Autowrap keeps the same cursor hyperlink across
+    // the boundary, so feeding more linked glyphs than the row width with one
+    // OSC 8 open fills row 0 edge-to-edge and resumes the same id at col 0 of
+    // row 1. The two rows are physically connected, so both rows underline as
+    // one span regardless of which row is hovered.
+    let mut t = make_terminal(5, 10);
+    t.feed("\x1b]8;id=g;https://wrap/target\x07ABCDEFGHIJKLMN\x1b]8;;\x07");
+    let from_first = find_osc8_link_at(&t, 0, 3).expect("hover first row");
+    let from_tail = find_osc8_link_at(&t, 1, 2).expect("hover continuation row");
+    assert_eq!(from_first, from_tail, "both hovers resolve to one connected span");
+    let segs: Vec<(isize, usize, usize)> = from_first
+        .segments
+        .iter()
+        .map(|s| (s.abs_line, s.start_col, s.end_col))
+        .collect();
+    // Row 0 cols 0..9 (full), row 1 cols 0..3 (remaining 4 of 14 glyphs).
+    assert_eq!(segs, vec![(0, 0, 9), (1, 0, 3)]);
+    assert_eq!(from_first.url, "https://wrap/target");
+}
+
+#[test]
+fn osc8_link_wrapped_across_three_rows_resolves_to_three_segments() {
+    // A single link long enough to fill two full rows and spill onto a third.
+    // 10-col grid, 24 linked glyphs: row 0 cols 0..9, row 1 cols 0..9, row 2
+    // cols 0..3. Hovering the *middle* row must yield the identical sorted set
+    // of all three segments.
+    let mut t = make_terminal(5, 10);
+    t.feed("\x1b]8;;https://three/rows\x07ABCDEFGHIJKLMNOPQRSTUVWX\x1b]8;;\x07");
+    let expected = vec![(0isize, 0usize, 9usize), (1, 0, 9), (2, 0, 3)];
+    for (row, col) in [(0, 4), (1, 5), (2, 1)] {
+        let hu = find_osc8_link_at(&t, row, col)
+            .unwrap_or_else(|| panic!("hover row {row} col {col}"));
+        let segs: Vec<(isize, usize, usize)> = hu
+            .segments
+            .iter()
+            .map(|s| (s.abs_line, s.start_col, s.end_col))
+            .collect();
+        assert_eq!(segs, expected, "hovering row {row} yields all three segments");
+        assert_eq!(hu.url, "https://three/rows");
+    }
+}
+
+#[test]
+fn osc8_wrapped_link_hover_anywhere_yields_identical_hoverurl() {
+    // Every cell of one wrapped link must produce the byte-identical HoverUrl
+    // (segments sorted by line then column) so the renderer's repaint de-dup
+    // sees no change as the pointer slides along the link. 24 glyphs over a
+    // 10-col grid spans rows 0..2.
+    let mut t = make_terminal(5, 10);
+    t.feed("\x1b]8;;https://three/rows\x07ABCDEFGHIJKLMNOPQRSTUVWX\x1b]8;;\x07");
+    let reference = find_osc8_link_at(&t, 0, 0).expect("hover first cell");
+    for (row, col) in [(0, 0), (0, 9), (1, 0), (1, 9), (2, 0), (2, 3)] {
+        let hu = find_osc8_link_at(&t, row, col)
+            .unwrap_or_else(|| panic!("hover row {row} col {col}"));
+        assert_eq!(hu, reference, "hover at row {row} col {col} equals the reference");
+    }
+}
+
+#[test]
+fn osc8_no_downward_extension_when_row_below_lacks_link_at_col0() {
+    // Row 0's link reaches the last column, but row 1 does NOT resume the same
+    // link at col 0 (it begins with a space, then a fresh same-URI link). That
+    // breaks the autowrap connectivity signature, so the run stays on row 0.
+    let mut t = make_terminal(5, 10);
+    // 10 linked glyphs exactly fill row 0 (cols 0..9). The link closes; row 1
+    // begins with a literal space, then a new link occurrence.
+    t.feed("\x1b]8;;https://x/\x07ABCDEFGHIJ\x1b]8;;\x07 \x1b]8;;https://x/\x07KL\x1b]8;;\x07");
+    let hu = find_osc8_link_at(&t, 0, 5).expect("hover row 0 link");
+    let segs: Vec<(isize, usize, usize)> = hu
+        .segments
+        .iter()
+        .map(|s| (s.abs_line, s.start_col, s.end_col))
+        .collect();
+    assert_eq!(segs, vec![(0, 0, 9)], "no extension: row 1 col 0 is not the link");
+    // And the row-1 occurrence stands alone.
+    let hu1 = find_osc8_link_at(&t, 1, 1).expect("hover row 1 link");
+    let segs1: Vec<(isize, usize, usize)> = hu1
+        .segments
+        .iter()
+        .map(|s| (s.abs_line, s.start_col, s.end_col))
+        .collect();
+    assert_eq!(segs1, vec![(1, 1, 2)], "row 1 occurrence is its own run");
+}
+
+#[test]
+fn osc8_no_upward_extension_when_row_above_lacks_link_at_last_col() {
+    // The hovered run starts at col 0 of row 1, but row 0's last cell is NOT
+    // this link, so it isn't a wrap continuation and there's no upward pull.
+    let mut t = make_terminal(5, 10);
+    // Row 0: "hi" then plain text not reaching the edge; newline; row 1 starts
+    // with the link at col 0.
+    t.feed("hi\r\n\x1b]8;;https://x/\x07AB\x1b]8;;\x07");
+    let abs1 = t.visual_to_abs_line(1);
+    let hu = find_osc8_link_at(&t, abs1, 0).expect("hover row 1 link");
+    let segs: Vec<(isize, usize, usize)> = hu
+        .segments
+        .iter()
+        .map(|s| (s.abs_line, s.start_col, s.end_col))
+        .collect();
+    assert_eq!(segs, vec![(abs1, 0, 1)], "starts at col 0 but no row above to join");
+}
+
+// ---- run_containing: the contiguous-run helper find_osc8_link_at builds on ----
+
+/// Build a row of cells where the chars in `link_chars` (by column) carry
+/// hyperlink id `id` and the rest carry none. `s` sets the glyphs.
+fn linked_cells(s: &str, id: std::num::NonZeroU32, linked: &[usize]) -> Vec<style::Cell> {
+    s.chars()
+        .enumerate()
+        .map(|(i, ch)| {
+            let mut c = style::Cell::new(ch, style::Style::new());
+            if linked.contains(&i) {
+                c.hyperlink = Some(id);
+            }
+            c
+        })
+        .collect()
+}
+
+#[test]
+fn run_containing_none_when_col_lacks_id() {
+    let id = std::num::NonZeroU32::new(1).unwrap();
+    // Cols 2..4 carry the link; col 0 does not.
+    let cells = linked_cells("ABCDEF", id, &[2, 3, 4]);
+    assert_eq!(run_containing(&cells, id, 0), None, "unlinked cell yields None");
+    // A different id at a linked col also yields None.
+    let other = std::num::NonZeroU32::new(2).unwrap();
+    assert_eq!(run_containing(&cells, other, 3), None, "wrong id yields None");
+}
+
+#[test]
+fn run_containing_bounded_by_non_id_cells_both_sides() {
+    let id = std::num::NonZeroU32::new(7).unwrap();
+    // "AB[CDE]FG": linked run is cols 2..4, plain on both sides.
+    let cells = linked_cells("ABCDEFG", id, &[2, 3, 4]);
+    for col in 2..=4 {
+        assert_eq!(
+            run_containing(&cells, id, col),
+            Some((2, 4)),
+            "any col in the run returns the same inclusive bounds"
+        );
+    }
+}
+
+#[test]
+fn run_containing_touching_row_edges() {
+    let id = std::num::NonZeroU32::new(3).unwrap();
+    // Entire row is one link: run spans col 0 to the last col.
+    let cells = linked_cells("ABCD", id, &[0, 1, 2, 3]);
+    assert_eq!(run_containing(&cells, id, 0), Some((0, 3)), "left edge");
+    assert_eq!(run_containing(&cells, id, 3), Some((0, 3)), "right edge");
+}
+
+#[test]
+fn run_containing_out_of_bounds_col_is_none() {
+    let id = std::num::NonZeroU32::new(1).unwrap();
+    let cells = linked_cells("AB", id, &[0, 1]);
+    assert_eq!(run_containing(&cells, id, 2), None, "col == len is out of bounds");
+    assert_eq!(run_containing(&cells, id, 99), None, "far past the end");
+    assert_eq!(run_containing(&[], id, 0), None, "empty row");
 }
 
 #[test]
