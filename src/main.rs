@@ -30,6 +30,7 @@
 //!   [`pty`], [`touchid`], [`paths`].
 
 mod app_window;
+mod appearance;
 mod box_drawing;
 mod command_palette;
 mod completion;

@@ -172,10 +172,17 @@ impl WindowState {
         self.apply_active_scheme();
     }
 
-    /// True when the OS is currently in dark mode, per winit's tracked window
-    /// theme (updated from `WindowEvent::ThemeChanged`). Defaults to light if
-    /// the platform doesn't report one.
+    /// True when the OS is currently in dark mode. On macOS this reads the
+    /// *system* appearance (`NSApp.effectiveAppearance`) rather than
+    /// `Window::theme()`: we pin each window's `NSAppearance` to its scheme
+    /// background, which makes `Window::theme()` report that pinned value, not
+    /// the OS setting (see [`crate::appearance`]). Elsewhere, and as a fallback,
+    /// it uses winit's tracked window theme. Defaults to light if neither
+    /// source reports one.
     pub(crate) fn system_is_dark(&self) -> bool {
+        if let Some(dark) = crate::appearance::system_is_dark() {
+            return dark;
+        }
         self.window.theme() == Some(winit::window::Theme::Dark)
     }
 
