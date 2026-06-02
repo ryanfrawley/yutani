@@ -25,12 +25,12 @@ mod imp {
     pub struct GlassPalette;
 
     impl GlassPalette {
-        pub fn show(&mut self, _parent: &Window) {}
+        pub fn show(&mut self, _parent: &Window, _details: Vec<String>) {}
         pub fn hide(&mut self) {}
         pub fn visible(&self) -> bool {
             false
         }
-        pub fn enter_commands(&self) {}
+        pub fn enter_commands(&self, _details: Vec<String>) {}
         pub fn enter_argument(&self, _prompt: &str) {}
         pub fn enter_choose(&self, _prompt: &str, _choices: Vec<String>) {}
         pub fn set_appearance(&self, _dark: bool) {}
@@ -253,6 +253,10 @@ mod imp {
         /// All candidate display strings for the current mode (command titles
         /// or the chooser's options). Empty in argument mode.
         candidates: RefCell<Vec<String>>,
+        /// Right-aligned status detail per candidate, parallel to `candidates`
+        /// (current theme, "On"/"Off", …). Empty, or shorter than `candidates`,
+        /// means no detail for those rows — the chooser modes pass none.
+        details: RefCell<Vec<String>>,
         /// Indices into `candidates`, best match first (current filter result).
         filtered: RefCell<Vec<usize>>,
         /// True in command / choose mode (Enter accepts the selected row),
@@ -355,13 +359,21 @@ mod imp {
                 _column: *mut AnyObject,
                 row: isize,
             ) -> Option<Retained<NSView>> {
-                let text = {
+                let (text, detail) = {
                     let filtered = self.ivars().filtered.borrow();
                     let candidates = self.ivars().candidates.borrow();
-                    filtered
+                    let details = self.ivars().details.borrow();
+                    let cand = filtered
                         .get(row as usize)
-                        .and_then(|&i| candidates.get(i))
-                        .cloned()
+                        .and_then(|&i| candidates.get(i).map(|c| (i, c.clone())));
+                    match cand {
+                        Some((i, c)) => (
+                            Some(c),
+                            // Empty / absent detail → no right-side label.
+                            details.get(i).filter(|d| !d.is_empty()).cloned(),
+                        ),
+                        None => (None, None),
+                    }
                 };
                 // Single tail expression: the method_id macro wraps the return,
                 // so an early `return None` isn't allowed here.
@@ -376,24 +388,39 @@ mod imp {
                         let _: () = msg_send![&*container, setAutoresizingMask: 2usize]; // width
 
                         let th = (ROW_FONT_SIZE * 1.3).round();
+                        let row_y = ((ROW_HEIGHT - th) / 2.0).round();
+                        // Split the row: the title gets the left ~62%, the status
+                        // detail the right edge. The detail ends at ROW_LABEL_INSET
+                        // from the right so it mirrors the title's left inset.
+                        let title_w = (w * 0.62).round();
                         let label_frame = NSRect::new(
-                            NSPoint::new(ROW_LABEL_INSET, ((ROW_HEIGHT - th) / 2.0).round()),
-                            NSSize::new(w - ROW_LABEL_INSET - PAD, th),
+                            NSPoint::new(ROW_LABEL_INSET, row_y),
+                            NSSize::new(title_w - ROW_LABEL_INSET, th),
                         );
-                        let label: Retained<NSTextField> =
-                            msg_send![mtm.alloc::<NSTextField>(), initWithFrame: label_frame];
-                        let _: () = msg_send![&*label, setEditable: false];
-                        let _: () = msg_send![&*label, setSelectable: false];
-                        let _: () = msg_send![&*label, setBezeled: false];
-                        let _: () = msg_send![&*label, setBordered: false];
-                        let _: () = msg_send![&*label, setDrawsBackground: false];
-                        let font: Retained<NSFont> =
-                            msg_send![class!(NSFont), systemFontOfSize: ROW_FONT_SIZE];
-                        let _: () = msg_send![&*label, setFont: &*font];
+                        let label = make_row_label(mtm, label_frame);
                         let s = NSString::from_str(&text);
                         let _: () = msg_send![&*label, setStringValue: &*s];
                         let _: () = msg_send![&*label, setAutoresizingMask: 2usize]; // width
                         container.addSubview(&label);
+
+                        // The status detail, right-aligned and dimmed, when set.
+                        if let Some(detail) = detail {
+                            let detail_frame = NSRect::new(
+                                NSPoint::new(title_w, row_y),
+                                NSSize::new(w - title_w - ROW_LABEL_INSET, th),
+                            );
+                            let dlabel = make_row_label(mtm, detail_frame);
+                            let ds = NSString::from_str(&detail);
+                            let _: () = msg_send![&*dlabel, setStringValue: &*ds];
+                            // Right-aligned (NSTextAlignmentRight = 1).
+                            let _: () = msg_send![&*dlabel, setAlignment: 1isize];
+                            let secondary: Retained<NSColor> =
+                                msg_send![class!(NSColor), secondaryLabelColor];
+                            let _: () = msg_send![&*dlabel, setTextColor: &*secondary];
+                            // Pin to the right edge (flexible left margin).
+                            let _: () = msg_send![&*dlabel, setAutoresizingMask: 1usize];
+                            container.addSubview(&dlabel);
+                        }
                         container
                     }
                 })
@@ -427,6 +454,7 @@ mod imp {
             let this = mtm.alloc::<PaletteController>();
             let this = this.set_ivars(ControllerIvars {
                 candidates: RefCell::new(Vec::new()),
+                details: RefCell::new(Vec::new()),
                 filtered: RefCell::new(Vec::new()),
                 list_mode: Cell::new(true),
                 fade_top: Cell::new(false),
@@ -437,9 +465,11 @@ mod imp {
             unsafe { msg_send![super(this), init] }
         }
 
-        /// Replace the candidate list (on mode change / open) and reset filter.
-        fn set_candidates(&self, candidates: Vec<String>) {
+        /// Replace the candidate list + parallel details (on mode change / open)
+        /// and reset the filter.
+        fn set_candidates(&self, candidates: Vec<String>, details: Vec<String>) {
             *self.ivars().candidates.borrow_mut() = candidates;
+            *self.ivars().details.borrow_mut() = details;
             self.apply_query("");
         }
 
@@ -744,7 +774,9 @@ mod imp {
                 controller,
                 visible: false,
             };
-            palette.enter_commands();
+            // No window state yet at construction; `show` re-enters with the
+            // live per-command details.
+            palette.enter_commands(Vec::new());
             Some(palette)
         }
     }
@@ -756,6 +788,36 @@ mod imp {
             .iter()
             .map(|c| c.title.to_string())
             .collect()
+    }
+
+    /// The status detail for each command (current theme, "On"/"Off", …), in
+    /// registry order, parallel to [`command_titles`]. Empty when the host
+    /// supplies none (e.g. the construction-time call before any window state).
+    fn command_details(details: Vec<String>) -> Vec<String> {
+        if details.len() == command_palette::COMMANDS.len() {
+            details
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Build a bare, transparent, non-editable row label with the shared row
+    /// font. The caller sets the string, alignment, and color. Used for both the
+    /// title and the right-aligned status detail so they stay visually matched.
+    fn make_row_label(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSTextField> {
+        unsafe {
+            let label: Retained<NSTextField> =
+                msg_send![mtm.alloc::<NSTextField>(), initWithFrame: frame];
+            let _: () = msg_send![&*label, setEditable: false];
+            let _: () = msg_send![&*label, setSelectable: false];
+            let _: () = msg_send![&*label, setBezeled: false];
+            let _: () = msg_send![&*label, setBordered: false];
+            let _: () = msg_send![&*label, setDrawsBackground: false];
+            let font: Retained<NSFont> =
+                msg_send![class!(NSFont), systemFontOfSize: ROW_FONT_SIZE];
+            let _: () = msg_send![&*label, setFont: &*font];
+            label
+        }
     }
 
     /// Install a 4-stop vertical gradient mask on the scroll view. The two end
@@ -815,9 +877,15 @@ mod imp {
             self.visible
         }
 
-        /// Configure the field placeholder + candidate list + accept semantics
-        /// for the current mode, clearing the query.
-        fn set_mode(&self, placeholder: &str, candidates: Vec<String>, list_mode: bool) {
+        /// Configure the field placeholder + candidate list (and parallel status
+        /// details) + accept semantics for the current mode, clearing the query.
+        fn set_mode(
+            &self,
+            placeholder: &str,
+            candidates: Vec<String>,
+            details: Vec<String>,
+            list_mode: bool,
+        ) {
             unsafe {
                 let ph = NSString::from_str(placeholder);
                 let _: () = msg_send![&*self.field, setPlaceholderString: &*ph];
@@ -827,7 +895,7 @@ mod imp {
                 let _: () = msg_send![&*self.scroll, setHidden: !list_mode];
             }
             self.controller.ivars().list_mode.set(list_mode);
-            self.controller.set_candidates(candidates);
+            self.controller.set_candidates(candidates, details);
             self.resize_panel(list_mode);
         }
 
@@ -856,19 +924,27 @@ mod imp {
             }
         }
 
-        /// Browse the full command list (the default mode on open).
-        pub fn enter_commands(&self) {
-            self.set_mode("Command palette", command_titles(), true);
+        /// Browse the full command list (the default mode on open). `details`
+        /// carries the per-command status to show on the right; an empty / wrong
+        /// -length vec just omits it.
+        pub fn enter_commands(&self, details: Vec<String>) {
+            self.set_mode(
+                "Command palette",
+                command_titles(),
+                command_details(details),
+                true,
+            );
         }
 
         /// Collect a free-text argument (e.g. a window title).
         pub fn enter_argument(&self, prompt: &str) {
-            self.set_mode(prompt, Vec::new(), false);
+            self.set_mode(prompt, Vec::new(), Vec::new(), false);
         }
 
-        /// Pick from a host-supplied list (e.g. color schemes).
+        /// Pick from a host-supplied list (e.g. color schemes). No status
+        /// details — the chooser rows are values, not stateful commands.
         pub fn enter_choose(&self, prompt: &str, choices: Vec<String>) {
-            self.set_mode(prompt, choices, true);
+            self.set_mode(prompt, choices, Vec::new(), true);
         }
 
         /// Match the panel's appearance (and thus its glass + label colors) to
@@ -889,11 +965,12 @@ mod imp {
 
         /// Position over `parent` (centered, near the top), attach as a child
         /// window, show it, and focus the search field on the command list.
-        pub fn show(&mut self, parent: &Window) {
+        /// `details` is the per-command status to show on the right.
+        pub fn show(&mut self, parent: &Window, details: Vec<String>) {
             let Some(parent_ns) = glass::parent_nswindow(parent) else {
                 return;
             };
-            self.enter_commands();
+            self.enter_commands(details);
             self.place(parent_ns);
             unsafe {
                 // Start transparent, then fade in.
