@@ -602,6 +602,15 @@ pub struct Terminal {
     // via `sync_update()` and force-releases it via `clear_sync_update()` when
     // its safety timeout fires (so a crashed app can't freeze the display).
     sync_update: bool,
+    // Grapheme clustering (?2027). When set, multi-codepoint grapheme clusters
+    // (combining marks, ZWJ emoji, flags, skin tones, VS16) are absorbed into a
+    // single cell as the user expects. When reset, `print` falls back to the
+    // legacy per-codepoint model (each codepoint lands in its own cell), for
+    // apps that count widths that way. Defaults ON — yutani has always
+    // clustered — so the mode just makes that behavior explicit and toggleable;
+    // apps can probe it by printing a cluster and checking the cursor advance
+    // (DSR 6). See https://github.com/contour-terminal/contour (mode 2027).
+    grapheme_clustering: bool,
     // Alternate scroll (?1007). When set, and the alt screen is active with no
     // mouse tracking in effect, the front end turns wheel motion into cursor-key
     // presses so pagers (less, man) scroll. Defaults on, matching xterm's
@@ -941,6 +950,8 @@ impl Terminal {
             color_scheme_notify: false,
             last_notified_dark: None,
             sync_update: false,
+            // On by default: yutani has always done grapheme clustering.
+            grapheme_clustering: true,
             alternate_scroll: true,
             alt_scroll_snapshot: None,
             alt_scroll_net: 0,
