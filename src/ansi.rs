@@ -95,6 +95,11 @@ pub enum Event {
 
     Sgr(Vec<u16>),
 
+    // DECRQM — request mode (CSI [?] Ps $ p). The host asks whether a mode is
+    // set or reset; the caller replies with a DECRPM report. `private` is true
+    // for DEC private modes (`?` prefix), false for ANSI modes.
+    RequestMode { private: bool, mode: u16 },
+
     // DEC private mode (CSI ? N h/l). One event per param.
     PrivateModeSet(u16),
     PrivateModeReset(u16),
@@ -512,6 +517,15 @@ impl Parser {
         if self.intermediate == Some(' ') && final_byte == 'q' {
             let p0 = self.params.first().copied();
             emit(Event::SetCursorStyle(p0.unwrap_or(0)));
+            return;
+        }
+        // DECRQM (CSI [?] Ps $ p) — request mode. Carries a `$` intermediate, so
+        // handle it before the generic intermediate-drop below.
+        if self.intermediate == Some('$') && final_byte == 'p' {
+            emit(Event::RequestMode {
+                private: self.private,
+                mode: self.params.first().copied().unwrap_or(0),
+            });
             return;
         }
         if self.intermediate.is_some() {
@@ -956,6 +970,51 @@ mod tests {
         assert_eq!(
             collect("\x1b[?996n"),
             vec![Event::PrivateDeviceStatusReport(996)],
+        );
+    }
+
+    #[test]
+    fn decrqm_parses_private_and_ansi() {
+        // DECRQM carries a `$` intermediate and a `p` final. The `?` selects a
+        // DEC private mode; without it, an ANSI mode.
+        assert_eq!(
+            collect("\x1b[?2026$p"),
+            vec![Event::RequestMode { private: true, mode: 2026 }],
+        );
+        assert_eq!(
+            collect("\x1b[4$p"),
+            vec![Event::RequestMode { private: false, mode: 4 }],
+        );
+    }
+
+    #[test]
+    fn decrqm_intermediate_does_not_collide_with_decscusr() {
+        // Both DECSCUSR (`CSI Ps SP q`) and DECRQM (`CSI [?] Ps $ p`) carry a
+        // CSI intermediate, and both are special-cased ahead of the generic
+        // intermediate-drop in `dispatch_csi`. Feed them in one stream to pin
+        // that the `$`/`p` DECRQM branch doesn't swallow the ` `/`q` DECSCUSR
+        // branch (or vice versa) — each must still produce its own event.
+        assert_eq!(
+            collect("\x1b[3 q\x1b[?2026$p"),
+            vec![
+                Event::SetCursorStyle(3),
+                Event::RequestMode { private: true, mode: 2026 },
+            ],
+        );
+    }
+
+    #[test]
+    fn decrqm_omitted_param_defaults_to_zero() {
+        // No digits before the `$p` → the param list is empty, so the parser
+        // substitutes mode 0 (which the terminal reports as "not recognized").
+        // Pinned for both the private (`?`) and ANSI forms.
+        assert_eq!(
+            collect("\x1b[?$p"),
+            vec![Event::RequestMode { private: true, mode: 0 }],
+        );
+        assert_eq!(
+            collect("\x1b[$p"),
+            vec![Event::RequestMode { private: false, mode: 0 }],
         );
     }
 
