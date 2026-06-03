@@ -589,6 +589,7 @@ impl Terminal {
             1006 => self.mouse_sgr = set,
             1007 => self.alternate_scroll = set,
             2004 => self.bracketed_paste = set,
+            1004 => self.focus_reporting = set,
             // Color-scheme update notifications (Contour mode 2031). Seed the
             // baseline polarity on enable so only a later light/dark flip
             // notifies; clear it on disable.
@@ -798,6 +799,7 @@ impl Terminal {
         self.mouse_any_motion = false;
         self.mouse_sgr = false;
         self.bracketed_paste = false;
+        self.focus_reporting = false;
         // RIS restores the power-on state, where synchronized output is off.
         // Clearing it here also guarantees a BSU that's never followed by an ESU
         // can't keep the front end holding the present across a reset.

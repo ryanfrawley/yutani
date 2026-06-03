@@ -1812,6 +1812,108 @@
     }
 
     #[test]
+    fn mode_1004_focus_report_emits_in_and_out() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004h");
+        // Focus-in → CSI I, focus-out → CSI O; each returns true (queued) so
+        // the front end knows to flush.
+        assert!(t.focus_report(true));
+        assert_eq!(t.take_response(), b"\x1b[I".to_vec());
+        assert!(t.focus_report(false));
+        assert_eq!(t.take_response(), b"\x1b[O".to_vec());
+    }
+
+    #[test]
+    fn focus_report_silent_when_mode_1004_disabled() {
+        let mut t = Terminal::new(5, 3, 100);
+        // No `CSI ? 1004 h` → focus changes produce nothing.
+        assert!(!t.focus_report(true));
+        assert!(!t.focus_report(false));
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn mode_1004_reset_stops_focus_reports() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004h");
+        t.feed("\x1b[?1004l");
+        assert!(!t.focus_report(true));
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn mode_1004_cleared_by_full_reset() {
+        // RIS restores power-on state, where focus reporting is off.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004h");
+        assert!(t.focus_report(true));
+        let _ = t.take_response();
+        t.feed("\x1bc"); // RIS
+        assert!(!t.focus_report(true));
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn mode_1004_independent_of_bracketed_paste() {
+        // 1004 and 2004 sit next to each other in the private-mode match arm;
+        // toggling one must not bleed into the other (guards a fall-through or
+        // copy-paste typo between the two arms).
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004h");
+        assert!(t.focus_report(true), "1004 should be on");
+        let _ = t.take_response();
+        assert!(!t.bracketed_paste(), "enabling 1004 must not enable 2004");
+
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2004h");
+        assert!(t.bracketed_paste(), "2004 should be on");
+        assert!(
+            !t.focus_report(true),
+            "enabling 2004 must not enable focus reporting"
+        );
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn mode_1004_and_2004_set_together_in_one_sequence() {
+        // The parser emits one PrivateModeSet per param, so a multi-param `h`
+        // must enable every listed mode independently.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004;2004h");
+        assert!(t.bracketed_paste(), "2004 enabled by combined sequence");
+        assert!(
+            t.focus_report(true),
+            "1004 enabled by combined sequence"
+        );
+        assert_eq!(t.take_response(), b"\x1b[I".to_vec());
+    }
+
+    #[test]
+    fn focus_report_does_not_debounce() {
+        // Focus reporting is edge-driven by the front end: the terminal just
+        // serializes exactly what it's told, so repeated same-direction reports
+        // each queue another `CSI I` rather than collapsing into one.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1004h");
+        assert!(t.focus_report(true));
+        assert!(t.focus_report(true));
+        assert!(t.focus_report(true));
+        assert_eq!(t.take_response(), b"\x1b[I\x1b[I\x1b[I".to_vec());
+    }
+
+    #[test]
+    fn focus_report_appends_after_pending_dsr_reply() {
+        // A focus change can land while an earlier query reply is still
+        // unflushed; the report must follow it in order, since `take_response`
+        // hands back the buffer as a single ordered stream.
+        let mut t = Terminal::new(10, 3, 100);
+        t.feed("\x1b[?1004h");
+        t.feed("\x1b[5n"); // DSR — queues `CSI 0 n`
+        assert!(t.focus_report(true));
+        assert_eq!(t.take_response(), b"\x1b[0n\x1b[I".to_vec());
+    }
+
+    #[test]
     fn full_reset_clears_app_cursor_keys_and_response() {
         let mut t = Terminal::new(5, 3, 100);
         t.feed("\x1b[?1h\x1b[5n");

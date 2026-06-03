@@ -582,6 +582,10 @@ pub struct Terminal {
     // Bracketed paste (?2004): when set, the GUI wraps pasted text in
     // ESC [ 200 ~ … ESC [ 201 ~ before sending it to the PTY.
     bracketed_paste: bool,
+    // Focus reporting (?1004): when set, the front end sends `CSI I` on
+    // focus-in and `CSI O` on focus-out so apps (vim, tmux, neovim) can react
+    // to the window gaining/losing key focus — autoread, cursor-shape, redraw.
+    focus_reporting: bool,
     // Color-scheme update notifications (DEC private mode 2031, Contour's
     // extension). When an app enables it (`CSI ? 2031 h`), a live light/dark
     // flip of the terminal background emits `CSI ? 997 ; 1 n` (dark) /
@@ -933,6 +937,7 @@ impl Terminal {
             mouse_any_motion: false,
             mouse_sgr: false,
             bracketed_paste: false,
+            focus_reporting: false,
             color_scheme_notify: false,
             last_notified_dark: None,
             sync_update: false,
@@ -1367,6 +1372,19 @@ impl Terminal {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Queue a focus in/out report (`CSI I` / `CSI O`) when focus reporting
+    /// (DEC mode 1004) is enabled. Returns whether a report was queued — the
+    /// focus-change path has no PTY feed to drain, so a `true` return tells the
+    /// front end to flush the response itself.
+    pub fn focus_report(&mut self, focused: bool) -> bool {
+        if !self.focus_reporting {
+            return false;
+        }
+        self.pending_response
+            .extend_from_slice(if focused { b"\x1b[I" } else { b"\x1b[O" });
+        true
     }
 
     /// Whether the app is mid-frame under synchronized output (DEC 2026). The
