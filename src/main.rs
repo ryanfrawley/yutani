@@ -760,6 +760,11 @@ struct WindowState {
     /// When the last frame was actually rendered, for the [`MIN_FRAME_INTERVAL`]
     /// pacing gate.
     last_render_at: std::time::Instant,
+    /// Deadline at which a held synchronized-output frame (DEC mode 2026) is
+    /// force-released. `Some` while the active tab is mid-sync; armed on the
+    /// rising edge in `about_to_wait` and cleared when sync ends (ESU) or the
+    /// deadline ([`SYNC_UPDATE_TIMEOUT`]) expires.
+    sync_deadline: Option<std::time::Instant>,
 
     window: Window,
 
@@ -1256,6 +1261,17 @@ pub(crate) const MIN_FRAME_INTERVAL: std::time::Duration =
 /// self-wake for the rest — so the UI stays live through the burst. ~128 KiB is
 /// roughly one frame's worth of parse work at observed feed throughput.
 pub(crate) const PTY_FEED_CAP: usize = 128 * 1024;
+
+/// Safety cap on how long a synchronized-output frame (DEC mode 2026) may hold
+/// the display. An app brackets an atomic frame with BSU…ESU; if the ESU never
+/// arrives (the app crashed or hung mid-update), this bounds how long the
+/// screen stays frozen before the front end force-releases and repaints. Long
+/// enough that a legitimately large frame streamed across several PTY_FEED_CAP
+/// chunks still completes atomically; short enough that a stuck app recovers
+/// almost imperceptibly.
+pub(crate) const SYNC_UPDATE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 /// Duration of the smooth-scroll slide for an explicit alt-screen scroll
 /// (SU/SD/line-feed) captured from the running app. Kept short so the terminal
 /// stays responsive — the final frame is reached this many seconds after the
@@ -1741,6 +1757,7 @@ impl WindowState {
             render_pending: false,
             // In the past, so the first frame paints immediately.
             last_render_at: std::time::Instant::now() - MIN_FRAME_INTERVAL,
+            sync_deadline: None,
             window,
             shared,
             atlas,
@@ -1850,6 +1867,14 @@ impl WindowState {
     /// rendering regardless, so the switch never appears to stall.
     fn hidden(&self) -> bool {
         self.occluded && !self.focused
+    }
+
+    /// Whether the active tab is mid-frame under synchronized output (DEC mode
+    /// 2026). The `RedrawRequested` handler holds the present while this is true
+    /// so a partially-composed frame never reaches the screen; the grid keeps
+    /// updating underneath and `about_to_wait` enforces [`SYNC_UPDATE_TIMEOUT`].
+    pub(crate) fn sync_output_active(&self) -> bool {
+        self.active_tab().terminal.sync_update()
     }
 
     /// Mark the vertex buffer stale and ask winit to redraw. Repeated calls

@@ -596,6 +596,9 @@ impl Terminal {
                 self.color_scheme_notify = set;
                 self.last_notified_dark = if set { Some(self.bg_is_dark()) } else { None };
             }
+            // Synchronized output: BSU (`h`) / ESU (`l`). The grid keeps
+            // updating; the front end gates presentation on this flag.
+            2026 => self.sync_update = set,
             1049 | 1047 | 47 => self.switch_screen(set, code == 1049),
             // DECLRMM. Enabling/disabling resets the margins to the full
             // screen — apps must re-issue DECSLRM after enabling.
@@ -795,6 +798,10 @@ impl Terminal {
         self.mouse_any_motion = false;
         self.mouse_sgr = false;
         self.bracketed_paste = false;
+        // RIS restores the power-on state, where synchronized output is off.
+        // Clearing it here also guarantees a BSU that's never followed by an ESU
+        // can't keep the front end holding the present across a reset.
+        self.sync_update = false;
         self.alternate_scroll = true;
         self.alt_scroll_snapshot = None;
         self.alt_scroll_net = 0;
