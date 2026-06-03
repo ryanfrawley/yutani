@@ -65,6 +65,7 @@ impl Terminal {
             Event::DeleteChar(n) => self.delete_chars(n as usize),
             Event::EraseChar(n) => self.erase_chars(n as usize),
             Event::DeviceStatusReport(code) => self.device_status_report(code),
+            Event::PrivateDeviceStatusReport(code) => self.private_device_status_report(code),
             Event::DeviceAttributes => self.reply(b"\x1b[?1;2c"),
             // VT220 ID, firmware version 276, ROM cartridge 0 — what xterm
             // sends. Apps just check that the reply is well-formed.
@@ -588,6 +589,13 @@ impl Terminal {
             1006 => self.mouse_sgr = set,
             1007 => self.alternate_scroll = set,
             2004 => self.bracketed_paste = set,
+            // Color-scheme update notifications (Contour mode 2031). Seed the
+            // baseline polarity on enable so only a later light/dark flip
+            // notifies; clear it on disable.
+            2031 => {
+                self.color_scheme_notify = set;
+                self.last_notified_dark = if set { Some(self.bg_is_dark()) } else { None };
+            }
             1049 | 1047 | 47 => self.switch_screen(set, code == 1049),
             // DECLRMM. Enabling/disabling resets the margins to the full
             // screen — apps must re-issue DECSLRM after enabling.
@@ -694,6 +702,18 @@ impl Terminal {
                 self.pending_response.extend_from_slice(s.as_bytes());
             }
             _ => {}
+        }
+    }
+
+    // DEC private DSR (`CSI ? Ps n`). `CSI ? 996 n` queries the current
+    // color-scheme preference (Contour's mode-2031 extension); we answer with
+    // the same `CSI ? 997 ; Ps n` report the change notification uses, derived
+    // from the background luminance so the query and the notification always
+    // agree. Other private DSR codes are unimplemented and stay silent.
+    fn private_device_status_report(&mut self, code: u16) {
+        if code == 996 {
+            let dark = self.bg_is_dark();
+            self.push_color_scheme_report(dark);
         }
     }
 
