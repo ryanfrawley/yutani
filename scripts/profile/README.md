@@ -48,6 +48,38 @@ Each targets a different hot path from the analysis:
   churn (one `Vec<Cell>` clone+alloc per scrolled row).
 - **`mixed`** — all three, a rough "real session" blend.
 
+The four above are `cat`-floods (parse-bound): bytes arrive faster than vsync, so
+they coalesce into a handful of rendered frames. Good for the parser / grid /
+scrollback path, useless for the render path.
+
+- **`redraw`** — the **render-bound** workload. Not a corpus + `cat`; a *paced*
+  full-screen repainter (`redraw.py`) that emits one repaint per frame interval
+  and sleeps between frames, so each repaint renders as its own frame. Every
+  cell's glyph shifts each frame, so the per-row cache misses on every row and
+  `update_vertices` does a full rebuild — exercising the glyph-lookup (FxHash) and
+  vertex-Vec paths the render tier touches. `YUTANI_REDRAW_FRAMES` / `_FPS` /
+  `_BATCH` tune it; `_BATCH=N` inserts a brief idle every N frames so `PERFLOG`
+  flushes a per-batch `[perf]` line (the way to read per-frame `update_vertices`
+  time).
+
+  Caveat learned from building it: the renderer is **frame-paced at ~62fps and
+  each `update_vertices` is sub-millisecond** (~80µs on a normal grid), so the
+  render path is ~0.5% of a frame budget — render-tier changes are real per-frame
+  headroom but **invisible to wall-clock / aggregate sampling** under any
+  workload. To quantify a render change, read `PERFLOG`'s `update … x N` (per-frame
+  µs), not the macro number.
+
+## `bench_hasher.rs` — isolate a hasher change
+
+`update_vertices` is too small a slice to measure a hasher swap through the GUI.
+`bench_hasher.rs` is a dependency-free micro-benchmark of the exact hot op — a
+`HashMap<char, AtlasEntry>::get` per cell — under SipHash vs FxHash:
+
+```sh
+rustc -O scripts/profile/bench_hasher.rs -o /tmp/bench_hasher && /tmp/bench_hasher
+# SipHash ~5.5 ns/lookup, FxHash ~1.8 ns/lookup -> ~3x, ~37us/frame saved at 10k cells
+```
+
 ## Measuring an improvement (before/after protocol)
 
 The macro number is the workload's wall-clock consume time, appended to
