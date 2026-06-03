@@ -1348,6 +1348,15 @@ impl CursorAnim {
             return self.to;
         }
         let t = self.started_at.elapsed().as_secs_f32() / duration;
+        self.eased_at(t)
+    }
+
+    /// The smoothstep-eased position at normalized progress `t` (clamped to
+    /// 0..=1): `e = t*t*(3 - 2t)` applied to each axis. Split out from
+    /// [`current`] so the curve is pure — testable at an exact `t` without the
+    /// `Instant::now()` drift that made wall-clock-based assertions flaky.
+    fn eased_at(&self, t: f32) -> (f32, f32) {
+        let t = t.clamp(0.0, 1.0);
         let e = t * t * (3.0 - 2.0 * t);
         (
             self.from.0 + (self.to.0 - self.from.0) * e,
