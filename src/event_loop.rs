@@ -444,7 +444,16 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 // actually changed). `invalidate()` below redraws.
                 state.recompute_completions();
                 state.perf.note_pty(bytes, t0.elapsed());
-                state.invalidate();
+                // Synchronized output (DEC 2026): if this chunk left the app
+                // mid-frame (BSU without a matching ESU), accumulate the grid
+                // changes but hold the repaint — `about_to_wait` arms the safety
+                // timeout and `RedrawRequested` keeps the present gated. Once the
+                // ESU lands (sync clears), paint the finished frame atomically.
+                if state.sync_output_active() {
+                    state.vertices_dirty = true;
+                } else {
+                    state.invalidate();
+                }
                 // New / removed cells may have changed which URL (if any)
                 // sits under the pointer.
                 state.update_hover_url();
@@ -637,6 +646,18 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                         // still paints.
                     }
                     WindowEvent::RedrawRequested => {
+                        // Synchronized output (DEC mode 2026): the app is
+                        // composing a frame. Hold the present until it ends (ESU)
+                        // or the safety timeout fires so a half-built frame never
+                        // reaches the screen — the grid keeps updating underneath,
+                        // `vertices_dirty` stays set, and the release path
+                        // (`about_to_wait`, or the post-feed branch below) issues
+                        // the repaint. Returning without arming `render_pending`
+                        // keeps the loop from spinning at the frame cadence during
+                        // the hold (`about_to_wait` only re-arms a pending frame).
+                        if state.sync_output_active() {
+                            return;
+                        }
                         // Two cheap gates before the ~7ms vertex rebuild, so a
                         // frame we shouldn't render yet costs the main thread
                         // nothing (leaving the run loop free for AppKit's native
@@ -967,6 +988,23 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 state.perf.maybe_flush();
                 continue;
             }
+            // Synchronized-output (DEC 2026) safety timeout. While the active
+            // tab holds a sync frame, arm a deadline on the rising edge; if it
+            // expires before the app sends ESU (it hung or crashed mid-update),
+            // force-release the hold and repaint so the screen can't freeze. The
+            // deadline isn't refreshed while sync persists, so it bounds the
+            // freeze from the *first* held frame regardless of further output.
+            if state.sync_output_active() {
+                let now = std::time::Instant::now();
+                let deadline = *state.sync_deadline.get_or_insert(now + SYNC_UPDATE_TIMEOUT);
+                if now >= deadline {
+                    state.sync_deadline = None;
+                    state.active_tab_mut().terminal.clear_sync_update();
+                    state.invalidate();
+                }
+            } else {
+                state.sync_deadline = None;
+            }
             // Re-arm a deferred redraw once it's due: the pacing interval has
             // elapsed *and* a present target is free. Requesting the redraw only
             // when both hold means the loop sleeps (idle, AppKit-available) until
@@ -1039,6 +1077,8 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                 next_image_anim,
                 next_deferred,
                 state.perf.next_wake(),
+                // Wake to enforce the sync-output release deadline.
+                state.sync_deadline,
             ]
             .into_iter()
             .flatten()

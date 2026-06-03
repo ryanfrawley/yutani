@@ -1709,6 +1709,109 @@
     }
 
     #[test]
+    fn mode_2026_synchronized_output_tracks() {
+        let mut t = Terminal::new(5, 3, 100);
+        assert!(!t.sync_update());
+        t.feed("\x1b[?2026h"); // BSU
+        assert!(t.sync_update());
+        t.feed("\x1b[?2026l"); // ESU
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn mode_2026_content_between_bsu_esu_still_applies_to_grid() {
+        // Synchronized output gates *presentation*, not parsing: the grid must
+        // keep updating while sync is held so the finished frame is correct when
+        // the front end finally paints it.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026hAB");
+        assert!(t.sync_update());
+        assert_eq!(t.row(0)[0].ch, 'A');
+        assert_eq!(t.row(0)[1].ch, 'B');
+        t.feed("C\x1b[?2026l");
+        assert!(!t.sync_update());
+        assert_eq!(t.row(0)[2].ch, 'C');
+    }
+
+    #[test]
+    fn clear_sync_update_forces_release_and_later_esu_is_noop() {
+        // The front end's safety timeout force-releases a sync frame an app
+        // never ended; a subsequent stray ESU must not reassert anything.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026h");
+        assert!(t.sync_update());
+        t.clear_sync_update();
+        assert!(!t.sync_update());
+        t.feed("\x1b[?2026l");
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn mode_2026_bsu_is_idempotent() {
+        // Apps may emit BSU again without an intervening ESU (e.g. nested
+        // frame guards); sync is a single boolean, so the second BSU is a
+        // no-op and one ESU still fully releases the held frame.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026h\x1b[?2026h");
+        assert!(t.sync_update());
+        t.feed("\x1b[?2026l");
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn mode_2026_toggles_across_feed_chunk_boundary() {
+        // PTY reads split anywhere, so the private-mode sequence can arrive in
+        // pieces; the parser must reassemble it across feed() calls rather than
+        // resetting mid-sequence and dropping the toggle.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026");
+        assert!(!t.sync_update()); // sequence not yet terminated
+        t.feed("h");
+        assert!(t.sync_update());
+        t.feed("\x1b[?20");
+        t.feed("26l");
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn mode_2026_unrelated_private_mode_does_not_disturb_sync() {
+        // Each DEC private mode is independent; toggling something else (here
+        // cursor visibility, mode 25) while a frame is held must not perturb
+        // the synchronized-output state.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026h");
+        assert!(t.sync_update());
+        t.feed("\x1b[?25l"); // hide cursor mid-frame
+        assert!(t.sync_update());
+        assert!(!t.cursor_visible());
+        t.feed("\x1b[?2026l");
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn clear_sync_update_when_not_in_sync_is_noop() {
+        // The front-end safety timeout may fire clear_sync_update() defensively
+        // even when no frame is held; that must be harmless rather than flip any
+        // state.
+        let mut t = Terminal::new(5, 3, 100);
+        assert!(!t.sync_update());
+        t.clear_sync_update();
+        assert!(!t.sync_update());
+    }
+
+    #[test]
+    fn mode_2026_cleared_by_full_reset() {
+        // RIS restores the power-on state, which has synchronized output off.
+        // A BSU that's never matched by an ESU must not survive the reset and
+        // keep the front end holding the present.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2026h");
+        assert!(t.sync_update());
+        t.feed("\x1bc"); // RIS
+        assert!(!t.sync_update());
+    }
+
+    #[test]
     fn full_reset_clears_app_cursor_keys_and_response() {
         let mut t = Terminal::new(5, 3, 100);
         t.feed("\x1b[?1h\x1b[5n");

@@ -591,6 +591,13 @@ pub struct Terminal {
     // same-polarity scheme swaps, font reloads — stay silent.
     color_scheme_notify: bool,
     last_notified_dark: Option<bool>,
+    // Synchronized output (DEC private mode 2026). Set between an app's
+    // Begin Sync Update (`CSI ? 2026 h`) and End Sync Update (`CSI ? 2026 l`):
+    // the grid keeps applying bytes, but the front end holds the *present* so a
+    // half-composed frame never reaches the screen. The front end reads this
+    // via `sync_update()` and force-releases it via `clear_sync_update()` when
+    // its safety timeout fires (so a crashed app can't freeze the display).
+    sync_update: bool,
     // Alternate scroll (?1007). When set, and the alt screen is active with no
     // mouse tracking in effect, the front end turns wheel motion into cursor-key
     // presses so pagers (less, man) scroll. Defaults on, matching xterm's
@@ -928,6 +935,7 @@ impl Terminal {
             bracketed_paste: false,
             color_scheme_notify: false,
             last_notified_dark: None,
+            sync_update: false,
             alternate_scroll: true,
             alt_scroll_snapshot: None,
             alt_scroll_net: 0,
@@ -1359,6 +1367,20 @@ impl Terminal {
 
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether the app is mid-frame under synchronized output (DEC 2026). The
+    /// front end holds presentation while this is true (see `clear_sync_update`).
+    pub fn sync_update(&self) -> bool {
+        self.sync_update
+    }
+
+    /// Force-release synchronized output. Called by the front end's safety
+    /// timeout when an app begins a sync frame but never ends it (e.g. it
+    /// crashed mid-update), so the display can't stay frozen indefinitely. A
+    /// later `CSI ? 2026 l` is then a harmless no-op.
+    pub fn clear_sync_update(&mut self) {
+        self.sync_update = false;
     }
 
     /// DEC mode ?1007 (alternate scroll). When true and the alt screen is
