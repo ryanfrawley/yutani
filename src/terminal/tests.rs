@@ -1828,6 +1828,110 @@
     }
 
     #[test]
+    fn decrqm_reports_set_and_reset_for_private_mode() {
+        let mut t = Terminal::new(5, 3, 100);
+        // 2004 (bracketed paste) starts reset → Pm = 2.
+        t.feed("\x1b[?2004$p");
+        assert_eq!(t.take_response(), b"\x1b[?2004;2$y".to_vec());
+        // Enable it, then query → Pm = 1.
+        t.feed("\x1b[?2004h");
+        t.feed("\x1b[?2004$p");
+        assert_eq!(t.take_response(), b"\x1b[?2004;1$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_tracks_live_mode_state() {
+        // Grapheme clustering (2027) defaults on → 1; disabling flips it to 2.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2027$p");
+        assert_eq!(t.take_response(), b"\x1b[?2027;1$y".to_vec());
+        t.feed("\x1b[?2027l");
+        t.feed("\x1b[?2027$p");
+        assert_eq!(t.take_response(), b"\x1b[?2027;2$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_unrecognized_private_mode_reports_zero() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?9999$p");
+        assert_eq!(t.take_response(), b"\x1b[?9999;0$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_ansi_mode_reports_zero() {
+        // No ANSI (non-private) modes are implemented, so any are "not
+        // recognized" — and the reply omits the `?` private prefix.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[4$p");
+        assert_eq!(t.take_response(), b"\x1b[4;0$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_reports_default_on_modes_without_prior_toggle() {
+        // A mode that powers on enabled must report Pm = 1 on a fresh terminal,
+        // with no `h`/`l` ever issued — proving `private_mode_state` reads the
+        // live default, not a "seen a set" flag. Autowrap (7) and cursor
+        // visibility (25) both default on in `Terminal::new`.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?7$p");
+        assert_eq!(t.take_response(), b"\x1b[?7;1$y".to_vec());
+        t.feed("\x1b[?25$p");
+        assert_eq!(t.take_response(), b"\x1b[?25;1$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_alt_screen_mode_follows_screen_switch() {
+        // 47/1047/1049 all map to `use_alternate` in `private_mode_state`.
+        // On the primary screen the mode reads reset (2); after switching to
+        // the alternate screen it reads set (1). Confirms DECRQM tracks the
+        // real screen state rather than a per-code flag.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?1049$p");
+        assert_eq!(t.take_response(), b"\x1b[?1049;2$y".to_vec());
+        t.feed("\x1b[?1049h"); // enter alternate screen
+        t.feed("\x1b[?1049$p");
+        assert_eq!(t.take_response(), b"\x1b[?1049;1$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_query_does_not_mutate_queried_mode() {
+        // DECRQM is a pure read: querying a disabled mode twice must report
+        // reset (2) both times — the query must never flip the state it reads.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2004$p");
+        assert_eq!(t.take_response(), b"\x1b[?2004;2$y".to_vec());
+        t.feed("\x1b[?2004$p");
+        assert_eq!(t.take_response(), b"\x1b[?2004;2$y".to_vec());
+        assert!(!t.bracketed_paste(), "query must leave the mode untouched");
+    }
+
+    #[test]
+    fn decrqm_omitted_param_reports_zero() {
+        // A DECRQM with no param (`CSI ? $ p` / `CSI $ p`) defaults to mode 0,
+        // which is never a real mode → "not recognized" (Pm = 0). The reply
+        // echoes mode 0, keeping or dropping the `?` to match the request.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?$p");
+        assert_eq!(t.take_response(), b"\x1b[?0;0$y".to_vec());
+        t.feed("\x1b[$p");
+        assert_eq!(t.take_response(), b"\x1b[0;0$y".to_vec());
+    }
+
+    #[test]
+    fn decrqm_reports_more_implemented_modes() {
+        // A couple more round-trips beyond the existing 2004/2026/2027 cases.
+        let mut t = Terminal::new(5, 3, 100);
+        // Focus reporting (1004) defaults off; enable → 1.
+        t.feed("\x1b[?1004h");
+        t.feed("\x1b[?1004$p");
+        assert_eq!(t.take_response(), b"\x1b[?1004;1$y".to_vec());
+        // Cursor visibility (25) defaults on; hide via `?25l` → 2.
+        t.feed("\x1b[?25l");
+        t.feed("\x1b[?25$p");
+        assert_eq!(t.take_response(), b"\x1b[?25;2$y".to_vec());
+    }
+
+    #[test]
     fn mode_2026_synchronized_output_tracks() {
         let mut t = Terminal::new(5, 3, 100);
         assert!(!t.sync_update());

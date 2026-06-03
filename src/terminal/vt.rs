@@ -78,6 +78,7 @@ impl Terminal {
             Event::Sgr(params) => self.cursor.style.apply_sgr(&params),
             Event::PrivateModeSet(n) => self.private_mode(n, true),
             Event::PrivateModeReset(n) => self.private_mode(n, false),
+            Event::RequestMode { private, mode } => self.report_mode(private, mode),
             Event::SaveCursor => self.save_cursor(),
             Event::RestoreCursor => self.restore_cursor(),
             Event::FullReset => self.full_reset(),
@@ -618,6 +619,49 @@ impl Terminal {
             }
             _ => {}
         }
+    }
+
+    /// Current on/off state of a DEC private mode for DECRQM reporting, or
+    /// `None` if we don't implement it. Mirrors [`private_mode`]: every code
+    /// answered here is one we actually act on, so the report never claims
+    /// support for a mode that does nothing.
+    fn private_mode_state(&self, code: u16) -> Option<bool> {
+        Some(match code {
+            1 => self.app_cursor_keys,
+            7 => self.autowrap,
+            25 => self.cursor_visible,
+            69 => self.lrmm_enabled,
+            1000 => self.mouse_press_release,
+            1002 => self.mouse_button_motion,
+            1003 => self.mouse_any_motion,
+            1004 => self.focus_reporting,
+            1006 => self.mouse_sgr,
+            1007 => self.alternate_scroll,
+            47 | 1047 | 1049 => self.use_alternate,
+            2004 => self.bracketed_paste,
+            2026 => self.sync_update,
+            2027 => self.grapheme_clustering,
+            2031 => self.color_scheme_notify,
+            _ => return None,
+        })
+    }
+
+    /// Reply to a DECRQM request (`CSI [?] Ps $ p`) with a DECRPM report
+    /// (`CSI [?] Ps ; Pm $ y`). Pm is 1 = set, 2 = reset, 0 = not recognized.
+    /// We implement no ANSI (non-private) modes, so those always report 0.
+    fn report_mode(&mut self, private: bool, mode: u16) {
+        let pm = if private {
+            match self.private_mode_state(mode) {
+                Some(true) => 1,
+                Some(false) => 2,
+                None => 0,
+            }
+        } else {
+            0
+        };
+        let prefix = if private { "?" } else { "" };
+        let s = format!("\x1b[{prefix}{mode};{pm}$y");
+        self.pending_response.extend_from_slice(s.as_bytes());
     }
 
     /// Handle a captured DCS payload. Currently we implement xterm's
