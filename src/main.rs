@@ -780,6 +780,18 @@ struct WindowState {
     /// composite pass draws them in two `draw_indexed` calls so glow can
     /// bloom each layer independently.
     num_bg_indices: u32,
+    /// Reusable scratch buffers for `update_vertices`, kept across frames so the
+    /// per-frame geometry rebuild reuses their heap allocation instead of
+    /// allocating fresh `Vec`s sized to the whole grid every frame. Taken via
+    /// `mem::take` at the top of the build, cleared, refilled, and restored at
+    /// the end (the function has no early returns, so the round-trip always
+    /// completes). `damage_scratch` likewise reuses the per-frame copy of the
+    /// row-damage bitmap.
+    vert_scratch: Vec<renderer::vertex::Vertex>,
+    idx_scratch: Vec<u32>,
+    bg_vert_scratch: Vec<renderer::vertex::Vertex>,
+    fg_vert_scratch: Vec<renderer::vertex::Vertex>,
+    damage_scratch: Vec<bool>,
     // Separate buffer for the edge-fade strip quads. Drawn in the composite
     // pass with the blur sampler bound, so the strips are filled with the
     // dual-Kawase blur of the scene rather than a flat white tint.
@@ -1737,6 +1749,11 @@ impl WindowState {
             index_buffer,
             num_indices: 0,
             num_bg_indices: 0,
+            vert_scratch: Vec::new(),
+            idx_scratch: Vec::new(),
+            bg_vert_scratch: Vec::new(),
+            fg_vert_scratch: Vec::new(),
+            damage_scratch: Vec::new(),
             strip_vertex_buffer,
             strip_index_buffer,
             num_strip_indices: 0,

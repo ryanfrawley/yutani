@@ -95,8 +95,15 @@ impl WindowState {
         let cols = self.active_tab().terminal.cols;
         let rows = self.active_tab().terminal.rows;
         let area = cols * rows;
-        let mut vertices: Vec<renderer::vertex::Vertex> = Vec::with_capacity(8 * (area + 1));
-        let mut indices: Vec<u32> = Vec::with_capacity(12 * (area + 1));
+        // Reuse last frame's heap allocations (see the `*_scratch` fields on
+        // `WindowState`). `clear` keeps the capacity; `reserve` covers a grown
+        // grid. Restored to `self` at the end of the function.
+        let mut vertices = std::mem::take(&mut self.vert_scratch);
+        let mut indices = std::mem::take(&mut self.idx_scratch);
+        vertices.clear();
+        indices.clear();
+        vertices.reserve(8 * (area + 1));
+        indices.reserve(12 * (area + 1));
 
         // All face-derived metrics are pulled in one borrow so the shared
         // font's `Ref` is dropped before the `ensure_*` fill calls below
@@ -908,7 +915,13 @@ impl WindowState {
         } else {
             viewport_key.view_offset.min(rows)
         };
-        let row_damage_vec = self.active_tab().terminal.row_damage().to_vec();
+        // Detach the row-damage bitmap from `self` so the loop below can mutate
+        // `self` (row cache) while `is_damaged` reads it. Reuse the scratch
+        // allocation instead of a fresh `to_vec()` each frame; restored after
+        // the loop.
+        let mut row_damage_vec = std::mem::take(&mut self.damage_scratch);
+        row_damage_vec.clear();
+        row_damage_vec.extend_from_slice(self.active_tab().terminal.row_damage());
         let is_damaged = |r: isize| -> bool {
             let live = r - live_off as isize;
             if live < 0 || live as usize >= rows {
@@ -926,8 +939,12 @@ impl WindowState {
         let top_abs = evicted + self.active_tab().terminal.visual_to_abs_line(0);
 
         // Build per-layer cell geometry; indices are regenerated at assembly.
-        let mut bg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
-        let mut fg_verts: Vec<renderer::vertex::Vertex> = Vec::with_capacity(4 * area);
+        let mut bg_verts = std::mem::take(&mut self.bg_vert_scratch);
+        let mut fg_verts = std::mem::take(&mut self.fg_vert_scratch);
+        bg_verts.clear();
+        fg_verts.clear();
+        bg_verts.reserve(4 * area);
+        fg_verts.reserve(4 * area);
         // Lines freshly emitted this frame, inserted into the cache after the
         // loop so the loop body never holds a `&mut self.tabs` borrow.
         let mut fresh_rows: Vec<(isize, RowVerts)> = Vec::new();
@@ -2168,6 +2185,14 @@ impl WindowState {
             .write_buffer(&self.index_buffer, 0, bytemuck::cast_slice(&indices));
         self.num_indices = indices.len() as u32;
         self.num_bg_indices = num_bg_indices;
+
+        // Return the scratch buffers to `self` so next frame reuses their
+        // capacity instead of reallocating (see the `*_scratch` fields).
+        self.vert_scratch = vertices;
+        self.idx_scratch = indices;
+        self.bg_vert_scratch = bg_verts;
+        self.fg_vert_scratch = fg_verts;
+        self.damage_scratch = row_damage_vec;
 
         self.perf.note_update_phases(
             _perf_t_shape1.duration_since(_perf_t_shape0),
