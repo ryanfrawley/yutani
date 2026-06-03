@@ -257,12 +257,20 @@ impl Grid {
                 }
             }
         }
+        // Blank the freed rows unconditionally. Unlike `clear_row` (change-gated
+        // for apps that repaint blank spans they never wrote), a scrolled-away
+        // row almost always held content, so the per-cell compare is wasted work
+        // that nearly always falls through to the write — a flat `fill` + a
+        // single `mark_dirty` is cheaper on the streaming hot path.
         for r in bottom + 1 - n..=bottom {
-            if full_width {
-                self.clear_row(r, 0, self.cols, blank);
+            let (from, to) = if full_width {
+                (0, self.cols)
             } else {
-                self.clear_row(r, left, right + 1, blank);
-            }
+                (left, right + 1)
+            };
+            let base = self.row_base(r);
+            self.cells[base + from..base + to].fill(blank);
+            self.mark_dirty(r);
         }
         // Shift placements that intersect the scroll region. Partial-width
         // scrolls (DECSLRM) leave images alone — the use case (per-pane tmux

@@ -1950,13 +1950,23 @@ impl Terminal {
             // screen have already scrolled past what any slide could show.
             self.primary_scroll_net = (self.primary_scroll_net + n.min(self.rows)).min(self.rows);
             for _ in 0..n.min(self.rows) {
-                let line = self.primary.row(self.scroll_top).to_vec();
-                if self.scrollback.len() == self.scrollback_limit {
-                    self.scrollback.pop_front();
+                // Reuse the evicted front row's allocation instead of dropping
+                // it and allocating a fresh `Vec` for the pushed line. At steady
+                // state (scrollback full — the common case under a flood) this
+                // makes the scrollback push allocation-free: every scrolled line
+                // otherwise paid a malloc + free, which profiling showed as a
+                // few percent of the main thread on streaming output.
+                let mut line = if self.scrollback.len() == self.scrollback_limit {
                     self.scrollback_evicted += 1;
                     self.evict_scrollback_placement_front();
                     self.evict_scrollback_mark_front();
-                }
+                    let mut recycled = self.scrollback.pop_front().unwrap();
+                    recycled.clear();
+                    recycled
+                } else {
+                    Vec::new()
+                };
+                line.extend_from_slice(self.primary.row(self.scroll_top));
                 self.scrollback.push_back(line);
                 // Keep the user's view of historical content stable while
                 // new lines stream into scrollback. visible_cell indexes from
