@@ -1,5 +1,11 @@
 extern crate freetype as ft;
-use std::collections::{HashMap, HashSet};
+// FxHashMap/FxHashSet (rustc's own hasher) for the glyph caches. These are hot:
+// `variants` (char key) and `ligatures` (glyph-id key) are looked up once per
+// visible cell per frame. FxHash is a small-key win over the default SipHash and
+// needs no DoS resistance for process-internal caches. Aliased to the std names
+// so the rest of the file is unchanged except constructors (Fx maps have no
+// `::new()`/`::with_capacity()` — use `::default()` / `with_capacity_and_hasher`).
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::box_drawing;
 
@@ -618,7 +624,7 @@ impl Font {
             cached_underline_position: 0,
             cached_underline_thickness: 0,
             current_tune: None,
-            metric_cache: HashMap::new(),
+            metric_cache: HashMap::default(),
             hinting: crate::config::Hinting::default(),
         }
     }
@@ -942,10 +948,10 @@ impl Font {
         .expect("notdef must fit in a freshly-built atlas");
 
         let mut variants_entries: [HashMap<char, AtlasEntry>; 4] = [
-            HashMap::with_capacity(4096),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::with_capacity_and_hasher(4096, Default::default()),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
         ];
 
         // Pre-pack only Regular printable ASCII — the glyphs the first frame
@@ -1010,10 +1016,10 @@ impl Font {
             color_dirty: false,
             variants: variants_entries,
             ligatures: [
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
             ],
             notdef,
             pack_x: x,
@@ -1021,13 +1027,13 @@ impl Font {
             pack_row_height: row_height,
             dirty: false,
             tried_chars: [
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
             ],
-            clusters: HashMap::new(),
-            tried_clusters: HashSet::new(),
+            clusters: HashMap::default(),
+            tried_clusters: HashSet::default(),
         }
     }
 }
@@ -1407,10 +1413,10 @@ mod tests {
 
     fn atlas_with(reg: &[char], bold: &[char]) -> Atlas {
         let mut variants: [HashMap<char, AtlasEntry>; 4] = [
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
         ];
         for &c in reg {
             variants[FaceVariant::Regular as usize].insert(c, entry(0));
@@ -1431,10 +1437,10 @@ mod tests {
             color_dirty: false,
             variants,
             ligatures: [
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
             ],
             notdef: entry(99),
             pack_x: 0,
@@ -1442,13 +1448,13 @@ mod tests {
             pack_row_height: 0,
             dirty: false,
             tried_chars: [
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
             ],
-            clusters: HashMap::new(),
-            tried_clusters: HashSet::new(),
+            clusters: HashMap::default(),
+            tried_clusters: HashSet::default(),
         }
     }
 
@@ -1855,16 +1861,16 @@ mod tests {
             color_pack_row_height: 0,
             color_dirty: false,
             variants: [
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
             ],
             ligatures: [
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
+                HashMap::default(),
             ],
             notdef: entry(99),
             pack_x: 2,
@@ -1872,13 +1878,13 @@ mod tests {
             pack_row_height: 0,
             dirty: false,
             tried_chars: [
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
+                HashSet::default(),
             ],
-            clusters: HashMap::new(),
-            tried_clusters: HashSet::new(),
+            clusters: HashMap::default(),
+            tried_clusters: HashSet::default(),
         }
     }
 

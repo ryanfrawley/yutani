@@ -32,6 +32,11 @@ image = { version = "0.24", default-features = false, features = ["png", "jpeg",
 base64 = "0.21"
 flate2 = "1"
 toml = "0.8"
+# Fast, non-DoS-resistant hasher for hot internal caches keyed by small integer
+# / char keys (glyph atlas lookups run once per visible cell per frame). FxHash
+# is what rustc itself uses for exactly this shape of key; already in the
+# dependency tree transitively, so this adds no new compile.
+rustc-hash = "1.1"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", default-features = false, features = ["winuser", "wingdi"] }
