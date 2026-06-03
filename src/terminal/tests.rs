@@ -8736,3 +8736,125 @@
         t.feed("\x1b[F"); // CPL — would go row 0 col 0 if implemented
         assert_eq!((t.cursor().row, t.cursor().col), (1, 2), "CPL is a no-op");
     }
+
+    // ---- Scrollback Vec recycling at capacity (perf optimization in
+    // `scroll_region_up_by`: the evicted front row's allocation is reused for
+    // the pushed line via pop_front + clear + extend_from_slice). These pin the
+    // *content correctness* of that reuse — the risk is stale bytes from the
+    // evicted row surviving into the recycled buffer.
+
+    #[test]
+    fn scroll_far_past_limit_keeps_exact_last_n_lines_uncorrupted() {
+        // Feed many more distinct full-width lines than the scrollback limit, so
+        // every push past the limit lands in a *recycled* buffer (the steady
+        // state under a flood). The recycled rows must carry the freshly
+        // scrolled bytes, never a tail of the evicted row they reused. With a
+        // 1-row grid; each line is printed then a trailing CRLF scrolls it into
+        // scrollback (including the last). So after `total` lines the grid is
+        // blank and scrollback holds the final LIMIT lines in order: indices
+        // total-LIMIT .. total-1.
+        const LIMIT: usize = 4;
+        let cols = 5;
+        let mut t = Terminal::new(cols, 1, LIMIT);
+        let total = 3 * LIMIT + 2; // well past 2*LIMIT
+        // 26 distinct glyphs cycled; each line is `cols` copies of one glyph so
+        // the whole row is a single recognizable byte pattern.
+        let glyph = |i: usize| (b'A' + (i % 26) as u8) as char;
+        for i in 0..total {
+            let line: String = std::iter::repeat(glyph(i)).take(cols).collect();
+            t.feed(&line);
+            t.feed("\r\n");
+        }
+        // Scrollback pins at the limit and holds the final LIMIT lines.
+        assert_eq!(t.scrollback_len(), LIMIT);
+        assert!(t.scrollback_evicted() >= (total - LIMIT) as u64);
+        for slot in 0..LIMIT {
+            let line_idx = total - LIMIT + slot;
+            let expected = glyph(line_idx);
+            let row = &t.scrollback[slot];
+            // No stale tail: the recycled buffer is exactly `cols` wide…
+            assert_eq!(
+                row.len(),
+                cols,
+                "recycled scrollback row {slot} must be exactly {cols} cells, no leftover tail"
+            );
+            // …and every cell is the freshly scrolled glyph, not stale bytes.
+            for (col, cell) in row.iter().enumerate() {
+                assert_eq!(
+                    cell.ch, expected,
+                    "scrollback row {slot} col {col}: recycled buffer carries wrong/stale content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recycled_row_holding_longer_line_then_shorter_has_no_leftover_tail() {
+        // The recycle path is `pop_front -> clear() -> extend_from_slice`. If a
+        // recycled buffer once held a *wider* row (more cells) and then receives
+        // a *narrower* one, the clear() must drop the old length so no tail of
+        // the evicted-wide row survives. A horizontal shrink makes the live grid
+        // narrower while older scrollback Vecs keep their original (wider) width,
+        // so a later scroll recycles a wide buffer to hold a narrow row.
+        let wide = 8;
+        let narrow = 3;
+        let limit = 2;
+        let mut t = Terminal::new(wide, 1, limit);
+        // Fill scrollback to the limit with full-width WIDE rows.
+        t.feed("WWWWWWWW\r\n"); // -> scrollback[0], 8 cells of 'W'
+        t.feed("XXXXXXXX\r\n"); // -> scrollback[1], 8 cells of 'X'
+        assert_eq!(t.scrollback_len(), limit);
+        assert_eq!(t.scrollback[0].len(), wide, "fixture: wide rows are 8 cells");
+
+        // Shrink columns; existing scrollback Vecs keep their 8-cell width.
+        t.resize(narrow, 1);
+        assert_eq!(t.scrollback[0].len(), wide, "old scrollback keeps its width");
+
+        // Now flood narrow rows. Each scroll is at capacity, so it recycles a
+        // previously-WIDE buffer to hold a NARROW (3-cell) row. After enough
+        // pushes the wide originals are gone and every slot is a recycled buffer.
+        for ch in ['a', 'b', 'c', 'd'] {
+            let line: String = std::iter::repeat(ch).take(narrow).collect();
+            t.feed(&line);
+            t.feed("\r\n");
+        }
+        assert_eq!(t.scrollback_len(), limit);
+        // Both rows must be exactly `narrow` wide — clear() dropped the old
+        // wider length, leaving no leftover 'W'/'X' tail past column 2.
+        for slot in 0..limit {
+            assert_eq!(
+                t.scrollback[slot].len(),
+                narrow,
+                "recycled wide buffer must shrink to the narrow row's width, no tail"
+            );
+        }
+        // Content is the last two narrow lines ('c', then 'd'), uncorrupted.
+        assert!(t.scrollback[0].iter().all(|c| c.ch == 'c'));
+        assert!(t.scrollback[1].iter().all(|c| c.ch == 'd'));
+    }
+
+    #[test]
+    fn freed_bottom_row_after_scroll_is_fully_blanked_and_dirty() {
+        // The grid optimization blanks freed scroll-region rows with an
+        // unconditional `fill(blank) + mark_dirty` (replacing the change-gated
+        // `clear_row`). Existing damage tests assert the freed row is *dirty*;
+        // this additionally pins that the freed row's *content* is fully blanked
+        // across every column — the end-state guaranteed by the new `fill`.
+        let mut t = Terminal::new(6, 3, 100);
+        t.feed("aaa\r\nbbb\r\nccc"); // rows 0..2 filled, cursor at bottom
+        t.clear_row_damage();
+        t.feed("\x1b[3;1H\n"); // cursor to bottom, bare LF -> full-screen scroll up 1
+        // Every cell of the freed bottom row is blank — no surviving 'ccc'.
+        for col in 0..t.cols {
+            assert_eq!(
+                t.primary.get(2, col).ch,
+                ' ',
+                "freed bottom row col {col} must be fully blanked after scroll"
+            );
+        }
+        // And the freed row is marked dirty so the renderer re-emits it.
+        assert!(
+            t.row_damage()[2],
+            "freed bottom row must be marked dirty after scroll"
+        );
+    }
