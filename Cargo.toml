@@ -72,3 +72,15 @@ objc2-app-kit = { version = "0.3", features = [
     "NSWindow",
 ] }
 raw-window-handle = "0.5"
+
+# Profiling build: release-grade optimization with full debug info kept so the
+# sampler (samply) resolves real symbols and inlined frames instead of stripped
+# addresses. Used by scripts/profile/profile.sh. `debug = true` emits DWARF;
+# `strip = false` keeps it in the binary; `split-debuginfo = "unpacked"` keeps
+# the .dSYM-style sidecar handy on macOS. samply walks stacks via the DWARF +
+# compact-unwind info this keeps, so no extra frame-pointer flag is needed.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+split-debuginfo = "unpacked"
