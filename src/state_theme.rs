@@ -305,6 +305,16 @@ impl WindowState {
         // for OSC 10/11/12 so reports match the scheme's hex literals.
         let to_u8 = palette::color_to_srgb_u8;
         self.active_tab_mut().terminal.set_default_colors(to_u8(p.foreground), to_u8(p.background), to_u8(p.cursor));
+        // If an app subscribed to color-scheme updates (DEC mode 2031) and the
+        // background just crossed the light/dark line, emit the notification and
+        // flush it to the PTY now: this path is reached from theme changes
+        // (system appearance, palette commands, config reload), none of which is
+        // followed by a `PtyInput` feed, so the event loop's usual post-feed
+        // response drain won't run for it.
+        if self.active_tab_mut().terminal.notify_color_scheme_change() {
+            let reply = self.active_tab_mut().terminal.take_response();
+            self.write_pty(&reply);
+        }
         // The native tab titles use dynamic system colors that track the window
         // appearance, but re-style so a theme flip repaints them immediately.
         tab_style::restyle(&self.window);

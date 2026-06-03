@@ -582,6 +582,15 @@ pub struct Terminal {
     // Bracketed paste (?2004): when set, the GUI wraps pasted text in
     // ESC [ 200 ~ … ESC [ 201 ~ before sending it to the PTY.
     bracketed_paste: bool,
+    // Color-scheme update notifications (DEC private mode 2031, Contour's
+    // extension). When an app enables it (`CSI ? 2031 h`), a live light/dark
+    // flip of the terminal background emits `CSI ? 997 ; 1 n` (dark) /
+    // `; 2 n` (light) so the app can re-query OSC 11 and re-theme without a
+    // restart. `last_notified_dark` is the polarity we last reported (seeded
+    // on enable) so palette refreshes that don't cross the light/dark line —
+    // same-polarity scheme swaps, font reloads — stay silent.
+    color_scheme_notify: bool,
+    last_notified_dark: Option<bool>,
     // Alternate scroll (?1007). When set, and the alt screen is active with no
     // mouse tracking in effect, the front end turns wheel motion into cursor-key
     // presses so pagers (less, man) scroll. Defaults on, matching xterm's
@@ -917,6 +926,8 @@ impl Terminal {
             mouse_any_motion: false,
             mouse_sgr: false,
             bracketed_paste: false,
+            color_scheme_notify: false,
+            last_notified_dark: None,
             alternate_scroll: true,
             alt_scroll_snapshot: None,
             alt_scroll_net: 0,
@@ -1476,6 +1487,47 @@ impl Terminal {
         self.default_fg_rgb = fg;
         self.default_bg_rgb = bg;
         self.default_cursor_rgb = cursor;
+    }
+
+    /// Luminance test on the reported background: true when the OSC-11 default
+    /// background is perceptually dark. Drives the color-scheme reports so the
+    /// signal an app receives (and the answer to a `CSI ? 996 n` query) always
+    /// agrees with what it would conclude from the background color itself.
+    fn bg_is_dark(&self) -> bool {
+        let [r, g, b] = self.default_bg_rgb;
+        // Rec.709 luma, integer-scaled (0.2126/0.7152/0.0722 × 256).
+        let luma = (r as u32 * 54 + g as u32 * 183 + b as u32 * 19) >> 8;
+        luma < 128
+    }
+
+    /// Queue a DEC mode 2031 color-scheme report (`CSI ? 997 ; Ps n`, with
+    /// Ps = 1 dark / 2 light). Shared by the unsolicited change notification
+    /// and the `CSI ? 996 n` state query; the caller drains it via
+    /// `take_response()`.
+    pub(crate) fn push_color_scheme_report(&mut self, dark: bool) {
+        let ps = if dark { 1 } else { 2 };
+        let s = format!("\x1b[?997;{ps}n");
+        self.pending_response.extend_from_slice(s.as_bytes());
+    }
+
+    /// After the front end pushes new theme colors (`set_default_colors`),
+    /// notify a 2031-subscribed app iff the background just crossed the
+    /// light/dark line. No-op when mode 2031 is off or the polarity is
+    /// unchanged, so same-polarity scheme swaps and font reloads stay silent.
+    /// Returns whether a report was queued — the theme path runs outside the
+    /// post-feed drain, so a `true` return tells the caller to flush the
+    /// response to the PTY itself.
+    pub fn notify_color_scheme_change(&mut self) -> bool {
+        if !self.color_scheme_notify {
+            return false;
+        }
+        let dark = self.bg_is_dark();
+        if self.last_notified_dark == Some(dark) {
+            return false;
+        }
+        self.last_notified_dark = Some(dark);
+        self.push_color_scheme_report(dark);
+        true
     }
 
     /// Walk every cell on every grid (primary, alternate, scrollback)

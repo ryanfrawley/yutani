@@ -54,6 +54,10 @@ pub enum Event {
     // expected to write a reply back to the host.
     DeviceStatusReport(u16),
 
+    // CSI ? <n>n — private DSR. 996 = query the color-scheme preference
+    // (Contour's mode-2031 extension); caller replies with CSI ? 997 ; Ps n.
+    PrivateDeviceStatusReport(u16),
+
     // CSI c (or CSI 0c) — Primary Device Attributes. Caller replies with
     // identification (e.g. \e[?1;2c).
     DeviceAttributes,
@@ -586,6 +590,13 @@ impl Parser {
                     emit(Event::PrivateModeReset(p));
                 }
             }
+            // CSI ? Ps n — private device status report (e.g. ? 996 n, the
+            // mode-2031 color-scheme query).
+            'n' => {
+                for &p in &self.params {
+                    emit(Event::PrivateDeviceStatusReport(p));
+                }
+            }
             _ => {}
         }
     }
@@ -934,6 +945,32 @@ mod tests {
                 Event::DeviceStatusReport(6),
                 Event::DeviceStatusReport(5),
                 Event::DeviceStatusReport(0),
+            ],
+        );
+    }
+
+    #[test]
+    fn private_device_status_report_parses() {
+        // `CSI ? Ps n` is a private DSR (the mode-2031 color-scheme query),
+        // distinct from the non-private `CSI Ps n`.
+        assert_eq!(
+            collect("\x1b[?996n"),
+            vec![Event::PrivateDeviceStatusReport(996)],
+        );
+    }
+
+    #[test]
+    fn private_device_status_report_emits_per_param() {
+        // The 'n' arm mirrors the 'h'/'l' private-mode arms: it emits one
+        // event per parameter rather than collapsing the list. A multi-param
+        // private DSR like `CSI ? 996 ; 1 n` therefore yields a report event
+        // for each param, so a terminal that only acts on 996 still sees it
+        // regardless of trailing params.
+        assert_eq!(
+            collect("\x1b[?996;1n"),
+            vec![
+                Event::PrivateDeviceStatusReport(996),
+                Event::PrivateDeviceStatusReport(1),
             ],
         );
     }

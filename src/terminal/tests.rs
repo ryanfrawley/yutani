@@ -909,6 +909,158 @@
         assert!(t.take_response().is_empty());
     }
 
+    // ---- DEC mode 2031: color-scheme update notifications ----
+
+    #[test]
+    fn mode_2031_query_996_reports_dark_for_dark_background() {
+        // A fresh terminal defaults to a black background → dark preference.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?996n");
+        assert_eq!(t.take_response(), b"\x1b[?997;1n".to_vec());
+    }
+
+    #[test]
+    fn mode_2031_query_996_reports_light_for_light_background() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.set_default_colors([0x00, 0x00, 0x00], [0xff, 0xff, 0xff], [0x00, 0x00, 0x00]);
+        t.feed("\x1b[?996n");
+        assert_eq!(t.take_response(), b"\x1b[?997;2n".to_vec());
+    }
+
+    #[test]
+    fn mode_2031_query_996_answered_even_when_unsubscribed() {
+        // The state query is a direct request — it must reply regardless of
+        // whether the app has enabled the 2031 change notifications.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?996n");
+        assert_eq!(t.take_response(), b"\x1b[?997;1n".to_vec());
+    }
+
+    #[test]
+    fn notify_color_scheme_change_silent_when_unsubscribed() {
+        let mut t = Terminal::new(5, 3, 100);
+        // No `CSI ? 2031 h`, so the front end's post-theme hook is a no-op even
+        // across a real light/dark flip.
+        t.set_default_colors([0xcc; 3], [0xff, 0xff, 0xff], [0xcc; 3]);
+        assert!(!t.notify_color_scheme_change());
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn notify_color_scheme_change_emits_on_polarity_flip() {
+        let mut t = Terminal::new(5, 3, 100);
+        // Subscribe while dark (default black bg) → baseline polarity = dark.
+        t.feed("\x1b[?2031h");
+        // Flip the background to light, then run the front end's hook.
+        t.set_default_colors([0x00; 3], [0xff, 0xff, 0xff], [0x00; 3]);
+        assert!(t.notify_color_scheme_change());
+        assert_eq!(t.take_response(), b"\x1b[?997;2n".to_vec());
+    }
+
+    #[test]
+    fn notify_color_scheme_change_silent_without_polarity_flip() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2031h"); // baseline dark
+        // Same-polarity swap (black → a darker grey) must not notify.
+        t.set_default_colors([0xcc; 3], [0x11, 0x11, 0x11], [0xcc; 3]);
+        assert!(!t.notify_color_scheme_change());
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn notify_color_scheme_change_debounces_repeat_polarity() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2031h"); // baseline dark
+        // First flip to light notifies.
+        t.set_default_colors([0x00; 3], [0xff; 3], [0x00; 3]);
+        assert!(t.notify_color_scheme_change());
+        assert_eq!(t.take_response(), b"\x1b[?997;2n".to_vec());
+        // Re-running the hook still in light is silent.
+        t.set_default_colors([0x00; 3], [0xfe; 3], [0x00; 3]);
+        assert!(!t.notify_color_scheme_change());
+        assert!(t.take_response().is_empty());
+        // Flipping back to dark notifies again.
+        t.set_default_colors([0x00; 3], [0x00; 3], [0x00; 3]);
+        assert!(t.notify_color_scheme_change());
+        assert_eq!(t.take_response(), b"\x1b[?997;1n".to_vec());
+    }
+
+    #[test]
+    fn mode_2031_reset_stops_notifications() {
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2031h");
+        t.feed("\x1b[?2031l"); // unsubscribe before any flip
+        t.set_default_colors([0x00; 3], [0xff; 3], [0x00; 3]); // flip to light
+        assert!(!t.notify_color_scheme_change());
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn mode_2031_luminance_threshold_boundary() {
+        // bg_is_dark uses Rec.709 luma >> 8 with a `< 128` cutoff. For a neutral
+        // grey [v;3] the luma reduces exactly to v, so v=127 is the last dark
+        // value and v=128 the first light one — pin both sides of the cutoff so
+        // an off-by-one in the threshold (e.g. `<=` vs `<`) is caught.
+        let mut t = Terminal::new(5, 3, 100);
+        t.set_default_colors([0x00; 3], [127, 127, 127], [0x00; 3]);
+        t.feed("\x1b[?996n");
+        assert_eq!(t.take_response(), b"\x1b[?997;1n".to_vec(), "luma 127 is dark");
+
+        t.set_default_colors([0x00; 3], [128, 128, 128], [0x00; 3]);
+        t.feed("\x1b[?996n");
+        assert_eq!(t.take_response(), b"\x1b[?997;2n".to_vec(), "luma 128 is light");
+    }
+
+    #[test]
+    fn mode_2031_query_996_does_not_seed_notification_baseline() {
+        // The 996 state query must be a pure read: it answers without touching
+        // `last_notified_dark`. So after subscribing (baseline = dark) and then
+        // querying, a subsequent real flip to light must still notify exactly
+        // once — the query must not have moved the baseline.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2031h"); // baseline dark (default black bg)
+        t.feed("\x1b[?996n"); // a query while still dark
+        assert_eq!(t.take_response(), b"\x1b[?997;1n".to_vec());
+        // Now flip to light: the notification must fire despite the prior query.
+        t.set_default_colors([0x00; 3], [0xff; 3], [0x00; 3]);
+        assert!(t.notify_color_scheme_change());
+        assert_eq!(t.take_response(), b"\x1b[?997;2n".to_vec());
+    }
+
+    #[test]
+    fn mode_2031_reenable_reseeds_baseline_to_current_background() {
+        // Re-enabling 2031 re-seeds the baseline to the *current* background.
+        // Subscribe while dark, flip to light without notifying (no hook call),
+        // then re-enable: the baseline becomes light, so the front-end hook is
+        // silent even though the polarity differs from the original enable.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?2031h"); // baseline dark
+        t.set_default_colors([0x00; 3], [0xff; 3], [0x00; 3]); // now light
+        t.feed("\x1b[?2031h"); // re-enable → baseline reseeded to light
+        assert!(!t.notify_color_scheme_change());
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn private_dsr_unknown_code_is_silent() {
+        // Only 996 is implemented for the private DSR. An unknown private DSR
+        // such as `CSI ? 5 n` must produce no reply — answering would confuse a
+        // host that never asked the color-scheme question.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[?5n");
+        assert!(t.take_response().is_empty());
+    }
+
+    #[test]
+    fn non_private_996_dsr_is_not_color_scheme_query() {
+        // The color-scheme query is the *private* form (`CSI ? 996 n`). The
+        // non-private `CSI 996 n` routes through the ordinary DSR handler, which
+        // only knows codes 5/6, so it must stay silent — the `?` is load-bearing.
+        let mut t = Terminal::new(5, 3, 100);
+        t.feed("\x1b[996n");
+        assert!(t.take_response().is_empty());
+    }
+
     #[test]
     fn deccm_set_and_reset_toggles_app_cursor_keys() {
         let mut t = Terminal::new(5, 3, 100);
