@@ -563,6 +563,14 @@ impl ApplicationHandler<app_window::CustomEvent> for App {
                     }
                     WindowEvent::Focused(focused) => {
                         state.focused = focused;
+                        // Focus reporting (DEC mode 1004): tell a subscribed app
+                        // the window gained / lost key focus (`CSI I` / `CSI O`).
+                        // This path has no PTY feed to drain the report, so flush
+                        // it to the PTY ourselves.
+                        if state.active_tab_mut().terminal.focus_report(focused) {
+                            let reply = state.active_tab_mut().terminal.take_response();
+                            state.write_pty(&reply);
+                        }
                         // Snap the cursor to its solid phase on either
                         // transition: gaining focus shouldn't catch the
                         // cursor mid-blink-off, and losing focus parks it
