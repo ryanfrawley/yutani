@@ -46,7 +46,7 @@ TIMEOUT=120
 # --- parse args -------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    stream|glyphs|scroll|mixed) WORKLOAD="$1"; shift ;;
+    stream|glyphs|scroll|mixed|redraw) WORKLOAD="$1"; shift ;;
     --repeat) REPEAT="$2"; shift 2 ;;
     --mb) MB="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
@@ -91,10 +91,17 @@ if command -v dsymutil >/dev/null 2>&1; then
   dsymutil "$BIN" 2>/dev/null || echo "   (dsymutil failed; frames may be unsymbolicated)" >&2
 fi
 
-# --- corpus -----------------------------------------------------------------
-if [[ ! -f "$CORPUS_DIR/${WORKLOAD}.txt" ]]; then
-  echo ">> generating corpus (~${MB} MiB each) in $CORPUS_DIR..." >&2
-  python3 "$SCRIPT_DIR/gen-corpus.py" "$CORPUS_DIR" --mb "$MB"
+# --- driver + corpus --------------------------------------------------------
+# `redraw` is the render-bound workload: a paced full-screen repainter (no
+# corpus, no cat). Every other workload floods a deterministic corpus via cat.
+if [[ "$WORKLOAD" == redraw ]]; then
+  DRIVER="$SCRIPT_DIR/redraw.py"
+else
+  DRIVER="$SCRIPT_DIR/workload.sh"
+  if [[ ! -f "$CORPUS_DIR/${WORKLOAD}.txt" ]]; then
+    echo ">> generating corpus (~${MB} MiB each) in $CORPUS_DIR..." >&2
+    python3 "$SCRIPT_DIR/gen-corpus.py" "$CORPUS_DIR" --mb "$MB"
+  fi
 fi
 
 # --- isolate state so first-run onboarding never blocks the run, and the
@@ -106,7 +113,7 @@ cleanup() { rm -rf "$TMPSTATE"; }
 trap cleanup EXIT
 
 mkdir -p "$(dirname "$OUT")"
-chmod +x "$SCRIPT_DIR/workload.sh"
+chmod +x "$DRIVER"
 
 echo ">> recording: workload=$WORKLOAD repeat=$REPEAT rate=${RATE}Hz" >&2
 echo "   keep the Yutani window frontmost/visible (occluded windows skip rendering)." >&2
@@ -122,10 +129,12 @@ SAMPLY_ARGS=(record --rate "$RATE" --unstable-presymbolicate -o "$OUT")
 set +e
 env \
   XDG_STATE_HOME="$TMPSTATE" \
-  SHELL="$SCRIPT_DIR/workload.sh" \
+  SHELL="$DRIVER" \
   YUTANI_BENCH="$WORKLOAD" \
   YUTANI_BENCH_CORPUS="$ROOT/$CORPUS_DIR" \
   YUTANI_BENCH_REPEAT="$REPEAT" \
+  YUTANI_REDRAW_FRAMES="${YUTANI_REDRAW_FRAMES:-600}" \
+  YUTANI_REDRAW_FPS="${YUTANI_REDRAW_FPS:-55}" \
   YUTANI_BENCH_RESULT="$ROOT/$RESULT" \
   samply "${SAMPLY_ARGS[@]}" -- "$BIN" &
 SAMPLY_PID=$!
