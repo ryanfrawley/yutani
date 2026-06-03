@@ -308,6 +308,125 @@
     }
 
     #[test]
+    fn mode_2027_disabled_falls_back_to_per_codepoint() {
+        // Resetting grapheme clustering (DEC 2027) makes each codepoint land in
+        // its own cell — the legacy model some apps assume when measuring text.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b[?2027l");
+        t.feed("e\u{0301}"); // e + combining acute
+        assert!(t.row(0)[0].cluster.is_none(), "no cluster formed");
+        assert_eq!(t.row(0)[0].ch, 'e');
+        assert_eq!(t.row(0)[1].ch, '\u{0301}', "combining mark in its own cell");
+        assert_eq!(t.cursor().col, 2, "cursor advanced once per codepoint");
+    }
+
+    #[test]
+    fn mode_2027_set_restores_clustering() {
+        // After turning clustering off then on again, absorption resumes.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b[?2027l");
+        t.feed("\x1b[?2027h");
+        t.feed("e\u{0301}");
+        assert_eq!(grapheme_at(&t, 0, 0), "e\u{0301}");
+        assert_eq!(t.cursor().col, 1, "cluster absorbed back into one cell");
+    }
+
+    #[test]
+    fn mode_2027_cleared_by_full_reset() {
+        // RIS restores the power-on default, which has clustering on.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b[?2027l");
+        t.feed("\x1bc"); // RIS
+        t.feed("e\u{0301}");
+        assert_eq!(grapheme_at(&t, 0, 0), "e\u{0301}");
+        assert_eq!(t.cursor().col, 1);
+    }
+
+    #[test]
+    fn mode_2027_disabled_zwj_emoji_does_not_merge() {
+        // With clustering off, the ZWJ family sequence is laid out codepoint by
+        // codepoint: each emoji keeps its own 2-cell lead+spacer and the ZWJ
+        // glue takes a narrow cell of its own. Contrast with
+        // zwj_sequence_is_one_grapheme_two_cells, which fuses the whole run.
+        let mut t = Terminal::new(20, 1, 100);
+        t.feed("\x1b[?2027l");
+        t.feed("👨\u{200D}👩"); // man + ZWJ + woman
+        // No grapheme cluster anywhere along the run.
+        assert!(t.row(0)[0].cluster.is_none(), "lead emoji not a cluster");
+        // 👨 (wide): lead + spacer.
+        assert_eq!(t.row(0)[0].ch, '👨');
+        assert!(t.row(0)[1].is_wide_spacer());
+        // ZWJ (narrow) lands in its own cell rather than being absorbed.
+        assert_eq!(t.row(0)[2].ch, '\u{200D}');
+        assert!(!t.row(0)[2].is_wide_spacer());
+        // 👩 (wide): lead + spacer.
+        assert_eq!(t.row(0)[3].ch, '👩');
+        assert!(t.row(0)[4].is_wide_spacer());
+        // Cursor advanced by the sum of per-codepoint widths: 2 + 1 + 2.
+        assert_eq!(t.cursor().col, 5, "advance is sum of per-codepoint widths");
+    }
+
+    #[test]
+    fn mode_2027_disabled_regional_indicators_do_not_form_flag() {
+        // With clustering off, a regional-indicator pair does NOT fuse into a
+        // single 2-cell flag (cf. regional_indicator_pair_forms_one_two_cell_flag).
+        // Each RI is a narrow codepoint occupying its own single cell.
+        let mut t = Terminal::new(10, 1, 100);
+        t.feed("\x1b[?2027l");
+        t.feed("🇯🇵"); // regional indicators J + P
+        assert_eq!(t.row(0)[0].ch, '🇯');
+        assert!(t.row(0)[0].cluster.is_none(), "no flag cluster formed");
+        assert!(!t.row(0)[0].is_wide_spacer(), "RI is narrow, no spacer");
+        assert_eq!(t.row(0)[1].ch, '🇵', "second RI is its own cell, not a spacer");
+        assert!(t.row(0)[1].cluster.is_none());
+        assert_eq!(t.cursor().col, 2, "two narrow cells, one per indicator");
+    }
+
+    #[test]
+    fn mode_2027_toggle_is_independent_of_bracketed_paste() {
+        // Mode 2027 and bracketed paste (2004) share the private_mode match but
+        // must not alias: toggling one leaves the other untouched.
+        let mut t = Terminal::new(10, 1, 100);
+        // Enabling bracketed paste then disabling 2027 must keep paste enabled.
+        t.feed("\x1b[?2004h");
+        t.feed("\x1b[?2027l");
+        assert!(t.bracketed_paste(), "disabling 2027 must not clear 2004");
+        // And clustering is genuinely off: e + combining acute splits.
+        t.feed("e\u{0301}");
+        assert!(t.row(0)[0].cluster.is_none(), "2027 really did toggle off");
+        assert_eq!(t.cursor().col, 2);
+
+        // Conversely, disabling bracketed paste must not re-enable clustering.
+        let mut t2 = Terminal::new(10, 1, 100);
+        t2.feed("\x1b[?2027l"); // clustering off
+        t2.feed("\x1b[?2004l"); // toggle the neighbor
+        t2.feed("e\u{0301}");
+        assert!(t2.row(0)[0].cluster.is_none(), "toggling 2004 must not touch 2027");
+        assert_eq!(t2.cursor().col, 2);
+    }
+
+    #[test]
+    fn mode_2027_disable_is_not_retroactive() {
+        // Disabling clustering mid-line affects only subsequent input: a cluster
+        // already laid down with clustering on stays fused; the next one splits.
+        let mut t = Terminal::new(10, 2, 100);
+        t.feed("e\u{0301}"); // default: clustering on → one cell
+        assert_eq!(grapheme_at(&t, 0, 0), "e\u{0301}", "first cluster fused");
+        assert_eq!(t.cursor().col, 1);
+
+        t.feed("\r\n"); // fresh line so the second base is unambiguous
+        t.feed("\x1b[?2027l"); // now disable clustering
+        t.feed("e\u{0301}"); // → two cells
+        assert!(t.row(1)[0].cluster.is_none(), "second base not clustered");
+        assert_eq!(t.row(1)[0].ch, 'e');
+        assert_eq!(t.row(1)[1].ch, '\u{0301}', "combining mark spills to its own cell");
+        assert_eq!(t.cursor().col, 2);
+
+        // The earlier cluster is untouched — disabling is not retroactive.
+        assert_eq!(grapheme_at(&t, 0, 0), "e\u{0301}");
+    }
+
+    #[test]
     fn scroll_when_lf_at_bottom() {
         let mut t = Terminal::new(5, 2, 100);
         t.feed("AAA\r\nBBB\r\nCCC");

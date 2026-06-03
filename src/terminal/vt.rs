@@ -108,15 +108,20 @@ impl Terminal {
         // Gated on the cursor still sitting right after that grapheme: any
         // CR/LF/CUP since leaves the anchor stale, and a stray combining mark
         // then prints on its own (the pre-existing behavior).
-        if let Some(a) = self.last_grapheme {
-            if self.cursor.row == a.post_row && self.cursor.col == a.post_col {
-                let ri_pair = crate::width::is_regional_indicator(ch) && a.ri_pending;
-                if ri_pair || crate::width::extends_grapheme(a.last, ch) {
-                    // A flag pair, or a VS16 forcing emoji presentation onto a
-                    // narrow base, promotes a one-cell grapheme to two cells.
-                    let widen = (ri_pair || ch == '\u{FE0F}') && !a.wide;
-                    self.merge_grapheme(a, ch, widen);
-                    return;
+        // Skipped when grapheme clustering is disabled (DEC mode 2027 reset):
+        // each codepoint then lands in its own cell, the legacy model some apps
+        // assume when computing string widths.
+        if self.grapheme_clustering {
+            if let Some(a) = self.last_grapheme {
+                if self.cursor.row == a.post_row && self.cursor.col == a.post_col {
+                    let ri_pair = crate::width::is_regional_indicator(ch) && a.ri_pending;
+                    if ri_pair || crate::width::extends_grapheme(a.last, ch) {
+                        // A flag pair, or a VS16 forcing emoji presentation onto
+                        // a narrow base, promotes a one-cell grapheme to two.
+                        let widen = (ri_pair || ch == '\u{FE0F}') && !a.wide;
+                        self.merge_grapheme(a, ch, widen);
+                        return;
+                    }
                 }
             }
         }
@@ -600,6 +605,9 @@ impl Terminal {
             // Synchronized output: BSU (`h`) / ESU (`l`). The grid keeps
             // updating; the front end gates presentation on this flag.
             2026 => self.sync_update = set,
+            // Grapheme clustering: reset (`l`) drops to legacy per-codepoint
+            // placement; set (`h`) restores the default cluster absorption.
+            2027 => self.grapheme_clustering = set,
             1049 | 1047 | 47 => self.switch_screen(set, code == 1049),
             // DECLRMM. Enabling/disabling resets the margins to the full
             // screen — apps must re-issue DECSLRM after enabling.
@@ -804,6 +812,8 @@ impl Terminal {
         // Clearing it here also guarantees a BSU that's never followed by an ESU
         // can't keep the front end holding the present across a reset.
         self.sync_update = false;
+        // Power-on default has grapheme clustering on.
+        self.grapheme_clustering = true;
         self.alternate_scroll = true;
         self.alt_scroll_snapshot = None;
         self.alt_scroll_net = 0;
