@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Process-unique identifier for a tab (one PTY + `Terminal`). Minted per
@@ -33,7 +34,16 @@ pub enum CustomEvent {
 pub struct PtyOutbox(Arc<Mutex<Outbox>>);
 
 struct Outbox {
-    text: String,
+    /// Decoded UTF-8 bytes awaiting drain. A `VecDeque` (not a `String`) so a
+    /// capped drain consumes the front in O(cap): the head pointer advances and
+    /// the freed space is recycled for later pushes, with no copy of the
+    /// unconsumed tail. A `String` here forced `split_off` to memmove the whole
+    /// remaining backlog on every drain — O(n²) under sustained backpressure,
+    /// which profiling showed as ~a third of the main thread on a flood.
+    ///
+    /// Invariant: only ever extended from `&str`, and capped drains cut on a
+    /// UTF-8 char boundary, so the contents are always valid UTF-8.
+    bytes: VecDeque<u8>,
     /// True while a `PtyInput` wake is in flight (buffer non-empty and the loop
     /// hasn't drained it yet). Gates duplicate wakes so the proxy queue can't
     /// fill with one event per read.
@@ -43,7 +53,7 @@ struct Outbox {
 impl PtyOutbox {
     pub fn new() -> Self {
         PtyOutbox(Arc::new(Mutex::new(Outbox {
-            text: String::new(),
+            bytes: VecDeque::new(),
             notified: false,
         })))
     }
@@ -53,7 +63,7 @@ impl PtyOutbox {
     /// before the loop drains return `false`, collapsing the burst.
     pub fn push(&self, s: &str) -> bool {
         let mut g = self.0.lock().unwrap();
-        g.text.push_str(s);
+        g.bytes.extend(s.as_bytes());
         let wake = !g.notified;
         g.notified = true;
         wake
@@ -66,18 +76,29 @@ impl PtyOutbox {
     /// continue (capping the work per loop turn keeps the UI responsive).
     pub fn drain_up_to(&self, cap: usize) -> (String, bool) {
         let mut g = self.0.lock().unwrap();
-        if g.text.len() <= cap {
-            g.notified = false;
-            (std::mem::take(&mut g.text), false)
+        let len = g.bytes.len();
+        let (bound, more) = if len <= cap {
+            (len, false)
         } else {
+            // Round `cap` down to a char boundary: back off while the byte at
+            // `bound` is a UTF-8 continuation byte (0b10xx_xxxx). The buffer is
+            // valid UTF-8 and `bound > 0`, so this lands on a real boundary.
             let mut bound = cap;
-            while bound > 0 && !g.text.is_char_boundary(bound) {
+            while bound > 0 && g.bytes[bound] & 0xC0 == 0x80 {
                 bound -= 1;
             }
-            let remainder = g.text.split_off(bound);
-            let chunk = std::mem::replace(&mut g.text, remainder);
-            (chunk, true)
+            (bound, true)
+        };
+        if !more {
+            g.notified = false;
         }
+        // Front drain: O(bound). The remaining tail is not relocated.
+        let chunk: Vec<u8> = g.bytes.drain(..bound).collect();
+        debug_assert!(std::str::from_utf8(&chunk).is_ok());
+        // SAFETY: `bytes` is only ever extended from `&str` and cut on a char
+        // boundary, so `chunk` is always valid UTF-8 (asserted in debug builds).
+        let s = unsafe { String::from_utf8_unchecked(chunk) };
+        (s, more)
     }
 }
 
@@ -278,5 +299,174 @@ mod tests {
             assert_eq!(chunk, "datamore");
             assert!(!more);
         }
+    }
+
+    #[test]
+    fn large_buffer_drained_at_small_cap_reassembles_byte_for_byte() {
+        // The core of the VecDeque rewrite: a big backlog drained in many small
+        // front-cuts must come back out in order, byte-for-byte identical, with
+        // every turn but the last reporting a remainder. (Under the old String
+        // backend this was the O(n²) memmove-the-tail path.)
+        let ob = PtyOutbox::new();
+        // ~256 KiB of deterministic non-ASCII-free content; pushed in several
+        // chunks to mimic a flood arriving across reads.
+        let mut input = String::new();
+        for i in 0..25_000u32 {
+            input.push_str(&format!("line{i:05}\n"));
+        }
+        assert!(input.len() > 200_000, "want a backlog well past any cap");
+        // Push in pieces (only the first should request a wake).
+        let mid = {
+            // split on a char boundary near the middle
+            let mut m = input.len() / 2;
+            while !input.is_char_boundary(m) {
+                m += 1;
+            }
+            m
+        };
+        assert!(ob.push(&input[..mid]), "first push wakes");
+        assert!(!ob.push(&input[mid..]), "second push coalesces");
+
+        // Drain repeatedly at a small cap until empty, reassembling as we go.
+        let cap = 97; // small, prime-ish, not a divisor of the content length
+        let mut out = String::with_capacity(input.len());
+        let mut turns = 0;
+        loop {
+            let (chunk, more) = ob.drain_up_to(cap);
+            assert!(
+                chunk.len() <= cap,
+                "a capped chunk never exceeds the cap (turn {turns})"
+            );
+            out.push_str(&chunk);
+            turns += 1;
+            if !more {
+                break;
+            }
+            assert!(turns < 100_000, "drain must terminate");
+        }
+        assert_eq!(out, input, "reassembled stream must equal the input exactly");
+        // Many turns actually happened — we exercised the multi-chunk path.
+        assert!(
+            turns >= input.len() / cap,
+            "expected at least {} drain turns, took {turns}",
+            input.len() / cap
+        );
+        // Buffer is empty and the latch was cleared by the final full drain.
+        assert!(ob.push("z"), "push after the final full drain wakes again");
+    }
+
+    #[test]
+    fn interleaved_push_and_drain_preserves_fifo_with_no_loss() {
+        // Producer/consumer interleave simulated single-threaded: push a slice,
+        // drain a capped chunk, push more, drain again… Everything must emerge
+        // in FIFO order with nothing lost or duplicated, and the final drain
+        // (after the producer stops) must report `more == false`.
+        let ob = PtyOutbox::new();
+        let mut expected = String::new();
+        let mut out = String::new();
+        let cap = 5;
+
+        let mut woke_first = false;
+        for round in 0..200u32 {
+            let piece = format!("[{round}]"); // variable-length, 3–7 bytes
+            expected.push_str(&piece);
+            let wake = ob.push(&piece);
+            if !woke_first {
+                assert!(wake, "the very first push into an empty buffer wakes");
+                woke_first = true;
+            }
+            // Drain one capped chunk each round — the consumer lags the producer,
+            // so a backlog builds and persists (more stays true throughout).
+            let (chunk, _more) = ob.drain_up_to(cap);
+            assert!(chunk.len() <= cap);
+            out.push_str(&chunk);
+        }
+        // Producer stopped; flush the remaining backlog to completion.
+        loop {
+            let (chunk, more) = ob.drain_up_to(cap);
+            out.push_str(&chunk);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(out, expected, "FIFO order preserved, no loss or duplication");
+        // Final drain emptied the buffer, so the latch re-arms.
+        assert!(ob.push("!"), "latch clear after the buffer fully drained");
+    }
+
+    #[test]
+    fn multibyte_content_capped_mid_char_never_yields_invalid_utf8() {
+        // Caps repeatedly land mid-character on a mix of 2-, 3- and 4-byte
+        // scalars. Each chunk must be independently valid UTF-8 (rounded down to
+        // a boundary) and the concatenation must equal the original string. A
+        // bad boundary cut would corrupt the stream or panic.
+        let ob = PtyOutbox::new();
+        let mut input = String::new();
+        // emoji (4 bytes), CJK (3 bytes), accented latin (2 bytes), ascii (1).
+        for _ in 0..400 {
+            input.push_str("😀漢ña");
+        }
+        ob.push(&input);
+
+        // Sweep caps that are deliberately not aligned to the 4+3+2+1 = 10-byte
+        // group, so cuts land inside every kind of multibyte scalar.
+        let caps = [1usize, 2, 3, 4, 5, 7, 11, 13];
+        let mut out = String::new();
+        let mut i = 0;
+        loop {
+            let cap = caps[i % caps.len()];
+            i += 1;
+            let (chunk, more) = ob.drain_up_to(cap);
+            // `chunk` is a String, so if drain ever produced invalid UTF-8 it
+            // would have panicked building it; assert validity explicitly too.
+            assert!(
+                std::str::from_utf8(chunk.as_bytes()).is_ok(),
+                "every chunk is valid UTF-8"
+            );
+            assert!(chunk.len() <= cap, "chunk respects the cap");
+            out.push_str(&chunk);
+            if !more {
+                break;
+            }
+            assert!(i < 1_000_000, "drain must terminate");
+        }
+        assert_eq!(out, input, "multibyte stream reassembles exactly");
+    }
+
+    #[test]
+    fn wake_latch_re_arms_only_after_a_full_multi_drain_sequence() {
+        // Across a long capped-drain sequence the pending-wake latch must stay
+        // armed for every intermediate (remainder) turn and clear exactly once,
+        // on the turn that finally empties the buffer.
+        let ob = PtyOutbox::new();
+        ob.push(&"x".repeat(50)); // single push, wakes once
+        let cap = 7;
+        let mut emptied = false;
+        for turn in 0..100 {
+            let (_chunk, more) = ob.drain_up_to(cap);
+            if more {
+                // Backlog remains: latch must still be armed, so a push here
+                // does NOT request another wake (the loop self-wakes).
+                assert!(
+                    !ob.push(""),
+                    "turn {turn}: latch stays armed while a remainder is pending"
+                );
+            } else {
+                // This turn emptied the buffer (note: the empty push above only
+                // armed the latch, it added no bytes). The latch is now clear,
+                // so the next push must wake.
+                assert!(
+                    ob.push("more"),
+                    "turn {turn}: full drain clears the latch — next push wakes"
+                );
+                emptied = true;
+                break;
+            }
+        }
+        assert!(emptied, "the sequence must reach a full-drain turn");
+        // After re-arming, the freshly pushed bytes drain and re-clear normally.
+        let (chunk, more) = ob.drain_up_to(1024);
+        assert_eq!(chunk, "more");
+        assert!(!more);
     }
 }
