@@ -671,18 +671,33 @@ fn current_returns_to_after_duration_elapses() {
 
 #[test]
 fn smoothstep_midpoint_is_half() {
-    // smoothstep(0.5) = 0.25 * (3 - 1) = 0.5
-    let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.5);
-    let p = a.current(0.2);
+    // smoothstep(0.5) = 0.25 * (3 - 1) = 0.5. Exercise the curve at an exact
+    // `t` via `eased_at` — the wall-clock path (`current`) drifts a few
+    // microseconds past `t`, which at the curve's steepest point overshot the
+    // 1e-4 tolerance and made this flaky. `eased_at` ignores `started_at`, so
+    // the timestamp here is irrelevant.
+    let a = CursorAnim { from: (0.0, 0.0), to: (10.0, 4.0), started_at: Instant::now() };
+    let p = a.eased_at(0.5);
     assert!(approx_pair(p, (5.0, 2.0)), "got {:?}", p);
 }
 
 #[test]
 fn smoothstep_quarter_point() {
-    // smoothstep(0.25) = 0.0625 * (3 - 0.5) = 0.15625
-    let mut a = anim_at_t((0.0, 0.0), (10.0, 4.0), 0.2, 0.25);
-    let p = a.current(0.2);
+    // smoothstep(0.25) = 0.0625 * (3 - 0.5) = 0.15625.
+    let a = CursorAnim { from: (0.0, 0.0), to: (10.0, 4.0), started_at: Instant::now() };
+    let p = a.eased_at(0.25);
     assert!(approx_pair(p, (1.5625, 0.625)), "got {:?}", p);
+}
+
+#[test]
+fn eased_at_endpoints_and_clamps() {
+    let a = CursorAnim { from: (1.0, 2.0), to: (11.0, 6.0), started_at: Instant::now() };
+    // Endpoints are exact: t=0 → from, t=1 → to.
+    assert!(approx_pair(a.eased_at(0.0), (1.0, 2.0)));
+    assert!(approx_pair(a.eased_at(1.0), (11.0, 6.0)));
+    // Out-of-range progress clamps rather than extrapolating past the target.
+    assert!(approx_pair(a.eased_at(-0.5), (1.0, 2.0)));
+    assert!(approx_pair(a.eased_at(2.0), (11.0, 6.0)));
 }
 
 #[test]
