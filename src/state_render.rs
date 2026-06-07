@@ -82,6 +82,20 @@ pub(crate) fn advance_fade_phase(phase: f32, target: f32, dt: f32, secs: f32) ->
     }
 }
 
+/// Blur amount for an edge-fade strip, given `edge_proximity` — how close the
+/// strip segment is to the window edge, normalized so `0.0` is the band's inner
+/// end and `1.0` is the very edge. The strip shader turns this into a disk-blur
+/// radius (`radius = STRIP_BLUR_MAX_RADIUS * amount`), so the returned value is
+/// the blur *strength* at that point.
+///
+/// The mapping is deliberately the **identity** (clamped to `[0, 1]`): the blur
+/// grows *linearly* with proximity to the edge — sharp at the band's inner end,
+/// maximal right at the edge. Centralized here so the ramp's shape is defined in
+/// one place; a future non-linear falloff would only change this function.
+pub(crate) fn edge_blur_amount(edge_proximity: f32) -> f32 {
+    edge_proximity.clamp(0.0, 1.0)
+}
+
 impl WindowState {
     // Rebuild the vertex/index buffers for the current terminal state. Emits
     // one bg quad + one glyph quad per cell for the grid, plus a cursor box
@@ -2277,20 +2291,24 @@ impl WindowState {
                           c0: [f32; 4],
                           c1: [f32; 4],
                           tint0: f32,
-                          tint1: f32| {
+                          tint1: f32,
+                          blur0: f32,
+                          blur1: f32| {
             // The strip pipeline draws through the same (scrolled) camera, but
             // edge fades are pinned to the window — cancel the camera offset.
             let y0 = y0 - camera_vert;
             let y1 = y1 - camera_vert;
             let start = vertices.len() as u16;
-            // radii.yzw = 0 so the shader skips the SDF mask; radii.x carries
-            // the blur-vs-solid tint and is interpolated across the strip, so
-            // the y0 vertices get `tint0` and the y1 vertices `tint1` — letting
-            // a strip ramp from blur toward the solid bg fill along its height.
+            // radii.zw = 0 so the shader skips the SDF mask. radii.x carries the
+            // blur-vs-solid tint; radii.y the blur amount (<0 = sample the
+            // precomputed dual-Kawase blur; >=0 = disk-blur the sharp scene with
+            // radius ∝ amount). Both interpolate across the strip's height — the
+            // y0 vertices get `tint0`/`blur0`, the y1 vertices `tint1`/`blur1` —
+            // so a strip can ramp its blur and its solid-fill mix along its run.
             // local_pos / half_size go unused.
             let stub = [0.0_f32, 0.0];
-            let radii0 = [tint0, 0.0, 0.0, 0.0];
-            let radii1 = [tint1, 0.0, 0.0, 0.0];
+            let radii0 = [tint0, blur0, 0.0, 0.0];
+            let radii1 = [tint1, blur1, 0.0, 0.0];
             vertices.push(renderer::vertex::Vertex {
                 position: [0.0, y0, 0.0],
                 tex_coords: [bg_u, bg_v],
@@ -2405,8 +2423,10 @@ impl WindowState {
             // the lower part so the band has no hard bottom edge — it dissolves
             // into the tab strip / content rather than ending on a glass line.
             let solid_to = band_bottom * 0.35;
-            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, solid_to, solid, solid, 0.0, 0.0);
-            push_strip(&mut strip_vertices, &mut strip_indices, solid_to, band_bottom, solid, clear, 0.0, 0.0);
+            // blur = -1 → sample the precomputed dual-Kawase blur (the constant
+            // "fat" frost), not the per-fragment scene blur the edges use.
+            push_strip(&mut strip_vertices, &mut strip_indices, 0.0, solid_to, solid, solid, 0.0, 0.0, -1.0, -1.0);
+            push_strip(&mut strip_vertices, &mut strip_indices, solid_to, band_bottom, solid, clear, 0.0, 0.0, -1.0, -1.0);
             blur_strip = true;
         }
 
@@ -2438,6 +2458,11 @@ impl WindowState {
                     let a = |u: f32| top_alpha * r(u);
                     // Fade toward the bg fill, concentrated at the very edge.
                     let tint = |u: f32| r(u) * r(u);
+                    // Blur amount ramps *linearly* with proximity to the edge:
+                    // full (1.0) at the top edge (u=0), none (0.0, sharp) at the
+                    // band bottom (u=1). The strip shader turns this into a disk
+                    // radius, so the scene blurs progressively more toward the edge.
+                    let blur = |u: f32| edge_blur_amount(1.0 - u);
                     let mut prev_y = 0.0_f32;
                     for i in 1..=SEGS {
                         let u0 = (i - 1) as f32 / SEGS as f32;
@@ -2445,7 +2470,7 @@ impl WindowState {
                         let y1 = soft_band * u1;
                         let c0 = [bg[0], bg[1], bg[2], a(u0)];
                         let c1 = [bg[0], bg[1], bg[2], a(u1)];
-                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1));
+                        push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1), blur(u0), blur(u1));
                         prev_y = y1;
                     }
                     blur_strip = true;
@@ -2456,7 +2481,9 @@ impl WindowState {
                     // color.
                     let bg = palette::get().background;
                     let solid = [bg[0], bg[1], bg[2], top_alpha];
-                    push_strip(&mut strip_vertices, &mut strip_indices, 0.0, bar_h, solid, solid, 1.0, 1.0);
+                    // tint = 1 → pure solid fill; the blur source is unused, so
+                    // -1 takes the cheap branch (skips the disk-blur taps).
+                    push_strip(&mut strip_vertices, &mut strip_indices, 0.0, bar_h, solid, solid, 1.0, 1.0, -1.0, -1.0);
                 }
             }
         }
@@ -2479,6 +2506,9 @@ impl WindowState {
             let r = |u: f32| u * u * (3.0 - 2.0 * u);
             let a = |u: f32| bottom_alpha * r(u);
             let tint = |u: f32| r(u) * r(u);
+            // Linear blur ramp mirrored for the bottom: none (sharp) at the band
+            // top (u=0), full at the very bottom edge (u=1).
+            let blur = |u: f32| edge_blur_amount(u);
             let band_top = win_h - bottom_band_height;
             let mut prev_y = band_top;
             for i in 1..=SEGS {
@@ -2487,7 +2517,7 @@ impl WindowState {
                 let y1 = band_top + bottom_band_height * u1;
                 let c0 = [bg[0], bg[1], bg[2], a(u0)];
                 let c1 = [bg[0], bg[1], bg[2], a(u1)];
-                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1));
+                push_strip(&mut strip_vertices, &mut strip_indices, prev_y, y1, c0, c1, tint(u0), tint(u1), blur(u0), blur(u1));
                 prev_y = y1;
             }
             blur_strip = true;
@@ -3509,5 +3539,56 @@ mod tests {
         let (r_lo, r_hi) = WindowState::phantom_row_band(0.0, ROWS, LH, 1000.0 * LH);
         assert_eq!(r_lo, -2 - 1000);
         assert_eq!(r_hi, ROWS as isize + 2);
+    }
+
+    #[test]
+    fn edge_blur_amount_is_sharp_at_inner_end() {
+        // edge_proximity == 0.0 is the band's inner end: no blur, so the
+        // multiplier into the max radius is exactly zero (perfectly sharp).
+        assert_eq!(edge_blur_amount(0.0), 0.0);
+    }
+
+    #[test]
+    fn edge_blur_amount_is_max_at_window_edge() {
+        // edge_proximity == 1.0 is the very window edge: full blur, so the
+        // helper passes the radius through at its maximum (exactly 1.0).
+        assert_eq!(edge_blur_amount(1.0), 1.0);
+    }
+
+    #[test]
+    fn edge_blur_amount_is_identity_within_range() {
+        // The ramp is linear across the band, so any in-range proximity maps
+        // to itself unchanged. These multiples of the range are exact in f32,
+        // so plain equality holds with no epsilon.
+        assert_eq!(edge_blur_amount(0.25), 0.25);
+        assert_eq!(edge_blur_amount(0.5), 0.5);
+        assert_eq!(edge_blur_amount(0.75), 0.75);
+    }
+
+    #[test]
+    fn edge_blur_amount_clamps_below_zero() {
+        // A proximity past the inner end (negative) must not yield negative
+        // blur, which would invert the effect; it clamps to the sharp floor.
+        assert_eq!(edge_blur_amount(-0.3), 0.0);
+    }
+
+    #[test]
+    fn edge_blur_amount_clamps_above_one() {
+        // A proximity past the window edge (> 1.0) must not exceed the max
+        // radius multiplier; it clamps to the 1.0 ceiling.
+        assert_eq!(edge_blur_amount(1.4), 1.0);
+    }
+
+    #[test]
+    fn edge_blur_amount_top_bottom_caller_mapping_is_symmetric() {
+        // Callers feed `1.0 - u` for the top edge and `u` for the bottom,
+        // where `u` is the segment's normalized position. The two edges must
+        // therefore mirror each other across the band: at the inner end
+        // (u == 0 top, u == 1 bottom) both are sharp; at the window edge
+        // (u == 1 top, u == 0 bottom) both are at max blur.
+        assert_eq!(edge_blur_amount(1.0 - 0.0), edge_blur_amount(1.0)); // top at u=0 == bottom at u=1
+        assert_eq!(edge_blur_amount(1.0 - 1.0), edge_blur_amount(0.0)); // top at u=1 == bottom at u=0
+        // And a midpoint stays on the diagonal: u=0.5 gives 0.5 either way.
+        assert_eq!(edge_blur_amount(1.0 - 0.5), edge_blur_amount(0.5));
     }
 }
