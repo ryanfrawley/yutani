@@ -35,6 +35,7 @@ pub struct BlurPipelines {
     pub format: wgpu::TextureFormat,
     sampler: wgpu::Sampler,
     blur_bgl: wgpu::BindGroupLayout, // group(0) for fullscreen passes
+    strip_src_bgl: wgpu::BindGroupLayout, // group(0) for the strip pass (blur + scene)
     strip_uniform_bgl: wgpu::BindGroupLayout, // group(2) for the strip pass
 
     pub blit_pipeline: wgpu::RenderPipeline,
@@ -97,6 +98,51 @@ impl BlurPipelines {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // The strip pass's group(0): the same blur texture / sampler / uniform
+        // as the fullscreen passes, plus the sharp scene at binding 3 so the
+        // strip shader can apply its own variable-radius blur.
+        let strip_src_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur strip src bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                     },
                     count: None,
                 },
@@ -168,7 +214,7 @@ impl BlurPipelines {
         // --- Strip pipeline (group 0 = blur tex, group 1 = camera, group 2 = uniform). ---
         let strip_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blur strip layout"),
-            bind_group_layouts: &[&blur_bgl, camera_bgl, &strip_uniform_bgl],
+            bind_group_layouts: &[&strip_src_bgl, camera_bgl, &strip_uniform_bgl],
             push_constant_ranges: &[],
         });
         let strip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -211,6 +257,7 @@ impl BlurPipelines {
             format,
             sampler,
             blur_bgl,
+            strip_src_bgl,
             strip_uniform_bgl,
             blit_pipeline,
             blit_alpha_pipeline,
@@ -320,6 +367,7 @@ impl BlurChain {
             height,
             &pipelines.sampler,
             &pipelines.blur_bgl,
+            &pipelines.strip_src_bgl,
             &pipelines.blit_uniform,
             &down_uniforms,
             &up_uniforms,
@@ -355,6 +403,7 @@ impl BlurChain {
             height,
             &pipelines.sampler,
             &pipelines.blur_bgl,
+            &pipelines.strip_src_bgl,
             &pipelines.blit_uniform,
             &self.down_uniforms,
             &self.up_uniforms,
@@ -510,6 +559,7 @@ fn build_resources(
     height: u32,
     sampler: &wgpu::Sampler,
     blur_bgl: &wgpu::BindGroupLayout,
+    strip_src_bgl: &wgpu::BindGroupLayout,
     blit_uniform: &wgpu::Buffer,
     down_uniforms: &[wgpu::Buffer],
     up_uniforms: &[wgpu::Buffer],
@@ -613,10 +663,33 @@ fn build_resources(
         up_bgs.push(make_bg(src, &up_uniforms[i], "blur up bg"));
     }
 
-    // Strip pass samples the final blur, which after run() lives in chain[0].
-    // Reuse the blit uniform buffer (its texel_size field is unused here —
-    // the strip shader has its own group-2 uniform with 1/viewport).
-    let strip_blur_bg = make_bg(&chain[0].view, blit_uniform, "blur strip blur bg");
+    // Strip pass: binding 0 is the final dual-Kawase blur (in chain[0] after
+    // run(), for the title-bar glass band) and binding 3 is the sharp scene
+    // (which the edge strips blur themselves with a per-fragment radius). Reuse
+    // the blit uniform buffer (its texel_size field is unused here — the strip
+    // shader has its own group-2 uniform with 1/viewport).
+    let strip_blur_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("blur strip blur bg"),
+        layout: strip_src_bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&chain[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: blit_uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&scene.view),
+            },
+        ],
+    });
 
     (
         scene,
