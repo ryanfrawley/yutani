@@ -557,6 +557,64 @@ fn py_in_top_toolbar_band_scales_with_dpi() {
 }
 
 #[test]
+fn titlebar_double_click_minimize_setting() {
+    // "Minimize" miniaturizes the window.
+    assert_eq!(
+        titlebar_double_click_action(Some("Minimize")),
+        TitlebarDoubleClickAction::Minimize
+    );
+}
+
+#[test]
+fn titlebar_double_click_none_setting() {
+    // "None" disables the gesture entirely.
+    assert_eq!(
+        titlebar_double_click_action(Some("None")),
+        TitlebarDoubleClickAction::None
+    );
+}
+
+#[test]
+fn titlebar_double_click_defaults_to_zoom() {
+    // Absent key (modern macOS default) and the explicit "Maximize"/"Fill"
+    // / any unrecognized value all zoom — matching the user expectation that
+    // a title-bar double-click maximizes.
+    assert_eq!(
+        titlebar_double_click_action(None),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("Maximize")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("Fill")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    // An empty string is not a recognized action either → zoom.
+    assert_eq!(
+        titlebar_double_click_action(Some("")),
+        TitlebarDoubleClickAction::Zoom
+    );
+}
+
+#[test]
+fn titlebar_double_click_match_is_case_sensitive() {
+    // macOS writes `AppleActionOnDoubleClick` with exact casing
+    // ("Minimize" / "None" / "Maximize"); the mapping matches verbatim. Off-case
+    // variants are unrecognized and must fall through to zoom rather than
+    // minimizing or no-op'ing — guards against someone lower-casing the input.
+    assert_eq!(
+        titlebar_double_click_action(Some("minimize")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("none")),
+        TitlebarDoubleClickAction::Zoom
+    );
+}
+
+#[test]
 fn chrome_band_from_falls_back_to_reserve_when_query_fails() {
     // No native height available → use the renderer's fixed reserve.
     let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
