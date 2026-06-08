@@ -4004,3 +4004,33 @@ fn classify_corner_column_zero_boundary() {
         CornerType::Concave
     );
 }
+
+// Shift+click selection extension pivots the moving end around the persisted
+// drag origin (`press_cell`) regardless of whether the new point lands above
+// or below it. The direction-agnostic guarantee reduces to `Selection::range()`
+// normalizing its endpoints into reading order, so a selection built
+// origin→below and one built origin→above (the up case) cover the same span
+// with the origin as one inclusive endpoint either way.
+#[test]
+fn selection_range_normalizes_regardless_of_extend_direction() {
+    let origin = (5isize, 3usize);
+
+    // Extend downward: head is past the origin in reading order.
+    let down = Selection { anchor: origin, head: (8, 1) };
+    assert_eq!(down.range(), ((5, 3), (8, 1)));
+
+    // Extend upward: the moving end now precedes the origin. range() still
+    // yields (start, end) in reading order, with the origin as the end.
+    let up = Selection { anchor: origin, head: (2, 9) };
+    assert_eq!(up.range(), ((2, 9), (5, 3)));
+
+    // Pivoting back onto the origin's own row keeps column order sane.
+    let same_row_left = Selection { anchor: origin, head: (5, 0) };
+    assert_eq!(same_row_left.range(), ((5, 0), (5, 3)));
+    let same_row_right = Selection { anchor: origin, head: (5, 7) };
+    assert_eq!(same_row_right.range(), ((5, 3), (5, 7)));
+
+    // A degenerate (collapsed) selection round-trips unchanged.
+    let collapsed = Selection { anchor: origin, head: origin };
+    assert_eq!(collapsed.range(), (origin, origin));
+}
