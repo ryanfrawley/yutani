@@ -557,6 +557,64 @@ fn py_in_top_toolbar_band_scales_with_dpi() {
 }
 
 #[test]
+fn titlebar_double_click_minimize_setting() {
+    // "Minimize" miniaturizes the window.
+    assert_eq!(
+        titlebar_double_click_action(Some("Minimize")),
+        TitlebarDoubleClickAction::Minimize
+    );
+}
+
+#[test]
+fn titlebar_double_click_none_setting() {
+    // "None" disables the gesture entirely.
+    assert_eq!(
+        titlebar_double_click_action(Some("None")),
+        TitlebarDoubleClickAction::None
+    );
+}
+
+#[test]
+fn titlebar_double_click_defaults_to_zoom() {
+    // Absent key (modern macOS default) and the explicit "Maximize"/"Fill"
+    // / any unrecognized value all zoom — matching the user expectation that
+    // a title-bar double-click maximizes.
+    assert_eq!(
+        titlebar_double_click_action(None),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("Maximize")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("Fill")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    // An empty string is not a recognized action either → zoom.
+    assert_eq!(
+        titlebar_double_click_action(Some("")),
+        TitlebarDoubleClickAction::Zoom
+    );
+}
+
+#[test]
+fn titlebar_double_click_match_is_case_sensitive() {
+    // macOS writes `AppleActionOnDoubleClick` with exact casing
+    // ("Minimize" / "None" / "Maximize"); the mapping matches verbatim. Off-case
+    // variants are unrecognized and must fall through to zoom rather than
+    // minimizing or no-op'ing — guards against someone lower-casing the input.
+    assert_eq!(
+        titlebar_double_click_action(Some("minimize")),
+        TitlebarDoubleClickAction::Zoom
+    );
+    assert_eq!(
+        titlebar_double_click_action(Some("none")),
+        TitlebarDoubleClickAction::Zoom
+    );
+}
+
+#[test]
 fn chrome_band_from_falls_back_to_reserve_when_query_fails() {
     // No native height available → use the renderer's fixed reserve.
     let reserve = (WINDOW_PADDING + DECORATOR_HEIGHT) as f64;
@@ -3945,4 +4003,34 @@ fn classify_corner_column_zero_boundary() {
         classify_corner_with_neighbor(0, Some((0, 4)), HorizSide::Right),
         CornerType::Concave
     );
+}
+
+// Shift+click selection extension pivots the moving end around the persisted
+// drag origin (`press_cell`) regardless of whether the new point lands above
+// or below it. The direction-agnostic guarantee reduces to `Selection::range()`
+// normalizing its endpoints into reading order, so a selection built
+// origin→below and one built origin→above (the up case) cover the same span
+// with the origin as one inclusive endpoint either way.
+#[test]
+fn selection_range_normalizes_regardless_of_extend_direction() {
+    let origin = (5isize, 3usize);
+
+    // Extend downward: head is past the origin in reading order.
+    let down = Selection { anchor: origin, head: (8, 1) };
+    assert_eq!(down.range(), ((5, 3), (8, 1)));
+
+    // Extend upward: the moving end now precedes the origin. range() still
+    // yields (start, end) in reading order, with the origin as the end.
+    let up = Selection { anchor: origin, head: (2, 9) };
+    assert_eq!(up.range(), ((2, 9), (5, 3)));
+
+    // Pivoting back onto the origin's own row keeps column order sane.
+    let same_row_left = Selection { anchor: origin, head: (5, 0) };
+    assert_eq!(same_row_left.range(), ((5, 0), (5, 3)));
+    let same_row_right = Selection { anchor: origin, head: (5, 7) };
+    assert_eq!(same_row_right.range(), ((5, 3), (5, 7)));
+
+    // A degenerate (collapsed) selection round-trips unchanged.
+    let collapsed = Selection { anchor: origin, head: origin };
+    assert_eq!(collapsed.range(), (origin, origin));
 }

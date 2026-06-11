@@ -2910,23 +2910,26 @@ extern "C" fn yutani_new_window_for_tab(
 /// mouse-down to hand AppKit, and the drag hesitates for up to ~500ms.
 ///
 /// Here we're still *inside* event delivery with the real event in hand, so a
-/// left mouse-down on the empty title-bar strip goes straight to
+/// single left mouse-down on the empty title-bar strip goes straight to
 /// `performWindowDragWithEvent:` and the window follows the cursor instantly.
-/// That one call covers *both* gestures: a single click starts the drag, and a
-/// double-click performs the system "Double-click a window's title bar to"
-/// action (zoom / minimize / nothing, per System Settings) — AppKit reads the
-/// `AppleActionOnDoubleClick` default itself, so we don't.
 ///
-/// We deliberately do *not* run a zoom/minimize ourselves on a double-click.
-/// Doing so on top of `performWindowDragWithEvent:` ran the action twice — our
-/// handler resized the window to full while AppKit's own (drag-armed)
-/// double-click zoom then toggled it straight back to the saved user frame, so
-/// from a manually-shrunk window a double-tap animated out to full and bounced
-/// right back, indefinitely. Routing the whole gesture through the one AppKit
-/// call is what AppKit expects and leaves no competing toggle.
+/// A *double*-click on that strip we run ourselves
+/// (`perform_titlebar_double_click_action`) and we **must not** hand the
+/// double-click event to `performWindowDragWithEvent:`. AppKit only performs its
+/// own title-bar double-click action when it recognizes the press as landing on
+/// a real title-bar view — which our full-size content view isn't, *until* a
+/// genuine title-text double-click "primes" that recognizer for the window.
+/// That priming dependence is exactly the regression we keep hitting: before it,
+/// `performWindowDragWithEvent:` does nothing on the bare strip, so the window
+/// never zooms; after it, AppKit's action fires too, and if we *also* ran our
+/// own zoom the two toggles fought and the window bounced full→back on every
+/// double-tap. Owning the action ourselves on `clickCount >= 2` — and never
+/// routing that event through AppKit — makes exactly one zoom happen in both
+/// states. Single clicks (`clickCount == 1`) still drive the native drag.
 ///
-/// Everything else — clicks on the traffic lights, the tab bar, or the terminal
-/// body — falls through to the normal `NSWindow` path (and on to winit).
+/// Everything else — clicks on the traffic lights, the tab bar, the title text,
+/// or the terminal body — falls through to the normal `NSWindow` path (and on to
+/// winit), keeping AppKit's native title-text double-click behavior intact.
 #[cfg(target_os = "macos")]
 extern "C" fn yutani_send_event(
     this: *mut objc2::runtime::AnyObject,
@@ -2989,12 +2992,18 @@ extern "C" fn yutani_send_event(
                     let content: NSRect = msg_send![this, contentLayoutRect];
                     let titlebar = frame.size.height - content.size.height;
                     if titlebar > 0.0 && loc.y > content.size.height {
-                        // One AppKit call drives the whole gesture: a single
-                        // click drags the window, a double-click performs the
-                        // system title-bar action (zoom / minimize / nothing).
-                        // See this function's doc comment for why we must not
-                        // also run the zoom ourselves.
-                        let _: () = msg_send![this, performWindowDragWithEvent: event];
+                        if ns_event.clickCount() >= 2 {
+                            // Run the system double-click action ourselves.
+                            // AppKit won't do it for the bare content view
+                            // (unless a real title-text double-click has primed
+                            // it), and feeding the double-click event to
+                            // `performWindowDragWithEvent:` is what made the two
+                            // actions fight. See the doc comment above.
+                            perform_titlebar_double_click_action(this);
+                        } else {
+                            // Single click: start the native drag instantly.
+                            let _: () = msg_send![this, performWindowDragWithEvent: event];
+                        }
                         return;
                     }
                 }
@@ -3003,6 +3012,62 @@ extern "C" fn yutani_send_event(
         // Default NSWindow dispatch for everything we didn't claim.
         let this_ref: &AnyObject = &*this;
         let _: () = msg_send![super(this_ref, class!(NSWindow)), sendEvent: event];
+    }
+}
+
+/// The macOS "Double-click a window's title bar to" behavior.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum TitlebarDoubleClickAction {
+    Zoom,
+    Minimize,
+    None,
+}
+
+/// Map the `NSGlobalDomain` `AppleActionOnDoubleClick` setting (System Settings ›
+/// Desktop & Dock) to the action a title-bar double-click should take. `setting`
+/// is the raw default string, or `None` when the key is absent. `"Minimize"`
+/// miniaturizes, `"None"` does nothing, and anything else — including the absent
+/// default — zooms (the modern macOS default). Free function so the mapping is
+/// unit-testable without `NSUserDefaults`; `perform_titlebar_double_click_action`
+/// reads the live default and delegates here.
+fn titlebar_double_click_action(setting: Option<&str>) -> TitlebarDoubleClickAction {
+    match setting {
+        Some("Minimize") => TitlebarDoubleClickAction::Minimize,
+        Some("None") => TitlebarDoubleClickAction::None,
+        _ => TitlebarDoubleClickAction::Zoom,
+    }
+}
+
+/// Apply the system "Double-click a window's title bar to" action to `window`.
+/// We invoke this for double-clicks on the bare title-bar strip — see
+/// `yutani_send_event` for why AppKit doesn't do it for us there.
+///
+/// We route through the `performZoom:` / `performMiniaturize:` action methods
+/// rather than `zoom:` / `miniaturize:` so the window gets to validate/animate
+/// exactly as the green button and the Window menu do.
+#[cfg(target_os = "macos")]
+unsafe fn perform_titlebar_double_click_action(window: *mut objc2::runtime::AnyObject) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+
+    let nil = std::ptr::null_mut::<AnyObject>();
+    let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    let setting: Option<objc2::rc::Retained<NSString>> = if defaults.is_null() {
+        None
+    } else {
+        let key = NSString::from_str("AppleActionOnDoubleClick");
+        msg_send![defaults, stringForKey: &*key]
+    };
+    let setting = setting.map(|s| s.to_string());
+    match titlebar_double_click_action(setting.as_deref()) {
+        TitlebarDoubleClickAction::Minimize => {
+            let _: () = msg_send![window, performMiniaturize: nil];
+        }
+        TitlebarDoubleClickAction::None => {}
+        TitlebarDoubleClickAction::Zoom => {
+            let _: () = msg_send![window, performZoom: nil];
+        }
     }
 }
 
