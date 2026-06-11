@@ -226,6 +226,21 @@ impl WindowState {
     /// cell, picking Cell / Word / Line granularity respectively.
     pub(crate) fn handle_mouse_press(&mut self) {
         let p = self.pixel_to_selection_point(self.mouse_x, self.mouse_y);
+        // Shift+click extends the existing selection instead of starting a
+        // fresh one. The original drag origin (`press_cell`, kept alive across
+        // the release) stays anchored and the clicked cell becomes the moving
+        // end — so repeated shift+clicks above or below keep dragging that same
+        // tail toward the pointer, regardless of direction. Honors the live
+        // `selection_mode`, so a shift+click after a double / triple click
+        // extends by word / line. Falls through to a fresh anchor when there's
+        // no origin to pivot on (e.g. right after typing cleared the selection).
+        if self.modifiers.shift_key() {
+            if let Some(anchor) = self.active_tab().press_cell {
+                self.active_tab_mut().press_pixel = Some((self.mouse_x, self.mouse_y));
+                self.active_tab_mut().selection = self.compute_selection(anchor, p);
+                return;
+            }
+        }
         let now = std::time::Instant::now();
         let continued = self.active_tab()
             .last_click
@@ -268,7 +283,9 @@ impl WindowState {
     }
 
     pub(crate) fn handle_mouse_release(&mut self) {
-        self.active_tab_mut().press_cell = None;
+        // Deliberately keep `press_cell`: it's the selection's origin, and a
+        // later shift+click pivots the moving end around it. `press_pixel` only
+        // gates the cell-mode click-vs-drag slop on the next press, so drop it.
         self.active_tab_mut().press_pixel = None;
     }
 
@@ -315,9 +332,13 @@ impl WindowState {
 
     pub(crate) fn clear_selection(&mut self) -> bool {
         // Reset multi-click bookkeeping too — typing should make the next
-        // click count as a fresh single-click.
+        // click count as a fresh single-click. Drop the stored origin as well
+        // so a later shift+click can't pivot around a now-stale cell (the row
+        // it named may have scrolled away once the selection is gone).
         self.active_tab_mut().last_click = None;
         self.active_tab_mut().click_count = 0;
+        self.active_tab_mut().press_cell = None;
+        self.active_tab_mut().press_pixel = None;
         if self.active_tab().selection.is_some() {
             self.active_tab_mut().selection = None;
             true
